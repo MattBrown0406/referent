@@ -1,6 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
-import { LinearGradient } from 'expo-linear-gradient';
 import { StatusBar } from 'expo-status-bar';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
@@ -455,17 +454,6 @@ export default function App() {
           </View>
         </View>
 
-        <TouchableOpacity activeOpacity={0.9} onPress={() => setTab('match')}>
-          <LinearGradient colors={['#245F4D', '#173F36']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.matchHero}>
-            <View style={styles.matchHeroIcon}><AppIcon name="sparkles" size={23} color={COLORS.gold} /></View>
-            <View style={styles.matchHeroCopy}>
-              <Text style={styles.matchHeroTitle}>Find the right placement</Text>
-              <Text style={styles.matchHeroBody}>Match clinical needs, coverage, cost, and location—then use reciprocity to break a tie.</Text>
-            </View>
-            <View style={styles.heroArrow}><AppIcon name="arrow-forward" size={20} color={COLORS.ink} /></View>
-          </LinearGradient>
-        </TouchableOpacity>
-
         <View style={styles.statRow}>
           <View style={styles.statCard}>
             <Text style={styles.statNumber}>{partners.length}</Text>
@@ -906,12 +894,6 @@ const styles = StyleSheet.create({
   eyebrow: { color: COLORS.gray, fontSize: 11, fontWeight: '800', letterSpacing: 1.25, marginBottom: 7 },
   heroTitle: { fontSize: 29, lineHeight: 35, color: COLORS.ink, fontWeight: '800', letterSpacing: -0.9 },
   heroSubtitle: { fontSize: 15, color: COLORS.gray, marginTop: 5 },
-  matchHero: { minHeight: 144, borderRadius: 24, padding: 20, flexDirection: 'row', alignItems: 'flex-start', marginBottom: 16, shadowColor: COLORS.ink, shadowOpacity: 0.18, shadowRadius: 16, shadowOffset: { width: 0, height: 8 }, elevation: 5 },
-  matchHeroIcon: { width: 42, height: 42, borderRadius: 14, backgroundColor: 'rgba(255,255,255,0.12)', alignItems: 'center', justifyContent: 'center' },
-  matchHeroCopy: { flex: 1, paddingHorizontal: 14 },
-  matchHeroTitle: { color: COLORS.white, fontSize: 19, fontWeight: '800', letterSpacing: -0.35, marginBottom: 7 },
-  matchHeroBody: { color: '#DCE9E4', fontSize: 13, lineHeight: 19 },
-  heroArrow: { width: 34, height: 34, borderRadius: 17, backgroundColor: COLORS.gold, alignItems: 'center', justifyContent: 'center', alignSelf: 'center' },
   statRow: { flexDirection: 'row', gap: 12, marginBottom: 28 },
   statCard: { flex: 1, backgroundColor: COLORS.white, borderRadius: 20, padding: 17, borderWidth: 1, borderColor: '#E6E9E4' },
   statNumber: { fontSize: 28, fontWeight: '800', color: COLORS.ink, letterSpacing: -0.8 },
