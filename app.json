@@ -1,14 +1,14 @@
 {
   "expo": {
-    "name": "Referent",
-    "slug": "referent",
+    "name": "ReferralFit",
+    "slug": "referralfit",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.mattbrown.referent",
+      "bundleIdentifier": "com.mattbrown.referralfit",
       "buildNumber": "1",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
@@ -27,7 +27,7 @@
       "favicon": "./assets/favicon.png",
       "bundler": "metro"
     },
-    "scheme": "referent",
+    "scheme": "referralfit",
     "plugins": [
       "expo-font"
     ]

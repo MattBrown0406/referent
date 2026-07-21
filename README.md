@@ -1,4 +1,4 @@
-# Referent
+# ReferralFit
 
 A native Expo app for managing professional referral relationships and finding clinically appropriate placements.
 

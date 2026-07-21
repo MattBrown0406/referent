@@ -55,7 +55,8 @@ const COLORS = {
   blue: '#507C86',
 };
 
-const STORAGE_KEY = 'referent-v1';
+const STORAGE_KEY = 'referralfit-v1';
+const LEGACY_STORAGE_KEY = 'referent-v1';
 
 const emptyPartner = {
   name: '',
@@ -265,16 +266,24 @@ export default function App() {
   const [matchTherapies, setMatchTherapies] = useState<string[]>(['Trauma', 'Dual diagnosis']);
 
   useEffect(() => {
-    AsyncStorage.getItem(STORAGE_KEY)
-      .then((value) => {
+    async function loadStoredData() {
+      try {
+        const currentValue = await AsyncStorage.getItem(STORAGE_KEY);
+        const legacyValue = currentValue ? null : await AsyncStorage.getItem(LEGACY_STORAGE_KEY);
+        const value = currentValue || legacyValue;
         if (value) {
           const stored = JSON.parse(value);
           if (Array.isArray(stored.partners)) setPartners(stored.partners);
           if (Array.isArray(stored.referrals)) setReferrals(stored.referrals);
+          if (!currentValue && legacyValue) await AsyncStorage.setItem(STORAGE_KEY, legacyValue);
         }
-      })
-      .catch(() => undefined)
-      .finally(() => setLoaded(true));
+      } catch {
+        // Keep the bundled demo data if local storage cannot be read.
+      } finally {
+        setLoaded(true);
+      }
+    }
+    loadStoredData();
   }, []);
 
   useEffect(() => {
@@ -420,7 +429,7 @@ export default function App() {
           <View style={styles.brandMark}>
             <AppIcon name="git-compare-outline" size={20} color={COLORS.white} />
           </View>
-          <Text style={styles.brandName}>{title || 'Referent'}</Text>
+          <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
         </View>
         <TouchableOpacity style={styles.demoBadge} onPress={() => Alert.alert('Demo data', 'All people, programs, and contact details in this prototype are fictional.')}>
           <View style={styles.demoDot} />
