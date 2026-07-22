@@ -12,6 +12,7 @@ import {
   Pressable,
   SafeAreaView,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -59,6 +60,22 @@ const COLORS = {
 
 const STORAGE_KEY = 'referralfit-v2';
 
+type PartnerForm = {
+  name: string;
+  organization: string;
+  types: Partner['type'][];
+  city: string;
+  state: string;
+  phone: string;
+  email: string;
+  website: string;
+  cashMin: string;
+  cashMax: string;
+  insurance: string;
+  therapies: string[];
+  note: string;
+};
+
 function localDateStamp() {
   const now = new Date();
   const year = now.getFullYear();
@@ -80,20 +97,42 @@ function currentGreeting() {
   return 'Good evening.';
 }
 
-const emptyPartner = {
+function makeEmptyPartnerForm(): PartnerForm {
+  return {
   name: '',
   organization: '',
-  type: 'Inpatient' as Partner['type'],
+  types: ['Inpatient'],
   city: '',
   state: '',
   phone: '',
   email: '',
+  website: '',
   cashMin: '',
   cashMax: '',
   insurance: '',
-  therapies: '',
+  therapies: [],
   note: '',
-};
+  };
+}
+
+function typesForPartner(partner: Partner): Partner['type'][] {
+  if (partner.types?.length) return partner.types;
+  const legacyTypes = (partner.levels || []).filter((level): level is Partner['type'] => partnerTypes.includes(level as Partner['type']));
+  return legacyTypes.length ? legacyTypes : [partner.type];
+}
+
+function partnerTypeLabel(partner: Partner) {
+  return typesForPartner(partner).join(' · ');
+}
+
+function partnerShareMessage(partner: Partner) {
+  return [
+    partner.organization,
+    `Contact: ${partner.name}`,
+    partner.phone ? `Phone: ${partner.phone}` : '',
+    partner.website ? `Website: ${partner.website}` : '',
+  ].filter(Boolean).join('\n');
+}
 
 const emptyReferral = {
   direction: 'Inbound' as ReferralDirection,
@@ -201,20 +240,24 @@ function MultiSelectDropdown({
   options,
   onChange,
   icon,
+  emptyLabel = 'Any therapeutic need',
+  selectedNoun = 'needs',
 }: {
   label: string;
   values: string[];
   options: string[];
   onChange: (values: string[]) => void;
   icon: IconName;
+  emptyLabel?: string;
+  selectedNoun?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [draftValues, setDraftValues] = useState<string[]>(values);
   const summary = values.length === 0
-    ? 'Any therapeutic need'
+    ? emptyLabel
     : values.length === 1
       ? values[0]
-      : `${values.length} needs selected`;
+      : `${values.length} ${selectedNoun} selected`;
   const toggle = (option: string) => setDraftValues((current) => current.includes(option)
     ? current.filter((item) => item !== option)
     : [...current, option]);
@@ -300,38 +343,55 @@ function Initials({ name, size = 48 }: { name: string; size?: number }) {
   );
 }
 
-function PartnerCard({ partner, onPress, compact = false }: { partner: Partner; onPress: () => void; compact?: boolean }) {
+function PartnerCard({
+  partner,
+  onPress,
+  onShare,
+  compact = false,
+}: {
+  partner: Partner;
+  onPress: () => void;
+  onShare?: () => void;
+  compact?: boolean;
+}) {
   const balance = partner.inbound - partner.outbound;
   return (
-    <TouchableOpacity activeOpacity={0.84} onPress={onPress} style={[styles.partnerCard, compact && styles.partnerCardCompact]}>
-      <View style={styles.partnerCardTop}>
-        <Initials name={partner.organization} size={compact ? 44 : 50} />
-        <View style={styles.partnerCardIdentity}>
-          <Text style={styles.partnerOrg} numberOfLines={1}>{partner.organization}</Text>
-          <Text style={styles.partnerName} numberOfLines={1}>{partner.name}</Text>
+    <View style={[styles.partnerCard, compact && styles.partnerCardCompact]}>
+      <TouchableOpacity activeOpacity={0.84} onPress={onPress}>
+        <View style={styles.partnerCardTop}>
+          <Initials name={partner.organization} size={compact ? 44 : 50} />
+          <View style={styles.partnerCardIdentity}>
+            <Text style={styles.partnerOrg} numberOfLines={1}>{partner.organization}</Text>
+            <Text style={styles.partnerName} numberOfLines={1}>{partner.name}</Text>
+          </View>
+          {partner.favorite ? <AppIcon name="heart" size={18} color={COLORS.coral} /> : <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />}
         </View>
-        {partner.favorite ? <AppIcon name="heart" size={18} color={COLORS.coral} /> : <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />}
-      </View>
-      <View style={styles.metaRow}>
-        <View style={styles.typeBadge}><Text style={styles.typeBadgeText}>{partner.type}</Text></View>
-        <Text style={styles.metaText}>{partner.city}, {partner.state}</Text>
-      </View>
-      {!compact ? (
-        <>
+        <View style={styles.metaRow}>
+          <View style={[styles.typeBadge, styles.partnerTypeBadge]}><Text numberOfLines={1} style={styles.typeBadgeText}>{partnerTypeLabel(partner)}</Text></View>
+          <Text numberOfLines={1} style={styles.metaText}>{partner.city}, {partner.state}</Text>
+        </View>
+        {!compact ? (
           <View style={styles.tagRow}>
             {partner.therapies.slice(0, 3).map((therapy) => <View key={therapy} style={styles.miniTag}><Text style={styles.miniTagText}>{therapy}</Text></View>)}
             {partner.therapies.length > 3 ? <Text style={styles.moreTags}>+{partner.therapies.length - 3}</Text> : null}
           </View>
-          <View style={styles.partnerFooter}>
+        ) : null}
+      </TouchableOpacity>
+      {!compact ? (
+        <View style={styles.partnerFooter}>
             <Text style={styles.partnerFooterText}>{partner.insurance.length > 1 ? `${partner.insurance.length - 1} insurance plans` : 'Cash pay'}</Text>
             <View style={[styles.balanceBadge, balance > 0 && styles.balanceBadgeWarm]}>
               <AppIcon name={balance > 0 ? 'arrow-undo' : 'swap-horizontal'} size={13} color={balance > 0 ? COLORS.coral : COLORS.forest} />
               <Text style={[styles.balanceText, balance > 0 && styles.balanceTextWarm]}>{balance > 0 ? `${balance} to return` : 'Balanced'}</Text>
             </View>
-          </View>
-        </>
+            {onShare ? (
+              <TouchableOpacity accessibilityLabel={`Share ${partner.organization}`} accessibilityRole="button" onPress={onShare} style={styles.cardShareButton}>
+                <AppIcon name="share-outline" size={17} color={COLORS.forest} />
+              </TouchableOpacity>
+            ) : null}
+        </View>
       ) : null}
-    </TouchableOpacity>
+    </View>
   );
 }
 
@@ -353,9 +413,10 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [selectedPartner, setSelectedPartner] = useState<Partner | null>(null);
   const [showAddPartner, setShowAddPartner] = useState(false);
+  const [editingPartnerId, setEditingPartnerId] = useState<string | null>(null);
   const [showAddReferral, setShowAddReferral] = useState(false);
   const [activeReferralMatchId, setActiveReferralMatchId] = useState<string | null>(null);
-  const [partnerForm, setPartnerForm] = useState(emptyPartner);
+  const [partnerForm, setPartnerForm] = useState<PartnerForm>(makeEmptyPartnerForm);
   const [referralForm, setReferralForm] = useState(emptyReferral);
   const [search, setSearch] = useState('');
   const [directoryType, setDirectoryType] = useState('All');
@@ -420,8 +481,8 @@ export default function App() {
   const directoryPartners = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return partners
-      .filter((partner) => directoryType === 'All' || partner.type === directoryType)
-      .filter((partner) => !needle || `${partner.name} ${partner.organization} ${partner.city} ${partner.state} ${partner.therapies.join(' ')}`.toLowerCase().includes(needle))
+      .filter((partner) => directoryType === 'All' || typesForPartner(partner).includes(directoryType as Partner['type']))
+      .filter((partner) => !needle || `${partner.name} ${partner.organization} ${partner.city} ${partner.state} ${partnerTypeLabel(partner)} ${partner.therapies.join(' ')}`.toLowerCase().includes(needle))
       .sort((a, b) => Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)) || a.organization.localeCompare(b.organization));
   }, [partners, directoryType, search]);
 
@@ -448,12 +509,12 @@ export default function App() {
     const budget = Number(matchBudget) || Infinity;
     return partners
       .map((partner) => {
-        const typeFit = matchType === 'Any type' || partner.type === matchType;
+        const typeFit = matchType === 'Any type' || typesForPartner(partner).includes(matchType as Partner['type']);
         const paymentFit = matchInsurance === 'Cash pay' ? partner.cashMin <= budget : partner.insurance.includes(matchInsurance);
         const regionFit = matchState === 'ANY' || partner.state === matchState || partner.regions.includes('Nationwide');
         const matchesNeed = (need: string) => {
-          if (need === 'Men only') return partner.populations.includes('Men') && !partner.populations.includes('Women');
-          if (need === 'Women only') return partner.populations.includes('Women') && !partner.populations.includes('Men');
+          if (need === 'Men only') return partner.therapies.includes(need) || (partner.populations.includes('Men') && !partner.populations.includes('Women'));
+          if (need === 'Women only') return partner.therapies.includes(need) || (partner.populations.includes('Women') && !partner.populations.includes('Men'));
           if (need === 'LGBTQ+') return partner.therapies.includes(need) || partner.populations.includes('LGBTQ+');
           if (need === 'Adolescent') return partner.therapies.includes(need) || partner.populations.some((population) => ['Adolescent', 'Adolescents', 'Teens'].includes(population));
           return partner.therapies.includes(need);
@@ -550,35 +611,90 @@ export default function App() {
     setShowAddReferral(true);
   }
 
-  function addPartner() {
+  function openNewPartner() {
+    setEditingPartnerId(null);
+    setPartnerForm(makeEmptyPartnerForm());
+    setShowAddPartner(true);
+  }
+
+  function openEditPartner(partner: Partner) {
+    setEditingPartnerId(partner.id);
+    setPartnerForm({
+      name: partner.name,
+      organization: partner.organization,
+      types: typesForPartner(partner),
+      city: partner.city === '—' ? '' : partner.city,
+      state: partner.state === '—' ? '' : partner.state,
+      phone: partner.phone,
+      email: partner.email,
+      website: partner.website || '',
+      cashMin: partner.cashMin ? String(partner.cashMin) : '',
+      cashMax: partner.cashMax ? String(partner.cashMax) : '',
+      insurance: partner.insurance.join(', '),
+      therapies: partner.therapies,
+      note: partner.note,
+    });
+    setSelectedPartner(null);
+    setShowAddPartner(true);
+  }
+
+  function closePartnerForm() {
+    setShowAddPartner(false);
+    setEditingPartnerId(null);
+    setPartnerForm(makeEmptyPartnerForm());
+  }
+
+  async function sharePartner(partner: Partner) {
+    try {
+      await Share.share({
+        title: `${partner.organization} referral contact`,
+        message: partnerShareMessage(partner),
+      });
+    } catch {
+      Alert.alert('Unable to share', 'The share sheet could not be opened. Please try again.');
+    }
+  }
+
+  function savePartner() {
     if (!partnerForm.name.trim() || !partnerForm.organization.trim()) {
       Alert.alert('A little more detail', 'Add a contact name and organization first.');
       return;
     }
+    if (!partnerForm.types.length) {
+      Alert.alert('Choose a partner type', 'Select at least one level of care or provider type.');
+      return;
+    }
+    const existing = partners.find((partner) => partner.id === editingPartnerId);
     const partner: Partner = {
-      id: `p-${Date.now()}`,
+      id: existing?.id || `p-${Date.now()}`,
       name: partnerForm.name.trim(),
       organization: partnerForm.organization.trim(),
-      type: partnerForm.type,
+      type: partnerForm.types[0],
+      types: partnerForm.types,
       city: partnerForm.city.trim() || '—',
       state: partnerForm.state.trim().toUpperCase() || '—',
-      regions: ['Nationwide'],
+      regions: existing?.regions || ['Nationwide'],
       phone: partnerForm.phone.trim(),
       email: partnerForm.email.trim(),
+      website: partnerForm.website.trim(),
       cashMin: Number(partnerForm.cashMin) || 0,
       cashMax: Number(partnerForm.cashMax) || Number(partnerForm.cashMin) || 0,
       insurance: partnerForm.insurance.split(',').map((item) => item.trim()).filter(Boolean),
-      therapies: partnerForm.therapies.split(',').map((item) => item.trim()).filter(Boolean),
-      populations: ['Adults'],
-      levels: [partnerForm.type],
+      therapies: partnerForm.therapies,
+      populations: existing?.populations || ['Adults'],
+      levels: partnerForm.types,
       note: partnerForm.note.trim(),
-      inbound: 0,
-      outbound: 0,
-      lastContact: localDateStamp(),
+      inbound: existing?.inbound || 0,
+      outbound: existing?.outbound || 0,
+      lastContact: existing?.lastContact || localDateStamp(),
+      favorite: existing?.favorite,
     };
-    setPartners((current) => [partner, ...current]);
-    setPartnerForm(emptyPartner);
+    setPartners((current) => existing
+      ? current.map((item) => item.id === partner.id ? partner : item)
+      : [partner, ...current]);
+    setPartnerForm(makeEmptyPartnerForm());
     setShowAddPartner(false);
+    setEditingPartnerId(null);
     setSelectedPartner(partner);
   }
 
@@ -685,7 +801,7 @@ export default function App() {
               <Initials name={partner.organization} size={36} />
               <View style={{ flex: 1 }}>
                 <Text style={styles.returnPartnerName}>{partner.organization}</Text>
-                <Text style={styles.returnPartnerType}>{partner.type} · {partner.city}</Text>
+                <Text numberOfLines={1} style={styles.returnPartnerType}>{partnerTypeLabel(partner)} · {partner.city}</Text>
               </View>
               <Text style={styles.returnCount}>+{partner.inbound - partner.outbound}</Text>
               <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
@@ -831,7 +947,7 @@ export default function App() {
                 <View style={styles.matchTopLine}>
                   <View style={{ flex: 1 }}>
                     <Text numberOfLines={2} style={styles.matchOrg}>{match.partner.organization}</Text>
-                    <Text style={styles.matchLocation}>{match.partner.type} · {match.partner.city}, {match.partner.state}</Text>
+                    <Text numberOfLines={1} style={styles.matchLocation}>{partnerTypeLabel(match.partner)} · {match.partner.city}, {match.partner.state}</Text>
                   </View>
                   <View style={styles.scoreBlock}><Text style={styles.scoreNumber}>{match.clinicalScore}%</Text><Text style={styles.scoreLabel}>FIT</Text></View>
                 </View>
@@ -864,7 +980,7 @@ export default function App() {
         {renderHeader('Directory')}
         <View style={styles.directoryTitleRow}>
           <View><Text style={styles.screenTitle}>Your network</Text><Text style={styles.screenSubtitle}>{partners.length} people and programs</Text></View>
-          <TouchableOpacity style={styles.addButton} onPress={() => setShowAddPartner(true)}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>Add</Text></TouchableOpacity>
+          <TouchableOpacity style={styles.addButton} onPress={openNewPartner}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>Add</Text></TouchableOpacity>
         </View>
         <View style={styles.searchBox}>
           <AppIcon name="search" size={19} color={COLORS.gray} />
@@ -881,7 +997,7 @@ export default function App() {
           />
         </View>
         <View style={styles.directoryCountRow}><Text style={styles.directoryCount}>{directoryPartners.length} RESULTS</Text><AppIcon name="options-outline" size={18} color={COLORS.gray} /></View>
-        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} onPress={() => setSelectedPartner(partner)} />)}
+        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
         {!directoryPartners.length ? <EmptyState icon="people-outline" title="No partners found" body="Try another search or add a new relationship." /> : null}
       </ScrollView>
     );
@@ -990,13 +1106,15 @@ export default function App() {
               <Initials name={selectedPartner.organization} size={68} />
               <Text style={styles.profileOrg}>{selectedPartner.organization}</Text>
               <Text style={styles.profileName}>{selectedPartner.name}</Text>
-              <View style={styles.profileMeta}><View style={styles.typeBadge}><Text style={styles.typeBadgeText}>{selectedPartner.type}</Text></View><Text style={styles.metaText}>{selectedPartner.city}, {selectedPartner.state}</Text></View>
+              <View style={styles.profileMeta}><View style={[styles.typeBadge, styles.partnerTypeBadge]}><Text numberOfLines={2} style={styles.typeBadgeText}>{partnerTypeLabel(selectedPartner)}</Text></View><Text style={styles.metaText}>{selectedPartner.city}, {selectedPartner.state}</Text></View>
             </View>
 
             <View style={styles.profileActions}>
               <TouchableOpacity style={styles.profileAction} onPress={() => selectedPartner.phone && Linking.openURL(`tel:${selectedPartner.phone.replace(/[^\d+]/g, '')}`)}><AppIcon name="call" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Call</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => selectedPartner.email && Linking.openURL(`mailto:${selectedPartner.email}`)}><AppIcon name="mail" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Email</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openReferral('Outbound', selectedPartner.id)}><AppIcon name="paper-plane" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Refer</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.profileAction} onPress={() => sharePartner(selectedPartner)}><AppIcon name="share-social" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Share</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.profileAction} onPress={() => openEditPartner(selectedPartner)}><AppIcon name="create" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Edit</Text></TouchableOpacity>
             </View>
 
             <View style={styles.profileBalanceCard}>
@@ -1020,6 +1138,7 @@ export default function App() {
             <View style={styles.contactCard}>
               <View style={styles.contactLine}><AppIcon name="call-outline" size={17} color={COLORS.gray} /><Text style={styles.contactText}>{selectedPartner.phone || 'No phone recorded'}</Text></View>
               <View style={styles.contactLine}><AppIcon name="mail-outline" size={17} color={COLORS.gray} /><Text style={styles.contactText}>{selectedPartner.email || 'No email recorded'}</Text></View>
+              <View style={styles.contactLine}><AppIcon name="globe-outline" size={17} color={COLORS.gray} /><Text style={styles.contactText}>{selectedPartner.website || 'No website recorded'}</Text></View>
             </View>
           </ScrollView>
         </SafeAreaView>
@@ -1028,34 +1147,45 @@ export default function App() {
   }
 
   function AddPartnerModal() {
+    const isEditing = Boolean(editingPartnerId);
     return (
-      <Modal visible={showAddPartner} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setShowAddPartner(false)}>
+      <Modal visible={showAddPartner} animationType="slide" presentationStyle="pageSheet" onRequestClose={closePartnerForm}>
         <SafeAreaView style={styles.modalPage}>
           <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
             <View style={styles.modalHeader}>
-              <TouchableOpacity accessibilityLabel="Close add partner" onPress={() => setShowAddPartner(false)} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
-              <Text style={styles.modalHeaderTitle}>Add a partner</Text>
-              <TouchableOpacity onPress={addPartner}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityLabel="Close partner form" onPress={closePartnerForm} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>{isEditing ? 'Edit partner' : 'Add a partner'}</Text>
+              <TouchableOpacity onPress={savePartner}><Text style={styles.saveText}>{isEditing ? 'Update' : 'Save'}</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
-              <Text style={styles.formIntro}>Build a useful relationship record now. You can fill in more details as you learn them.</Text>
-              <FormField label="CONTACT NAME *" value={partnerForm.name} onChangeText={(name) => setPartnerForm({ ...partnerForm, name })} placeholder="Contact name" />
-              <FormField label="ORGANIZATION *" value={partnerForm.organization} onChangeText={(organization) => setPartnerForm({ ...partnerForm, organization })} placeholder="Program or practice" />
-              <DropdownField
-                label="PARTNER TYPE"
-                value={partnerForm.type}
+              <Text style={styles.formIntro}>{isEditing ? 'Update this record so future searches use the latest program details.' : 'Build a useful relationship record now. You can fill in more details as you learn them.'}</Text>
+              <FormField label="CONTACT NAME *" value={partnerForm.name} onChangeText={(name) => setPartnerForm((current) => ({ ...current, name }))} placeholder="Contact name" />
+              <FormField label="ORGANIZATION *" value={partnerForm.organization} onChangeText={(organization) => setPartnerForm((current) => ({ ...current, organization }))} placeholder="Program or practice" />
+              <MultiSelectDropdown
+                label="PARTNER TYPES *"
+                values={partnerForm.types}
+                options={partnerTypes}
                 icon="layers-outline"
-                onChange={(type) => setPartnerForm({ ...partnerForm, type: type as Partner['type'] })}
-                options={partnerTypes.map((type) => ({ label: type, value: type }))}
+                onChange={(types) => setPartnerForm((current) => ({ ...current, types: types as Partner['type'][] }))}
+                emptyLabel="Select partner types"
+                selectedNoun="types"
               />
-              <View style={styles.formRow}><View style={{ flex: 2 }}><FormField label="CITY" value={partnerForm.city} onChangeText={(city) => setPartnerForm({ ...partnerForm, city })} placeholder="City" /></View><View style={{ flex: 1 }}><FormField label="STATE" value={partnerForm.state} onChangeText={(state) => setPartnerForm({ ...partnerForm, state })} placeholder="CA" /></View></View>
-              <FormField label="PHONE" value={partnerForm.phone} onChangeText={(phone) => setPartnerForm({ ...partnerForm, phone })} placeholder="Phone number" keyboardType="phone-pad" />
-              <FormField label="EMAIL" value={partnerForm.email} onChangeText={(email) => setPartnerForm({ ...partnerForm, email })} placeholder="name@program.com" keyboardType="email-address" />
-              <View style={styles.formRow}><View style={{ flex: 1 }}><FormField label="CASH MIN" value={partnerForm.cashMin} onChangeText={(cashMin) => setPartnerForm({ ...partnerForm, cashMin })} placeholder="$0" keyboardType="number-pad" /></View><View style={{ flex: 1 }}><FormField label="CASH MAX" value={partnerForm.cashMax} onChangeText={(cashMax) => setPartnerForm({ ...partnerForm, cashMax })} placeholder="$0" keyboardType="number-pad" /></View></View>
-              <FormField label="INSURANCE (COMMA SEPARATED)" value={partnerForm.insurance} onChangeText={(insurance) => setPartnerForm({ ...partnerForm, insurance })} placeholder="Aetna, Cigna, Blue Cross" />
-              <FormField label="SPECIALTIES (COMMA SEPARATED)" value={partnerForm.therapies} onChangeText={(therapies) => setPartnerForm({ ...partnerForm, therapies })} placeholder="Trauma, EMDR, IFS" />
-              <FormField label="NOTES" value={partnerForm.note} onChangeText={(note) => setPartnerForm({ ...partnerForm, note })} placeholder="Relationship and program notes" multiline />
-              <TouchableOpacity style={styles.primaryButton} onPress={addPartner}><Text style={styles.primaryButtonText}>Save partner</Text></TouchableOpacity>
+              <View style={styles.formRow}><View style={{ flex: 2 }}><FormField label="CITY" value={partnerForm.city} onChangeText={(city) => setPartnerForm((current) => ({ ...current, city }))} placeholder="City" /></View><View style={{ flex: 1 }}><FormField label="STATE" value={partnerForm.state} onChangeText={(state) => setPartnerForm((current) => ({ ...current, state }))} placeholder="CA" /></View></View>
+              <FormField label="PHONE" value={partnerForm.phone} onChangeText={(phone) => setPartnerForm((current) => ({ ...current, phone }))} placeholder="Phone number" keyboardType="phone-pad" />
+              <FormField label="EMAIL" value={partnerForm.email} onChangeText={(email) => setPartnerForm((current) => ({ ...current, email }))} placeholder="name@program.com" keyboardType="email-address" />
+              <FormField label="WEBSITE" value={partnerForm.website} onChangeText={(website) => setPartnerForm((current) => ({ ...current, website }))} placeholder="https://program.com" keyboardType="url" />
+              <View style={styles.formRow}><View style={{ flex: 1 }}><FormField label="CASH MIN" value={partnerForm.cashMin} onChangeText={(cashMin) => setPartnerForm((current) => ({ ...current, cashMin }))} placeholder="$0" keyboardType="number-pad" /></View><View style={{ flex: 1 }}><FormField label="CASH MAX" value={partnerForm.cashMax} onChangeText={(cashMax) => setPartnerForm((current) => ({ ...current, cashMax }))} placeholder="$0" keyboardType="number-pad" /></View></View>
+              <FormField label="INSURANCE (COMMA SEPARATED)" value={partnerForm.insurance} onChangeText={(insurance) => setPartnerForm((current) => ({ ...current, insurance }))} placeholder="Aetna, Cigna, Blue Cross" />
+              <MultiSelectDropdown
+                label="THERAPEUTIC NEEDS"
+                values={partnerForm.therapies}
+                options={therapyOptions}
+                onChange={(therapies) => setPartnerForm((current) => ({ ...current, therapies }))}
+                icon="medkit-outline"
+                emptyLabel="Select therapeutic needs"
+              />
+              <FormField label="NOTES" value={partnerForm.note} onChangeText={(note) => setPartnerForm((current) => ({ ...current, note }))} placeholder="Relationship and program notes" multiline />
+              <TouchableOpacity style={styles.primaryButton} onPress={savePartner}><Text style={styles.primaryButtonText}>{isEditing ? 'Update partner' : 'Save partner'}</Text></TouchableOpacity>
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
@@ -1124,7 +1254,7 @@ export default function App() {
   );
 }
 
-function FormField({ label, value, onChangeText, placeholder, keyboardType, multiline, inputRef }: { label: string; value: string; onChangeText: (value: string) => void; placeholder: string; keyboardType?: 'default' | 'email-address' | 'phone-pad' | 'number-pad'; multiline?: boolean; inputRef?: React.Ref<TextInput> }) {
+function FormField({ label, value, onChangeText, placeholder, keyboardType, multiline, inputRef }: { label: string; value: string; onChangeText: (value: string) => void; placeholder: string; keyboardType?: 'default' | 'email-address' | 'phone-pad' | 'number-pad' | 'url'; multiline?: boolean; inputRef?: React.Ref<TextInput> }) {
   return (
     <View style={styles.formField}>
       <Text style={styles.fieldLabel}>{label}</Text>
@@ -1136,7 +1266,7 @@ function FormField({ label, value, onChangeText, placeholder, keyboardType, mult
         placeholderTextColor="#99A6A1"
         keyboardType={keyboardType}
         multiline={multiline}
-        autoCapitalize={keyboardType === 'email-address' ? 'none' : 'sentences'}
+        autoCapitalize={keyboardType === 'email-address' || keyboardType === 'url' ? 'none' : 'sentences'}
         style={[styles.formInput, multiline && styles.multilineInput]}
       />
     </View>
@@ -1290,18 +1420,20 @@ const styles = StyleSheet.create({
   initialsText: { color: COLORS.forest, fontWeight: '900', letterSpacing: -0.5 },
   metaRow: { flexDirection: 'row', alignItems: 'center', gap: 9, marginTop: 12 },
   typeBadge: { backgroundColor: COLORS.mintPale, borderRadius: 9, paddingHorizontal: 8, paddingVertical: 5 },
+  partnerTypeBadge: { flexShrink: 1, maxWidth: '74%' },
   typeBadgeText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
   metaText: { color: COLORS.gray, fontSize: 11 },
   tagRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 12 },
   miniTag: { borderRadius: 8, paddingHorizontal: 7, paddingVertical: 4, backgroundColor: '#F3F3EF' },
   miniTagText: { color: COLORS.inkSoft, fontSize: 9, fontWeight: '600' },
   moreTags: { color: COLORS.gray, fontSize: 10, alignSelf: 'center', fontWeight: '700' },
-  partnerFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#EFF1EF' },
-  partnerFooterText: { color: COLORS.gray, fontSize: 10, fontWeight: '600' },
+  partnerFooter: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#EFF1EF' },
+  partnerFooterText: { flex: 1, flexShrink: 1, color: COLORS.gray, fontSize: 10, fontWeight: '600' },
   balanceBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5 },
   balanceBadgeWarm: { backgroundColor: COLORS.coralPale },
   balanceText: { color: COLORS.forest, fontSize: 9, fontWeight: '800' },
   balanceTextWarm: { color: COLORS.coral },
+  cardShareButton: { width: 32, height: 32, borderRadius: 11, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.mint },
   emptyState: { alignItems: 'center', paddingVertical: 36, paddingHorizontal: 28 },
   emptyIcon: { width: 52, height: 52, borderRadius: 18, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
   emptyTitle: { color: COLORS.ink, fontSize: 16, fontWeight: '800' },
@@ -1347,9 +1479,9 @@ const styles = StyleSheet.create({
   profileOrg: { color: COLORS.ink, fontSize: 22, fontWeight: '800', letterSpacing: -0.5, marginTop: 12 },
   profileName: { color: COLORS.gray, fontSize: 13, marginTop: 4 },
   profileMeta: { flexDirection: 'row', gap: 9, alignItems: 'center', marginTop: 11 },
-  profileActions: { flexDirection: 'row', gap: 10, marginBottom: 18 },
+  profileActions: { flexDirection: 'row', gap: 6, marginBottom: 18 },
   profileAction: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: COLORS.white, borderRadius: 16, paddingVertical: 12, borderWidth: 1, borderColor: COLORS.line },
-  profileActionText: { color: COLORS.inkSoft, fontSize: 10, fontWeight: '700' },
+  profileActionText: { color: COLORS.inkSoft, fontSize: 9, fontWeight: '700' },
   profileBalanceCard: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: COLORS.coralPale, borderRadius: 18, padding: 16, marginBottom: 18 },
   profileBalanceTitle: { color: COLORS.ink, fontSize: 14, fontWeight: '800' },
   profileCounts: { alignItems: 'flex-end', gap: 3 },

@@ -13,11 +13,13 @@ export type Partner = {
   name: string;
   organization: string;
   type: PartnerType;
+  types?: PartnerType[];
   city: string;
   state: string;
   regions: string[];
   phone: string;
   email: string;
+  website?: string;
   cashMin: number;
   cashMax: number;
   insurance: string[];
