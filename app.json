@@ -4,7 +4,7 @@
     "slug": "referralfit",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/icon-fit-point.png",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
@@ -24,7 +24,7 @@
       "predictiveBackGestureEnabled": false
     },
     "web": {
-      "favicon": "./assets/favicon.png",
+      "favicon": "./assets/icon-fit-point.png",
       "bundler": "metro"
     },
     "scheme": "referralfit",

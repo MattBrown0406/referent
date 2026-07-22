@@ -4,6 +4,7 @@ import { StatusBar } from 'expo-status-bar';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
+  Image,
   KeyboardAvoidingView,
   Linking,
   Modal,
@@ -632,9 +633,7 @@ export default function App() {
     return (
       <View style={styles.header}>
         <View style={styles.brandRow}>
-          <View style={styles.brandMark}>
-            <AppIcon name="git-compare-outline" size={20} color={COLORS.white} />
-          </View>
+          <Image accessibilityLabel="ReferralFit Fit Point logo" source={require('./assets/icon-fit-point.png')} style={styles.brandMark} />
           <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
         </View>
       </View>
@@ -1148,7 +1147,7 @@ const styles = StyleSheet.create({
   scrollContent: { paddingHorizontal: 20, paddingTop: Platform.OS === 'android' ? 18 : 8, paddingBottom: 28 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 10, marginBottom: 22 },
   brandRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  brandMark: { width: 36, height: 36, borderRadius: 12, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
+  brandMark: { width: 36, height: 36, borderRadius: 12 },
   brandName: { fontSize: 19, fontWeight: '800', color: COLORS.ink, letterSpacing: -0.4 },
   welcomeRow: { marginBottom: 22 },
   eyebrow: { color: COLORS.gray, fontSize: 11, fontWeight: '800', letterSpacing: 1.25, marginBottom: 7 },
