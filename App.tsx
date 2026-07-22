@@ -182,6 +182,82 @@ function DropdownField({
   );
 }
 
+function MultiSelectDropdown({
+  label,
+  values,
+  options,
+  onChange,
+  icon,
+}: {
+  label: string;
+  values: string[];
+  options: string[];
+  onChange: (values: string[]) => void;
+  icon: IconName;
+}) {
+  const [open, setOpen] = useState(false);
+  const [draftValues, setDraftValues] = useState<string[]>(values);
+  const summary = values.length === 0
+    ? 'Any therapeutic need'
+    : values.length === 1
+      ? values[0]
+      : `${values.length} needs selected`;
+  const toggle = (option: string) => setDraftValues((current) => current.includes(option)
+    ? current.filter((item) => item !== option)
+    : [...current, option]);
+  const applySelections = () => {
+    onChange(draftValues);
+    setOpen(false);
+  };
+
+  return (
+    <View style={styles.dropdownField}>
+      <Text style={styles.fieldLabel}>{label}</Text>
+      <TouchableOpacity
+        accessibilityLabel={`${label}: ${summary}`}
+        accessibilityRole="button"
+        activeOpacity={0.8}
+        onPress={() => { setDraftValues(values); setOpen(true); }}
+        style={styles.dropdownButton}
+      >
+        <View style={styles.dropdownLeading}><AppIcon name={icon} size={18} color={COLORS.forest} /></View>
+        <Text numberOfLines={1} style={styles.dropdownValue}>{summary}</Text>
+        {values.length ? <View style={styles.multiSelectCount}><Text style={styles.multiSelectCountText}>{values.length}</Text></View> : null}
+        <AppIcon name="chevron-down" size={18} color={COLORS.gray} />
+      </TouchableOpacity>
+      <Modal transparent visible={open} animationType="fade" onRequestClose={() => setOpen(false)}>
+        <Pressable style={styles.dropdownOverlay} onPress={() => setOpen(false)}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <View style={styles.dropdownSheetHeader}>
+              <View>
+                <Text style={styles.dropdownSheetEyebrow}>SELECT MULTIPLE</Text>
+                <Text style={styles.dropdownSheetTitle}>{label}</Text>
+              </View>
+              <TouchableOpacity onPress={applySelections} style={styles.multiSelectDone}><Text style={styles.multiSelectDoneText}>Done</Text></TouchableOpacity>
+            </View>
+            <View style={styles.multiSelectActions}>
+              <Text style={styles.multiSelectSelectionText}>{draftValues.length ? `${draftValues.length} selected` : 'No filters selected'}</Text>
+              {draftValues.length ? <TouchableOpacity onPress={() => setDraftValues([])}><Text style={styles.multiSelectClear}>Clear all</Text></TouchableOpacity> : null}
+            </View>
+            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.dropdownOptions}>
+              {options.map((option) => {
+                const active = draftValues.includes(option);
+                return (
+                  <TouchableOpacity key={option} onPress={() => toggle(option)} style={[styles.dropdownOption, active && styles.dropdownOptionActive]}>
+                    <Text style={[styles.dropdownOptionText, styles.multiSelectOptionText, active && styles.dropdownOptionTextActive]}>{option}</Text>
+                    <AppIcon name={active ? 'checkbox' : 'square-outline'} size={21} color={active ? COLORS.forest : COLORS.gray} />
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    </View>
+  );
+}
+
 function SectionTitle({ title, action, onPress }: { title: string; action?: string; onPress?: () => void }) {
   return (
     <View style={styles.sectionTitleRow}>
@@ -367,6 +443,8 @@ export default function App() {
         const matchesNeed = (need: string) => {
           if (need === 'Men only') return partner.populations.includes('Men') && !partner.populations.includes('Women');
           if (need === 'Women only') return partner.populations.includes('Women') && !partner.populations.includes('Men');
+          if (need === 'LGBTQ+') return partner.therapies.includes(need) || partner.populations.includes('LGBTQ+');
+          if (need === 'Adolescent') return partner.therapies.includes(need) || partner.populations.some((population) => ['Adolescent', 'Adolescents', 'Teens'].includes(population));
           return partner.therapies.includes(need);
         };
         const matchedTherapies = matchTherapies.filter(matchesNeed);
@@ -717,18 +795,13 @@ export default function App() {
             </View>
           ) : null}
 
-          <Text style={styles.fieldLabel}>THERAPEUTIC NEEDS</Text>
-          <View style={styles.wrapPills}>
-            {therapyOptions.map((therapy) => (
-              <Pill
-                key={therapy}
-                label={therapy}
-                icon={matchTherapies.includes(therapy) ? 'checkmark' : undefined}
-                active={matchTherapies.includes(therapy)}
-                onPress={() => setMatchTherapies((current) => current.includes(therapy) ? current.filter((item) => item !== therapy) : [...current, therapy])}
-              />
-            ))}
-          </View>
+          <MultiSelectDropdown
+            label="THERAPEUTIC NEEDS"
+            values={matchTherapies}
+            options={therapyOptions}
+            onChange={setMatchTherapies}
+            icon="medkit-outline"
+          />
         </View>
 
         <View style={styles.resultsHeading}>
@@ -1144,6 +1217,14 @@ const styles = StyleSheet.create({
   dropdownOptionText: { color: COLORS.inkSoft, fontSize: 13, fontWeight: '700', flexShrink: 1 },
   dropdownOptionTextActive: { color: COLORS.forest, fontWeight: '800' },
   dropdownOptionDetail: { color: COLORS.gray, fontSize: 9, marginTop: 2 },
+  multiSelectCount: { minWidth: 23, height: 23, borderRadius: 12, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6 },
+  multiSelectCountText: { color: COLORS.white, fontSize: 10, fontWeight: '800' },
+  multiSelectDone: { backgroundColor: COLORS.forest, borderRadius: 12, paddingHorizontal: 13, paddingVertical: 8 },
+  multiSelectDoneText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
+  multiSelectActions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingTop: 13 },
+  multiSelectSelectionText: { color: COLORS.gray, fontSize: 10, fontWeight: '700' },
+  multiSelectClear: { color: COLORS.coral, fontSize: 10, fontWeight: '800' },
+  multiSelectOptionText: { flex: 1 },
   insuranceHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: -8, marginBottom: 14, paddingHorizontal: 2 },
   wrapPills: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   pill: { flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 20, paddingHorizontal: 13, paddingVertical: 9, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line },
