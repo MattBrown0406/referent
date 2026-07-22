@@ -72,7 +72,7 @@ type PartnerForm = {
   website: string;
   cashMin: string;
   cashMax: string;
-  insurance: string;
+  insurance: string[];
   therapies: string[];
   note: string;
 };
@@ -110,7 +110,7 @@ function makeEmptyPartnerForm(): PartnerForm {
   website: '',
   cashMin: '',
   cashMax: '',
-  insurance: '',
+  insurance: [],
   therapies: [],
   note: '',
   };
@@ -356,6 +356,7 @@ function PartnerCard({
   compact?: boolean;
 }) {
   const balance = partner.inbound - partner.outbound;
+  const insurancePlanCount = partner.insurance.filter((plan) => plan !== 'Cash pay').length;
   return (
     <View style={[styles.partnerCard, compact && styles.partnerCardCompact]}>
       <TouchableOpacity activeOpacity={0.84} onPress={onPress}>
@@ -380,7 +381,7 @@ function PartnerCard({
       </TouchableOpacity>
       {!compact ? (
         <View style={styles.partnerFooter}>
-            <Text style={styles.partnerFooterText}>{partner.insurance.length > 1 ? `${partner.insurance.length - 1} insurance plans` : 'Cash pay'}</Text>
+            <Text style={styles.partnerFooterText}>{insurancePlanCount ? `${insurancePlanCount} insurance ${insurancePlanCount === 1 ? 'plan' : 'plans'}` : 'Cash pay only'}</Text>
             <View style={[styles.balanceBadge, balance > 0 && styles.balanceBadgeWarm]}>
               <AppIcon name={balance > 0 ? 'arrow-undo' : 'swap-horizontal'} size={13} color={balance > 0 ? COLORS.coral : COLORS.forest} />
               <Text style={[styles.balanceText, balance > 0 && styles.balanceTextWarm]}>{balance > 0 ? `${balance} to return` : 'Balanced'}</Text>
@@ -508,6 +509,13 @@ export default function App() {
       return { label: provider, value: provider, detail };
     });
   }, [insuranceOptions, matchState]);
+
+  const partnerInsuranceOptions = useMemo(() => {
+    const stateCode = partnerForm.state.trim().toUpperCase();
+    const validState = stateOptions.some((state) => state.code === stateCode);
+    const plansForState = insuranceProvidersForState(validState ? stateCode : 'ANY').filter((plan) => plan !== 'Cash pay');
+    return Array.from(new Set([...plansForState, ...partnerForm.insurance.filter((plan) => plan !== 'Cash pay')]));
+  }, [partnerForm.state, partnerForm.insurance]);
 
   const matches = useMemo(() => {
     const budget = Number(matchBudget) || Infinity;
@@ -652,7 +660,7 @@ export default function App() {
       website: partner.website || '',
       cashMin: partner.cashMin ? String(partner.cashMin) : '',
       cashMax: partner.cashMax ? String(partner.cashMax) : '',
-      insurance: partner.insurance.join(', '),
+      insurance: partner.insurance.filter((plan) => plan !== 'Cash pay'),
       therapies: partner.therapies,
       note: partner.note,
     });
@@ -701,7 +709,7 @@ export default function App() {
       website: partnerForm.website.trim(),
       cashMin: Number(partnerForm.cashMin) || 0,
       cashMax: Number(partnerForm.cashMax) || Number(partnerForm.cashMin) || 0,
-      insurance: partnerForm.insurance.split(',').map((item) => item.trim()).filter(Boolean),
+      insurance: partnerForm.insurance,
       therapies: partnerForm.therapies,
       populations: existing?.populations || ['Adults'],
       levels: partnerForm.types,
@@ -1225,7 +1233,15 @@ export default function App() {
               <FormField label="EMAIL" value={partnerForm.email} onChangeText={(email) => setPartnerForm((current) => ({ ...current, email }))} placeholder="name@program.com" keyboardType="email-address" />
               <FormField label="WEBSITE" value={partnerForm.website} onChangeText={(website) => setPartnerForm((current) => ({ ...current, website }))} placeholder="https://program.com" keyboardType="url" />
               <View style={styles.formRow}><View style={{ flex: 1 }}><FormField label="CASH MIN" value={partnerForm.cashMin} onChangeText={(cashMin) => setPartnerForm((current) => ({ ...current, cashMin }))} placeholder="$0" keyboardType="number-pad" /></View><View style={{ flex: 1 }}><FormField label="CASH MAX" value={partnerForm.cashMax} onChangeText={(cashMax) => setPartnerForm((current) => ({ ...current, cashMax }))} placeholder="$0" keyboardType="number-pad" /></View></View>
-              <FormField label="INSURANCE (COMMA SEPARATED)" value={partnerForm.insurance} onChangeText={(insurance) => setPartnerForm((current) => ({ ...current, insurance }))} placeholder="Aetna, Cigna, Blue Cross" />
+              <MultiSelectDropdown
+                label="INSURANCES ACCEPTED"
+                values={partnerForm.insurance}
+                options={partnerInsuranceOptions}
+                onChange={(insurance) => setPartnerForm((current) => ({ ...current, insurance }))}
+                icon="shield-checkmark-outline"
+                emptyLabel="Select accepted insurance plans"
+                selectedNoun="plans"
+              />
               <MultiSelectDropdown
                 label="THERAPEUTIC NEEDS"
                 values={partnerForm.therapies}
