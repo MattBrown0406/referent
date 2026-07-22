@@ -290,7 +290,7 @@ export default function App() {
           if (Array.isArray(stored.referrals)) setReferrals(stored.referrals);
           if (Array.isArray(stored.referralMatches)) {
             setReferralMatches(stored.referralMatches);
-            const firstMatch = stored.referralMatches[0] as ReferralMatch | undefined;
+            const firstMatch = (stored.referralMatches as ReferralMatch[]).find((item) => item.status === 'Matching');
             setSelectedMatchId(firstMatch?.id || null);
             if (firstMatch) {
               setMatchClientLabel(firstMatch.clientLabel);
@@ -299,6 +299,13 @@ export default function App() {
               setMatchInsurance(firstMatch.insurance);
               setMatchBudget(firstMatch.maxBudget ? String(firstMatch.maxBudget) : '40000');
               setMatchTherapies(firstMatch.therapies);
+            } else {
+              setMatchClientLabel('');
+              setMatchType('Any type');
+              setMatchState('ANY');
+              setMatchInsurance('Cash pay');
+              setMatchBudget('40000');
+              setMatchTherapies([]);
             }
           }
           if (!currentValue && legacyValue) await AsyncStorage.setItem(STORAGE_KEY, legacyValue);
@@ -377,6 +384,8 @@ export default function App() {
     .slice()
     .sort((a, b) => b.date.localeCompare(a.date))
     .slice(0, 5);
+
+  const activeReferralMatches = referralMatches.filter((item) => item.status === 'Matching');
 
   function loadReferralMatch(referralMatch: ReferralMatch) {
     setSelectedMatchId(referralMatch.id);
@@ -494,6 +503,7 @@ export default function App() {
     };
     setReferrals((current) => [referral, ...current]);
     if (activeReferralMatchId) {
+      const nextActiveMatch = referralMatches.find((item) => item.status === 'Matching' && item.id !== activeReferralMatchId);
       setReferralMatches((current) => current.map((item) => item.id === activeReferralMatchId
         ? {
             ...item,
@@ -504,6 +514,8 @@ export default function App() {
             updatedAt: referral.date,
           }
         : item));
+      if (nextActiveMatch) loadReferralMatch(nextActiveMatch);
+      else startNewReferralMatch();
     }
     setPartners((current) => current.map((partner) => partner.id === referral.partnerId
       ? {
@@ -619,7 +631,7 @@ export default function App() {
   }
 
   function MatchScreen() {
-    const activeMatch = referralMatches.find((item) => item.id === selectedMatchId);
+    const activeMatch = activeReferralMatches.find((item) => item.id === selectedMatchId);
     return (
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
         {renderHeader('Placement match')}
@@ -631,17 +643,17 @@ export default function App() {
         <View style={styles.savedMatchesSection}>
           <View style={styles.savedMatchesHeader}>
             <View style={{ flex: 1 }}>
-              <Text style={styles.sectionTitle}>Referral matches</Text>
-              <Text style={styles.savedMatchesSubtitle}>Save each client once, then return whenever you need.</Text>
+              <Text style={styles.sectionTitle}>Active referral matches</Text>
+              <Text style={styles.savedMatchesSubtitle}>Assigned referrals move to the Referrals tab.</Text>
             </View>
             <TouchableOpacity style={styles.newMatchButton} onPress={startNewReferralMatch}>
               <AppIcon name="add" size={18} color={COLORS.white} />
               <Text style={styles.newMatchButtonText}>New</Text>
             </TouchableOpacity>
           </View>
-          {referralMatches.length ? (
+          {activeReferralMatches.length ? (
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.savedMatchList}>
-              {referralMatches.map((item) => {
+              {activeReferralMatches.map((item) => {
                 const assignedPartner = partners.find((partner) => partner.id === item.assignedPartnerId);
                 const selected = item.id === selectedMatchId;
                 return (
@@ -656,7 +668,7 @@ export default function App() {
                 );
               })}
             </ScrollView>
-          ) : <Text style={styles.noSavedMatches}>No saved matches yet. Create one to keep a client’s criteria available.</Text>}
+          ) : <Text style={styles.noSavedMatches}>No active matches. Create one when you are ready to place another client.</Text>}
         </View>
 
         <View style={styles.filterCard}>
