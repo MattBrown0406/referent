@@ -24,6 +24,7 @@ import {
   initialPartners,
   initialReferralMatches,
   initialReferrals,
+  InsuranceNetworkPreference,
   insuranceProvidersForState,
   medicaidPlansByState,
   nationalInsuranceProviders,
@@ -424,6 +425,7 @@ export default function App() {
   const [matchClientLabel, setMatchClientLabel] = useState('');
   const [matchType, setMatchType] = useState('Any type');
   const [matchInsurance, setMatchInsurance] = useState('Cash pay');
+  const [matchNetworkPreferences, setMatchNetworkPreferences] = useState<InsuranceNetworkPreference[]>(['In-network']);
   const [matchState, setMatchState] = useState('ANY');
   const [matchBudget, setMatchBudget] = useState('');
   const [matchTherapies, setMatchTherapies] = useState<string[]>([]);
@@ -446,6 +448,7 @@ export default function App() {
               setMatchType(firstMatch.levelOfCare);
               setMatchState(firstMatch.state);
               setMatchInsurance(firstMatch.insurance);
+              setMatchNetworkPreferences(firstMatch.networkPreferences?.length ? firstMatch.networkPreferences : ['In-network']);
               setMatchBudget(firstMatch.maxBudget ? String(firstMatch.maxBudget) : '');
               setMatchTherapies(firstMatch.therapies);
             } else {
@@ -453,6 +456,7 @@ export default function App() {
               setMatchType('Any type');
               setMatchState('ANY');
               setMatchInsurance('Cash pay');
+              setMatchNetworkPreferences(['In-network']);
               setMatchBudget('');
               setMatchTherapies([]);
             }
@@ -510,7 +514,14 @@ export default function App() {
     return partners
       .map((partner) => {
         const typeFit = matchType === 'Any type' || typesForPartner(partner).includes(matchType as Partner['type']);
-        const paymentFit = matchInsurance === 'Cash pay' ? partner.cashMin <= budget : partner.insurance.includes(matchInsurance);
+        const isInNetwork = matchInsurance !== 'Cash pay' && partner.insurance.includes(matchInsurance);
+        const paymentFit = matchInsurance === 'Cash pay'
+          ? partner.cashMin <= budget
+          : (matchNetworkPreferences.includes('In-network') && isInNetwork)
+            || (matchNetworkPreferences.includes('Out-of-network') && !isInNetwork);
+        const networkStatus: InsuranceNetworkPreference | null = matchInsurance === 'Cash pay'
+          ? null
+          : isInNetwork ? 'In-network' : 'Out-of-network';
         const regionFit = matchState === 'ANY' || partner.state === matchState || partner.regions.includes('Nationwide');
         const matchesNeed = (need: string) => {
           if (need === 'Men only') return partner.therapies.includes(need) || (partner.populations.includes('Men') && !partner.populations.includes('Women'));
@@ -524,11 +535,11 @@ export default function App() {
         const eligible = typeFit && paymentFit && regionFit && (matchTherapies.length === 0 || matchedTherapies.length > 0);
         const clinicalScore = Math.round(62 + clinicalCoverage * 30 + (paymentFit ? 4 : 0) + (regionFit ? 4 : 0));
         const reciprocity = partner.inbound - partner.outbound;
-        return { partner, matchedTherapies, clinicalScore: Math.min(clinicalScore, 100), reciprocity, eligible };
+        return { partner, matchedTherapies, clinicalScore: Math.min(clinicalScore, 100), reciprocity, eligible, networkStatus };
       })
       .filter((match) => match.eligible)
       .sort((a, b) => b.clinicalScore - a.clinicalScore || b.reciprocity - a.reciprocity || a.partner.cashMin - b.partner.cashMin);
-  }, [partners, matchType, matchInsurance, matchState, matchBudget, matchTherapies]);
+  }, [partners, matchType, matchInsurance, matchNetworkPreferences, matchState, matchBudget, matchTherapies]);
 
   const recentReferrals = referrals
     .slice()
@@ -543,8 +554,17 @@ export default function App() {
     setMatchType(referralMatch.levelOfCare);
     setMatchState(referralMatch.state);
     setMatchInsurance(referralMatch.insurance);
+    setMatchNetworkPreferences(referralMatch.networkPreferences?.length ? referralMatch.networkPreferences : ['In-network']);
     setMatchBudget(referralMatch.maxBudget ? String(referralMatch.maxBudget) : '');
     setMatchTherapies(referralMatch.therapies);
+  }
+
+  function toggleMatchNetworkPreference(preference: InsuranceNetworkPreference) {
+    setMatchNetworkPreferences((current) => {
+      if (!current.includes(preference)) return [...current, preference];
+      if (current.length === 1) return current;
+      return current.filter((item) => item !== preference);
+    });
   }
 
   function startNewReferralMatch() {
@@ -553,6 +573,7 @@ export default function App() {
     setMatchType('Any type');
     setMatchState('ANY');
     setMatchInsurance('Cash pay');
+    setMatchNetworkPreferences(['In-network']);
     setMatchBudget('');
     setMatchTherapies([]);
     requestAnimationFrame(() => matchClientLabelRef.current?.focus());
@@ -571,6 +592,7 @@ export default function App() {
       levelOfCare: matchType as ReferralMatch['levelOfCare'],
       state: matchState,
       insurance: matchInsurance,
+      networkPreferences: matchNetworkPreferences,
       maxBudget: matchInsurance === 'Cash pay' && matchBudget.trim() ? Number(matchBudget) || undefined : undefined,
       therapies: matchTherapies,
       status: existing?.status || 'Matching',
@@ -906,6 +928,32 @@ export default function App() {
             options={[{ label: 'Any Location', value: 'ANY' }, ...stateOptions.map((state) => ({ label: state.name, value: state.code }))]}
           />
 
+          <Text style={styles.fieldLabel}>INSURANCE NETWORK</Text>
+          <View style={styles.networkPreferenceRow}>
+            {(['In-network', 'Out-of-network'] as InsuranceNetworkPreference[]).map((preference) => {
+              const selected = matchNetworkPreferences.includes(preference);
+              return (
+                <TouchableOpacity
+                  key={preference}
+                  accessibilityLabel={`${preference}: ${selected ? 'selected' : 'not selected'}`}
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: selected }}
+                  activeOpacity={0.78}
+                  onPress={() => toggleMatchNetworkPreference(preference)}
+                  style={[styles.networkPreferenceOption, selected && styles.networkPreferenceOptionSelected]}
+                >
+                  <AppIcon name={selected ? 'checkbox' : 'square-outline'} size={21} color={selected ? COLORS.forest : COLORS.gray} />
+                  <Text style={[styles.networkPreferenceText, selected && styles.networkPreferenceTextSelected]}>{preference}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+          <Text style={styles.networkPreferenceHint}>{matchInsurance === 'Cash pay'
+            ? 'This preference applies after you select an insurance provider.'
+            : matchNetworkPreferences.length === 2
+              ? 'Showing both contracted and out-of-network options. Verify benefits before placement.'
+              : `Showing ${matchNetworkPreferences[0].toLowerCase()} options for ${matchInsurance}. Verify benefits before placement.`}</Text>
+
           <DropdownField
             label="PAYMENT / INSURANCE"
             value={matchInsurance}
@@ -956,7 +1004,9 @@ export default function App() {
                   <Text style={styles.matchReasonText}>{match.matchedTherapies.length ? `Matches ${match.matchedTherapies.join(', ')}` : 'Matches selected eligibility filters'}</Text>
                 </View>
                 <View style={styles.matchDetails}>
-                  <Text numberOfLines={1} style={[styles.matchDetailText, styles.matchInsuranceText]}>{match.partner.insurance.slice(0, 2).join(' · ')}</Text>
+                  <Text numberOfLines={1} style={[styles.matchDetailText, styles.matchInsuranceText]}>{matchInsurance === 'Cash pay'
+                    ? match.partner.insurance.slice(0, 2).join(' · ') || 'Cash pay'
+                    : `${match.networkStatus} · ${matchInsurance}`}</Text>
                   <Text numberOfLines={1} style={styles.matchPriceText}>{formatMoney(match.partner.cashMin)}–{formatMoney(match.partner.cashMax)}</Text>
                 </View>
                 {match.reciprocity > 0 ? (
@@ -1365,6 +1415,12 @@ const styles = StyleSheet.create({
   multiSelectClear: { color: COLORS.coral, fontSize: 10, fontWeight: '800' },
   multiSelectOptionText: { flex: 1 },
   insuranceHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: -8, marginBottom: 14, paddingHorizontal: 2 },
+  networkPreferenceRow: { flexDirection: 'row', gap: 9, marginBottom: 7 },
+  networkPreferenceOption: { flex: 1, minHeight: 48, flexDirection: 'row', alignItems: 'center', gap: 8, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, backgroundColor: COLORS.mintPale, paddingHorizontal: 12 },
+  networkPreferenceOptionSelected: { borderColor: COLORS.sage, backgroundColor: COLORS.mint },
+  networkPreferenceText: { flex: 1, color: COLORS.inkSoft, fontSize: 11, fontWeight: '700' },
+  networkPreferenceTextSelected: { color: COLORS.forest, fontWeight: '800' },
+  networkPreferenceHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginBottom: 14, paddingHorizontal: 2 },
   wrapPills: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   pill: { flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 20, paddingHorizontal: 13, paddingVertical: 9, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line },
   pillActive: { backgroundColor: COLORS.forest, borderColor: COLORS.forest },

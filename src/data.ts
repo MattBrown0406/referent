@@ -7,6 +7,7 @@ export type PartnerType =
   | 'Detox';
 
 export type ReferralDirection = 'Inbound' | 'Outbound';
+export type InsuranceNetworkPreference = 'In-network' | 'Out-of-network';
 
 export type Partner = {
   id: string;
@@ -49,6 +50,7 @@ export type ReferralMatch = {
   levelOfCare: PartnerType | 'Any type';
   state: string;
   insurance: string;
+  networkPreferences?: InsuranceNetworkPreference[];
   maxBudget?: number;
   therapies: string[];
   status: 'Matching' | 'Referred';
