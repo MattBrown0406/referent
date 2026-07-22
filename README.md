@@ -9,6 +9,8 @@ A native Expo app for managing professional referral relationships and finding c
 - State-aware insurance menus that list relevant regional plans before major national providers
 - State Medicaid program names and major Medicaid managed-care plans for every state and DC, informed by the CMS 2024 Managed Care Enrollment by Program and Plan dataset
 - Two-stage ranking: client fit first, referral reciprocity only as a tie-breaker
+- Reusable, locally saved client-match profiles with payment-aware budget fields
+- Referent assignment from a recommended match that automatically creates an outbound referral record
 - Inbound and outbound referral ledger with relationship-balance summaries
 - Add partners, favorite relationships, log referrals, and persist changes locally
 - Fictional demo data for safe product evaluation

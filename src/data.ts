@@ -41,6 +41,21 @@ export type Referral = {
   note: string;
 };
 
+export type ReferralMatch = {
+  id: string;
+  clientLabel: string;
+  levelOfCare: PartnerType | 'Any type';
+  state: string;
+  insurance: string;
+  maxBudget?: number;
+  therapies: string[];
+  status: 'Matching' | 'Referred';
+  createdAt: string;
+  updatedAt: string;
+  assignedPartnerId?: string;
+  referralId?: string;
+};
+
 export const partnerTypes: PartnerType[] = [
   'Inpatient',
   'IOP / PHP',
@@ -406,6 +421,21 @@ export const demoReferrals: Referral[] = [
   { id: 'r4', partnerId: 'p2', direction: 'Outbound', date: '2026-07-11', clientLabel: 'Client A.', outcome: 'Placed', note: 'Residential placement after clinical review.' },
   { id: 'r5', partnerId: 'p7', direction: 'Inbound', date: '2026-07-09', clientLabel: 'Family J.', outcome: 'Pending', note: 'Initial call scheduled.' },
   { id: 'r6', partnerId: 'p5', direction: 'Outbound', date: '2026-06-28', clientLabel: 'Client S.', outcome: 'Introduced', note: 'Continuing-care therapy referral.' },
+];
+
+export const demoReferralMatches: ReferralMatch[] = [
+  {
+    id: 'm1',
+    clientLabel: 'Family K.',
+    levelOfCare: 'Inpatient',
+    state: 'CA',
+    insurance: 'Cash pay',
+    maxBudget: 40000,
+    therapies: ['Trauma', 'Dual diagnosis'],
+    status: 'Matching',
+    createdAt: '2026-07-21',
+    updatedAt: '2026-07-21',
+  },
 ];
 
 export const formatMoney = (value: number) =>

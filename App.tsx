@@ -19,6 +19,7 @@ import {
 } from 'react-native';
 import {
   demoPartners,
+  demoReferralMatches,
   demoReferrals,
   formatMoney,
   insuranceProvidersForState,
@@ -28,6 +29,7 @@ import {
   partnerTypes,
   Referral,
   ReferralDirection,
+  ReferralMatch,
   regionalInsuranceByState,
   shortDate,
   stateOptions,
@@ -56,6 +58,14 @@ const COLORS = {
 
 const STORAGE_KEY = 'referralfit-v1';
 const LEGACY_STORAGE_KEY = 'referent-v1';
+
+function localDateStamp() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
 
 const emptyPartner = {
   name: '',
@@ -250,17 +260,21 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('home');
   const [partners, setPartners] = useState<Partner[]>(demoPartners);
   const [referrals, setReferrals] = useState<Referral[]>(demoReferrals);
+  const [referralMatches, setReferralMatches] = useState<ReferralMatch[]>(demoReferralMatches);
   const [loaded, setLoaded] = useState(false);
   const [selectedPartner, setSelectedPartner] = useState<Partner | null>(null);
   const [showAddPartner, setShowAddPartner] = useState(false);
   const [showAddReferral, setShowAddReferral] = useState(false);
+  const [activeReferralMatchId, setActiveReferralMatchId] = useState<string | null>(null);
   const [partnerForm, setPartnerForm] = useState(emptyPartner);
   const [referralForm, setReferralForm] = useState(emptyReferral);
   const [search, setSearch] = useState('');
   const [directoryType, setDirectoryType] = useState('All');
-  const [matchType, setMatchType] = useState('Any type');
+  const [selectedMatchId, setSelectedMatchId] = useState<string | null>('m1');
+  const [matchClientLabel, setMatchClientLabel] = useState('Family K.');
+  const [matchType, setMatchType] = useState('Inpatient');
   const [matchInsurance, setMatchInsurance] = useState('Cash pay');
-  const [matchState, setMatchState] = useState('ANY');
+  const [matchState, setMatchState] = useState('CA');
   const [matchBudget, setMatchBudget] = useState('40000');
   const [matchTherapies, setMatchTherapies] = useState<string[]>(['Trauma', 'Dual diagnosis']);
 
@@ -274,6 +288,19 @@ export default function App() {
           const stored = JSON.parse(value);
           if (Array.isArray(stored.partners)) setPartners(stored.partners);
           if (Array.isArray(stored.referrals)) setReferrals(stored.referrals);
+          if (Array.isArray(stored.referralMatches)) {
+            setReferralMatches(stored.referralMatches);
+            const firstMatch = stored.referralMatches[0] as ReferralMatch | undefined;
+            setSelectedMatchId(firstMatch?.id || null);
+            if (firstMatch) {
+              setMatchClientLabel(firstMatch.clientLabel);
+              setMatchType(firstMatch.levelOfCare);
+              setMatchState(firstMatch.state);
+              setMatchInsurance(firstMatch.insurance);
+              setMatchBudget(firstMatch.maxBudget ? String(firstMatch.maxBudget) : '40000');
+              setMatchTherapies(firstMatch.therapies);
+            }
+          }
           if (!currentValue && legacyValue) await AsyncStorage.setItem(STORAGE_KEY, legacyValue);
         }
       } catch {
@@ -287,8 +314,8 @@ export default function App() {
 
   useEffect(() => {
     if (!loaded) return;
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify({ partners, referrals })).catch(() => undefined);
-  }, [loaded, partners, referrals]);
+    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify({ partners, referrals, referralMatches })).catch(() => undefined);
+  }, [loaded, partners, referrals, referralMatches]);
 
   const totals = useMemo(() => ({
     inbound: partners.reduce((sum, partner) => sum + partner.inbound, 0),
@@ -351,7 +378,69 @@ export default function App() {
     .sort((a, b) => b.date.localeCompare(a.date))
     .slice(0, 5);
 
+  function loadReferralMatch(referralMatch: ReferralMatch) {
+    setSelectedMatchId(referralMatch.id);
+    setMatchClientLabel(referralMatch.clientLabel);
+    setMatchType(referralMatch.levelOfCare);
+    setMatchState(referralMatch.state);
+    setMatchInsurance(referralMatch.insurance);
+    setMatchBudget(referralMatch.maxBudget ? String(referralMatch.maxBudget) : '40000');
+    setMatchTherapies(referralMatch.therapies);
+  }
+
+  function startNewReferralMatch() {
+    setSelectedMatchId(null);
+    setMatchClientLabel('');
+    setMatchType('Any type');
+    setMatchState('ANY');
+    setMatchInsurance('Cash pay');
+    setMatchBudget('40000');
+    setMatchTherapies([]);
+  }
+
+  function saveCurrentReferralMatch() {
+    if (!matchClientLabel.trim()) {
+      Alert.alert('Name this match', 'Add a private client or family label so you can return to it later.');
+      return null;
+    }
+    const existing = referralMatches.find((item) => item.id === selectedMatchId);
+    const today = localDateStamp();
+    const referralMatch: ReferralMatch = {
+      id: existing?.id || `m-${Date.now()}`,
+      clientLabel: matchClientLabel.trim(),
+      levelOfCare: matchType as ReferralMatch['levelOfCare'],
+      state: matchState,
+      insurance: matchInsurance,
+      maxBudget: matchInsurance === 'Cash pay' ? Number(matchBudget) || 0 : undefined,
+      therapies: matchTherapies,
+      status: existing?.status || 'Matching',
+      createdAt: existing?.createdAt || today,
+      updatedAt: today,
+      assignedPartnerId: existing?.assignedPartnerId,
+      referralId: existing?.referralId,
+    };
+    setReferralMatches((current) => [referralMatch, ...current.filter((item) => item.id !== referralMatch.id)]);
+    setSelectedMatchId(referralMatch.id);
+    return referralMatch;
+  }
+
+  function openMatchedReferral(partnerId: string) {
+    const referralMatch = saveCurrentReferralMatch();
+    if (!referralMatch) return;
+    setActiveReferralMatchId(referralMatch.id);
+    setReferralForm({
+      ...emptyReferral,
+      direction: 'Outbound',
+      partnerId,
+      clientLabel: referralMatch.clientLabel,
+      outcome: 'Introduced',
+    });
+    setSelectedPartner(null);
+    setShowAddReferral(true);
+  }
+
   function openReferral(direction: ReferralDirection, partnerId?: string) {
+    setActiveReferralMatchId(null);
     setReferralForm({ ...emptyReferral, direction, partnerId: partnerId || partners[0]?.id || '' });
     setSelectedPartner(null);
     setShowAddReferral(true);
@@ -381,7 +470,7 @@ export default function App() {
       note: partnerForm.note.trim(),
       inbound: 0,
       outbound: 0,
-      lastContact: new Date().toISOString().slice(0, 10),
+      lastContact: localDateStamp(),
     };
     setPartners((current) => [partner, ...current]);
     setPartnerForm(emptyPartner);
@@ -398,12 +487,24 @@ export default function App() {
       id: `r-${Date.now()}`,
       partnerId: referralForm.partnerId,
       direction: referralForm.direction,
-      date: new Date().toISOString().slice(0, 10),
+      date: localDateStamp(),
       clientLabel: referralForm.clientLabel.trim(),
       outcome: referralForm.outcome,
       note: referralForm.note.trim(),
     };
     setReferrals((current) => [referral, ...current]);
+    if (activeReferralMatchId) {
+      setReferralMatches((current) => current.map((item) => item.id === activeReferralMatchId
+        ? {
+            ...item,
+            clientLabel: referral.clientLabel,
+            status: 'Referred',
+            assignedPartnerId: referral.partnerId,
+            referralId: referral.id,
+            updatedAt: referral.date,
+          }
+        : item));
+    }
     setPartners((current) => current.map((partner) => partner.id === referral.partnerId
       ? {
           ...partner,
@@ -414,6 +515,8 @@ export default function App() {
       : partner));
     setShowAddReferral(false);
     setReferralForm(emptyReferral);
+    if (activeReferralMatchId) setTab('referrals');
+    setActiveReferralMatchId(null);
   }
 
   function toggleFavorite(id: string) {
@@ -516,6 +619,7 @@ export default function App() {
   }
 
   function MatchScreen() {
+    const activeMatch = referralMatches.find((item) => item.id === selectedMatchId);
     return (
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
         {renderHeader('Placement match')}
@@ -524,7 +628,51 @@ export default function App() {
           <Text style={styles.screenSubtitle}>Clinical and financial fit come first. Relationship history is used only when fit is equal.</Text>
         </View>
 
+        <View style={styles.savedMatchesSection}>
+          <View style={styles.savedMatchesHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.sectionTitle}>Referral matches</Text>
+              <Text style={styles.savedMatchesSubtitle}>Save each client once, then return whenever you need.</Text>
+            </View>
+            <TouchableOpacity style={styles.newMatchButton} onPress={startNewReferralMatch}>
+              <AppIcon name="add" size={18} color={COLORS.white} />
+              <Text style={styles.newMatchButtonText}>New</Text>
+            </TouchableOpacity>
+          </View>
+          {referralMatches.length ? (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.savedMatchList}>
+              {referralMatches.map((item) => {
+                const assignedPartner = partners.find((partner) => partner.id === item.assignedPartnerId);
+                const selected = item.id === selectedMatchId;
+                return (
+                  <TouchableOpacity key={item.id} onPress={() => loadReferralMatch(item)} style={[styles.savedMatchCard, selected && styles.savedMatchCardActive]}>
+                    <View style={styles.savedMatchTop}>
+                      <View style={[styles.savedMatchIcon, item.status === 'Referred' && styles.savedMatchIconComplete]}><AppIcon name={item.status === 'Referred' ? 'checkmark' : 'person-outline'} size={16} color={item.status === 'Referred' ? COLORS.white : COLORS.forest} /></View>
+                      <Text numberOfLines={1} style={styles.savedMatchName}>{item.clientLabel}</Text>
+                    </View>
+                    <Text numberOfLines={1} style={styles.savedMatchMeta}>{item.levelOfCare === 'Any type' ? 'Any level' : item.levelOfCare} · {item.state === 'ANY' ? 'Any location' : item.state}</Text>
+                    <Text style={[styles.savedMatchStatus, item.status === 'Referred' && styles.savedMatchStatusComplete]}>{assignedPartner ? `Referred to ${assignedPartner.organization}` : 'Matching in progress'}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          ) : <Text style={styles.noSavedMatches}>No saved matches yet. Create one to keep a client’s criteria available.</Text>}
+        </View>
+
         <View style={styles.filterCard}>
+          <View style={styles.matchEditorHeader}>
+            <View>
+              <Text style={styles.matchEditorTitle}>{activeMatch ? 'Edit referral match' : 'New referral match'}</Text>
+              <Text style={styles.matchEditorStatus}>{activeMatch?.status === 'Referred' ? 'Referred · update or reuse these criteria' : 'Matching criteria'}</Text>
+            </View>
+            <TouchableOpacity style={styles.saveMatchButton} onPress={saveCurrentReferralMatch}>
+              <AppIcon name="bookmark" size={15} color={COLORS.forest} />
+              <Text style={styles.saveMatchButtonText}>Save match</Text>
+            </TouchableOpacity>
+          </View>
+          <FormField label="CLIENT / FAMILY LABEL *" value={matchClientLabel} onChangeText={setMatchClientLabel} placeholder="Use initials or a private label" />
+          <Text style={styles.privacyHint}><AppIcon name="lock-closed" size={13} color={COLORS.gray} /> Keep this de-identified; avoid protected health information.</Text>
+
           <DropdownField
             label="LEVEL OF CARE / PROVIDER"
             value={matchType}
@@ -580,29 +728,35 @@ export default function App() {
         </View>
 
         {matches.length ? matches.slice(0, 8).map((match, index) => (
-          <TouchableOpacity key={match.partner.id} onPress={() => setSelectedPartner(match.partner)} activeOpacity={0.85} style={[styles.matchCard, index === 0 && styles.bestMatchCard]}>
-            <View style={styles.matchRank}><Text style={[styles.matchRankText, index === 0 && { color: COLORS.white }]}>{index + 1}</Text></View>
-            <View style={styles.matchMain}>
-              <View style={styles.matchTopLine}>
-                <View style={{ flex: 1 }}>
-                  <Text numberOfLines={2} style={styles.matchOrg}>{match.partner.organization}</Text>
-                  <Text style={styles.matchLocation}>{match.partner.type} · {match.partner.city}, {match.partner.state}</Text>
+          <View key={match.partner.id} style={[styles.matchCard, index === 0 && styles.bestMatchCard]}>
+            <TouchableOpacity onPress={() => setSelectedPartner(match.partner)} activeOpacity={0.85} style={styles.matchCardContent}>
+              <View style={styles.matchRank}><Text style={[styles.matchRankText, index === 0 && { color: COLORS.white }]}>{index + 1}</Text></View>
+              <View style={styles.matchMain}>
+                <View style={styles.matchTopLine}>
+                  <View style={{ flex: 1 }}>
+                    <Text numberOfLines={2} style={styles.matchOrg}>{match.partner.organization}</Text>
+                    <Text style={styles.matchLocation}>{match.partner.type} · {match.partner.city}, {match.partner.state}</Text>
+                  </View>
+                  <View style={styles.scoreBlock}><Text style={styles.scoreNumber}>{match.clinicalScore}%</Text><Text style={styles.scoreLabel}>FIT</Text></View>
                 </View>
-                <View style={styles.scoreBlock}><Text style={styles.scoreNumber}>{match.clinicalScore}%</Text><Text style={styles.scoreLabel}>FIT</Text></View>
+                <View style={styles.matchReason}>
+                  <AppIcon name="checkmark-circle" size={17} color={COLORS.forest} />
+                  <Text style={styles.matchReasonText}>{match.matchedTherapies.length ? `Matches ${match.matchedTherapies.join(', ')}` : 'Matches selected eligibility filters'}</Text>
+                </View>
+                <View style={styles.matchDetails}>
+                  <Text numberOfLines={1} style={[styles.matchDetailText, styles.matchInsuranceText]}>{match.partner.insurance.slice(0, 2).join(' · ')}</Text>
+                  <Text numberOfLines={1} style={styles.matchPriceText}>{formatMoney(match.partner.cashMin)}–{formatMoney(match.partner.cashMax)}</Text>
+                </View>
+                {match.reciprocity > 0 ? (
+                  <View style={styles.reciprocityNote}><AppIcon name="heart" size={13} color={COLORS.coral} /><Text style={styles.reciprocityNoteText}>Tie-breaker: sent you {match.reciprocity} more than received</Text></View>
+                ) : null}
               </View>
-              <View style={styles.matchReason}>
-                <AppIcon name="checkmark-circle" size={17} color={COLORS.forest} />
-                <Text style={styles.matchReasonText}>{match.matchedTherapies.length ? `Matches ${match.matchedTherapies.join(', ')}` : 'Matches selected eligibility filters'}</Text>
-              </View>
-              <View style={styles.matchDetails}>
-                <Text numberOfLines={1} style={[styles.matchDetailText, styles.matchInsuranceText]}>{match.partner.insurance.slice(0, 2).join(' · ')}</Text>
-                <Text numberOfLines={1} style={styles.matchPriceText}>{formatMoney(match.partner.cashMin)}–{formatMoney(match.partner.cashMax)}</Text>
-              </View>
-              {match.reciprocity > 0 ? (
-                <View style={styles.reciprocityNote}><AppIcon name="heart" size={13} color={COLORS.coral} /><Text style={styles.reciprocityNoteText}>Tie-breaker: sent you {match.reciprocity} more than received</Text></View>
-              ) : null}
-            </View>
-          </TouchableOpacity>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.assignReferralButton} onPress={() => openMatchedReferral(match.partner.id)}>
+              <AppIcon name="paper-plane" size={16} color={COLORS.white} />
+              <Text style={styles.assignReferralButtonText}>Assign & refer {matchClientLabel.trim() || 'this client'}</Text>
+            </TouchableOpacity>
+          </View>
         )) : <EmptyState icon="search-outline" title="No eligible matches yet" body="Broaden one of the filters or add another partner to the directory." />}
       </ScrollView>
     );
@@ -814,22 +968,36 @@ export default function App() {
   }
 
   function AddReferralModal() {
+    const matchedReferral = referralMatches.find((item) => item.id === activeReferralMatchId);
+    const closeReferralModal = () => {
+      setShowAddReferral(false);
+      setActiveReferralMatchId(null);
+    };
     return (
-      <Modal visible={showAddReferral} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setShowAddReferral(false)}>
+      <Modal visible={showAddReferral} animationType="slide" presentationStyle="pageSheet" onRequestClose={closeReferralModal}>
         <SafeAreaView style={styles.modalPage}>
           <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
             <View style={styles.modalHeader}>
-              <TouchableOpacity accessibilityLabel="Close referral form" onPress={() => setShowAddReferral(false)} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
-              <Text style={styles.modalHeaderTitle}>Log a referral</Text>
+              <TouchableOpacity accessibilityLabel="Close referral form" onPress={closeReferralModal} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>{matchedReferral ? 'Assign referral' : 'Log a referral'}</Text>
               <TouchableOpacity onPress={addReferral}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
-              <Text style={styles.fieldLabel}>DIRECTION</Text>
-              <View style={styles.segmented}>
-                {(['Inbound', 'Outbound'] as ReferralDirection[]).map((direction) => <TouchableOpacity key={direction} onPress={() => setReferralForm({ ...referralForm, direction })} style={[styles.segment, referralForm.direction === direction && styles.segmentActive]}><AppIcon name={direction === 'Inbound' ? 'arrow-down' : 'arrow-up'} size={16} color={referralForm.direction === direction ? COLORS.white : COLORS.inkSoft} /><Text style={[styles.segmentText, referralForm.direction === direction && styles.segmentTextActive]}>{direction}</Text></TouchableOpacity>)}
-              </View>
-              <Text style={styles.directionExplainer}>{referralForm.direction === 'Inbound' ? 'A professional or program sent a family to you.' : 'You sent a client or family to a professional or program.'}</Text>
-              <Text style={styles.fieldLabel}>PARTNER</Text>
+              {matchedReferral ? (
+                <View style={styles.matchedReferralBanner}>
+                  <View style={styles.matchedReferralIcon}><AppIcon name="paper-plane" size={18} color={COLORS.forest} /></View>
+                  <View style={{ flex: 1 }}><Text style={styles.matchedReferralTitle}>Outbound referral for {matchedReferral.clientLabel}</Text><Text style={styles.matchedReferralBody}>Choose the referent receiving this client, then save it to the Referrals tab.</Text></View>
+                </View>
+              ) : (
+                <>
+                  <Text style={styles.fieldLabel}>DIRECTION</Text>
+                  <View style={styles.segmented}>
+                    {(['Inbound', 'Outbound'] as ReferralDirection[]).map((direction) => <TouchableOpacity key={direction} onPress={() => setReferralForm({ ...referralForm, direction })} style={[styles.segment, referralForm.direction === direction && styles.segmentActive]}><AppIcon name={direction === 'Inbound' ? 'arrow-down' : 'arrow-up'} size={16} color={referralForm.direction === direction ? COLORS.white : COLORS.inkSoft} /><Text style={[styles.segmentText, referralForm.direction === direction && styles.segmentTextActive]}>{direction}</Text></TouchableOpacity>)}
+                  </View>
+                  <Text style={styles.directionExplainer}>{referralForm.direction === 'Inbound' ? 'A professional or program sent a family to you.' : 'You sent a client or family to a professional or program.'}</Text>
+                </>
+              )}
+              <Text style={styles.fieldLabel}>{matchedReferral ? 'ASSIGN REFERENT' : 'PARTNER'}</Text>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.partnerPicker}>
                 {partners.slice().sort((a, b) => Number(b.id === referralForm.partnerId) - Number(a.id === referralForm.partnerId)).map((partner) => <TouchableOpacity key={partner.id} onPress={() => setReferralForm({ ...referralForm, partnerId: partner.id })} style={[styles.partnerPick, referralForm.partnerId === partner.id && styles.partnerPickActive]}><Initials name={partner.organization} size={34} /><Text numberOfLines={2} style={[styles.partnerPickText, referralForm.partnerId === partner.id && styles.partnerPickTextActive]}>{partner.organization}</Text></TouchableOpacity>)}
               </ScrollView>
@@ -838,7 +1006,7 @@ export default function App() {
               <Text style={styles.fieldLabel}>OUTCOME</Text>
               <View style={styles.wrapPills}>{(['Introduced', 'Consulted', 'Placed', 'Pending'] as Referral['outcome'][]).map((outcome) => <Pill key={outcome} label={outcome} active={referralForm.outcome === outcome} onPress={() => setReferralForm({ ...referralForm, outcome })} />)}</View>
               <FormField label="NOTE" value={referralForm.note} onChangeText={(note) => setReferralForm({ ...referralForm, note })} placeholder="Optional relationship note" multiline />
-              <TouchableOpacity style={styles.primaryButton} onPress={addReferral}><Text style={styles.primaryButtonText}>Save referral</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.primaryButton} onPress={addReferral}><Text style={styles.primaryButtonText}>{matchedReferral ? 'Save to referrals' : 'Save referral'}</Text></TouchableOpacity>
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
@@ -925,7 +1093,28 @@ const styles = StyleSheet.create({
   screenIntro: { marginBottom: 20 },
   screenTitle: { color: COLORS.ink, fontSize: 28, lineHeight: 34, fontWeight: '800', letterSpacing: -0.8 },
   screenSubtitle: { color: COLORS.gray, fontSize: 14, lineHeight: 20, marginTop: 5, maxWidth: 390 },
+  savedMatchesSection: { marginBottom: 18 },
+  savedMatchesHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 12 },
+  savedMatchesSubtitle: { color: COLORS.gray, fontSize: 10, lineHeight: 14, marginTop: 3 },
+  newMatchButton: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.forest, borderRadius: 14, paddingHorizontal: 12, paddingVertical: 9 },
+  newMatchButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
+  savedMatchList: { gap: 9, paddingRight: 20 },
+  savedMatchCard: { width: 225, backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.line, borderRadius: 17, padding: 12 },
+  savedMatchCardActive: { borderColor: COLORS.forest, borderWidth: 2, backgroundColor: COLORS.mintPale },
+  savedMatchTop: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  savedMatchIcon: { width: 28, height: 28, borderRadius: 9, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center' },
+  savedMatchIconComplete: { backgroundColor: COLORS.forest },
+  savedMatchName: { flex: 1, color: COLORS.ink, fontSize: 13, fontWeight: '800' },
+  savedMatchMeta: { color: COLORS.gray, fontSize: 10, marginTop: 9 },
+  savedMatchStatus: { minHeight: 28, color: COLORS.coral, fontSize: 10, lineHeight: 14, fontWeight: '700', marginTop: 5 },
+  savedMatchStatusComplete: { color: COLORS.forest },
+  noSavedMatches: { color: COLORS.gray, fontSize: 11, lineHeight: 16, backgroundColor: COLORS.white, borderRadius: 15, borderWidth: 1, borderColor: COLORS.line, padding: 13 },
   filterCard: { backgroundColor: COLORS.white, borderRadius: 24, padding: 18, borderWidth: 1, borderColor: '#E5E8E3', marginBottom: 26 },
+  matchEditorHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 16 },
+  matchEditorTitle: { color: COLORS.ink, fontSize: 16, fontWeight: '800' },
+  matchEditorStatus: { color: COLORS.gray, fontSize: 10, marginTop: 3 },
+  saveMatchButton: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: COLORS.mint, borderRadius: 13, paddingHorizontal: 11, paddingVertical: 9 },
+  saveMatchButtonText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
   fieldLabel: { color: COLORS.gray, fontSize: 10, fontWeight: '800', letterSpacing: 1.05, marginBottom: 9, marginTop: 5 },
   dropdownField: { marginBottom: 15 },
   dropdownButton: { minHeight: 52, flexDirection: 'row', alignItems: 'center', gap: 11, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, borderRadius: 15, paddingHorizontal: 12 },
@@ -958,8 +1147,9 @@ const styles = StyleSheet.create({
   resultsCount: { color: COLORS.gray, fontSize: 11, marginTop: 2 },
   rankBadge: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: COLORS.mint, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 14 },
   rankBadgeText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
-  matchCard: { flexDirection: 'row', backgroundColor: COLORS.white, borderRadius: 22, padding: 15, marginBottom: 12, borderWidth: 1, borderColor: '#E2E7E3' },
+  matchCard: { backgroundColor: COLORS.white, borderRadius: 22, padding: 15, marginBottom: 12, borderWidth: 1, borderColor: '#E2E7E3' },
   bestMatchCard: { borderColor: COLORS.sage, borderWidth: 1.5 },
+  matchCardContent: { flexDirection: 'row' },
   matchRank: { width: 28, height: 28, borderRadius: 9, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.forest, marginRight: 11 },
   matchRankText: { color: COLORS.white, fontSize: 12, fontWeight: '800' },
   matchMain: { flex: 1 },
@@ -977,6 +1167,8 @@ const styles = StyleSheet.create({
   matchPriceText: { flexShrink: 0, color: COLORS.gray, fontSize: 10, fontWeight: '600', textAlign: 'right' },
   reciprocityNote: { flexDirection: 'row', gap: 5, alignItems: 'center', marginTop: 9 },
   reciprocityNoteText: { flex: 1, flexShrink: 1, color: COLORS.coral, fontSize: 10, lineHeight: 14, fontWeight: '700' },
+  assignReferralButton: { minHeight: 42, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: COLORS.forest, borderRadius: 13, marginTop: 13 },
+  assignReferralButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
   directoryTitleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 },
   addButton: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.forest, borderRadius: 15, paddingHorizontal: 14, paddingVertical: 10 },
   addButtonText: { color: COLORS.white, fontSize: 12, fontWeight: '800' },
@@ -1081,6 +1273,10 @@ const styles = StyleSheet.create({
   formRow: { flexDirection: 'row', gap: 10 },
   primaryButton: { backgroundColor: COLORS.forest, borderRadius: 16, minHeight: 52, alignItems: 'center', justifyContent: 'center', marginTop: 10 },
   primaryButtonText: { color: COLORS.white, fontSize: 14, fontWeight: '800' },
+  matchedReferralBanner: { flexDirection: 'row', gap: 11, alignItems: 'center', backgroundColor: COLORS.mint, borderRadius: 17, padding: 14, marginBottom: 20 },
+  matchedReferralIcon: { width: 38, height: 38, borderRadius: 12, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center' },
+  matchedReferralTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '800' },
+  matchedReferralBody: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: 3 },
   segmented: { flexDirection: 'row', backgroundColor: COLORS.mintPale, borderRadius: 15, padding: 4, marginBottom: 9 },
   segment: { flex: 1, flexDirection: 'row', gap: 6, alignItems: 'center', justifyContent: 'center', paddingVertical: 10, borderRadius: 12 },
   segmentActive: { backgroundColor: COLORS.forest },
