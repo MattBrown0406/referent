@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import { StatusBar } from 'expo-status-bar';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Image,
@@ -366,6 +366,7 @@ export default function App() {
   const [matchState, setMatchState] = useState('ANY');
   const [matchBudget, setMatchBudget] = useState('');
   const [matchTherapies, setMatchTherapies] = useState<string[]>([]);
+  const matchClientLabelRef = useRef<TextInput>(null);
 
   useEffect(() => {
     async function loadStoredData() {
@@ -493,6 +494,7 @@ export default function App() {
     setMatchInsurance('Cash pay');
     setMatchBudget('');
     setMatchTherapies([]);
+    requestAnimationFrame(() => matchClientLabelRef.current?.focus());
   }
 
   function saveCurrentReferralMatch() {
@@ -755,7 +757,7 @@ export default function App() {
                 );
               })}
             </ScrollView>
-          ) : <Text style={styles.noSavedMatches}>No active matches. Create one when you are ready to place another client.</Text>}
+          ) : <Text style={styles.noSavedMatches}>No active matches. Create and save a client match now; add partners whenever you are ready.</Text>}
         </View>
 
         <View style={styles.filterCard}>
@@ -769,7 +771,7 @@ export default function App() {
               <Text style={styles.saveMatchButtonText}>Save match</Text>
             </TouchableOpacity>
           </View>
-          <FormField label="CLIENT / FAMILY LABEL *" value={matchClientLabel} onChangeText={setMatchClientLabel} placeholder="Use initials or a private label" />
+          <FormField inputRef={matchClientLabelRef} label="CLIENT / FAMILY LABEL *" value={matchClientLabel} onChangeText={setMatchClientLabel} placeholder="Use initials or a private label" />
           <Text style={styles.privacyHint}><AppIcon name="lock-closed" size={13} color={COLORS.gray} /> Keep this de-identified; avoid protected health information.</Text>
 
           <DropdownField
@@ -1112,21 +1114,22 @@ export default function App() {
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
       <View style={styles.appShell}>
-        <View style={styles.screen}>{tab === 'home' ? <HomeScreen /> : tab === 'match' ? <MatchScreen /> : tab === 'directory' ? <DirectoryScreen /> : <ReferralsScreen />}</View>
-        <BottomNav />
+        <View style={styles.screen}>{tab === 'home' ? HomeScreen() : tab === 'match' ? MatchScreen() : tab === 'directory' ? DirectoryScreen() : ReferralsScreen()}</View>
+        {BottomNav()}
       </View>
-      <PartnerDetailModal />
-      <AddPartnerModal />
-      <AddReferralModal />
+      {PartnerDetailModal()}
+      {AddPartnerModal()}
+      {AddReferralModal()}
     </SafeAreaView>
   );
 }
 
-function FormField({ label, value, onChangeText, placeholder, keyboardType, multiline }: { label: string; value: string; onChangeText: (value: string) => void; placeholder: string; keyboardType?: 'default' | 'email-address' | 'phone-pad' | 'number-pad'; multiline?: boolean }) {
+function FormField({ label, value, onChangeText, placeholder, keyboardType, multiline, inputRef }: { label: string; value: string; onChangeText: (value: string) => void; placeholder: string; keyboardType?: 'default' | 'email-address' | 'phone-pad' | 'number-pad'; multiline?: boolean; inputRef?: React.Ref<TextInput> }) {
   return (
     <View style={styles.formField}>
       <Text style={styles.fieldLabel}>{label}</Text>
       <TextInput
+        ref={inputRef}
         value={value}
         onChangeText={onChangeText}
         placeholder={placeholder}
