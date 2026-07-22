@@ -9,7 +9,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.mattbrown.referralfit",
-      "buildNumber": "1",
+      "buildNumber": "2",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
@@ -30,6 +30,12 @@
     "scheme": "referralfit",
     "plugins": [
       "expo-font"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "931063d5-1135-428d-adb9-572c7fe0885e"
+      }
+    },
+    "owner": "mattbrown0406"
   }
 }
