@@ -18,10 +18,10 @@ import {
   View,
 } from 'react-native';
 import {
-  demoPartners,
-  demoReferralMatches,
-  demoReferrals,
   formatMoney,
+  initialPartners,
+  initialReferralMatches,
+  initialReferrals,
   insuranceProvidersForState,
   medicaidPlansByState,
   nationalInsuranceProviders,
@@ -56,8 +56,7 @@ const COLORS = {
   blue: '#507C86',
 };
 
-const STORAGE_KEY = 'referralfit-v1';
-const LEGACY_STORAGE_KEY = 'referent-v1';
+const STORAGE_KEY = 'referralfit-v2';
 
 function localDateStamp() {
   const now = new Date();
@@ -65,6 +64,19 @@ function localDateStamp() {
   const month = String(now.getMonth() + 1).padStart(2, '0');
   const day = String(now.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+function currentDateLabel() {
+  return new Intl.DateTimeFormat('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
+    .format(new Date())
+    .toUpperCase();
+}
+
+function currentGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 12) return 'Good morning.';
+  if (hour < 17) return 'Good afternoon.';
+  return 'Good evening.';
 }
 
 const emptyPartner = {
@@ -84,7 +96,7 @@ const emptyPartner = {
 
 const emptyReferral = {
   direction: 'Inbound' as ReferralDirection,
-  partnerId: 'p1',
+  partnerId: '',
   clientLabel: '',
   outcome: 'Introduced' as Referral['outcome'],
   note: '',
@@ -334,9 +346,9 @@ function EmptyState({ icon, title, body }: { icon: IconName; title: string; body
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('home');
-  const [partners, setPartners] = useState<Partner[]>(demoPartners);
-  const [referrals, setReferrals] = useState<Referral[]>(demoReferrals);
-  const [referralMatches, setReferralMatches] = useState<ReferralMatch[]>(demoReferralMatches);
+  const [partners, setPartners] = useState<Partner[]>(initialPartners);
+  const [referrals, setReferrals] = useState<Referral[]>(initialReferrals);
+  const [referralMatches, setReferralMatches] = useState<ReferralMatch[]>(initialReferralMatches);
   const [loaded, setLoaded] = useState(false);
   const [selectedPartner, setSelectedPartner] = useState<Partner | null>(null);
   const [showAddPartner, setShowAddPartner] = useState(false);
@@ -346,20 +358,18 @@ export default function App() {
   const [referralForm, setReferralForm] = useState(emptyReferral);
   const [search, setSearch] = useState('');
   const [directoryType, setDirectoryType] = useState('All');
-  const [selectedMatchId, setSelectedMatchId] = useState<string | null>('m1');
-  const [matchClientLabel, setMatchClientLabel] = useState('Family K.');
-  const [matchType, setMatchType] = useState('Inpatient');
+  const [selectedMatchId, setSelectedMatchId] = useState<string | null>(null);
+  const [matchClientLabel, setMatchClientLabel] = useState('');
+  const [matchType, setMatchType] = useState('Any type');
   const [matchInsurance, setMatchInsurance] = useState('Cash pay');
-  const [matchState, setMatchState] = useState('CA');
-  const [matchBudget, setMatchBudget] = useState('40000');
-  const [matchTherapies, setMatchTherapies] = useState<string[]>(['Trauma', 'Dual diagnosis']);
+  const [matchState, setMatchState] = useState('ANY');
+  const [matchBudget, setMatchBudget] = useState('');
+  const [matchTherapies, setMatchTherapies] = useState<string[]>([]);
 
   useEffect(() => {
     async function loadStoredData() {
       try {
-        const currentValue = await AsyncStorage.getItem(STORAGE_KEY);
-        const legacyValue = currentValue ? null : await AsyncStorage.getItem(LEGACY_STORAGE_KEY);
-        const value = currentValue || legacyValue;
+        const value = await AsyncStorage.getItem(STORAGE_KEY);
         if (value) {
           const stored = JSON.parse(value);
           if (Array.isArray(stored.partners)) setPartners(stored.partners);
@@ -373,21 +383,20 @@ export default function App() {
               setMatchType(firstMatch.levelOfCare);
               setMatchState(firstMatch.state);
               setMatchInsurance(firstMatch.insurance);
-              setMatchBudget(firstMatch.maxBudget ? String(firstMatch.maxBudget) : '40000');
+              setMatchBudget(firstMatch.maxBudget ? String(firstMatch.maxBudget) : '');
               setMatchTherapies(firstMatch.therapies);
             } else {
               setMatchClientLabel('');
               setMatchType('Any type');
               setMatchState('ANY');
               setMatchInsurance('Cash pay');
-              setMatchBudget('40000');
+              setMatchBudget('');
               setMatchTherapies([]);
             }
           }
-          if (!currentValue && legacyValue) await AsyncStorage.setItem(STORAGE_KEY, legacyValue);
         }
       } catch {
-        // Keep the bundled demo data if local storage cannot be read.
+        // Keep a clean first-run state if local storage cannot be read.
       } finally {
         setLoaded(true);
       }
@@ -471,7 +480,7 @@ export default function App() {
     setMatchType(referralMatch.levelOfCare);
     setMatchState(referralMatch.state);
     setMatchInsurance(referralMatch.insurance);
-    setMatchBudget(referralMatch.maxBudget ? String(referralMatch.maxBudget) : '40000');
+    setMatchBudget(referralMatch.maxBudget ? String(referralMatch.maxBudget) : '');
     setMatchTherapies(referralMatch.therapies);
   }
 
@@ -481,7 +490,7 @@ export default function App() {
     setMatchType('Any type');
     setMatchState('ANY');
     setMatchInsurance('Cash pay');
-    setMatchBudget('40000');
+    setMatchBudget('');
     setMatchTherapies([]);
   }
 
@@ -498,7 +507,7 @@ export default function App() {
       levelOfCare: matchType as ReferralMatch['levelOfCare'],
       state: matchState,
       insurance: matchInsurance,
-      maxBudget: matchInsurance === 'Cash pay' ? Number(matchBudget) || 0 : undefined,
+      maxBudget: matchInsurance === 'Cash pay' && matchBudget.trim() ? Number(matchBudget) || undefined : undefined,
       therapies: matchTherapies,
       status: existing?.status || 'Matching',
       createdAt: existing?.createdAt || today,
@@ -527,6 +536,11 @@ export default function App() {
   }
 
   function openReferral(direction: ReferralDirection, partnerId?: string) {
+    if (!partners.length) {
+      Alert.alert('Add a partner first', 'Create the person or program in your Directory before logging a referral.');
+      setTab('directory');
+      return;
+    }
     setActiveReferralMatchId(null);
     setReferralForm({ ...emptyReferral, direction, partnerId: partnerId || partners[0]?.id || '' });
     setSelectedPartner(null);
@@ -623,10 +637,6 @@ export default function App() {
           </View>
           <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
         </View>
-        <TouchableOpacity style={styles.demoBadge} onPress={() => Alert.alert('Demo data', 'All people, programs, and contact details in this prototype are fictional.')}>
-          <View style={styles.demoDot} />
-          <Text style={styles.demoText}>DEMO</Text>
-        </TouchableOpacity>
       </View>
     );
   }
@@ -641,9 +651,9 @@ export default function App() {
         {renderHeader()}
         <View style={styles.welcomeRow}>
           <View>
-            <Text style={styles.eyebrow}>TUESDAY · JULY 21</Text>
-            <Text style={styles.heroTitle}>Good afternoon, Matt.</Text>
-            <Text style={styles.heroSubtitle}>Your referral network, in balance.</Text>
+            <Text style={styles.eyebrow}>{currentDateLabel()}</Text>
+            <Text style={styles.heroTitle}>{currentGreeting()}</Text>
+            <Text style={styles.heroSubtitle}>{partners.length ? 'Your referral network, in balance.' : 'Add your trusted referral partners to get started.'}</Text>
           </View>
         </View>
 
@@ -684,7 +694,7 @@ export default function App() {
 
         <SectionTitle title="Recent activity" action="Log referral" onPress={() => openReferral('Inbound')} />
         <View style={styles.activityCard}>
-          {recentReferrals.slice(0, 3).map((referral, index) => {
+          {recentReferrals.length ? recentReferrals.slice(0, 3).map((referral, index) => {
             const partner = partners.find((item) => item.id === referral.partnerId);
             if (!partner) return null;
             return (
@@ -702,7 +712,7 @@ export default function App() {
                 </View>
               </View>
             );
-          })}
+          }) : <EmptyState icon="swap-horizontal-outline" title="No referrals yet" body="Your inbound and outbound activity will appear here." />}
         </View>
       </ScrollView>
     );
@@ -790,8 +800,8 @@ export default function App() {
           {matchInsurance === 'Cash pay' ? (
             <View style={styles.budgetRow}>
               <View style={styles.budgetIcon}><AppIcon name="wallet-outline" size={18} color={COLORS.forest} /></View>
-              <View style={{ flex: 1 }}><Text style={styles.inputCaption}>Maximum cash budget</Text><TextInput value={matchBudget} onChangeText={setMatchBudget} keyboardType="number-pad" placeholder="40000" style={styles.inlineInput} /></View>
-              <Text style={styles.budgetValue}>{formatMoney(Number(matchBudget) || 0)}</Text>
+              <View style={{ flex: 1 }}><Text style={styles.inputCaption}>Maximum cash budget</Text><TextInput value={matchBudget} onChangeText={setMatchBudget} keyboardType="number-pad" placeholder="Optional" style={styles.inlineInput} /></View>
+              <Text style={styles.budgetValue}>{matchBudget.trim() ? formatMoney(Number(matchBudget) || 0) : 'Any budget'}</Text>
             </View>
           ) : null}
 
@@ -908,7 +918,7 @@ export default function App() {
         </View>
 
         <SectionTitle title="Referral history" />
-        <View style={styles.referralList}>
+        {recentReferrals.length ? <View style={styles.referralList}>
           {recentReferrals.map((referral, index) => {
             const partner = partners.find((item) => item.id === referral.partnerId);
             if (!partner) return null;
@@ -923,10 +933,10 @@ export default function App() {
               </TouchableOpacity>
             );
           })}
-        </View>
+        </View> : <EmptyState icon="swap-horizontal-outline" title="No referral history" body="Add a partner, then log your first inbound or outbound referral." />}
 
         <SectionTitle title="Relationship balance" />
-        {partners.slice().sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound)).slice(0, 5).map((partner) => {
+        {partners.length ? partners.slice().sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound)).slice(0, 5).map((partner) => {
           const total = Math.max(partner.inbound + partner.outbound, 1);
           const inboundWidth = `${Math.round((partner.inbound / total) * 100)}%` as `${number}%`;
           return (
@@ -935,7 +945,7 @@ export default function App() {
               <View style={styles.balanceTrack}><View style={[styles.balanceInbound, { width: inboundWidth }]} /></View>
             </TouchableOpacity>
           );
-        })}
+        }) : <EmptyState icon="people-outline" title="No relationships yet" body="Your give-and-receive balance will appear after you add referral partners." />}
       </ScrollView>
     );
   }
@@ -1028,7 +1038,7 @@ export default function App() {
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               <Text style={styles.formIntro}>Build a useful relationship record now. You can fill in more details as you learn them.</Text>
-              <FormField label="CONTACT NAME *" value={partnerForm.name} onChangeText={(name) => setPartnerForm({ ...partnerForm, name })} placeholder="e.g. Jamie Lee, LCSW" />
+              <FormField label="CONTACT NAME *" value={partnerForm.name} onChangeText={(name) => setPartnerForm({ ...partnerForm, name })} placeholder="Contact name" />
               <FormField label="ORGANIZATION *" value={partnerForm.organization} onChangeText={(organization) => setPartnerForm({ ...partnerForm, organization })} placeholder="Program or practice" />
               <DropdownField
                 label="PARTNER TYPE"
@@ -1038,7 +1048,7 @@ export default function App() {
                 options={partnerTypes.map((type) => ({ label: type, value: type }))}
               />
               <View style={styles.formRow}><View style={{ flex: 2 }}><FormField label="CITY" value={partnerForm.city} onChangeText={(city) => setPartnerForm({ ...partnerForm, city })} placeholder="City" /></View><View style={{ flex: 1 }}><FormField label="STATE" value={partnerForm.state} onChangeText={(state) => setPartnerForm({ ...partnerForm, state })} placeholder="CA" /></View></View>
-              <FormField label="PHONE" value={partnerForm.phone} onChangeText={(phone) => setPartnerForm({ ...partnerForm, phone })} placeholder="(555) 555-0123" keyboardType="phone-pad" />
+              <FormField label="PHONE" value={partnerForm.phone} onChangeText={(phone) => setPartnerForm({ ...partnerForm, phone })} placeholder="Phone number" keyboardType="phone-pad" />
               <FormField label="EMAIL" value={partnerForm.email} onChangeText={(email) => setPartnerForm({ ...partnerForm, email })} placeholder="name@program.com" keyboardType="email-address" />
               <View style={styles.formRow}><View style={{ flex: 1 }}><FormField label="CASH MIN" value={partnerForm.cashMin} onChangeText={(cashMin) => setPartnerForm({ ...partnerForm, cashMin })} placeholder="$0" keyboardType="number-pad" /></View><View style={{ flex: 1 }}><FormField label="CASH MAX" value={partnerForm.cashMax} onChangeText={(cashMax) => setPartnerForm({ ...partnerForm, cashMax })} placeholder="$0" keyboardType="number-pad" /></View></View>
               <FormField label="INSURANCE (COMMA SEPARATED)" value={partnerForm.insurance} onChangeText={(insurance) => setPartnerForm({ ...partnerForm, insurance })} placeholder="Aetna, Cigna, Blue Cross" />
@@ -1140,9 +1150,6 @@ const styles = StyleSheet.create({
   brandRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   brandMark: { width: 36, height: 36, borderRadius: 12, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
   brandName: { fontSize: 19, fontWeight: '800', color: COLORS.ink, letterSpacing: -0.4 },
-  demoBadge: { flexDirection: 'row', alignItems: 'center', gap: 6, borderRadius: 20, paddingHorizontal: 10, paddingVertical: 7, backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.line },
-  demoDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: COLORS.coral },
-  demoText: { fontSize: 10, fontWeight: '800', color: COLORS.inkSoft, letterSpacing: 1.1 },
   welcomeRow: { marginBottom: 22 },
   eyebrow: { color: COLORS.gray, fontSize: 11, fontWeight: '800', letterSpacing: 1.25, marginBottom: 7 },
   heroTitle: { fontSize: 29, lineHeight: 35, color: COLORS.ink, fontWeight: '800', letterSpacing: -0.9 },

@@ -13,7 +13,7 @@ A native Expo app for managing professional referral relationships and finding c
 - Referent assignment from a recommended match that automatically creates an outbound referral record
 - Inbound and outbound referral ledger with relationship-balance summaries
 - Add partners, favorite relationships, log referrals, and persist changes locally
-- Fictional demo data for safe product evaluation
+- Clean first-run state ready for the user’s own partners and referrals
 
 ## Run locally
 
