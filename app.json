@@ -4,19 +4,20 @@
     "slug": "referralfit",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon-fit-point.png",
+    "icon": "./assets/icon-bridge.png",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.mattbrown.referralfit",
-      "buildNumber": "6",
+      "buildNumber": "7",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
+      "package": "com.mattbrown.referralfit",
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#FCF9F2",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
@@ -24,12 +25,27 @@
       "predictiveBackGestureEnabled": false
     },
     "web": {
-      "favicon": "./assets/icon-fit-point.png",
+      "favicon": "./assets/favicon.png",
       "bundler": "metro"
     },
     "scheme": "referralfit",
     "plugins": [
-      "expo-font"
+      "expo-font",
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Allow ReferralFit to add case participants to your contacts when you choose Add to Contacts."
+        }
+      ],
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "Allow ReferralFit to add case appointments to your calendar when you choose Add to Calendar.",
+          "remindersPermission": "Allow ReferralFit to add reminders when you explicitly request them."
+        }
+      ],
+      "expo-document-picker",
+      "expo-sharing"
     ],
     "extra": {
       "eas": {

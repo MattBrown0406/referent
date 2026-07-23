@@ -38,8 +38,33 @@ import {
   stateOptions,
   therapyOptions,
 } from './src/data';
+import { isPaymentEligible, matchesServiceRegion, parseCashBudget, referralCountsByPartner } from './src/domain/matching';
+import { loadStoredData, restoreStoredData, updateStoredData } from './src/domain/storage';
+import {
+  createEmptyEnvelope,
+  generateId,
+  migrateStoredData,
+  normalizePartner,
+  normalizeReferral,
+  normalizeReferralMatch,
+  type SchemaV3Envelope,
+} from './src/domain/types';
+import { WorkflowScreen } from './src/features/workflow';
+import { workflowCollectionsFromState, workflowStateFromEnvelope } from './src/workflow/persistence';
+import { workflowReducer } from './src/workflow/reducer';
+import { createEmptyWorkflowState } from './src/workflow/state';
+import type { WorkflowState } from './src/workflow/types';
+import {
+  addAppointmentToCalendar,
+  deleteCaseDocument,
+  openCaseDocument,
+  pickCaseDocument,
+  pickBackupJson,
+  presentParticipantContact,
+  shareBackupJson,
+} from './src/native/integrations';
 
-type Tab = 'home' | 'match' | 'directory' | 'referrals';
+type Tab = 'home' | 'match' | 'directory' | 'referrals' | 'workflow';
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
 
 const COLORS = {
@@ -59,8 +84,6 @@ const COLORS = {
   blue: '#507C86',
 };
 
-const STORAGE_KEY = 'referralfit-v2';
-
 type PartnerForm = {
   name: string;
   organization: string;
@@ -73,6 +96,9 @@ type PartnerForm = {
   cashMin: string;
   cashMax: string;
   insurance: string[];
+  outOfNetworkInsurance: string[];
+  nationwide: boolean;
+  serviceStates: string;
   therapies: string[];
   note: string;
 };
@@ -111,9 +137,30 @@ function makeEmptyPartnerForm(): PartnerForm {
   cashMin: '',
   cashMax: '',
   insurance: [],
+  outOfNetworkInsurance: [],
+  nationwide: false,
+  serviceStates: '',
   therapies: [],
   note: '',
   };
+}
+
+const VALID_STATE_CODES = new Set(stateOptions.map(({ code }) => code));
+
+function validatedState(value: string): string | null {
+  const code = value.trim().toUpperCase();
+  return VALID_STATE_CODES.has(code) ? code : null;
+}
+
+function parseOptionalPrice(value: string): number | null | 'invalid' {
+  if (!value.trim()) return null;
+  const amount = Number(value);
+  return Number.isFinite(amount) && amount >= 0 ? amount : 'invalid';
+}
+
+function cashPriceLabel(partner: Partner): string {
+  if (partner.cashMin === null || partner.cashMax === null) return 'Cash price not recorded';
+  return `${formatMoney(partner.cashMin)}–${formatMoney(partner.cashMax)}`;
 }
 
 function typesForPartner(partner: Partner): Partner['type'][] {
@@ -160,6 +207,9 @@ function Pill({
 }) {
   return (
     <TouchableOpacity
+      accessibilityLabel={label}
+      accessibilityRole="checkbox"
+      accessibilityState={{ checked: active }}
       activeOpacity={0.75}
       onPress={onPress}
       style={[styles.pill, active && styles.pillActive]}
@@ -216,6 +266,9 @@ function DropdownField({
                 return (
                   <TouchableOpacity
                     key={option.value}
+                    accessibilityLabel={option.label}
+                    accessibilityRole="radio"
+                    accessibilityState={{ selected: active }}
                     onPress={() => { onChange(option.value); setOpen(false); }}
                     style={[styles.dropdownOption, active && styles.dropdownOptionActive]}
                   >
@@ -301,7 +354,7 @@ function MultiSelectDropdown({
               {options.map((option) => {
                 const active = draftValues.includes(option);
                 return (
-                  <TouchableOpacity key={option} onPress={() => toggle(option)} style={[styles.dropdownOption, active && styles.dropdownOptionActive]}>
+                  <TouchableOpacity key={option} accessibilityLabel={option} accessibilityRole="checkbox" accessibilityState={{ checked: active }} onPress={() => toggle(option)} style={[styles.dropdownOption, active && styles.dropdownOptionActive]}>
                     <Text style={[styles.dropdownOptionText, styles.multiSelectOptionText, active && styles.dropdownOptionTextActive]}>{option}</Text>
                     <AppIcon name={active ? 'checkbox' : 'square-outline'} size={21} color={active ? COLORS.forest : COLORS.gray} />
                   </TouchableOpacity>
@@ -349,13 +402,15 @@ function PartnerCard({
   onPress,
   onShare,
   compact = false,
+  counts,
 }: {
   partner: Partner;
   onPress: () => void;
   onShare?: () => void;
   compact?: boolean;
+  counts: { inbound: number; outbound: number };
 }) {
-  const balance = partner.inbound - partner.outbound;
+  const balance = counts.inbound - counts.outbound;
   const insurancePlanCount = partner.insurance.filter((plan) => plan !== 'Cash pay').length;
   return (
     <View style={[styles.partnerCard, compact && styles.partnerCardCompact]}>
@@ -412,6 +467,7 @@ export default function App() {
   const [partners, setPartners] = useState<Partner[]>(initialPartners);
   const [referrals, setReferrals] = useState<Referral[]>(initialReferrals);
   const [referralMatches, setReferralMatches] = useState<ReferralMatch[]>(initialReferralMatches);
+  const [workflowState, setWorkflowState] = useState<WorkflowState>(createEmptyWorkflowState);
   const [loaded, setLoaded] = useState(false);
   const [selectedPartner, setSelectedPartner] = useState<Partner | null>(null);
   const [showAddPartner, setShowAddPartner] = useState(false);
@@ -431,57 +487,137 @@ export default function App() {
   const [matchBudget, setMatchBudget] = useState('');
   const [matchTherapies, setMatchTherapies] = useState<string[]>([]);
   const matchClientLabelRef = useRef<TextInput>(null);
+  const envelopeRef = useRef<SchemaV3Envelope>(createEmptyEnvelope());
+  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  function applyEnvelope(data: SchemaV3Envelope) {
+    envelopeRef.current = data;
+    const safePartners = data.partners.map(normalizePartner);
+    const safeReferrals = data.referrals.map(normalizeReferral);
+    const safeMatches = data.referralMatches.map(normalizeReferralMatch);
+    setPartners(safePartners);
+    setReferrals(safeReferrals);
+    setReferralMatches(safeMatches);
+    setWorkflowState(workflowStateFromEnvelope(data));
+    const firstMatch = safeMatches.find((item) => item.status === 'Matching');
+    setSelectedMatchId(firstMatch?.id || null);
+    if (firstMatch) loadReferralMatch(firstMatch);
+  }
 
   useEffect(() => {
-    async function loadStoredData() {
-      try {
-        const value = await AsyncStorage.getItem(STORAGE_KEY);
-        if (value) {
-          const stored = JSON.parse(value);
-          if (Array.isArray(stored.partners)) setPartners(stored.partners);
-          if (Array.isArray(stored.referrals)) setReferrals(stored.referrals);
-          if (Array.isArray(stored.referralMatches)) {
-            setReferralMatches(stored.referralMatches);
-            const firstMatch = (stored.referralMatches as ReferralMatch[]).find((item) => item.status === 'Matching');
-            setSelectedMatchId(firstMatch?.id || null);
-            if (firstMatch) {
-              setMatchClientLabel(firstMatch.clientLabel);
-              setMatchType(firstMatch.levelOfCare);
-              setMatchState(firstMatch.state);
-              setMatchInsurance(firstMatch.insurance);
-              setMatchNetworkPreferences(firstMatch.networkPreferences?.length ? firstMatch.networkPreferences : ['In-network']);
-              setMatchBudget(firstMatch.maxBudget ? String(firstMatch.maxBudget) : '');
-              setMatchTherapies(firstMatch.therapies);
-            } else {
-              setMatchClientLabel('');
-              setMatchType('Any type');
-              setMatchState('ANY');
-              setMatchInsurance('Cash pay');
-              setMatchNetworkPreferences(['In-network']);
-              setMatchBudget('');
-              setMatchTherapies([]);
-            }
-          }
-        }
-      } catch {
-        // Keep a clean first-run state if local storage cannot be read.
-      } finally {
-        setLoaded(true);
+    let active = true;
+    loadStoredData(AsyncStorage).then((result) => {
+      if (!active) return;
+      if (result.status === 'recovery') {
+        setRecoveryError(`${result.error} The original data remains untouched under “${result.sourceKey}”.`);
+        return;
       }
-    }
-    loadStoredData();
+      applyEnvelope(result.data);
+      setLoaded(true);
+    }).catch((error) => {
+      if (active) setRecoveryError(`ReferralFit could not read or migrate local storage: ${error instanceof Error ? error.message : String(error)} No changes will be saved.`);
+    });
+    return () => { active = false; };
+  }, []);
+
+  const persistSnapshot = React.useCallback((snapshot: SchemaV3Envelope) => {
+    setSaving(true);
+    writeChainRef.current = writeChainRef.current
+      .catch(() => undefined)
+      .then(() => updateStoredData(AsyncStorage, (current) => ({
+        ...current,
+        partners: snapshot.partners,
+        referrals: snapshot.referrals,
+        referralMatches: snapshot.referralMatches,
+        cases: snapshot.cases,
+        participants: snapshot.participants,
+        checklistCompletions: snapshot.checklistCompletions,
+        documentReferences: snapshot.documentReferences,
+        tasks: snapshot.tasks,
+        appointments: snapshot.appointments,
+        revenueEntries: snapshot.revenueEntries,
+        workflowImports: snapshot.workflowImports,
+      })))
+      .then((saved) => {
+        envelopeRef.current = saved;
+        setStorageError(null);
+      })
+      .catch((error) => setStorageError(error instanceof Error ? error.message : String(error)))
+      .finally(() => setSaving(false));
   }, []);
 
   useEffect(() => {
-    if (!loaded) return;
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify({ partners, referrals, referralMatches })).catch(() => undefined);
-  }, [loaded, partners, referrals, referralMatches]);
+    if (!loaded || recoveryError) return;
+    persistSnapshot({ ...envelopeRef.current, partners, referrals, referralMatches, ...workflowCollectionsFromState(workflowState) });
+  }, [loaded, recoveryError, partners, referrals, referralMatches, workflowState, persistSnapshot]);
 
+  function retryStorageWrite() {
+    if (recoveryError) return;
+    persistSnapshot({ ...envelopeRef.current, partners, referrals, referralMatches, ...workflowCollectionsFromState(workflowState) });
+  }
+
+  async function exportBackup() {
+    const snapshot = { ...envelopeRef.current, partners, referrals, referralMatches, ...workflowCollectionsFromState(workflowState) };
+    const validated = migrateStoredData(snapshot);
+    await shareBackupJson(JSON.stringify(validated, null, 2));
+  }
+
+  async function restoreBackup() {
+    const raw = await pickBackupJson();
+    if (!raw) return;
+    const parsed = migrateStoredData(JSON.parse(raw) as unknown);
+    workflowStateFromEnvelope(parsed);
+    await writeChainRef.current.catch(() => undefined);
+    const restored = await restoreStoredData(AsyncStorage, raw);
+    applyEnvelope(restored.data);
+    setRecoveryError(null);
+    setStorageError(null);
+    setLoaded(true);
+    Alert.alert('Backup restored', restored.backupKey
+      ? `The selected backup is active. The exact previous local database was preserved under “${restored.backupKey}”.`
+      : 'The selected backup is now active.');
+  }
+
+  function convertReferralToCase(referral: Referral) {
+    const existing = Object.values(workflowState.cases).find((item) => item.referralId === referral.id);
+    if (existing) {
+      Alert.alert('Case already exists', `${existing.name} is already linked to this referral.`);
+      setTab('workflow');
+      return;
+    }
+    const timestamp = new Date().toISOString();
+    const linkedMatch = referralMatches.find((item) => item.referralId === referral.id);
+    setWorkflowState((current) => workflowReducer(current, {
+      type: 'case/upsert',
+      value: {
+        id: generateId('case'),
+        kind: 'intervention',
+        name: referral.clientLabel,
+        status: 'new',
+        archivedAt: null,
+        referralId: referral.id,
+        referralMatchId: linkedMatch?.id,
+        placementPartnerId: referral.direction === 'Outbound' ? referral.partnerId : undefined,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      },
+    }));
+    setTab('workflow');
+  }
+
+  const referralCounts = useMemo(() => referralCountsByPartner(partners, referrals), [partners, referrals]);
+  const countsFor = React.useCallback((partnerId: string) => referralCounts[partnerId] ?? { inbound: 0, outbound: 0 }, [referralCounts]);
   const totals = useMemo(() => ({
-    inbound: partners.reduce((sum, partner) => sum + partner.inbound, 0),
-    outbound: partners.reduce((sum, partner) => sum + partner.outbound, 0),
-    reciprocal: partners.filter((partner) => partner.inbound > partner.outbound).length,
-  }), [partners]);
+    inbound: referrals.filter((referral) => referral.direction === 'Inbound').length,
+    outbound: referrals.filter((referral) => referral.direction === 'Outbound').length,
+    reciprocal: partners.filter((partner) => {
+      const counts = referralCounts[partner.id];
+      return counts && counts.inbound > counts.outbound;
+    }).length,
+  }), [partners, referrals, referralCounts]);
 
   const directoryPartners = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -517,20 +653,23 @@ export default function App() {
     return Array.from(new Set([...plansForState, ...partnerForm.insurance.filter((plan) => plan !== 'Cash pay')]));
   }, [partnerForm.state, partnerForm.insurance]);
 
+  const cashBudget = useMemo(() => parseCashBudget(matchBudget), [matchBudget]);
   const matches = useMemo(() => {
-    const budget = Number(matchBudget) || Infinity;
+    if (matchInsurance === 'Cash pay' && cashBudget.kind === 'invalid') return [];
     return partners
       .map((partner) => {
         const typeFit = matchType === 'Any type' || typesForPartner(partner).includes(matchType as Partner['type']);
+        const paymentFit = isPaymentEligible(partner, {
+          insurance: matchInsurance,
+          budget: cashBudget,
+          networkPreferences: matchNetworkPreferences,
+        });
         const isInNetwork = matchInsurance !== 'Cash pay' && partner.insurance.includes(matchInsurance);
-        const paymentFit = matchInsurance === 'Cash pay'
-          ? partner.cashMin <= budget
-          : (matchNetworkPreferences.includes('In-network') && isInNetwork)
-            || (matchNetworkPreferences.includes('Out-of-network') && !isInNetwork);
+        const isOutOfNetwork = matchInsurance !== 'Cash pay' && (partner.outOfNetworkInsurance.includes(matchInsurance) || partner.outOfNetworkInsurance.includes('Any'));
         const networkStatus: InsuranceNetworkPreference | null = matchInsurance === 'Cash pay'
           ? null
-          : isInNetwork ? 'In-network' : 'Out-of-network';
-        const regionFit = matchState === 'ANY' || partner.state === matchState || partner.regions.includes('Nationwide');
+          : isInNetwork ? 'In-network' : isOutOfNetwork ? 'Out-of-network' : null;
+        const regionFit = matchesServiceRegion(partner, matchState);
         const matchesNeed = (need: string) => {
           if (need === 'Men only') return partner.therapies.includes(need) || (partner.populations.includes('Men') && !partner.populations.includes('Women'));
           if (need === 'Women only') return partner.therapies.includes(need) || (partner.populations.includes('Women') && !partner.populations.includes('Men'));
@@ -542,17 +681,18 @@ export default function App() {
         const clinicalCoverage = matchTherapies.length ? matchedTherapies.length / matchTherapies.length : 1;
         const eligible = typeFit && paymentFit && regionFit && (matchTherapies.length === 0 || matchedTherapies.length > 0);
         const clinicalScore = Math.round(62 + clinicalCoverage * 30 + (paymentFit ? 4 : 0) + (regionFit ? 4 : 0));
-        const reciprocity = partner.inbound - partner.outbound;
+        const counts = referralCounts[partner.id] ?? { inbound: 0, outbound: 0 };
+        const reciprocity = counts.inbound - counts.outbound;
         return { partner, matchedTherapies, clinicalScore: Math.min(clinicalScore, 100), reciprocity, eligible, networkStatus };
       })
       .filter((match) => match.eligible)
-      .sort((a, b) => b.clinicalScore - a.clinicalScore || b.reciprocity - a.reciprocity || a.partner.cashMin - b.partner.cashMin);
-  }, [partners, matchType, matchInsurance, matchNetworkPreferences, matchState, matchBudget, matchTherapies]);
+      .sort((a, b) => b.clinicalScore - a.clinicalScore || b.reciprocity - a.reciprocity || (a.partner.cashMin ?? Number.POSITIVE_INFINITY) - (b.partner.cashMin ?? Number.POSITIVE_INFINITY));
+  }, [partners, matchType, matchInsurance, matchNetworkPreferences, matchState, cashBudget, matchTherapies, referralCounts]);
 
-  const recentReferrals = referrals
+  const sortedReferrals = referrals
     .slice()
-    .sort((a, b) => b.date.localeCompare(a.date))
-    .slice(0, 5);
+    .sort((a, b) => b.date.localeCompare(a.date));
+  const recentReferrals = sortedReferrals.slice(0, 5);
 
   const activeReferralMatches = referralMatches.filter((item) => item.status === 'Matching');
 
@@ -592,23 +732,27 @@ export default function App() {
       Alert.alert('Name this match', 'Add a private client or family label so you can return to it later.');
       return null;
     }
+    if (matchInsurance === 'Cash pay' && cashBudget.kind === 'invalid') {
+      Alert.alert('Invalid cash budget', cashBudget.reason);
+      return null;
+    }
     const existing = referralMatches.find((item) => item.id === selectedMatchId);
     const today = localDateStamp();
-    const referralMatch: ReferralMatch = {
-      id: existing?.id || `m-${Date.now()}`,
+    const referralMatch = normalizeReferralMatch({
+      id: existing?.id || generateId('match'),
       clientLabel: matchClientLabel.trim(),
       levelOfCare: matchType as ReferralMatch['levelOfCare'],
       state: matchState,
       insurance: matchInsurance,
       networkPreferences: matchNetworkPreferences,
-      maxBudget: matchInsurance === 'Cash pay' && matchBudget.trim() ? Number(matchBudget) || undefined : undefined,
+      maxBudget: matchInsurance === 'Cash pay' && cashBudget.kind === 'limited' ? cashBudget.amount : undefined,
       therapies: matchTherapies,
       status: existing?.status || 'Matching',
       createdAt: existing?.createdAt || today,
       updatedAt: today,
       assignedPartnerId: existing?.assignedPartnerId,
       referralId: existing?.referralId,
-    };
+    });
     setReferralMatches((current) => [referralMatch, ...current.filter((item) => item.id !== referralMatch.id)]);
     setSelectedMatchId(referralMatch.id);
     return referralMatch;
@@ -658,9 +802,12 @@ export default function App() {
       phone: partner.phone,
       email: partner.email,
       website: partner.website || '',
-      cashMin: partner.cashMin ? String(partner.cashMin) : '',
-      cashMax: partner.cashMax ? String(partner.cashMax) : '',
+      cashMin: partner.cashMin === null ? '' : String(partner.cashMin),
+      cashMax: partner.cashMax === null ? '' : String(partner.cashMax),
       insurance: partner.insurance.filter((plan) => plan !== 'Cash pay'),
+      outOfNetworkInsurance: partner.outOfNetworkInsurance,
+      nationwide: partner.regions.includes('Nationwide'),
+      serviceStates: partner.regions.filter((region) => region !== 'Nationwide' && region !== partner.state).join(', '),
       therapies: partner.therapies,
       note: partner.note,
     });
@@ -685,31 +832,95 @@ export default function App() {
     }
   }
 
+  async function openExternalUrl(url: string, unavailableMessage: string) {
+    if (!url) {
+      Alert.alert('Not recorded', unavailableMessage);
+      return;
+    }
+    try {
+      if (!(await Linking.canOpenURL(url))) throw new Error('No compatible app is available.');
+      await Linking.openURL(url);
+    } catch (error) {
+      Alert.alert('Unable to open', error instanceof Error ? error.message : 'Please try again.');
+    }
+  }
+
   function savePartner() {
     if (!partnerForm.name.trim() || !partnerForm.organization.trim()) {
-      Alert.alert('A little more detail', 'Add a contact name and organization first.');
+      Alert.alert('Required fields', 'Contact name and organization are required.');
       return;
     }
     if (!partnerForm.types.length) {
       Alert.alert('Choose a partner type', 'Select at least one level of care or provider type.');
       return;
     }
+    const homeState = validatedState(partnerForm.state);
+    if (!homeState) {
+      Alert.alert('Valid state required', 'Enter a valid two-letter US state code for the partner’s home state.');
+      return;
+    }
+    const serviceStates = partnerForm.serviceStates.split(',').map((value) => value.trim().toUpperCase()).filter(Boolean);
+    const invalidServiceState = serviceStates.find((code) => !VALID_STATE_CODES.has(code));
+    if (invalidServiceState) {
+      Alert.alert('Invalid service state', `“${invalidServiceState}” is not a valid two-letter US state code.`);
+      return;
+    }
+    const cashMin = parseOptionalPrice(partnerForm.cashMin);
+    const cashMax = parseOptionalPrice(partnerForm.cashMax);
+    if (cashMin === 'invalid' || cashMax === 'invalid') {
+      Alert.alert('Invalid cash price', 'Cash prices must be blank or a nonnegative number.');
+      return;
+    }
+    if (cashMin !== null && cashMax !== null && cashMax < cashMin) {
+      Alert.alert('Invalid cash range', 'Maximum cash price must be greater than or equal to minimum cash price.');
+      return;
+    }
+    if (partnerForm.email.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(partnerForm.email.trim())) {
+      Alert.alert('Invalid email', 'Enter a valid email address or leave it blank.');
+      return;
+    }
+    if (partnerForm.phone.trim() && partnerForm.phone.replace(/\D/g, '').length < 7) {
+      Alert.alert('Invalid phone', 'Enter a valid phone number or leave it blank.');
+      return;
+    }
+    let website = partnerForm.website.trim();
+    const suppliedScheme = /^([a-z][a-z\d+.-]*):\/\//i.exec(website)?.[1]?.toLowerCase();
+    if (suppliedScheme && suppliedScheme !== 'http' && suppliedScheme !== 'https') {
+      Alert.alert('Invalid website', 'Website URLs must use http:// or https://.');
+      return;
+    }
+    if (website && !suppliedScheme) website = `https://${website}`;
+    if (website) {
+      try {
+        const parsed = new URL(website);
+        if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname.includes('.')) throw new Error('invalid');
+      } catch {
+        Alert.alert('Invalid website', 'Enter a valid website URL or leave it blank.');
+        return;
+      }
+    }
     const existing = partners.find((partner) => partner.id === editingPartnerId);
-    const partner: Partner = {
-      id: existing?.id || `p-${Date.now()}`,
+    const regions = Array.from(new Set([
+      homeState,
+      ...serviceStates.filter((state) => state !== homeState),
+      ...(partnerForm.nationwide ? ['Nationwide'] : []),
+    ]));
+    const partner = normalizePartner({
+      id: existing?.id || generateId('partner'),
       name: partnerForm.name.trim(),
       organization: partnerForm.organization.trim(),
       type: partnerForm.types[0],
       types: partnerForm.types,
       city: partnerForm.city.trim() || '—',
-      state: partnerForm.state.trim().toUpperCase() || '—',
-      regions: existing?.regions || ['Nationwide'],
+      state: homeState,
+      regions,
       phone: partnerForm.phone.trim(),
       email: partnerForm.email.trim(),
-      website: partnerForm.website.trim(),
-      cashMin: Number(partnerForm.cashMin) || 0,
-      cashMax: Number(partnerForm.cashMax) || Number(partnerForm.cashMin) || 0,
+      website,
+      cashMin,
+      cashMax,
       insurance: partnerForm.insurance,
+      outOfNetworkInsurance: partnerForm.outOfNetworkInsurance,
       therapies: partnerForm.therapies,
       populations: existing?.populations || ['Adults'],
       levels: partnerForm.types,
@@ -718,7 +929,7 @@ export default function App() {
       outbound: existing?.outbound || 0,
       lastContact: existing?.lastContact || localDateStamp(),
       favorite: existing?.favorite,
-    };
+    });
     setPartners((current) => existing
       ? current.map((item) => item.id === partner.id ? partner : item)
       : [partner, ...current]);
@@ -733,15 +944,15 @@ export default function App() {
       Alert.alert('A little more detail', 'Choose a partner and add a client or family label.');
       return;
     }
-    const referral: Referral = {
-      id: `r-${Date.now()}`,
+    const referral = normalizeReferral({
+      id: generateId('referral'),
       partnerId: referralForm.partnerId,
       direction: referralForm.direction,
       date: localDateStamp(),
       clientLabel: referralForm.clientLabel.trim(),
       outcome: referralForm.outcome,
       note: referralForm.note.trim(),
-    };
+    });
     setReferrals((current) => [referral, ...current]);
     if (activeReferralMatchId) {
       const nextActiveMatch = referralMatches.find((item) => item.status === 'Matching' && item.id !== activeReferralMatchId);
@@ -758,14 +969,6 @@ export default function App() {
       if (nextActiveMatch) loadReferralMatch(nextActiveMatch);
       else startNewReferralMatch();
     }
-    setPartners((current) => current.map((partner) => partner.id === referral.partnerId
-      ? {
-          ...partner,
-          inbound: partner.inbound + (referral.direction === 'Inbound' ? 1 : 0),
-          outbound: partner.outbound + (referral.direction === 'Outbound' ? 1 : 0),
-          lastContact: referral.date,
-        }
-      : partner));
     setShowAddReferral(false);
     setReferralForm(emptyReferral);
     if (activeReferralMatchId) setTab('referrals');
@@ -781,7 +984,7 @@ export default function App() {
     return (
       <View style={styles.header}>
         <View style={styles.brandRow}>
-          <Image accessibilityLabel="ReferralFit Fit Point logo" source={require('./assets/icon-fit-point.png')} style={styles.brandMark} />
+          <Image accessibilityLabel="ReferralFit bridge logo" source={require('./assets/icon-bridge.png')} style={styles.brandMark} />
           <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
         </View>
       </View>
@@ -790,8 +993,12 @@ export default function App() {
 
   function HomeScreen() {
     const giveBack = partners
-      .filter((partner) => partner.inbound > partner.outbound)
-      .sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound))
+      .filter((partner) => countsFor(partner.id).inbound > countsFor(partner.id).outbound)
+      .sort((a, b) => {
+        const aCounts = countsFor(a.id);
+        const bCounts = countsFor(b.id);
+        return (bCounts.inbound - bCounts.outbound) - (aCounts.inbound - aCounts.outbound);
+      })
       .slice(0, 3);
     return (
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
@@ -833,7 +1040,7 @@ export default function App() {
                 <Text style={styles.returnPartnerName}>{partner.organization}</Text>
                 <Text numberOfLines={1} style={styles.returnPartnerType}>{partnerTypeLabel(partner)} · {partner.city}</Text>
               </View>
-              <Text style={styles.returnCount}>+{partner.inbound - partner.outbound}</Text>
+              <Text style={styles.returnCount}>+{countsFor(partner.id).inbound - countsFor(partner.id).outbound}</Text>
               <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
             </TouchableOpacity>
           ))}
@@ -892,7 +1099,7 @@ export default function App() {
                 const assignedPartner = partners.find((partner) => partner.id === item.assignedPartnerId);
                 const selected = item.id === selectedMatchId;
                 return (
-                  <TouchableOpacity key={item.id} onPress={() => loadReferralMatch(item)} style={[styles.savedMatchCard, selected && styles.savedMatchCardActive]}>
+                  <TouchableOpacity key={item.id} accessibilityLabel={`Referral match ${item.clientLabel}`} accessibilityRole="radio" accessibilityState={{ selected }} onPress={() => loadReferralMatch(item)} style={[styles.savedMatchCard, selected && styles.savedMatchCardActive]}>
                     <View style={styles.savedMatchTop}>
                       <View style={[styles.savedMatchIcon, item.status === 'Referred' && styles.savedMatchIconComplete]}><AppIcon name={item.status === 'Referred' ? 'checkmark' : 'person-outline'} size={16} color={item.status === 'Referred' ? COLORS.white : COLORS.forest} /></View>
                       <Text numberOfLines={1} style={styles.savedMatchName}>{item.clientLabel}</Text>
@@ -973,8 +1180,8 @@ export default function App() {
           {matchInsurance === 'Cash pay' ? (
             <View style={styles.budgetRow}>
               <View style={styles.budgetIcon}><AppIcon name="wallet-outline" size={18} color={COLORS.forest} /></View>
-              <View style={{ flex: 1 }}><Text style={styles.inputCaption}>Maximum cash budget</Text><TextInput value={matchBudget} onChangeText={setMatchBudget} keyboardType="number-pad" placeholder="Optional" style={styles.inlineInput} /></View>
-              <Text style={styles.budgetValue}>{matchBudget.trim() ? formatMoney(Number(matchBudget) || 0) : 'Any budget'}</Text>
+              <View style={{ flex: 1 }}><Text style={styles.inputCaption}>Maximum cash budget</Text><TextInput accessibilityLabel="Maximum cash budget" value={matchBudget} onChangeText={setMatchBudget} keyboardType="decimal-pad" placeholder="Blank means unbounded" style={styles.inlineInput} />{cashBudget.kind === 'invalid' ? <Text style={styles.validationText}>{cashBudget.reason}</Text> : null}</View>
+              <Text style={styles.budgetValue}>{cashBudget.kind === 'unbounded' ? 'Unbounded' : cashBudget.kind === 'limited' ? formatMoney(cashBudget.amount) : 'Invalid'}</Text>
             </View>
           ) : null}
 
@@ -1015,7 +1222,7 @@ export default function App() {
                   <Text numberOfLines={1} style={[styles.matchDetailText, styles.matchInsuranceText]}>{matchInsurance === 'Cash pay'
                     ? match.partner.insurance.slice(0, 2).join(' · ') || 'Cash pay'
                     : `${match.networkStatus} · ${matchInsurance}`}</Text>
-                  <Text numberOfLines={1} style={styles.matchPriceText}>{formatMoney(match.partner.cashMin)}–{formatMoney(match.partner.cashMax)}</Text>
+                  <Text numberOfLines={1} style={styles.matchPriceText}>{cashPriceLabel(match.partner)}</Text>
                 </View>
                 {match.reciprocity > 0 ? (
                   <View style={styles.reciprocityNote}><AppIcon name="heart" size={13} color={COLORS.coral} /><Text style={styles.reciprocityNoteText}>Tie-breaker: sent you {match.reciprocity} more than received</Text></View>
@@ -1042,7 +1249,7 @@ export default function App() {
         </View>
         <View style={styles.searchBox}>
           <AppIcon name="search" size={19} color={COLORS.gray} />
-          <TextInput value={search} onChangeText={setSearch} placeholder="Name, program, location, specialty" placeholderTextColor="#91A09B" style={styles.searchInput} />
+          <TextInput accessibilityLabel="Search partner directory" value={search} onChangeText={setSearch} placeholder="Name, program, location, specialty" placeholderTextColor="#91A09B" style={styles.searchInput} />
           {search ? <TouchableOpacity onPress={() => setSearch('')}><AppIcon name="close-circle" size={18} color={COLORS.gray} /></TouchableOpacity> : null}
         </View>
         <View style={styles.directoryDropdown}>
@@ -1055,7 +1262,7 @@ export default function App() {
           />
         </View>
         <View style={styles.directoryCountRow}><Text style={styles.directoryCount}>{directoryPartners.length} RESULTS</Text><AppIcon name="options-outline" size={18} color={COLORS.gray} /></View>
-        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
+        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} counts={countsFor(partner.id)} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
         {!directoryPartners.length ? <EmptyState icon="people-outline" title="No partners found" body="Try another search or add a new relationship." /> : null}
       </ScrollView>
     );
@@ -1093,30 +1300,39 @@ export default function App() {
         </View>
 
         <SectionTitle title="Referral history" />
-        {recentReferrals.length ? <View style={styles.referralList}>
-          {recentReferrals.map((referral, index) => {
+        {sortedReferrals.length ? <View style={styles.referralList}>
+          {sortedReferrals.map((referral, index) => {
             const partner = partners.find((item) => item.id === referral.partnerId);
             if (!partner) return null;
             return (
-              <TouchableOpacity key={referral.id} onPress={() => setSelectedPartner(partner)} style={[styles.referralRow, index === recentReferrals.length - 1 && { borderBottomWidth: 0 }]}>
+              <View key={referral.id} style={[styles.referralRow, index === sortedReferrals.length - 1 && { borderBottomWidth: 0 }]}>
                 <View style={[styles.referralDirectionLine, { backgroundColor: referral.direction === 'Inbound' ? COLORS.forest : COLORS.blue }]} />
-                <View style={{ flex: 1 }}>
+                <TouchableOpacity accessibilityLabel={`Open ${partner.organization}`} accessibilityRole="button" onPress={() => setSelectedPartner(partner)} style={{ flex: 1 }}>
                   <View style={styles.referralTop}><Text style={styles.referralClient}>{referral.clientLabel}</Text><Text style={styles.referralDate}>{shortDate(referral.date)}</Text></View>
                   <Text style={styles.referralPartner}>{referral.direction === 'Inbound' ? 'From' : 'To'} {partner.organization}</Text>
                   <View style={styles.referralOutcome}><Text style={styles.referralOutcomeText}>{referral.outcome}</Text></View>
-                </View>
-              </TouchableOpacity>
+                </TouchableOpacity>
+                <TouchableOpacity accessibilityLabel={`Convert ${referral.clientLabel} referral to case`} accessibilityRole="button" onPress={() => convertReferralToCase(referral)} style={styles.convertCaseButton}>
+                  <AppIcon name="briefcase-outline" size={16} color={COLORS.forest} />
+                  <Text style={styles.convertCaseText}>Case</Text>
+                </TouchableOpacity>
+              </View>
             );
           })}
         </View> : <EmptyState icon="swap-horizontal-outline" title="No referral history" body="Add a partner, then log your first inbound or outbound referral." />}
 
         <SectionTitle title="Relationship balance" />
-        {partners.length ? partners.slice().sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound)).slice(0, 5).map((partner) => {
-          const total = Math.max(partner.inbound + partner.outbound, 1);
-          const inboundWidth = `${Math.round((partner.inbound / total) * 100)}%` as `${number}%`;
+        {partners.length ? partners.slice().sort((a, b) => {
+          const aCounts = countsFor(a.id);
+          const bCounts = countsFor(b.id);
+          return (bCounts.inbound - bCounts.outbound) - (aCounts.inbound - aCounts.outbound);
+        }).slice(0, 5).map((partner) => {
+          const counts = countsFor(partner.id);
+          const total = Math.max(counts.inbound + counts.outbound, 1);
+          const inboundWidth = `${Math.round((counts.inbound / total) * 100)}%` as `${number}%`;
           return (
             <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={styles.balanceRow}>
-              <View style={styles.balanceNameRow}><Text style={styles.balanceName} numberOfLines={1}>{partner.organization}</Text><Text style={styles.balanceNumbers}>{partner.inbound} in · {partner.outbound} out</Text></View>
+              <View style={styles.balanceNameRow}><Text style={styles.balanceName} numberOfLines={1}>{partner.organization}</Text><Text style={styles.balanceNumbers}>{counts.inbound} in · {counts.outbound} out</Text></View>
               <View style={styles.balanceTrack}><View style={[styles.balanceInbound, { width: inboundWidth }]} /></View>
             </TouchableOpacity>
           );
@@ -1131,13 +1347,14 @@ export default function App() {
       { key: 'match', label: 'Match', icon: 'sparkles-outline', activeIcon: 'sparkles' },
       { key: 'directory', label: 'Directory', icon: 'people-outline', activeIcon: 'people' },
       { key: 'referrals', label: 'Referrals', icon: 'swap-horizontal-outline', activeIcon: 'swap-horizontal' },
+      { key: 'workflow', label: 'Workflow', icon: 'briefcase-outline', activeIcon: 'briefcase' },
     ];
     return (
       <View style={styles.bottomNav}>
         {items.map((item) => {
           const active = tab === item.key;
           return (
-            <TouchableOpacity key={item.key} accessibilityLabel={`${item.label} tab`} onPress={() => setTab(item.key)} style={styles.navItem}>
+            <TouchableOpacity key={item.key} accessibilityLabel={`${item.label} tab`} accessibilityRole="tab" accessibilityState={{ selected: active }} onPress={() => setTab(item.key)} style={styles.navItem}>
               <View style={[styles.navIconWrap, active && styles.navIconActive]}><AppIcon name={active ? item.activeIcon : item.icon} size={21} color={active ? COLORS.white : COLORS.gray} /></View>
               <Text style={[styles.navLabel, active && styles.navLabelActive]}>{item.label}</Text>
             </TouchableOpacity>
@@ -1149,7 +1366,8 @@ export default function App() {
 
   function PartnerDetailModal() {
     if (!selectedPartner) return null;
-    const balance = selectedPartner.inbound - selectedPartner.outbound;
+    const selectedCounts = countsFor(selectedPartner.id);
+    const balance = selectedCounts.inbound - selectedCounts.outbound;
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setSelectedPartner(null)}>
         <SafeAreaView style={styles.modalPage}>
@@ -1157,7 +1375,7 @@ export default function App() {
           <View style={styles.modalHeader}>
             <TouchableOpacity accessibilityLabel="Close partner profile" onPress={() => setSelectedPartner(null)} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
             <Text style={styles.modalHeaderTitle}>Partner profile</Text>
-            <TouchableOpacity onPress={() => toggleFavorite(selectedPartner.id)} style={styles.closeButton}><AppIcon name={selectedPartner.favorite ? 'heart' : 'heart-outline'} size={21} color={selectedPartner.favorite ? COLORS.coral : COLORS.ink} /></TouchableOpacity>
+            <TouchableOpacity accessibilityLabel="Favorite partner" accessibilityRole="switch" accessibilityState={{ checked: selectedPartner.favorite }} onPress={() => toggleFavorite(selectedPartner.id)} style={styles.closeButton}><AppIcon name={selectedPartner.favorite ? 'heart' : 'heart-outline'} size={21} color={selectedPartner.favorite ? COLORS.coral : COLORS.ink} /></TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={styles.modalContent}>
             <View style={styles.profileHero}>
@@ -1168,8 +1386,8 @@ export default function App() {
             </View>
 
             <View style={styles.profileActions}>
-              <TouchableOpacity style={styles.profileAction} onPress={() => selectedPartner.phone && Linking.openURL(`tel:${selectedPartner.phone.replace(/[^\d+]/g, '')}`)}><AppIcon name="call" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Call</Text></TouchableOpacity>
-              <TouchableOpacity style={styles.profileAction} onPress={() => selectedPartner.email && Linking.openURL(`mailto:${selectedPartner.email}`)}><AppIcon name="mail" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Email</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityLabel={`Call ${selectedPartner.organization}`} accessibilityRole="button" style={styles.profileAction} onPress={() => openExternalUrl(selectedPartner.phone ? `tel:${selectedPartner.phone.replace(/[^\d+]/g, '')}` : '', 'No phone number is recorded for this partner.')}><AppIcon name="call" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Call</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityLabel={`Email ${selectedPartner.organization}`} accessibilityRole="button" style={styles.profileAction} onPress={() => openExternalUrl(selectedPartner.email ? `mailto:${selectedPartner.email}` : '', 'No email address is recorded for this partner.')}><AppIcon name="mail" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Email</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openReferral('Outbound', selectedPartner.id)}><AppIcon name="paper-plane" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Refer</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => sharePartner(selectedPartner)}><AppIcon name="share-social" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Share</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openEditPartner(selectedPartner)}><AppIcon name="create" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Edit</Text></TouchableOpacity>
@@ -1177,13 +1395,14 @@ export default function App() {
 
             <View style={styles.profileBalanceCard}>
               <View><Text style={styles.fieldLabel}>RELATIONSHIP BALANCE</Text><Text style={styles.profileBalanceTitle}>{balance > 0 ? `They’ve sent ${balance} more` : balance < 0 ? `You’ve sent ${Math.abs(balance)} more` : 'Perfectly balanced'}</Text></View>
-              <View style={styles.profileCounts}><Text style={styles.profileCount}><Text style={{ color: COLORS.forest }}>{selectedPartner.inbound}</Text> in</Text><Text style={styles.profileCount}><Text style={{ color: COLORS.blue }}>{selectedPartner.outbound}</Text> out</Text></View>
+              <View style={styles.profileCounts}><Text style={styles.profileCount}><Text style={{ color: COLORS.forest }}>{selectedCounts.inbound}</Text> in</Text><Text style={styles.profileCount}><Text style={{ color: COLORS.blue }}>{selectedCounts.outbound}</Text> out</Text></View>
             </View>
 
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Placement details</Text>
-              <View style={styles.infoLine}><AppIcon name="wallet-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Cash range</Text><Text style={styles.infoValue}>{formatMoney(selectedPartner.cashMin)}–{formatMoney(selectedPartner.cashMax)}</Text></View></View>
-              <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Insurance</Text><Text style={styles.infoValue}>{selectedPartner.insurance.join(' · ') || 'Not recorded'}</Text></View></View>
+              <View style={styles.infoLine}><AppIcon name="wallet-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Cash range</Text><Text style={styles.infoValue}>{cashPriceLabel(selectedPartner)}</Text></View></View>
+              <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>In-network insurance</Text><Text style={styles.infoValue}>{selectedPartner.insurance.join(' · ') || 'Not recorded'}</Text></View></View>
+              <View style={styles.infoLine}><AppIcon name="shield-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Recorded out-of-network</Text><Text style={styles.infoValue}>{selectedPartner.outOfNetworkInsurance.join(' · ') || 'Not recorded'}</Text></View></View>
               <View style={styles.infoLine}><AppIcon name="location-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Service area</Text><Text style={styles.infoValue}>{selectedPartner.regions.join(' · ')}</Text></View></View>
             </View>
 
@@ -1196,7 +1415,7 @@ export default function App() {
             <View style={styles.contactCard}>
               <View style={styles.contactLine}><AppIcon name="call-outline" size={17} color={COLORS.gray} /><Text style={styles.contactText}>{selectedPartner.phone || 'No phone recorded'}</Text></View>
               <View style={styles.contactLine}><AppIcon name="mail-outline" size={17} color={COLORS.gray} /><Text style={styles.contactText}>{selectedPartner.email || 'No email recorded'}</Text></View>
-              <View style={styles.contactLine}><AppIcon name="globe-outline" size={17} color={COLORS.gray} /><Text style={styles.contactText}>{selectedPartner.website || 'No website recorded'}</Text></View>
+              <TouchableOpacity accessibilityLabel={`Open ${selectedPartner.organization} website`} accessibilityRole="link" onPress={() => openExternalUrl(selectedPartner.website, 'No website is recorded for this partner.')} style={styles.contactLine}><AppIcon name="globe-outline" size={17} color={COLORS.gray} /><Text style={styles.contactText}>{selectedPartner.website || 'No website recorded'}</Text></TouchableOpacity>
             </View>
           </ScrollView>
         </SafeAreaView>
@@ -1228,18 +1447,31 @@ export default function App() {
                 emptyLabel="Select partner types"
                 selectedNoun="types"
               />
-              <View style={styles.formRow}><View style={{ flex: 2 }}><FormField label="CITY" value={partnerForm.city} onChangeText={(city) => setPartnerForm((current) => ({ ...current, city }))} placeholder="City" /></View><View style={{ flex: 1 }}><FormField label="STATE" value={partnerForm.state} onChangeText={(state) => setPartnerForm((current) => ({ ...current, state }))} placeholder="CA" /></View></View>
+              <View style={styles.formRow}><View style={{ flex: 2 }}><FormField label="CITY" value={partnerForm.city} onChangeText={(city) => setPartnerForm((current) => ({ ...current, city }))} placeholder="City" /></View><View style={{ flex: 1 }}><FormField label="HOME STATE *" value={partnerForm.state} onChangeText={(state) => setPartnerForm((current) => ({ ...current, state }))} placeholder="CA" /></View></View>
+              <TouchableOpacity accessibilityLabel="Nationwide service area" accessibilityRole="switch" accessibilityState={{ checked: partnerForm.nationwide }} onPress={() => setPartnerForm((current) => ({ ...current, nationwide: !current.nationwide }))} style={[styles.toggleRow, partnerForm.nationwide && styles.toggleRowActive]}>
+                <Text style={styles.toggleLabel}>Nationwide service area</Text><AppIcon name={partnerForm.nationwide ? 'toggle' : 'toggle-outline'} size={30} color={partnerForm.nationwide ? COLORS.forest : COLORS.gray} />
+              </TouchableOpacity>
+              <FormField label="ADDITIONAL SERVICE STATES" value={partnerForm.serviceStates} onChangeText={(serviceStates) => setPartnerForm((current) => ({ ...current, serviceStates }))} placeholder="Optional, comma-separated: NV, AZ" />
               <FormField label="PHONE" value={partnerForm.phone} onChangeText={(phone) => setPartnerForm((current) => ({ ...current, phone }))} placeholder="Phone number" keyboardType="phone-pad" />
               <FormField label="EMAIL" value={partnerForm.email} onChangeText={(email) => setPartnerForm((current) => ({ ...current, email }))} placeholder="name@program.com" keyboardType="email-address" />
               <FormField label="WEBSITE" value={partnerForm.website} onChangeText={(website) => setPartnerForm((current) => ({ ...current, website }))} placeholder="https://program.com" keyboardType="url" />
               <View style={styles.formRow}><View style={{ flex: 1 }}><FormField label="CASH MIN" value={partnerForm.cashMin} onChangeText={(cashMin) => setPartnerForm((current) => ({ ...current, cashMin }))} placeholder="$0" keyboardType="number-pad" /></View><View style={{ flex: 1 }}><FormField label="CASH MAX" value={partnerForm.cashMax} onChangeText={(cashMax) => setPartnerForm((current) => ({ ...current, cashMax }))} placeholder="$0" keyboardType="number-pad" /></View></View>
               <MultiSelectDropdown
-                label="INSURANCES ACCEPTED"
+                label="IN-NETWORK INSURANCES"
                 values={partnerForm.insurance}
                 options={partnerInsuranceOptions}
                 onChange={(insurance) => setPartnerForm((current) => ({ ...current, insurance }))}
                 icon="shield-checkmark-outline"
                 emptyLabel="Select accepted insurance plans"
+                selectedNoun="plans"
+              />
+              <MultiSelectDropdown
+                label="RECORDED OUT-OF-NETWORK INSURANCES"
+                values={partnerForm.outOfNetworkInsurance}
+                options={['Any', ...partnerInsuranceOptions]}
+                onChange={(outOfNetworkInsurance) => setPartnerForm((current) => ({ ...current, outOfNetworkInsurance }))}
+                icon="shield-outline"
+                emptyLabel="No out-of-network capability recorded"
                 selectedNoun="plans"
               />
               <MultiSelectDropdown
@@ -1284,14 +1516,14 @@ export default function App() {
                 <>
                   <Text style={styles.fieldLabel}>DIRECTION</Text>
                   <View style={styles.segmented}>
-                    {(['Inbound', 'Outbound'] as ReferralDirection[]).map((direction) => <TouchableOpacity key={direction} onPress={() => setReferralForm({ ...referralForm, direction })} style={[styles.segment, referralForm.direction === direction && styles.segmentActive]}><AppIcon name={direction === 'Inbound' ? 'arrow-down' : 'arrow-up'} size={16} color={referralForm.direction === direction ? COLORS.white : COLORS.inkSoft} /><Text style={[styles.segmentText, referralForm.direction === direction && styles.segmentTextActive]}>{direction}</Text></TouchableOpacity>)}
+                    {(['Inbound', 'Outbound'] as ReferralDirection[]).map((direction) => <TouchableOpacity key={direction} accessibilityLabel={`${direction} referral`} accessibilityRole="radio" accessibilityState={{ selected: referralForm.direction === direction }} onPress={() => setReferralForm({ ...referralForm, direction })} style={[styles.segment, referralForm.direction === direction && styles.segmentActive]}><AppIcon name={direction === 'Inbound' ? 'arrow-down' : 'arrow-up'} size={16} color={referralForm.direction === direction ? COLORS.white : COLORS.inkSoft} /><Text style={[styles.segmentText, referralForm.direction === direction && styles.segmentTextActive]}>{direction}</Text></TouchableOpacity>)}
                   </View>
                   <Text style={styles.directionExplainer}>{referralForm.direction === 'Inbound' ? 'A professional or program sent a family to you.' : 'You sent a client or family to a professional or program.'}</Text>
                 </>
               )}
               <Text style={styles.fieldLabel}>{matchedReferral ? 'ASSIGN REFERENT' : 'PARTNER'}</Text>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.partnerPicker}>
-                {partners.slice().sort((a, b) => Number(b.id === referralForm.partnerId) - Number(a.id === referralForm.partnerId)).map((partner) => <TouchableOpacity key={partner.id} onPress={() => setReferralForm({ ...referralForm, partnerId: partner.id })} style={[styles.partnerPick, referralForm.partnerId === partner.id && styles.partnerPickActive]}><Initials name={partner.organization} size={34} /><Text numberOfLines={2} style={[styles.partnerPickText, referralForm.partnerId === partner.id && styles.partnerPickTextActive]}>{partner.organization}</Text></TouchableOpacity>)}
+                {partners.slice().sort((a, b) => Number(b.id === referralForm.partnerId) - Number(a.id === referralForm.partnerId)).map((partner) => <TouchableOpacity key={partner.id} accessibilityLabel={partner.organization} accessibilityRole="radio" accessibilityState={{ selected: referralForm.partnerId === partner.id }} onPress={() => setReferralForm({ ...referralForm, partnerId: partner.id })} style={[styles.partnerPick, referralForm.partnerId === partner.id && styles.partnerPickActive]}><Initials name={partner.organization} size={34} /><Text numberOfLines={2} style={[styles.partnerPickText, referralForm.partnerId === partner.id && styles.partnerPickTextActive]}>{partner.organization}</Text></TouchableOpacity>)}
               </ScrollView>
               <FormField label="CLIENT / FAMILY LABEL *" value={referralForm.clientLabel} onChangeText={(clientLabel) => setReferralForm({ ...referralForm, clientLabel })} placeholder="Use initials or a private label" />
               <Text style={styles.privacyHint}><AppIcon name="lock-closed" size={13} color={COLORS.gray} /> Keep this de-identified; avoid clinical details or protected health information.</Text>
@@ -1306,11 +1538,67 @@ export default function App() {
     );
   }
 
+  if (recoveryError) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <View accessibilityRole="alert" style={styles.recoveryScreen}>
+          <AppIcon name="warning-outline" size={34} color={COLORS.coral} />
+          <Text style={styles.recoveryTitle}>Your saved data needs recovery</Text>
+          <Text style={styles.recoveryBody}>{recoveryError}</Text>
+          <Text style={styles.recoveryFootnote}>ReferralFit has disabled saving so the original data cannot be overwritten.</Text>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Restore a ReferralFit backup" onPress={() => void restoreBackup().catch((error) => Alert.alert('Restore failed', error instanceof Error ? error.message : String(error)))} style={styles.primaryButton}><Text style={styles.primaryButtonText}>Restore a backup</Text></TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (!loaded) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <View style={styles.recoveryScreen}><Text style={styles.recoveryBody}>Loading your saved ReferralFit data…</Text></View>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
       <View style={styles.appShell}>
-        <View style={styles.screen}>{tab === 'home' ? HomeScreen() : tab === 'match' ? MatchScreen() : tab === 'directory' ? DirectoryScreen() : ReferralsScreen()}</View>
+        {storageError ? (
+          <View accessibilityRole="alert" style={styles.storageBanner}>
+            <Text style={styles.storageBannerText}>Changes are not saved: {storageError}</Text>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel="Retry saving changes" onPress={retryStorageWrite} style={styles.storageRetry}><Text style={styles.storageRetryText}>Retry</Text></TouchableOpacity>
+          </View>
+        ) : saving ? <Text accessibilityLiveRegion="polite" style={styles.savingText}>Saving…</Text> : null}
+        <View style={styles.screen}>{tab === 'home'
+          ? HomeScreen()
+          : tab === 'match'
+            ? MatchScreen()
+            : tab === 'directory'
+              ? DirectoryScreen()
+              : tab === 'referrals'
+                ? ReferralsScreen()
+                : <WorkflowScreen
+                    state={workflowState}
+                    onChange={setWorkflowState}
+                    referrals={referrals}
+                    referralMatches={referralMatches}
+                    partners={partners}
+                    onRequestContactSync={async (participant) => {
+                      try { await presentParticipantContact(participant); } catch (error) { Alert.alert('Unable to add contact', error instanceof Error ? error.message : String(error)); }
+                    }}
+                    onRequestCalendarSync={async (appointment) => {
+                      try {
+                        await addAppointmentToCalendar(appointment);
+                        Alert.alert('Added to Calendar', `${appointment.title} was added to your device calendar.`);
+                      } catch (error) { Alert.alert('Unable to add calendar event', error instanceof Error ? error.message : String(error)); }
+                    }}
+                    onRequestDocumentPick={pickCaseDocument}
+                    onRequestDocumentOpen={openCaseDocument}
+                    onRequestDocumentRemove={deleteCaseDocument}
+                    onRequestBackupExport={exportBackup}
+                    onRequestBackupRestore={restoreBackup}
+                  />}</View>
         {BottomNav()}
       </View>
       {PartnerDetailModal()}
@@ -1325,6 +1613,7 @@ function FormField({ label, value, onChangeText, placeholder, keyboardType, mult
     <View style={styles.formField}>
       <Text style={styles.fieldLabel}>{label}</Text>
       <TextInput
+        accessibilityLabel={label.replace(/\s*\*$/, '')}
         ref={inputRef}
         value={value}
         onChangeText={onChangeText}
@@ -1343,6 +1632,16 @@ const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: COLORS.cream },
   appShell: { flex: 1, alignSelf: 'center', width: '100%', maxWidth: 520, backgroundColor: COLORS.cream, overflow: 'hidden' },
   screen: { flex: 1 },
+  recoveryScreen: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 28, backgroundColor: COLORS.cream },
+  recoveryTitle: { color: COLORS.ink, fontSize: 20, fontWeight: '800', textAlign: 'center', marginTop: 14 },
+  recoveryBody: { color: COLORS.inkSoft, fontSize: 13, lineHeight: 20, textAlign: 'center', marginTop: 10 },
+  recoveryFootnote: { color: COLORS.gray, fontSize: 11, lineHeight: 17, textAlign: 'center', marginTop: 12 },
+  storageBanner: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: COLORS.coralPale, borderBottomWidth: 1, borderBottomColor: COLORS.coral, paddingHorizontal: 14, paddingVertical: 9 },
+  storageBannerText: { flex: 1, color: COLORS.ink, fontSize: 11, lineHeight: 15, fontWeight: '600' },
+  storageRetry: { backgroundColor: COLORS.forest, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7 },
+  storageRetryText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
+  savingText: { color: COLORS.gray, backgroundColor: COLORS.white, fontSize: 10, textAlign: 'center', paddingVertical: 4 },
+  validationText: { color: COLORS.coral, fontSize: 10, fontWeight: '700', marginTop: 4 },
   scrollContent: { paddingHorizontal: 20, paddingTop: Platform.OS === 'android' ? 18 : 8, paddingBottom: 28 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 10, marginBottom: 22 },
   brandRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
@@ -1526,6 +1825,8 @@ const styles = StyleSheet.create({
   referralClient: { color: COLORS.ink, fontSize: 13, fontWeight: '800' },
   referralDate: { color: COLORS.gray, fontSize: 10 },
   referralPartner: { color: COLORS.gray, fontSize: 11, marginTop: 4 },
+  convertCaseButton: { alignSelf: 'center', alignItems: 'center', justifyContent: 'center', gap: 3, minWidth: 50, minHeight: 48, borderRadius: 12, backgroundColor: COLORS.mintPale },
+  convertCaseText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
   referralOutcome: { alignSelf: 'flex-start', backgroundColor: COLORS.mintPale, borderRadius: 8, paddingHorizontal: 7, paddingVertical: 4, marginTop: 8 },
   referralOutcomeText: { color: COLORS.forest, fontSize: 9, fontWeight: '800' },
   balanceRow: { marginBottom: 16 },
@@ -1574,6 +1875,9 @@ const styles = StyleSheet.create({
   formContent: { padding: 20, paddingBottom: 42 },
   formIntro: { color: COLORS.gray, fontSize: 13, lineHeight: 19, marginBottom: 20 },
   formField: { marginBottom: 15 },
+  toggleRow: { minHeight: 48, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: COLORS.white, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 14, marginBottom: 15 },
+  toggleRowActive: { borderColor: COLORS.forest, backgroundColor: COLORS.mintPale },
+  toggleLabel: { color: COLORS.inkSoft, fontSize: 13, fontWeight: '700' },
   formInput: { backgroundColor: COLORS.white, minHeight: 48, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 14, color: COLORS.ink, fontSize: 13, outlineStyle: 'none' } as any,
   multilineInput: { minHeight: 94, paddingTop: 13, textAlignVertical: 'top' },
   formRow: { flexDirection: 'row', gap: 10 },

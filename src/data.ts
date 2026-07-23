@@ -1,64 +1,20 @@
-export type PartnerType =
-  | 'Inpatient'
-  | 'IOP / PHP'
-  | 'Interventionist'
-  | 'Therapist'
-  | 'Sober Living'
-  | 'Detox';
+import type {
+  InsuranceNetworkPreference,
+  Partner,
+  PartnerType,
+  Referral,
+  ReferralDirection,
+  ReferralMatch,
+} from './domain/types';
 
-export type ReferralDirection = 'Inbound' | 'Outbound';
-export type InsuranceNetworkPreference = 'In-network' | 'Out-of-network';
-
-export type Partner = {
-  id: string;
-  name: string;
-  organization: string;
-  type: PartnerType;
-  types?: PartnerType[];
-  city: string;
-  state: string;
-  regions: string[];
-  phone: string;
-  email: string;
-  website?: string;
-  cashMin: number;
-  cashMax: number;
-  insurance: string[];
-  therapies: string[];
-  populations: string[];
-  levels: string[];
-  note: string;
-  inbound: number;
-  outbound: number;
-  lastContact: string;
-  favorite?: boolean;
-};
-
-export type Referral = {
-  id: string;
-  partnerId: string;
-  direction: ReferralDirection;
-  date: string;
-  clientLabel: string;
-  outcome: 'Placed' | 'Introduced' | 'Consulted' | 'Pending';
-  note: string;
-};
-
-export type ReferralMatch = {
-  id: string;
-  clientLabel: string;
-  levelOfCare: PartnerType | 'Any type';
-  state: string;
-  insurance: string;
-  networkPreferences?: InsuranceNetworkPreference[];
-  maxBudget?: number;
-  therapies: string[];
-  status: 'Matching' | 'Referred';
-  createdAt: string;
-  updatedAt: string;
-  assignedPartnerId?: string;
-  referralId?: string;
-};
+export type {
+  InsuranceNetworkPreference,
+  Partner,
+  PartnerType,
+  Referral,
+  ReferralDirection,
+  ReferralMatch,
+} from './domain/types';
 
 export const partnerTypes: PartnerType[] = [
   'Inpatient',
@@ -258,8 +214,9 @@ export const initialReferrals: Referral[] = [];
 
 export const initialReferralMatches: ReferralMatch[] = [];
 
-export const formatMoney = (value: number) =>
-  new Intl.NumberFormat('en-US', {
+export const formatMoney = (value: number | null) => value === null
+  ? 'Cash price not recorded'
+  : new Intl.NumberFormat('en-US', {
     style: 'currency',
     currency: 'USD',
     maximumFractionDigits: 0,
