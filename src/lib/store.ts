@@ -21,11 +21,47 @@ export type Touch = {
   occurredAt: string; // ISO timestamptz
 };
 
+export type FollowUpStatus = 'open' | 'done' | 'skipped';
+
+export type FollowUp = {
+  id: string;
+  partnerId?: string;
+  referralId?: string;
+  title: string;
+  dueOn: string; // YYYY-MM-DD
+  status: FollowUpStatus;
+  completedAt?: string; // ISO timestamptz
+  note: string;
+};
+
+export type PartnerScorecard = {
+  partnerId: string;
+  referralsSent: number;
+  admits: number;
+  nonAdmits: number;
+  avgFamilyExperience: number | null;
+  lastReferralOn: string | null; // YYYY-MM-DD
+};
+
+// Patch for the v2 outcome-enrichment columns on referrals (admitted,
+// admitted_on, family_experience, outcome_note). Packet fields
+// (packet_sent_at, match_profile_id) are set at insert time inside
+// referralToRow from the Referral object itself.
+export type ReferralOutcomePatch = {
+  admitted?: boolean | null;
+  admittedOn?: string | null; // YYYY-MM-DD
+  familyExperience?: number | null; // 1-5
+  outcomeNote?: string;
+  outcome?: Referral['outcome'];
+};
+
 export type Snapshot = {
   partners: Partner[];
   referrals: Referral[];
   referralMatches: ReferralMatch[];
   touches: Touch[];
+  followUps: FollowUp[];
+  scorecards: Record<string, PartnerScorecard>;
 };
 
 export type HydrateResult = {
@@ -78,7 +114,10 @@ type QueueOp =
   | { kind: 'referral.insert'; row: Record<string, unknown> }
   | { kind: 'match.insert'; row: Record<string, unknown> }
   | { kind: 'match.update'; id: string; patch: Record<string, unknown> }
-  | { kind: 'touch.insert'; row: Record<string, unknown> };
+  | { kind: 'touch.insert'; row: Record<string, unknown> }
+  | { kind: 'follow_up.insert'; row: Record<string, unknown> }
+  | { kind: 'follow_up.update'; id: string; patch: Record<string, unknown> }
+  | { kind: 'referral.update'; id: string; patch: Record<string, unknown> };
 
 async function readQueue(): Promise<QueueOp[]> {
   try {
@@ -123,6 +162,15 @@ async function applyQueueOp(op: QueueOp): Promise<void> {
       break;
     case 'touch.insert':
       ({ error } = await supabase.from('touches').insert(op.row));
+      break;
+    case 'follow_up.insert':
+      ({ error } = await supabase.from('follow_ups').upsert(op.row));
+      break;
+    case 'follow_up.update':
+      ({ error } = await supabase.from('follow_ups').update(op.patch).eq('id', op.id));
+      break;
+    case 'referral.update':
+      ({ error } = await supabase.from('referrals').update(op.patch).eq('id', op.id));
       break;
   }
   if (error) throw error;
@@ -188,6 +236,12 @@ type ReferralRow = {
   client_label: string | null;
   outcome: Referral['outcome'];
   note: string | null;
+  admitted: boolean | null;
+  admitted_on: string | null;
+  family_experience: number | null;
+  outcome_note: string | null;
+  packet_sent_at: string | null;
+  match_profile_id: string | null;
 };
 
 type MatchRow = {
@@ -218,6 +272,26 @@ type BalanceRow = {
   partner_id: string;
   inbound: number | string | null;
   outbound: number | string | null;
+};
+
+type FollowUpRow = {
+  id: string;
+  partner_id: string | null;
+  referral_id: string | null;
+  title: string;
+  due_on: string;
+  status: FollowUpStatus;
+  completed_at: string | null;
+  note: string | null;
+};
+
+type ScorecardRow = {
+  partner_id: string;
+  referrals_sent: number | string | null;
+  admits: number | string | null;
+  non_admits: number | string | null;
+  avg_family_experience: number | string | null;
+  last_referral_on: string | null;
 };
 
 function toNumber(value: number | string | null | undefined): number {
@@ -269,6 +343,12 @@ function mapReferralRow(row: ReferralRow): Referral {
     clientLabel: row.client_label || '',
     outcome: row.outcome,
     note: row.note || '',
+    packetSentAt: row.packet_sent_at || undefined,
+    matchProfileId: row.match_profile_id || undefined,
+    admitted: row.admitted,
+    admittedOn: row.admitted_on || undefined,
+    familyExperience: row.family_experience,
+    outcomeNote: row.outcome_note || '',
   };
 }
 
@@ -297,6 +377,36 @@ function mapTouchRow(row: TouchRow): Touch {
     kind: row.kind,
     note: row.note || '',
     occurredAt: row.occurred_at,
+  };
+}
+
+function mapFollowUpRow(row: FollowUpRow): FollowUp {
+  return {
+    id: row.id,
+    partnerId: row.partner_id || undefined,
+    referralId: row.referral_id || undefined,
+    title: row.title,
+    dueOn: row.due_on,
+    status: row.status,
+    completedAt: row.completed_at || undefined,
+    note: row.note || '',
+  };
+}
+
+function toNullableNumber(value: number | string | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function mapScorecardRow(row: ScorecardRow): PartnerScorecard {
+  return {
+    partnerId: row.partner_id,
+    referralsSent: toNumber(row.referrals_sent),
+    admits: toNumber(row.admits),
+    nonAdmits: toNumber(row.non_admits),
+    avgFamilyExperience: toNullableNumber(row.avg_family_experience),
+    lastReferralOn: row.last_referral_on,
   };
 }
 
@@ -337,6 +447,13 @@ function referralToRow(referral: Referral): Record<string, unknown> {
     client_label: referral.clientLabel,
     outcome: referral.outcome,
     note: referral.note,
+    // v2 columns (deployed migration 20260724150000) — packet + outcome data
+    packet_sent_at: referral.packetSentAt ?? null,
+    match_profile_id: referral.matchProfileId ?? null,
+    admitted: referral.admitted ?? null,
+    admitted_on: referral.admittedOn ?? null,
+    family_experience: referral.familyExperience ?? null,
+    outcome_note: referral.outcomeNote ?? '',
   };
 }
 
@@ -366,6 +483,29 @@ function touchToRow(touch: Touch): Record<string, unknown> {
   };
 }
 
+function followUpToRow(followUp: FollowUp): Record<string, unknown> {
+  return {
+    id: followUp.id,
+    partner_id: followUp.partnerId ?? null,
+    referral_id: followUp.referralId ?? null,
+    title: followUp.title,
+    due_on: followUp.dueOn,
+    status: followUp.status,
+    completed_at: followUp.completedAt ?? null,
+    note: followUp.note,
+  };
+}
+
+function referralOutcomePatchToRow(patch: ReferralOutcomePatch): Record<string, unknown> {
+  const row: Record<string, unknown> = {};
+  if (patch.admitted !== undefined) row.admitted = patch.admitted;
+  if (patch.admittedOn !== undefined) row.admitted_on = patch.admittedOn;
+  if (patch.familyExperience !== undefined) row.family_experience = patch.familyExperience;
+  if (patch.outcomeNote !== undefined) row.outcome_note = patch.outcomeNote;
+  if (patch.outcome !== undefined) row.outcome = patch.outcome;
+  return row;
+}
+
 // ─── Local cache ────────────────────────────────────────────────────────────
 
 async function writeCache(snapshot: Snapshot): Promise<void> {
@@ -387,6 +527,8 @@ async function readCache(): Promise<Snapshot | null> {
       referrals: Array.isArray(parsed.referrals) ? parsed.referrals : [],
       referralMatches: Array.isArray(parsed.referralMatches) ? parsed.referralMatches : [],
       touches: Array.isArray(parsed.touches) ? parsed.touches : [],
+      followUps: Array.isArray(parsed.followUps) ? parsed.followUps : [],
+      scorecards: parsed.scorecards && typeof parsed.scorecards === 'object' ? parsed.scorecards : {},
     };
   } catch {
     return null;
@@ -404,7 +546,7 @@ async function readLegacySnapshot(): Promise<Snapshot | null> {
     const referrals = Array.isArray(stored.referrals) ? stored.referrals as Referral[] : [];
     const referralMatches = Array.isArray(stored.referralMatches) ? stored.referralMatches as ReferralMatch[] : [];
     if (!partners.length && !referrals.length && !referralMatches.length) return null;
-    return { partners, referrals, referralMatches, touches: [] };
+    return { partners, referrals, referralMatches, touches: [], followUps: [], scorecards: {} };
   } catch {
     return null;
   }
@@ -431,24 +573,33 @@ async function importLegacySnapshot(legacy: Snapshot): Promise<void> {
 // ─── Read path ──────────────────────────────────────────────────────────────
 
 async function fetchSnapshot(): Promise<Snapshot> {
-  const [partnersRes, referralsRes, matchesRes, touchesRes, balancesRes] = await Promise.all([
+  const [partnersRes, referralsRes, matchesRes, touchesRes, balancesRes, followUpsRes, scorecardsRes] = await Promise.all([
     supabase.from('partners').select('*').order('created_at', { ascending: false }),
     supabase.from('referrals').select('*').order('referred_on', { ascending: false }),
     supabase.from('match_profiles').select('*').order('updated_at', { ascending: false }),
     supabase.from('touches').select('*').order('occurred_at', { ascending: false }),
     supabase.from('partner_balances').select('partner_id, inbound, outbound'),
+    supabase.from('follow_ups').select('*').order('due_on', { ascending: true }),
+    supabase.from('partner_scorecard').select('partner_id, referrals_sent, admits, non_admits, avg_family_experience, last_referral_on'),
   ]);
-  const firstError = partnersRes.error || referralsRes.error || matchesRes.error || touchesRes.error || balancesRes.error;
+  const firstError = partnersRes.error || referralsRes.error || matchesRes.error || touchesRes.error || balancesRes.error || followUpsRes.error || scorecardsRes.error;
   if (firstError) throw firstError;
 
   const balanceByPartner = new Map<string, BalanceRow>();
   for (const row of (balancesRes.data || []) as BalanceRow[]) balanceByPartner.set(row.partner_id, row);
+
+  const scorecards: Record<string, PartnerScorecard> = {};
+  for (const row of (scorecardsRes.data || []) as ScorecardRow[]) {
+    scorecards[row.partner_id] = mapScorecardRow(row);
+  }
 
   return {
     partners: ((partnersRes.data || []) as PartnerRow[]).map((row) => mapPartnerRow(row, balanceByPartner.get(row.id))),
     referrals: ((referralsRes.data || []) as ReferralRow[]).map(mapReferralRow),
     referralMatches: ((matchesRes.data || []) as MatchRow[]).map(mapMatchRow),
     touches: ((touchesRes.data || []) as TouchRow[]).map(mapTouchRow),
+    followUps: ((followUpsRes.data || []) as FollowUpRow[]).map(mapFollowUpRow),
+    scorecards,
   };
 }
 
@@ -480,7 +631,7 @@ export async function hydrate(): Promise<HydrateResult> {
     const cached = await readCache();
     if (cached) return { snapshot: cached, source: 'cache' };
     if (isNetworkError(error)) {
-      return { snapshot: { partners: [], referrals: [], referralMatches: [], touches: [] }, source: 'cache' };
+      return { snapshot: { partners: [], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} }, source: 'cache' };
     }
     throw error;
   }
@@ -549,6 +700,36 @@ export async function createTouch(touch: Touch): Promise<void> {
 export async function assignMatchReferral(referral: Referral, match: ReferralMatch): Promise<void> {
   await createReferral(referral);
   await updateMatchProfile(match);
+}
+
+export async function createFollowUp(followUp: FollowUp): Promise<void> {
+  const row = followUpToRow(followUp);
+  await runOrQueue({ kind: 'follow_up.insert', row }, () => supabase.from('follow_ups').insert(row));
+}
+
+export async function updateFollowUp(followUp: FollowUp): Promise<void> {
+  const row = followUpToRow(followUp);
+  const { id, ...patch } = row;
+  await runOrQueue({ kind: 'follow_up.update', id: followUp.id, patch }, () =>
+    supabase.from('follow_ups').update(patch).eq('id', followUp.id));
+}
+
+// Partial update of the v2 outcome columns on a referral (admitted,
+// family_experience, outcome_note, outcome). Kept separate from
+// createReferral so the caller never has to round-trip the whole row.
+export async function updateReferralOutcome(id: string, patch: ReferralOutcomePatch): Promise<void> {
+  const row = referralOutcomePatchToRow(patch);
+  await runOrQueue({ kind: 'referral.update', id, patch: row }, () =>
+    supabase.from('referrals').update(row).eq('id', id));
+}
+
+// Stamp packet_sent_at (and match_profile_id when it isn't set yet) onto an
+// existing referral — used when a packet is sent for an already-assigned
+// match, where no new referral row is created.
+export async function updateReferralPacketStamp(id: string, packetSentAt: string, matchProfileId: string): Promise<void> {
+  const patch = { packet_sent_at: packetSentAt, match_profile_id: matchProfileId };
+  await runOrQueue({ kind: 'referral.update', id, patch }, () =>
+    supabase.from('referrals').update(patch).eq('id', id));
 }
 
 // Re-hydrate from the server (used after flushing the offline queue so local

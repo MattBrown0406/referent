@@ -2,6 +2,7 @@ import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 
 import type { Partner, Referral, ReferralMatch } from '../data';
+import type { FollowUp } from './store';
 
 // ─── Behavior ───────────────────────────────────────────────────────────────
 
@@ -94,12 +95,30 @@ export type NotificationInput = {
   partners: Partner[];
   referralMatches: ReferralMatch[];
   referrals: Referral[];
+  followUps?: FollowUp[]; // optional so older call sites keep compiling
 };
 
+function dateStamp(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+// Open follow-ups due today or earlier.
+export function followUpsDue(followUps: FollowUp[]): FollowUp[] {
+  const today = dateStamp(startOfToday());
+  return followUps
+    .filter((followUp) => followUp.status === 'open' && followUp.dueOn <= today)
+    .sort((a, b) => a.dueOn.localeCompare(b.dueOn));
+}
+
 // Recompute and reschedule everything: one daily 7 AM briefing (only when
-// there is something worth saying), then per-partner cadence nags at 9 AM.
-// Priority when capped: briefing first, then most-overdue partners.
-export async function rescheduleNotifications({ partners, referralMatches, referrals }: NotificationInput): Promise<void> {
+// there is something worth saying), then per-partner cadence nags at 9 AM,
+// then one reminder per open follow-up at 9 AM on its due date.
+// Priority when capped: briefing first, then most-overdue partners, then
+// follow-ups by due date.
+export async function rescheduleNotifications({ partners, referralMatches, referrals, followUps = [] }: NotificationInput): Promise<void> {
   ensureNotificationHandler();
   try {
     const granted = await ensureNotificationSetup();
@@ -109,15 +128,24 @@ export async function rescheduleNotifications({ partners, referralMatches, refer
     const cold = partnersGoingCold(partners);
     const matchesInProgress = referralMatches.filter((match) => match.status === 'Matching').length;
     const pendingReferrals = referrals.filter((referral) => referral.outcome === 'Pending').length;
+    const dueFollowUps = followUpsDue(followUps);
 
     let remaining = MAX_SCHEDULED;
 
     // (a) Daily briefing at 7:00 AM — skip entirely when everything is zero.
-    if (cold.length > 0 || matchesInProgress > 0 || pendingReferrals > 0) {
+    if (cold.length > 0 || matchesInProgress > 0 || pendingReferrals > 0 || dueFollowUps.length > 0) {
+      const parts = [
+        `${cold.length} ${cold.length === 1 ? 'partner' : 'partners'} going cold`,
+        `${matchesInProgress} ${matchesInProgress === 1 ? 'match' : 'matches'} in progress`,
+        `${pendingReferrals} pending ${pendingReferrals === 1 ? 'referral' : 'referrals'}`,
+      ];
+      if (dueFollowUps.length > 0) {
+        parts.push(`${dueFollowUps.length} ${dueFollowUps.length === 1 ? 'follow-up' : 'follow-ups'} due`);
+      }
       await Notifications.scheduleNotificationAsync({
         content: {
           title: 'ReferralFit briefing',
-          body: `${cold.length} ${cold.length === 1 ? 'partner' : 'partners'} going cold · ${matchesInProgress} ${matchesInProgress === 1 ? 'match' : 'matches'} in progress · ${pendingReferrals} pending ${pendingReferrals === 1 ? 'referral' : 'referrals'}`,
+          body: parts.join(' · '),
           data: { target: 'home' },
           ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
         },
@@ -184,6 +212,41 @@ export async function rescheduleNotifications({ partners, referralMatches, refer
         });
         remaining -= 1;
       }
+    }
+
+    // (c) One reminder per open follow-up at 9:00 AM on its due date. If the
+    // follow-up is already overdue (or 9 AM has passed on the due day), the
+    // reminder goes out at the next 9 AM. Taps route to the home tab, where
+    // the Follow-ups section lives.
+    const openFollowUps = followUps
+      .filter((followUp) => followUp.status === 'open')
+      .sort((a, b) => a.dueOn.localeCompare(b.dueOn));
+    const partnerById = new Map(partners.map((partner) => [partner.id, partner]));
+    for (const followUp of openFollowUps) {
+      if (remaining <= 0) break;
+      const parsed = new Date(`${followUp.dueOn}T12:00:00`);
+      if (Number.isNaN(parsed.getTime())) continue;
+      const dueDay = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+      let when = atTime(dueDay, 9, 0);
+      if (when.getTime() <= now.getTime()) {
+        // Due date already passed (or 9 AM today did) — remind tomorrow 9 AM.
+        when = nextTime(9, 0);
+      }
+      const partnerName = followUp.partnerId ? partnerById.get(followUp.partnerId)?.name : undefined;
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title: 'Follow-up due',
+          body: partnerName ? `${followUp.title} — ${partnerName}` : followUp.title,
+          data: { target: 'home' },
+          ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+        },
+        trigger: {
+          type: Notifications.SchedulableTriggerInputTypes.DATE,
+          date: when,
+          ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+        },
+      });
+      remaining -= 1;
     }
   } catch {
     // Notification scheduling must never break the app (e.g. in Expo Go or

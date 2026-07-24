@@ -43,25 +43,40 @@ import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import {
   assignMatchReferral,
+  createFollowUp,
   createMatchProfile,
   createPartner,
   createReferral,
   createTouch,
   flushWriteQueue,
+  FollowUp,
   hydrate,
+  PartnerScorecard,
   pendingWriteCount,
   persistCache,
   refreshSnapshot,
+  Snapshot,
   Touch,
   TouchKind,
+  updateFollowUp,
   updateMatchProfile,
   updatePartner,
+  updateReferralOutcome,
+  updateReferralPacketStamp,
 } from './src/lib/store';
 import {
+  followUpsDue,
   partnersGoingCold,
   rescheduleNotifications,
   subscribeToNotificationResponses,
 } from './src/lib/notifications';
+import {
+  buildFitReasons,
+  buildPacket,
+  labelLooksLikeFullName,
+  PacketAudience,
+  PacketFitInput,
+} from './src/lib/packet';
 
 type Tab = 'home' | 'match' | 'directory' | 'referrals';
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
@@ -161,6 +176,15 @@ function partnerShareMessage(partner: Partner) {
     partner.phone ? `Phone: ${partner.phone}` : '',
     partner.website ? `Website: ${partner.website}` : '',
   ].filter(Boolean).join('\n');
+}
+
+function addDaysStamp(days: number) {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 const emptyReferral = {
@@ -453,6 +477,22 @@ export default function App() {
   const [touchPartner, setTouchPartner] = useState<Partner | null>(null);
   const [touchKind, setTouchKind] = useState<TouchKind>('call');
   const [touchNote, setTouchNote] = useState('');
+  const [followUps, setFollowUps] = useState<FollowUp[]>([]);
+  const [scorecards, setScorecards] = useState<Record<string, PartnerScorecard>>({});
+  // Match Packet compose state: which partner + which match profile the
+  // packet is for, and whether the assign-on-send flow should run.
+  const [packetTarget, setPacketTarget] = useState<{ partner: Partner; match: ReferralMatch; assignOnSend: boolean } | null>(null);
+  const [packetAudience, setPacketAudience] = useState<PacketAudience>('family');
+  const [packetText, setPacketText] = useState('');
+  // One-tap confirm shown when Share.share can't tell us whether the user
+  // actually sent (iOS reports dismiss and send identically in most cases).
+  const [packetSendConfirm, setPacketSendConfirm] = useState(false);
+  // Outcome capture sheet, opened when completing an admit-check follow-up.
+  const [outcomeFollowUp, setOutcomeFollowUp] = useState<FollowUp | null>(null);
+  const [outcomeAnswer, setOutcomeAnswer] = useState<'yes' | 'no' | null>(null);
+  const [outcomeAdmittedOn, setOutcomeAdmittedOn] = useState('');
+  const [outcomeStars, setOutcomeStars] = useState(0);
+  const [outcomeNote, setOutcomeNote] = useState('');
   const [notifPrePromptVisible, setNotifPrePromptVisible] = useState(false);
   const [partnerForm, setPartnerForm] = useState<PartnerForm>(makeEmptyPartnerForm);
   const [referralForm, setReferralForm] = useState(emptyReferral);
@@ -470,21 +510,23 @@ export default function App() {
 
   // Push a snapshot of in-memory state to the offline cache, refresh the
   // offline indicator + queued-write count, and recompute notifications.
-  const syncDerived = useCallback(async (snapshot?: { partners: Partner[]; referrals: Referral[]; referralMatches: ReferralMatch[]; touches: Touch[] }) => {
-    const data = snapshot || { partners, referrals, referralMatches, touches };
+  const syncDerived = useCallback(async (snapshot?: Snapshot) => {
+    const data = snapshot || { partners, referrals, referralMatches, touches, followUps, scorecards };
     const pending = await pendingWriteCount();
     setQueuedWrites(pending);
     setOffline(pending > 0);
     await persistCache(data);
     rescheduleNotifications(data).catch(() => undefined);
-  }, [partners, referrals, referralMatches, touches]);
+  }, [partners, referrals, referralMatches, touches, followUps, scorecards]);
 
   // Apply a freshly loaded snapshot to state, restoring the match-form
   // selection exactly like the previous AsyncStorage loader did.
-  const applySnapshot = useCallback((snapshot: { partners: Partner[]; referrals: Referral[]; referralMatches: ReferralMatch[]; touches: Touch[] }) => {
+  const applySnapshot = useCallback((snapshot: Snapshot) => {
     setPartners(snapshot.partners);
     setReferrals(snapshot.referrals);
     setTouches(snapshot.touches);
+    setFollowUps(snapshot.followUps);
+    setScorecards(snapshot.scorecards);
     setReferralMatches(snapshot.referralMatches);
     const firstMatch = snapshot.referralMatches.find((item) => item.status === 'Matching');
     setSelectedMatchId(firstMatch?.id || null);
@@ -614,7 +656,7 @@ export default function App() {
           ? partner.cashMin <= budget
           : (matchNetworkPreferences.includes('In-network') && isInNetwork)
             || (matchNetworkPreferences.includes('Out-of-network') && !isInNetwork);
-        const networkStatus: InsuranceNetworkPreference | null = matchInsurance === 'Cash pay'
+        const matchNetworkStatus: InsuranceNetworkPreference | null = matchInsurance === 'Cash pay'
           ? null
           : isInNetwork ? 'In-network' : 'Out-of-network';
         const regionFit = matchState === 'ANY' || partner.state === matchState || partner.regions.includes('Nationwide');
@@ -630,11 +672,27 @@ export default function App() {
         const eligible = typeFit && paymentFit && regionFit && (matchTherapies.length === 0 || matchedTherapies.length > 0);
         const clinicalScore = Math.round(62 + clinicalCoverage * 30 + (paymentFit ? 4 : 0) + (regionFit ? 4 : 0));
         const reciprocity = partner.inbound - partner.outbound;
-        return { partner, matchedTherapies, clinicalScore: Math.min(clinicalScore, 100), reciprocity, eligible, networkStatus };
+        // The exact fit signals the Match Packet's "why this fits" section is
+        // generated from — same dimensions this memo already computes.
+        const fitInput: PacketFitInput = { networkStatus: matchNetworkStatus, matchedTherapies, regionFit, paymentFit };
+        const scorecard = scorecards[partner.id];
+        const avgFamilyExperience = scorecard?.avgFamilyExperience ?? null;
+        const decided = (scorecard?.admits || 0) + (scorecard?.nonAdmits || 0);
+        const admitRate = decided > 0 ? (scorecard?.admits || 0) / decided : null;
+        return { partner, matchedTherapies, clinicalScore: Math.min(clinicalScore, 100), reciprocity, eligible, networkStatus: matchNetworkStatus, fitInput, avgFamilyExperience, admitRate };
       })
       .filter((match) => match.eligible)
-      .sort((a, b) => b.clinicalScore - a.clinicalScore || b.reciprocity - a.reciprocity || a.partner.cashMin - b.partner.cashMin);
-  }, [partners, matchType, matchInsurance, matchNetworkPreferences, matchState, matchBudget, matchTherapies]);
+      // Tie-break order after fit score (v1 scorecard change): average family
+      // experience, then admit rate, then the pre-existing reciprocity
+      // tie-breaker. Reciprocity stays — it just now comes after outcomes.
+      // nulls sort last within each tier.
+      .sort((a, b) =>
+        b.clinicalScore - a.clinicalScore
+        || (b.avgFamilyExperience ?? -1) - (a.avgFamilyExperience ?? -1)
+        || (b.admitRate ?? -1) - (a.admitRate ?? -1)
+        || b.reciprocity - a.reciprocity
+        || a.partner.cashMin - b.partner.cashMin);
+  }, [partners, matchType, matchInsurance, matchNetworkPreferences, matchState, matchBudget, matchTherapies, scorecards]);
 
   const recentReferrals = referrals
     .slice()
@@ -700,7 +758,7 @@ export default function App() {
     setReferralMatches(nextMatches);
     setSelectedMatchId(referralMatch.id);
     (existing ? updateMatchProfile(referralMatch) : createMatchProfile(referralMatch))
-      .then(() => syncDerived({ partners, referrals, referralMatches: nextMatches, touches }))
+      .then(() => syncDerived({ partners, referrals, referralMatches: nextMatches, touches, followUps, scorecards }))
       .catch((error) => {
         Alert.alert('Sync issue', `This match was saved on this device but could not sync: ${error.message}`);
         syncDerived();
@@ -733,6 +791,291 @@ export default function App() {
     setReferralForm({ ...emptyReferral, direction, partnerId: partnerId || partners[0]?.id || '' });
     setSelectedPartner(null);
     setShowAddReferral(true);
+  }
+
+  // ─── Match Packet ───────────────────────────────────────────────────────
+
+  // Save the match profile as it currently stands (or reuse the saved one),
+  // so the packet always reflects the same criteria the matcher used.
+  function currentOrSavedMatch(): ReferralMatch | null {
+    const existing = referralMatches.find((item) => item.id === selectedMatchId);
+    if (existing) return existing;
+    return saveCurrentReferralMatch();
+  }
+
+  // Build the PacketFitInput the pure generator expects, using the same
+  // formulas as the matches memo (they share PacketFitInput field names).
+  function fitInputForMatch(matchProfile: ReferralMatch, partner: Partner): PacketFitInput {
+    const isInNetwork = matchProfile.insurance !== 'Cash pay' && partner.insurance.includes(matchProfile.insurance);
+    const preferences = matchProfile.networkPreferences?.length ? matchProfile.networkPreferences : (['In-network'] as InsuranceNetworkPreference[]);
+    const paymentFit = matchProfile.insurance === 'Cash pay'
+      ? partner.cashMin <= (matchProfile.maxBudget ?? Infinity)
+      : (preferences.includes('In-network') && isInNetwork)
+        || (preferences.includes('Out-of-network') && !isInNetwork);
+    const networkStatus: InsuranceNetworkPreference | null = matchProfile.insurance === 'Cash pay'
+      ? null
+      : isInNetwork ? 'In-network' : 'Out-of-network';
+    const regionFit = !matchProfile.state || matchProfile.state === 'ANY' || partner.state === matchProfile.state || partner.regions.includes('Nationwide');
+    const matchesNeed = (need: string) => {
+      if (need === 'Men only') return partner.therapies.includes(need) || (partner.populations.includes('Men') && !partner.populations.includes('Women'));
+      if (need === 'Women only') return partner.therapies.includes(need) || (partner.populations.includes('Women') && !partner.populations.includes('Men'));
+      if (need === 'LGBTQ+') return partner.therapies.includes(need) || partner.populations.includes('LGBTQ+');
+      if (need === 'Adolescent') return partner.therapies.includes(need) || partner.populations.some((population) => ['Adolescent', 'Adolescents', 'Teens'].includes(population));
+      return partner.therapies.includes(need);
+    };
+    return { networkStatus, matchedTherapies: matchProfile.therapies.filter(matchesNeed), regionFit, paymentFit };
+  }
+
+  // From a recommended match card: the profile only gets assigned (status →
+  // Referred) if the packet is actually sent.
+  function openPacketComposer(partner: Partner, fitInput: PacketFitInput) {
+    const matchProfile = currentOrSavedMatch();
+    if (!matchProfile) return;
+    const reasons = buildFitReasons(matchProfile, partner, fitInput);
+    setPacketTarget({ partner, match: matchProfile, assignOnSend: true });
+    setPacketAudience('family');
+    setPacketText(buildPacket(matchProfile, partner, reasons, 'family'));
+    setSelectedPartner(null);
+  }
+
+  // From a Referred profile (assigned partner): the assignment already
+  // exists, so sending only logs the packet + follow-up on that referral.
+  function openPacketForAssigned(matchProfile: ReferralMatch) {
+    const partner = partners.find((item) => item.id === matchProfile.assignedPartnerId);
+    if (!partner) return;
+    const reasons = buildFitReasons(matchProfile, partner, fitInputForMatch(matchProfile, partner));
+    setPacketTarget({ partner, match: matchProfile, assignOnSend: false });
+    setPacketAudience('family');
+    setPacketText(buildPacket(matchProfile, partner, reasons, 'family'));
+  }
+
+  // Regenerate the editable text when the audience toggle flips. Edits made
+  // in the textarea are replaced — same behavior as re-tapping a template.
+  function switchPacketAudience(audience: PacketAudience) {
+    if (!packetTarget) return;
+    setPacketAudience(audience);
+    const fitInput = packetTarget.match.status === 'Referred'
+      ? fitInputForMatch(packetTarget.match, packetTarget.partner)
+      : matches.find((item) => item.partner.id === packetTarget.partner.id)?.fitInput || fitInputForMatch(packetTarget.match, packetTarget.partner);
+    setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput), audience));
+  }
+
+  async function sharePacketText() {
+    if (!packetTarget) return;
+    try {
+      const result = await Share.share({
+        title: `Placement recommendation — ${packetTarget.match.clientLabel}`,
+        message: packetText,
+      });
+      // Honest platform note: on iOS, UIActivityViewController does not
+      // reliably distinguish "shared" from "dismissed" — dismissing the sheet
+      // can resolve with activityType null and no error, and some share
+      // extensions report success before the user confirms. Rather than guess,
+      // we always ask the one-tap confirm before running post-send automation.
+      if (result.action === Share.sharedAction || result.action === Share.dismissedAction) {
+        setPacketSendConfirm(true);
+      }
+    } catch {
+      Alert.alert('Unable to share', 'The share sheet could not be opened. Please try again.');
+    }
+  }
+
+  function closePacketComposer() {
+    setPacketTarget(null);
+    setPacketSendConfirm(false);
+    setPacketAudience('family');
+  }
+
+  // Post-send automation ("the loop"): referral + touch + follow-up, all
+  // through the sync data layer so they queue offline like everything else.
+  // If the profile wasn't assigned yet, this runs the SAME assignment code
+  // path as the manual "Assign & refer" flow (assignMatchReferral: referral
+  // insert first, then the match profile update) — not a duplicate of it.
+  function finalizePacketSend() {
+    if (!packetTarget) return;
+    const { partner, match, assignOnSend } = packetTarget;
+    const now = new Date();
+    const todayStamp = localDateStamp();
+    let nextMatches = referralMatches;
+    let referral: Referral | null = null;
+    let assignedMatch: ReferralMatch | null = null;
+
+    if (assignOnSend) {
+      // New outbound referral linked to the profile, packet fields set.
+      referral = {
+        id: makeId('r'),
+        partnerId: partner.id,
+        direction: 'Outbound',
+        date: todayStamp,
+        clientLabel: match.clientLabel,
+        outcome: 'Introduced',
+        note: 'Match packet sent',
+        packetSentAt: now.toISOString(),
+        matchProfileId: match.id,
+      };
+      assignedMatch = {
+        ...match,
+        status: 'Referred',
+        assignedPartnerId: partner.id,
+        referralId: referral.id,
+        updatedAt: now.toISOString(),
+      };
+      nextMatches = referralMatches.map((item) => (item.id === match.id ? (assignedMatch as ReferralMatch) : item));
+      setReferralMatches(nextMatches);
+      if (selectedMatchId === match.id) {
+        const nextActive = referralMatches.find((item) => item.status === 'Matching' && item.id !== match.id);
+        if (nextActive) loadReferralMatch(nextActive);
+        else startNewReferralMatch();
+      }
+    } else if (match.referralId) {
+      // Already assigned: stamp the packet fields onto the existing referral.
+      referral = referrals.find((item) => item.id === match.referralId) || null;
+      if (referral) {
+        referral = { ...referral, packetSentAt: now.toISOString(), matchProfileId: referral.matchProfileId || match.id };
+      }
+    }
+    if (!referral) {
+      closePacketComposer();
+      return;
+    }
+    const referralId = referral.id;
+
+    const touch: Touch = {
+      id: makeId('t'),
+      partnerId: partner.id,
+      kind: 'text',
+      note: 'Sent match packet',
+      occurredAt: now.toISOString(),
+    };
+    const followUp: FollowUp = {
+      id: makeId('f'),
+      partnerId: partner.id,
+      referralId,
+      title: 'Check in — did they admit?',
+      dueOn: addDaysStamp(3),
+      status: 'open',
+      note: '',
+    };
+
+    const nextReferrals = [referral, ...referrals.filter((item) => item.id !== referralId)];
+    const nextTouches = [touch, ...touches];
+    const nextFollowUps = [followUp, ...followUps];
+    // Balance + last-contact optimistic bumps mirror addReferral/saveTouch;
+    // the server (balances view, touches trigger) stays canonical.
+    const nextPartners = partners.map((item) => item.id === partner.id
+      ? {
+          ...item,
+          outbound: item.outbound + (assignOnSend ? 1 : 0),
+          lastContact: todayStamp,
+        }
+      : item);
+    setReferrals(nextReferrals);
+    setTouches(nextTouches);
+    setFollowUps(nextFollowUps);
+    setPartners(nextPartners);
+    closePacketComposer();
+
+    const snapshot: Snapshot = { partners: nextPartners, referrals: nextReferrals, referralMatches: nextMatches, touches: nextTouches, followUps: nextFollowUps, scorecards };
+    const referralAtSend = referral;
+    const writes: Promise<void>[] = [];
+    if (assignOnSend && assignedMatch) {
+      // Same code path as the manual assign flow: referral insert first,
+      // then the match profile update (assignMatchReferral in the store).
+      writes.push(assignMatchReferral(referralAtSend, assignedMatch));
+    } else {
+      // Already assigned: stamp packet_sent_at / match_profile_id onto the
+      // existing referral via a targeted update op.
+      writes.push(updateReferralPacketStamp(referralId, now.toISOString(), match.id));
+    }
+    writes.push(createTouch(touch), createFollowUp(followUp));
+
+    Promise.all(writes)
+      .then(() => {
+        syncDerived(snapshot);
+        Alert.alert('Packet logged', `Referral logged, touch recorded, and a follow-up was set for ${shortDate(followUp.dueOn)}.`);
+      })
+      .catch((error) => {
+        Alert.alert('Sync issue', `The packet was logged on this device but could not fully sync: ${error.message}`);
+        syncDerived();
+      });
+  }
+
+  // ─── Follow-ups ─────────────────────────────────────────────────────────
+
+  function persistFollowUpChange(updated: FollowUp, nextFollowUps: FollowUp[]) {
+    setFollowUps(nextFollowUps);
+    updateFollowUp(updated)
+      .then(() => syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
+      .catch((error) => {
+        Alert.alert('Sync issue', `This follow-up was updated on this device but could not sync: ${error.message}`);
+        syncDerived();
+      });
+  }
+
+  function skipFollowUp(followUp: FollowUp) {
+    const updated: FollowUp = { ...followUp, status: 'skipped', completedAt: new Date().toISOString() };
+    persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
+  }
+
+  function snoozeFollowUp(followUp: FollowUp, days: number) {
+    const updated: FollowUp = { ...followUp, dueOn: addDaysStamp(days) };
+    persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
+  }
+
+  // Done on an admit-check opens the outcome capture sheet; Done on any
+  // other follow-up just completes it.
+  function completeFollowUp(followUp: FollowUp) {
+    if (followUp.referralId) {
+      setOutcomeFollowUp(followUp);
+      setOutcomeAnswer(null);
+      setOutcomeAdmittedOn(localDateStamp());
+      setOutcomeStars(0);
+      setOutcomeNote('');
+      return;
+    }
+    const updated: FollowUp = { ...followUp, status: 'done', completedAt: new Date().toISOString() };
+    persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
+  }
+
+  function closeOutcomeSheet() {
+    setOutcomeFollowUp(null);
+    setOutcomeAnswer(null);
+    setOutcomeStars(0);
+    setOutcomeNote('');
+  }
+
+  function saveOutcome() {
+    const followUp = outcomeFollowUp;
+    if (!followUp || !outcomeAnswer) return;
+    const now = new Date().toISOString();
+    const completed: FollowUp = { ...followUp, status: 'done', completedAt: now };
+    const nextFollowUps = followUps.map((item) => (item.id === followUp.id ? completed : item));
+    setFollowUps(nextFollowUps);
+    const writes: Promise<void>[] = [updateFollowUp(completed)];
+    let nextReferrals = referrals;
+    if (followUp.referralId) {
+      const stars = outcomeStars > 0 ? outcomeStars : null;
+      const patch = outcomeAnswer === 'yes'
+        ? { admitted: true, admittedOn: outcomeAdmittedOn || localDateStamp(), outcome: 'Placed' as Referral['outcome'], familyExperience: stars, outcomeNote: outcomeNote.trim() }
+        : { admitted: false, outcomeNote: outcomeNote.trim() };
+      nextReferrals = referrals.map((item) => (item.id === followUp.referralId ? { ...item, ...patch } : item));
+      setReferrals(nextReferrals);
+      writes.push(updateReferralOutcome(followUp.referralId, patch));
+    }
+    closeOutcomeSheet();
+    Promise.all(writes)
+      .then(() => syncDerived({ partners, referrals: nextReferrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
+      .catch((error) => {
+        Alert.alert('Sync issue', `This outcome was saved on this device but could not sync: ${error.message}`);
+        syncDerived();
+      });
+  }
+
+  function outcomeNotYet() {
+    // "Not yet" isn't an outcome — snooze the check-in +4 days and keep it open.
+    if (!outcomeFollowUp) return;
+    snoozeFollowUp(outcomeFollowUp, 4);
+    closeOutcomeSheet();
   }
 
   function openNewPartner() {
@@ -826,7 +1169,7 @@ export default function App() {
     setEditingPartnerId(null);
     setSelectedPartner(partner);
     (existing ? updatePartner(partner) : createPartner(partner))
-      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches }))
+      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards }))
       .catch((error) => {
         Alert.alert('Sync issue', `This partner was saved on this device but could not sync: ${error.message}`);
         syncDerived();
@@ -881,7 +1224,7 @@ export default function App() {
     setReferralForm(emptyReferral);
     if (activeReferralMatchId) setTab('referrals');
     setActiveReferralMatchId(null);
-    const snapshot = { partners: nextPartners, referrals: nextReferrals, referralMatches: nextMatches, touches };
+    const snapshot: Snapshot = { partners: nextPartners, referrals: nextReferrals, referralMatches: nextMatches, touches, followUps, scorecards };
     // Assignment flow: referral first, then the match profile update.
     const write = assignedMatch
       ? assignMatchReferral(referral, { ...assignedMatch, clientLabel: referral.clientLabel, status: 'Referred', assignedPartnerId: referral.partnerId, referralId: referral.id, updatedAt: new Date().toISOString() })
@@ -924,7 +1267,7 @@ export default function App() {
     setTouchNote('');
     setTouchKind('call');
     createTouch(touch)
-      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches: nextTouches }))
+      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches: nextTouches, followUps, scorecards }))
       .catch((error) => {
         Alert.alert('Sync issue', `This touch was logged on this device but could not sync: ${error.message}`);
         syncDerived();
@@ -939,7 +1282,7 @@ export default function App() {
     setPartners(nextPartners);
     setSelectedPartner((current) => current?.id === id ? { ...current, favorite: !current.favorite } : current);
     updatePartner(updated)
-      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches }))
+      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards }))
       .catch((error) => {
         Alert.alert('Sync issue', `This change was saved on this device but could not sync: ${error.message}`);
         syncDerived();
@@ -985,6 +1328,14 @@ export default function App() {
       .filter((partner) => partner.inbound > partner.outbound)
       .sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound))
       .slice(0, 3);
+    const dueFollowUps = followUpsDue(followUps);
+    const todayStamp = localDateStamp();
+    const overdueDays = (dueOn: string) => {
+      const parsed = new Date(`${dueOn}T12:00:00`);
+      const dueDay = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+      const today = new Date(`${todayStamp}T12:00:00`);
+      return Math.max(0, Math.round((today.getTime() - dueDay.getTime()) / 86400000));
+    };
     return (
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
         {renderHeader()}
@@ -995,6 +1346,34 @@ export default function App() {
             <Text style={styles.heroSubtitle}>{partners.length ? 'Your referral network, in balance.' : 'Add your trusted referral partners to get started.'}</Text>
           </View>
         </View>
+
+        {dueFollowUps.length ? (
+          <>
+            <SectionTitle title="Follow-ups" />
+            <View style={styles.followUpCard}>
+              {dueFollowUps.map((followUp, index) => {
+                const partner = partners.find((item) => item.id === followUp.partnerId);
+                const overdueBy = overdueDays(followUp.dueOn);
+                return (
+                  <View key={followUp.id} style={[styles.followUpRow, index === dueFollowUps.length - 1 && { borderBottomWidth: 0 }]}>
+                    <View style={styles.followUpIcon}><AppIcon name="alarm-outline" size={17} color={COLORS.coral} /></View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.followUpTitle}>{followUp.title}</Text>
+                      <Text style={styles.followUpMeta}>
+                        {partner ? `${partner.organization} · ` : ''}{overdueBy > 0 ? `${overdueBy} ${overdueBy === 1 ? 'day' : 'days'} overdue` : 'Due today'}
+                      </Text>
+                      <View style={styles.followUpActions}>
+                        <TouchableOpacity style={styles.followUpActionDone} onPress={() => completeFollowUp(followUp)}><Text style={styles.followUpActionDoneText}>Done</Text></TouchableOpacity>
+                        <TouchableOpacity style={styles.followUpAction} onPress={() => skipFollowUp(followUp)}><Text style={styles.followUpActionText}>Skip</Text></TouchableOpacity>
+                        <TouchableOpacity style={styles.followUpAction} onPress={() => snoozeFollowUp(followUp, 2)}><Text style={styles.followUpActionText}>+2 days</Text></TouchableOpacity>
+                      </View>
+                    </View>
+                  </View>
+                );
+              })}
+            </View>
+          </>
+        ) : null}
 
         <View style={styles.statRow}>
           <View style={styles.statCard}>
@@ -1091,6 +1470,12 @@ export default function App() {
                     </View>
                     <Text numberOfLines={1} style={styles.savedMatchMeta}>{item.levelOfCare === 'Any type' ? 'Any level' : item.levelOfCare} · {item.state === 'ANY' ? 'Any location' : item.state}</Text>
                     <Text style={[styles.savedMatchStatus, item.status === 'Referred' && styles.savedMatchStatusComplete]}>{assignedPartner ? `Referred to ${assignedPartner.organization}` : 'Matching in progress'}</Text>
+                    {item.status === 'Referred' && assignedPartner ? (
+                      <TouchableOpacity style={styles.savedMatchPacketButton} onPress={() => openPacketForAssigned(item)}>
+                        <AppIcon name="paper-plane-outline" size={13} color={COLORS.forest} />
+                        <Text style={styles.savedMatchPacketButtonText}>Send packet</Text>
+                      </TouchableOpacity>
+                    ) : null}
                   </TouchableOpacity>
                 );
               })}
@@ -1214,10 +1599,16 @@ export default function App() {
                 ) : null}
               </View>
             </TouchableOpacity>
-            <TouchableOpacity style={styles.assignReferralButton} onPress={() => openMatchedReferral(match.partner.id)}>
-              <AppIcon name="paper-plane" size={16} color={COLORS.white} />
-              <Text style={styles.assignReferralButtonText}>Assign & refer {matchClientLabel.trim() || 'this client'}</Text>
-            </TouchableOpacity>
+            <View style={styles.matchActionRow}>
+              <TouchableOpacity style={styles.packetButton} onPress={() => openPacketComposer(match.partner, match.fitInput)}>
+                <AppIcon name="document-text" size={16} color={COLORS.forest} />
+                <Text style={styles.packetButtonText}>Send packet</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.assignReferralButton, styles.matchActionFlex]} onPress={() => openMatchedReferral(match.partner.id)}>
+                <AppIcon name="paper-plane" size={16} color={COLORS.white} />
+                <Text style={styles.assignReferralButtonText}>Assign & refer {matchClientLabel.trim() || 'this client'}</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         )) : <EmptyState icon="search-outline" title="No eligible matches yet" body="Broaden one of the filters or add another partner to the directory." />}
       </ScrollView>
@@ -1378,6 +1769,25 @@ export default function App() {
               <View style={styles.infoLine}><AppIcon name="calendar-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Cadence</Text><Text style={styles.infoValue}>{selectedPartner.touchCadenceDays ? `Every ${selectedPartner.touchCadenceDays} days` : 'No cadence set'}</Text></View></View>
               <View style={[styles.infoLine, { borderBottomWidth: 0 }]}><AppIcon name="time-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Last contact</Text><Text style={styles.infoValue}>{selectedPartner.lastContact ? shortDate(selectedPartner.lastContact) : 'Not recorded'}</Text></View></View>
             </View>
+            {(() => {
+              // Track record from the partner_scorecard view — hidden until
+              // the partner has actually received at least one referral.
+              const scorecard = scorecards[selectedPartner.id];
+              if (!scorecard || scorecard.referralsSent === 0) return null;
+              return (
+                <View style={[styles.infoCard, { marginTop: 12 }]}>
+                  <Text style={styles.infoTitle}>Track record</Text>
+                  <View style={[styles.infoLine, { borderBottomWidth: 0 }]}>
+                    <AppIcon name="ribbon-outline" size={18} color={COLORS.gray} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.infoValue}>
+                        {scorecard.referralsSent} sent · {scorecard.admits} admitted{scorecard.avgFamilyExperience != null ? ` · ${scorecard.avgFamilyExperience}★ family experience` : ''}
+                      </Text>
+                    </View>
+                  </View>
+                </View>
+              );
+            })()}
             {(() => {
               const partnerTouches = touches.filter((touch) => touch.partnerId === selectedPartner.id).slice(0, 5);
               return partnerTouches.length ? (
@@ -1571,7 +1981,7 @@ export default function App() {
     const dismiss = () => setNotifPrePromptVisible(false);
     const enable = async () => {
       dismiss();
-      await rescheduleNotifications({ partners, referrals, referralMatches });
+      await rescheduleNotifications({ partners, referrals, referralMatches, followUps });
     };
     return (
       <Modal visible transparent animationType="fade" onRequestClose={dismiss}>
@@ -1587,6 +1997,147 @@ export default function App() {
             </View>
           </Pressable>
         </Pressable>
+      </Modal>
+    );
+  }
+
+  function PacketComposeModal() {
+    if (!packetTarget) return null;
+    const labelWarning = labelLooksLikeFullName(packetTarget.match.clientLabel);
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={closePacketComposer}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityLabel="Close match packet" onPress={closePacketComposer} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Match packet</Text>
+              <View style={styles.closeButton} />
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>
+                A de-identified recommendation for {packetTarget.partner.organization}. Sending logs the referral, updates last contact, and sets a check-in follow-up.
+              </Text>
+              <Text style={styles.fieldLabel}>SENDING TO</Text>
+              <View style={styles.segmented}>
+                {(['family', 'partner'] as PacketAudience[]).map((audience) => (
+                  <TouchableOpacity key={audience} onPress={() => switchPacketAudience(audience)} style={[styles.segment, packetAudience === audience && styles.segmentActive]}>
+                    <AppIcon name={audience === 'family' ? 'people' : 'business'} size={16} color={packetAudience === audience ? COLORS.white : COLORS.inkSoft} />
+                    <Text style={[styles.segmentText, packetAudience === audience && styles.segmentTextActive]}>{audience === 'family' ? 'Sending to family' : 'Sending to partner'}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              {labelWarning ? (
+                <Text style={styles.packetReminder}><AppIcon name="lock-closed" size={13} color={COLORS.coral} /> Reminder: keep labels de-identified</Text>
+              ) : null}
+              <Text style={styles.fieldLabel}>PACKET TEXT</Text>
+              <TextInput
+                value={packetText}
+                onChangeText={setPacketText}
+                multiline
+                placeholderTextColor="#99A6A1"
+                style={[styles.formInput, styles.packetEditor]}
+              />
+              <TouchableOpacity style={styles.primaryButton} onPress={sharePacketText}>
+                <Text style={styles.primaryButtonText}>Share packet…</Text>
+              </TouchableOpacity>
+              <Text style={styles.packetShareHint}>Opens the native share sheet — Messages, Mail, or anything else. After it closes we'll confirm it went out, then log everything.</Text>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  // One-tap confirm shown after the share sheet closes. iOS's share sheet
+  // can't reliably tell us whether the user actually sent, so we ask instead
+  // of logging phantom referrals.
+  function PacketSendConfirmModal() {
+    if (!packetSendConfirm || !packetTarget) return null;
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={() => setPacketSendConfirm(false)}>
+        <Pressable style={styles.dropdownOverlay} onPress={() => setPacketSendConfirm(false)}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <View style={styles.prePromptBody}>
+              <View style={styles.prePromptIcon}><AppIcon name="paper-plane" size={24} color={COLORS.forest} /></View>
+              <Text style={styles.prePromptTitle}>Did you send it?</Text>
+              <Text style={styles.prePromptText}>iOS can't always tell us whether the packet actually went out. Confirming logs the referral, records the touch, and sets the check-in follow-up.</Text>
+              <TouchableOpacity style={styles.primaryButton} onPress={finalizePacketSend}><Text style={styles.primaryButtonText}>Sent — log it</Text></TouchableOpacity>
+              <TouchableOpacity onPress={() => setPacketSendConfirm(false)} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel — don't log</Text></TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
+  function OutcomeCaptureModal() {
+    if (!outcomeFollowUp) return null;
+    const referral = referrals.find((item) => item.id === outcomeFollowUp.referralId);
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={closeOutcomeSheet}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityLabel="Close outcome capture" onPress={closeOutcomeSheet} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Outcome check-in</Text>
+              <View style={styles.closeButton} />
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>
+                {outcomeFollowUp.title}{referral ? ` — ${referral.clientLabel}` : ''}
+              </Text>
+              <Text style={styles.fieldLabel}>DID THEY ADMIT?</Text>
+              <View style={styles.segmented}>
+                {([['yes', 'Yes'], ['no', 'No']] as const).map(([answer, label]) => (
+                  <TouchableOpacity key={answer} onPress={() => setOutcomeAnswer(answer)} style={[styles.segment, outcomeAnswer === answer && styles.segmentActive]}>
+                    <AppIcon name={answer === 'yes' ? 'checkmark-circle' : 'close-circle'} size={16} color={outcomeAnswer === answer ? COLORS.white : COLORS.inkSoft} />
+                    <Text style={[styles.segmentText, outcomeAnswer === answer && styles.segmentTextActive]}>{label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <TouchableOpacity onPress={outcomeNotYet} style={styles.outcomeNotYet}>
+                <AppIcon name="time-outline" size={15} color={COLORS.blue} />
+                <Text style={styles.outcomeNotYetText}>Not yet — snooze this check-in 4 days</Text>
+              </TouchableOpacity>
+
+              {outcomeAnswer === 'yes' ? (
+                <>
+                  <DropdownField
+                    label="ADMITTED ON"
+                    value={outcomeAdmittedOn}
+                    icon="calendar-outline"
+                    onChange={setOutcomeAdmittedOn}
+                    options={Array.from({ length: 15 }, (_, index) => {
+                      const date = new Date();
+                      date.setDate(date.getDate() - index);
+                      const stamp = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+                      return { label: index === 0 ? `Today (${shortDate(stamp)})` : shortDate(stamp), value: stamp };
+                    })}
+                  />
+                  <Text style={styles.fieldLabel}>HOW WAS THE FAMILY'S EXPERIENCE SO FAR? (OPTIONAL)</Text>
+                  <View style={styles.starRow}>
+                    {[1, 2, 3, 4, 5].map((star) => (
+                      <TouchableOpacity key={star} accessibilityLabel={`${star} star${star === 1 ? '' : 's'}`} onPress={() => setOutcomeStars(star === outcomeStars ? 0 : star)} style={styles.starButton}>
+                        <AppIcon name={star <= outcomeStars ? 'star' : 'star-outline'} size={30} color={star <= outcomeStars ? COLORS.gold : COLORS.gray} />
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  <FormField label="NOTE (OPTIONAL)" value={outcomeNote} onChangeText={setOutcomeNote} placeholder="Anything worth remembering for next time" multiline />
+                </>
+              ) : null}
+              {outcomeAnswer === 'no' ? (
+                <FormField label="NOTE (OPTIONAL)" value={outcomeNote} onChangeText={setOutcomeNote} placeholder="What happened instead?" multiline />
+              ) : null}
+
+              <TouchableOpacity style={[styles.primaryButton, !outcomeAnswer && { opacity: 0.45 }]} disabled={!outcomeAnswer} onPress={saveOutcome}>
+                <Text style={styles.primaryButtonText}>Save outcome</Text>
+              </TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
       </Modal>
     );
   }
@@ -1620,6 +2171,9 @@ export default function App() {
       {AddReferralModal()}
       {LogTouchModal()}
       {NotifPrePromptModal()}
+      {PacketComposeModal()}
+      {PacketSendConfirmModal()}
+      {OutcomeCaptureModal()}
     </SafeAreaView>
   );
 }
@@ -1914,4 +2468,30 @@ const styles = StyleSheet.create({
   prePromptText: { color: COLORS.gray, fontSize: 13, lineHeight: 19, marginBottom: 20 },
   prePromptNotNow: { alignItems: 'center', paddingVertical: 12 },
   prePromptNotNowText: { color: COLORS.gray, fontSize: 12, fontWeight: '700' },
+  // Match Packet
+  matchActionRow: { flexDirection: 'row', gap: 8, marginTop: 13 },
+  matchActionFlex: { flex: 1, marginTop: 0 },
+  packetButton: { minHeight: 42, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: COLORS.mint, borderRadius: 13, paddingHorizontal: 13 },
+  packetButtonText: { color: COLORS.forest, fontSize: 11, fontWeight: '800' },
+  savedMatchPacketButton: { flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 9, backgroundColor: COLORS.mint, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 6, alignSelf: 'flex-start' },
+  savedMatchPacketButtonText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
+  packetReminder: { color: COLORS.coral, fontSize: 10, lineHeight: 15, marginTop: -4, marginBottom: 14, fontWeight: '700' },
+  packetEditor: { minHeight: 260, paddingTop: 13, textAlignVertical: 'top', lineHeight: 19 },
+  packetShareHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: 12, textAlign: 'center' },
+  // Follow-ups
+  followUpCard: { backgroundColor: COLORS.white, borderRadius: 22, paddingHorizontal: 16, borderWidth: 1, borderColor: '#E5E8E3', marginBottom: 27 },
+  followUpRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 11, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
+  followUpIcon: { width: 34, height: 34, borderRadius: 11, backgroundColor: COLORS.coralPale, alignItems: 'center', justifyContent: 'center' },
+  followUpTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '700' },
+  followUpMeta: { color: COLORS.gray, fontSize: 11, marginTop: 3 },
+  followUpActions: { flexDirection: 'row', gap: 7, marginTop: 9 },
+  followUpActionDone: { backgroundColor: COLORS.forest, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7 },
+  followUpActionDoneText: { color: COLORS.white, fontSize: 10, fontWeight: '800' },
+  followUpAction: { backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7, borderWidth: 1, borderColor: COLORS.line },
+  followUpActionText: { color: COLORS.inkSoft, fontSize: 10, fontWeight: '700' },
+  // Outcome capture
+  outcomeNotYet: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 12, marginBottom: 10 },
+  outcomeNotYetText: { color: COLORS.blue, fontSize: 12, fontWeight: '700' },
+  starRow: { flexDirection: 'row', gap: 8, marginBottom: 18 },
+  starButton: { padding: 4 },
 });
