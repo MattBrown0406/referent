@@ -23,6 +23,10 @@ export type Touch = {
 
 export type FollowUpStatus = 'open' | 'done' | 'skipped';
 
+// v4 Today Command Center kinds (migration 20260724190000). 'touch' is a
+// partner-relationship touch (Done → Log touch); the rest are self-evident.
+export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch';
+
 export type FollowUp = {
   id: string;
   partnerId?: string;
@@ -33,6 +37,10 @@ export type FollowUp = {
   status: FollowUpStatus;
   completedAt?: string; // ISO timestamptz
   note: string;
+  kind?: FollowUpKind; // v4 — absent rows read as 'follow_up' (DB default)
+  dueTime?: string; // HH:MM (24h, from the DB time column) — consults mostly
+  waitingOn?: string; // who/what we're waiting on, when kind='waiting_on'
+  snoozedUntil?: string; // YYYY-MM-DD — hides the item from Today until then
 };
 
 export type PartnerScorecard = {
@@ -287,6 +295,10 @@ type FollowUpRow = {
   status: FollowUpStatus;
   completed_at: string | null;
   note: string | null;
+  kind: FollowUpKind | null; // v4 today-command-center
+  due_time: string | null; // Postgres time serializes as "HH:MM:SS"
+  waiting_on: string | null;
+  snoozed_until: string | null;
 };
 
 type ScorecardRow = {
@@ -397,6 +409,11 @@ function mapFollowUpRow(row: FollowUpRow): FollowUp {
     status: row.status,
     completedAt: row.completed_at || undefined,
     note: row.note || '',
+    kind: row.kind || 'follow_up',
+    // time columns come back as "HH:MM:SS" — keep HH:MM for display/compare.
+    dueTime: row.due_time ? row.due_time.slice(0, 5) : undefined,
+    waitingOn: row.waiting_on || undefined,
+    snoozedUntil: row.snoozed_until || undefined,
   };
 }
 
@@ -503,6 +520,10 @@ function followUpToRow(followUp: FollowUp): Record<string, unknown> {
     status: followUp.status,
     completed_at: followUp.completedAt ?? null,
     note: followUp.note,
+    kind: followUp.kind ?? 'follow_up',
+    due_time: followUp.dueTime ?? null,
+    waiting_on: followUp.waitingOn ?? '',
+    snoozed_until: followUp.snoozedUntil ?? null,
   };
 }
 

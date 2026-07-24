@@ -15,7 +15,8 @@ A native Expo app for managing professional referral relationships and finding c
 - Add partners, favorite relationships, log referrals and touches, with per-partner stay-in-touch cadences
 - Case files: one family, one place — contacts with one-tap call/text/email (auto-logged to the timeline), payment tracking, documents in a private bucket, and phone-number search across cases
 - Match packets that close the loop: share a de-identified placement recommendation, log the referral, set the check-in follow-up — all case-linked when the profile started from a case
-- Daily briefing and cadence reminder notifications (local, on-device)
+- Today Command Center: the home screen is a prioritized daily operating list (OVERDUE / TODAY / PARTNERS DUE) — one-tap call/text that auto-logs, a Done sheet that always forces a next step or a closed loop, snooze, set-next-step, and a 5-second "I need to…" quick add. New inquiry cases auto-create their first-call action
+- Daily briefing (counts the today list), cadence reminders, and consult alerts 30 minutes ahead (local, on-device)
 
 ## Backend
 

@@ -1,4 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { StatusBar } from 'expo-status-bar';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -50,6 +51,7 @@ import {
   createTouch,
   flushWriteQueue,
   FollowUp,
+  FollowUpKind,
   hydrate,
   PartnerScorecard,
   pendingWriteCount,
@@ -65,11 +67,20 @@ import {
   updateReferralPacketStamp,
 } from './src/lib/store';
 import {
-  followUpsDue,
-  partnersGoingCold,
   rescheduleNotifications,
   subscribeToNotificationResponses,
+  todayLoad,
 } from './src/lib/notifications';
+import {
+  buildTodaySections,
+  followUpToCard,
+  nextStepDate,
+  partnersDueToday,
+  prunePartnerSnoozes,
+  snoozeDate,
+  TodayCard,
+  WhenChoice,
+} from './src/lib/today';
 import {
   buildFitReasons,
   buildPacket,
@@ -212,6 +223,18 @@ function documentIcon(mimeType: string): IconName {
   return 'document';
 }
 
+function todayKindIcon(card: TodayCard): IconName {
+  switch (card.kind) {
+    case 'first_call': return 'call-outline';
+    case 'promised_call': return 'call';
+    case 'consult': return 'calendar';
+    case 'waiting_on': return 'hourglass-outline';
+    case 'touch': return 'hand-left-outline';
+    case 'cadence': return 'repeat';
+    default: return 'return-up-back';
+  }
+}
+
 type PartnerForm = {
   name: string;
   organization: string;
@@ -241,13 +264,6 @@ function currentDateLabel() {
   return new Intl.DateTimeFormat('en-US', { weekday: 'long', month: 'long', day: 'numeric' })
     .format(new Date())
     .toUpperCase();
-}
-
-function currentGreeting() {
-  const hour = new Date().getHours();
-  if (hour < 12) return 'Good morning.';
-  if (hour < 17) return 'Good afternoon.';
-  return 'Good evening.';
 }
 
 function makeEmptyPartnerForm(): PartnerForm {
@@ -627,6 +643,18 @@ export default function App() {
   const [outcomeStars, setOutcomeStars] = useState(0);
   const [outcomeNote, setOutcomeNote] = useState('');
   const [notifPrePromptVisible, setNotifPrePromptVisible] = useState(false);
+  // Today Command Center (v4)
+  const [partnerSnoozes, setPartnerSnoozes] = useState<Record<string, string>>({});
+  const [showHomeMore, setShowHomeMore] = useState(false);
+  const [doneCard, setDoneCard] = useState<TodayCard | null>(null); // "Done — what's next?" sheet
+  const [nextStepCard, setNextStepCard] = useState<TodayCard | null>(null); // Set-next-step sheet
+  const [doneStatusPicker, setDoneStatusPicker] = useState(false); // Close-the-loop case status picker
+  const [stepForm, setStepForm] = useState<{ kind: FollowUpKind; when: WhenChoice; customDate: string; time: string; waitingOn: string; note: string }>({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', waitingOn: '', note: '' });
+  const [snoozeCard, setSnoozeCard] = useState<TodayCard | null>(null);
+  const [showQuickAdd, setShowQuickAdd] = useState(false);
+  const [quickAddForm, setQuickAddForm] = useState<{ kind: FollowUpKind; title: string; targetType: 'none' | 'case' | 'partner'; targetId: string; targetSearch: string; when: WhenChoice; customDate: string; time: string; waitingOn: string }>({ kind: 'follow_up', title: '', targetType: 'none', targetId: '', targetSearch: '', when: 'today', customDate: '', time: '', waitingOn: '' });
+  const [contactPick, setContactPick] = useState<{ card: TodayCard; action: 'call' | 'text'; contacts: CaseContact[] } | null>(null);
+  const [todayQuickNote, setTodayQuickNote] = useState<{ card: TodayCard; action: 'call' | 'text'; contact?: CaseContact } | null>(null);
   const [partnerForm, setPartnerForm] = useState<PartnerForm>(makeEmptyPartnerForm);
   const [referralForm, setReferralForm] = useState(emptyReferral);
   const [search, setSearch] = useState('');
@@ -745,6 +773,20 @@ export default function App() {
     if (!session) return undefined;
     return subscribeToNotificationResponses((target) => setTab(target));
   }, [session]);
+
+  // Local snooze map for the VIRTUAL partner-cadence cards. These cards are
+  // never materialized as follow_ups rows (a logged touch self-heals them),
+  // so their snooze lives on-device: { [partnerId]: YYYY-MM-DD }. Entries at
+  // or before today reappear, so expired ones are pruned on load.
+  useEffect(() => {
+    AsyncStorage.getItem('referralfit-partner-snooze-v1')
+      .then((raw) => {
+        if (!raw) return;
+        const parsed = JSON.parse(raw) as Record<string, string>;
+        setPartnerSnoozes(prunePartnerSnoozes(parsed, new Date()));
+      })
+      .catch(() => undefined);
+  }, []);
 
   const totals = useMemo(() => ({
     inbound: partners.reduce((sum, partner) => sum + partner.inbound, 0),
@@ -1246,9 +1288,26 @@ export default function App() {
     setCaseForm(makeEmptyCaseForm());
     const writes: Promise<unknown>[] = [createCase(record)];
     if (primaryContact) writes.push(createContact(primaryContact));
+    let nextFollowUps = followUps;
+    if (record.status === 'inquiry') {
+      // AUTO-CREATE (v4): a new inquiry is a new lead — the first call goes
+      // on today's list automatically. Case-linked, due today.
+      const firstCall: FollowUp = {
+        id: makeId('f'),
+        caseId: record.id,
+        kind: 'first_call',
+        title: `First call — ${record.title}`,
+        dueOn: localDateStamp(),
+        status: 'open',
+        note: '',
+      };
+      nextFollowUps = [firstCall, ...followUps];
+      setFollowUps(nextFollowUps);
+      writes.push(createFollowUp(firstCall));
+    }
     Promise.all(writes)
       .then(() => {
-        syncDerived(undefined, [record, ...previous]);
+        syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }, [record, ...previous]);
         openCase(record.id);
       })
       .catch((error) => failCaseChange(`The case could not be saved: ${error.message}`, () => setCases(previous)));
@@ -1580,7 +1639,381 @@ export default function App() {
     updateCase(updated).catch((error) => failCaseChange(`The case link could not be saved: ${error.message}`, () => setCases(previous)));
   }
 
-  // ─── Follow-ups ─────────────────────────────────────────────────────────
+  // ─── Today Command Center ───────────────────────────────────────────────
+  // Home is a prioritized operating list built from open follow_ups (mirroring
+  // the today_actions view semantics client-side) + virtual partner-cadence
+  // cards. Every card action either logs work or forces a decision.
+
+  function followUpContext(followUp: FollowUp) {
+    const partner = partners.find((item) => item.id === followUp.partnerId);
+    const linkedCase = cases.find((item) => item.id === followUp.caseId);
+    const referral = referrals.find((item) => item.id === followUp.referralId);
+    return {
+      caseTitle: linkedCase?.title,
+      partnerName: partner ? partner.organization : undefined,
+      partnerPhone: partner?.phone || undefined,
+      referralAwaitingAnswer: Boolean(referral?.packetSentAt && referral.admitted == null),
+    };
+  }
+
+  const todaySections = useMemo(() => {
+    const now = new Date();
+    return buildTodaySections(followUps, partnersDueToday(partners, now, partnerSnoozes), now, followUpContext);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followUps, partners, cases, referrals, partnerSnoozes]);
+
+  const todayCounts = useMemo(() => todayLoad(followUps, partners), [followUps, partners]);
+
+  function openCaseById(caseId: string) {
+    if (activeCaseId === caseId) return;
+    openCase(caseId);
+  }
+
+  // THE RULE: completing anything requires an outcome. Backed items always
+  // open the "Done — what's next?" sheet; only virtual partner cards and
+  // unlinked standalone items may complete plainly (cadence self-reschedules).
+  function openDoneSheet(card: TodayCard) {
+    if (card.virtual || (!card.caseId && !card.referralId)) {
+      if (card.virtual) openTouchLogger(partners.find((item) => item.id === card.partnerId) as Partner);
+      else if (card.followUp) completePlainFollowUp(card.followUp);
+      return;
+    }
+    setDoneStatusPicker(false);
+    setStepForm({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', waitingOn: '', note: '' });
+    setDoneCard(card);
+  }
+
+  function openDoneNextStepFlow(card: TodayCard) {
+    // Done → Next step: keep doneCard SET (it's what switches the shared
+    // step sheet's confirm to complete-and-create) and layer the sheet on
+    // top. Preselect a sensible kind so one tap can finish: first_call →
+    // Consult (book it), waiting_on → keep waiting.
+    const followUp = card.followUp;
+    const suggested: FollowUpKind = followUp?.kind === 'first_call' ? 'consult' : followUp?.kind === 'waiting_on' ? 'waiting_on' : 'follow_up';
+    setStepForm({
+      kind: suggested,
+      when: followUp?.kind === 'first_call' ? 'in3days' : 'tomorrow',
+      customDate: '',
+      time: '',
+      waitingOn: followUp?.waitingOn || '',
+      note: '',
+    });
+    setNextStepCard(card);
+  }
+
+  function openNextStepSheet(card: TodayCard) {
+    const followUp = card.followUp;
+    setStepForm({
+      kind: followUp?.kind || (card.virtual ? 'touch' : 'follow_up'),
+      when: 'tomorrow',
+      customDate: '',
+      time: followUp?.dueTime || '',
+      waitingOn: followUp?.waitingOn || '',
+      note: followUp?.note || '',
+    });
+    setNextStepCard(card);
+  }
+
+  // Complete with nothing after — allowed only for unlinked standalone items.
+  function completePlainFollowUp(followUp: FollowUp) {
+    const updated: FollowUp = { ...followUp, status: 'done', completedAt: new Date().toISOString(), snoozedUntil: undefined };
+    persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
+  }
+
+  // Log a 'system' timeline event on a case-linked card action, e.g.
+  // "Completed: First call — set next: Consult Thu 2pm". Best-effort: a
+  // failure here never blocks the follow-up write.
+  function logTodaySystemEvent(caseId: string, body: string) {
+    const eventId = makeId('e');
+    const event: CaseEvent = { id: eventId, caseId, kind: 'system', body, occurredAt: new Date().toISOString() };
+    applyCaseEvent(event);
+    logCaseEvent(caseId, 'system', body, {}, eventId).catch(() => undefined);
+  }
+
+  // Done → "Next step…": complete the current item AND create the next
+  // follow_up, carrying the case/partner links forward.
+  function confirmDoneNextStep() {
+    const card = doneCard;
+    if (!card?.followUp) return;
+    const followUp = card.followUp;
+    const now = new Date().toISOString();
+    const dueOn = nextStepDate(stepForm.when, new Date(), stepForm.customDate);
+    const dueTime = stepForm.kind === 'consult' && stepForm.time ? stepForm.time : undefined;
+    const completed: FollowUp = { ...followUp, status: 'done', completedAt: now, snoozedUntil: undefined };
+    const next: FollowUp = {
+      id: makeId('f'),
+      partnerId: followUp.partnerId,
+      referralId: followUp.referralId,
+      caseId: followUp.caseId,
+      kind: stepForm.kind,
+      title: nextStepTitle(stepForm.kind, card),
+      dueOn,
+      dueTime,
+      waitingOn: stepForm.kind === 'waiting_on' ? stepForm.waitingOn.trim() : undefined,
+      note: stepForm.note.trim(),
+      status: 'open',
+    };
+    const nextFollowUps = [next, ...followUps.map((item) => (item.id === followUp.id ? completed : item))];
+    setFollowUps(nextFollowUps);
+    setDoneCard(null);
+    if (followUp.caseId) logTodaySystemEvent(followUp.caseId, `Completed: ${followUp.title} — set next: ${next.title} (${shortDate(next.dueOn)}${next.dueTime ? ` ${next.dueTime}` : ''})`);
+    Promise.all([updateFollowUp(completed), createFollowUp(next)])
+      .then(() => syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
+      .catch((error) => {
+        Alert.alert('Sync issue', `This was saved on this device but could not sync: ${error.message}`);
+        syncDerived();
+      });
+  }
+
+  function nextStepTitle(kind: FollowUpKind, card: TodayCard): string {
+    const anchor = card.context.caseTitle || card.context.partnerName || card.title;
+    switch (kind) {
+      case 'promised_call': return `Call back — ${anchor}`;
+      case 'consult': return `Consult — ${anchor}`;
+      case 'waiting_on': return `Check — ${stepForm.waitingOn.trim() || anchor}`;
+      case 'touch': return `Reach out — ${anchor}`;
+      case 'first_call': return `First call — ${anchor}`;
+      default: return `Follow up — ${anchor}`;
+    }
+  }
+
+  // Done → "Close the loop": referral admit-checks route to the existing
+  // outcome capture; case-linked items complete + optionally advance/close
+  // the case; partner items complete plainly.
+  function confirmDoneCloseLoop() {
+    const card = doneCard;
+    if (!card?.followUp) return;
+    const followUp = card.followUp;
+    setDoneCard(null);
+    if (card.referralId && card.context.referralAwaitingAnswer) {
+      // Reuse the packet outcome sheet as-is (admitted? experience stars).
+      setOutcomeFollowUp(followUp);
+      setOutcomeAnswer(null);
+      setOutcomeAdmittedOn(localDateStamp());
+      setOutcomeStars(0);
+      setOutcomeNote('');
+      return;
+    }
+    if (card.caseId) {
+      setDoneStatusPicker(true); // inline status picker inside the Done sheet
+      setDoneCard(card);
+      return;
+    }
+    completePlainFollowUp(followUp);
+  }
+
+  // Case-linked close-the-loop: complete the item and set the case status
+  // (status 'keep' = leave it where it is).
+  function closeLoopWithStatus(status: CaseStatus | 'keep') {
+    const card = doneCard;
+    if (!card?.followUp) return;
+    const followUp = card.followUp;
+    const record = cases.find((item) => item.id === followUp.caseId);
+    setDoneCard(null);
+    setDoneStatusPicker(false);
+    completePlainFollowUp(followUp);
+    logTodaySystemEvent(followUp.caseId as string, `Completed: ${followUp.title} — closed the loop${record && status !== 'keep' ? ` (case → ${status})` : ''}`);
+    if (record && status !== 'keep' && status !== record.status) changeCaseStatus(record, status);
+  }
+
+  // Set Next Step WITHOUT completing: retype/reschedule the current item
+  // (kind/due_on/due_time/waiting_on/note), or MATERIALIZE a one-off
+  // follow_up for a virtual cadence card (the only way a cadence card gets a
+  // concrete next step — the cadence itself still self-heals on a touch).
+  function confirmNextStep() {
+    const card = nextStepCard;
+    if (!card) return;
+    const dueOn = nextStepDate(stepForm.when, new Date(), stepForm.customDate);
+    const dueTime = stepForm.kind === 'consult' && stepForm.time ? stepForm.time : undefined;
+    const waitingOn = stepForm.kind === 'waiting_on' ? stepForm.waitingOn.trim() : undefined;
+    setNextStepCard(null);
+    if (card.virtual) {
+      const created: FollowUp = {
+        id: makeId('f'),
+        partnerId: card.virtual.partnerId,
+        kind: stepForm.kind,
+        title: nextStepTitle(stepForm.kind, card),
+        dueOn,
+        dueTime,
+        waitingOn,
+        note: stepForm.note.trim(),
+        status: 'open',
+      };
+      const nextFollowUps = [created, ...followUps];
+      setFollowUps(nextFollowUps);
+      createFollowUp(created)
+        .then(() => syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
+        .catch((error) => {
+          Alert.alert('Sync issue', `This next step was saved on this device but could not sync: ${error.message}`);
+          syncDerived();
+        });
+      return;
+    }
+    const followUp = card.followUp as FollowUp;
+    const updated: FollowUp = {
+      ...followUp,
+      kind: stepForm.kind,
+      dueOn,
+      dueTime,
+      waitingOn,
+      note: stepForm.note.trim(),
+      snoozedUntil: undefined, // a fresh next step clears any snooze
+    };
+    if (followUp.caseId) logTodaySystemEvent(followUp.caseId, `Next step: ${followUp.title} → ${updated.title} (${shortDate(updated.dueOn)}${updated.dueTime ? ` ${updated.dueTime}` : ''})`);
+    persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
+  }
+
+  // Snooze: backed items write snoozed_until (today_actions hides them until
+  // then); virtual partner cards use the local AsyncStorage snooze map and
+  // materialize nothing.
+  function confirmSnooze(choice: 'plus1' | 'plus2' | 'nextweek') {
+    const card = snoozeCard;
+    if (!card) return;
+    const until = snoozeDate(choice, new Date());
+    setSnoozeCard(null);
+    if (card.virtual) {
+      const next = prunePartnerSnoozes({ ...partnerSnoozes, [card.virtual.partnerId]: until }, new Date());
+      setPartnerSnoozes(next);
+      AsyncStorage.setItem('referralfit-partner-snooze-v1', JSON.stringify(next)).catch(() => undefined);
+      return;
+    }
+    const followUp = card.followUp as FollowUp;
+    const updated: FollowUp = { ...followUp, snoozedUntil: until };
+    persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
+  }
+
+  // Call/Text from a card. Target resolution: case-linked → the case's
+  // primary contact (action sheet when several have numbers); partner-linked
+  // → the partner's phone. Every completed action logs (case_event and/or
+  // partner touch) and offers the same quick-note prompt the case file uses.
+  function cardContactAction(card: TodayCard, action: 'call' | 'text') {
+    const launch = (digits: string) => {
+      Linking.openURL(`${action === 'call' ? 'tel' : 'sms'}:${digits}`).catch(() => Alert.alert('Unable to open', 'This device could not open that action.'));
+    };
+    const clean = (phone: string) => phone.replace(/[^\d+]/g, '');
+    if (card.caseId) {
+      const record = cases.find((item) => item.id === card.caseId);
+      fetchCaseData()
+        .then((data) => {
+          const contacts = data.caseContacts.filter((item) => item.caseId === card.caseId && item.phone.trim());
+          if (!contacts.length) {
+            Alert.alert('No phone on file', `This case has no contact with a phone number.${record ? ' Add one in the case file.' : ''}`);
+            return;
+          }
+          const primary = contacts.find((item) => item.isPrimary) || contacts[0];
+          if (contacts.length > 1) {
+            setContactPick({ card, action, contacts });
+            return;
+          }
+          launch(clean(primary.phone));
+          logCardContact(card, action, primary);
+        })
+        .catch(() => Alert.alert('Offline', 'Case contacts load from the server — try again with a connection.'));
+      return;
+    }
+    if (card.partnerId) {
+      const partner = partners.find((item) => item.id === card.partnerId);
+      const digits = partner ? clean(partner.phone) : '';
+      if (!digits) {
+        Alert.alert('No phone on file', `${partner?.organization || 'This partner'} has no phone number — add one in the Directory.`);
+        return;
+      }
+      launch(digits);
+      logCardContact(card, action, undefined);
+      return;
+    }
+    Alert.alert('No one to reach', 'Link this item to a case or partner to call or text from here.');
+  }
+
+  // The logging half of a card call/text: case_event for case-linked items
+  // (via the same path case detail uses), a partner touch when a partner is
+  // involved, then the skippable quick note.
+  function logCardContact(card: TodayCard, action: 'call' | 'text', contact?: CaseContact) {
+    const now = new Date().toISOString();
+    const verb = action === 'call' ? 'Called' : 'Texted';
+    if (card.caseId && contact) {
+      const eventId = makeId('e');
+      const event: CaseEvent = {
+        id: eventId,
+        caseId: card.caseId,
+        kind: action,
+        body: `${verb} ${contact.name}${contact.relationship ? ` (${contact.relationship})` : ''} — ${card.title}`,
+        contactId: contact.id,
+        occurredAt: now,
+      };
+      applyCaseEvent(event);
+      logCaseEvent(card.caseId, action, event.body, { contactId: contact.id }, eventId).catch(() => undefined);
+    }
+    if (card.partnerId) {
+      const touch: Touch = { id: makeId('t'), partnerId: card.partnerId, kind: action, note: card.title, occurredAt: now };
+      const nextTouches = [touch, ...touches];
+      const todayStamp = localDateStamp();
+      const nextPartners = partners.map((partner) => partner.id === card.partnerId ? { ...partner, lastContact: todayStamp } : partner);
+      setTouches(nextTouches);
+      setPartners(nextPartners);
+      createTouch(touch)
+        .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches: nextTouches, followUps, scorecards }))
+        .catch(() => syncDerived());
+    }
+    setQuickNoteText('');
+    setTodayQuickNote({ card, action, contact });
+  }
+
+  function saveTodayQuickNote() {
+    const note = quickNoteText.trim();
+    const target = todayQuickNote;
+    setTodayQuickNote(null);
+    setQuickNoteText('');
+    if (!note || !target) return;
+    const now = new Date().toISOString();
+    if (target.card.caseId && target.contact) {
+      const eventId = makeId('e');
+      const event: CaseEvent = { id: eventId, caseId: target.card.caseId, kind: 'note', body: note, contactId: target.contact.id, occurredAt: now };
+      applyCaseEvent(event);
+      logCaseEvent(target.card.caseId, 'note', note, { contactId: target.contact.id }, eventId).catch(() => undefined);
+    }
+    if (target.card.partnerId) {
+      const touch: Touch = { id: makeId('t'), partnerId: target.card.partnerId, kind: 'other', note, occurredAt: now };
+      const nextTouches = [touch, ...touches];
+      setTouches(nextTouches);
+      createTouch(touch)
+        .then(() => syncDerived({ partners, referrals, referralMatches, touches: nextTouches, followUps, scorecards }))
+        .catch(() => syncDerived());
+    }
+  }
+
+  // Quick-add ("I need to…"): the 5-second capture. kind + who + when →
+  // a follow_up, optionally linked to a case or partner.
+  function saveQuickAdd() {
+    if (!quickAddForm.title.trim()) {
+      Alert.alert('Say what it is', 'One line is enough — "I promised Sarah I\'d call Thursday".');
+      return;
+    }
+    const linkedCase = quickAddForm.targetType === 'case' ? cases.find((item) => item.id === quickAddForm.targetId) : undefined;
+    const linkedPartner = quickAddForm.targetType === 'partner' ? partners.find((item) => item.id === quickAddForm.targetId) : undefined;
+    const followUp: FollowUp = {
+      id: makeId('f'),
+      caseId: linkedCase?.id,
+      partnerId: linkedPartner?.id,
+      kind: quickAddForm.kind,
+      title: quickAddForm.title.trim(),
+      dueOn: nextStepDate(quickAddForm.when, new Date(), quickAddForm.customDate),
+      dueTime: quickAddForm.kind === 'consult' && quickAddForm.time ? quickAddForm.time : undefined,
+      waitingOn: quickAddForm.kind === 'waiting_on' ? quickAddForm.waitingOn.trim() : undefined,
+      status: 'open',
+      note: '',
+    };
+    const nextFollowUps = [followUp, ...followUps];
+    setFollowUps(nextFollowUps);
+    setShowQuickAdd(false);
+    setQuickAddForm({ kind: 'follow_up', title: '', targetType: 'none', targetId: '', targetSearch: '', when: 'today', customDate: '', time: '', waitingOn: '' });
+    createFollowUp(followUp)
+      .then(() => syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
+      .catch((error) => {
+        Alert.alert('Sync issue', `This was saved on this device but could not sync: ${error.message}`);
+        syncDerived();
+      });
+  }
 
   function persistFollowUpChange(updated: FollowUp, nextFollowUps: FollowUp[]) {
     setFollowUps(nextFollowUps);
@@ -1599,21 +2032,6 @@ export default function App() {
 
   function snoozeFollowUp(followUp: FollowUp, days: number) {
     const updated: FollowUp = { ...followUp, dueOn: addDaysStamp(days) };
-    persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
-  }
-
-  // Done on an admit-check opens the outcome capture sheet; Done on any
-  // other follow-up just completes it.
-  function completeFollowUp(followUp: FollowUp) {
-    if (followUp.referralId) {
-      setOutcomeFollowUp(followUp);
-      setOutcomeAnswer(null);
-      setOutcomeAdmittedOn(localDateStamp());
-      setOutcomeStars(0);
-      setOutcomeNote('');
-      return;
-    }
-    const updated: FollowUp = { ...followUp, status: 'done', completedAt: new Date().toISOString() };
     persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
   }
 
@@ -1903,139 +2321,185 @@ export default function App() {
     );
   }
 
+  // Compact action row for the Today list. Primary row: Call / Text / Done;
+  // the ⋯ overflow opens one sheet with Snooze + Set Next Step — all five
+  // actions reachable in one tap + one sheet.
+  function TodayCardRow({ card, overdue }: { card: TodayCard; overdue?: boolean }) {
+    const openLinked = () => {
+      if (card.caseId) openCaseById(card.caseId);
+      else if (card.partnerId) {
+        const partner = partners.find((item) => item.id === card.partnerId);
+        if (partner) setSelectedPartner(partner);
+      }
+    };
+    return (
+      <View style={[styles.todayRow, overdue && styles.todayRowOverdue]}>
+        <View style={[styles.todayKindIcon, overdue && styles.todayKindIconOverdue]}>
+          <AppIcon name={todayKindIcon(card)} size={16} color={overdue ? COLORS.coral : COLORS.forest} />
+        </View>
+        <View style={styles.todayRowBody}>
+          <TouchableOpacity activeOpacity={card.caseId || card.partnerId ? 0.7 : 1} onPress={openLinked}>
+            <Text numberOfLines={2} style={styles.todayRowTitle}>{card.title}</Text>
+            {card.subtitle ? <Text numberOfLines={1} style={styles.todayRowMeta}>{card.subtitle}</Text> : null}
+            {overdue ? <Text style={styles.todayOverdueBadge}>{card.daysOverdue} {card.daysOverdue === 1 ? 'day' : 'days'} overdue</Text> : null}
+          </TouchableOpacity>
+          <View style={styles.todayActionRow}>
+            <TouchableOpacity accessibilityLabel={`Call — ${card.title}`} onPress={() => cardContactAction(card, 'call')} style={styles.todayIconButton}>
+              <AppIcon name="call" size={15} color={COLORS.forest} />
+            </TouchableOpacity>
+            <TouchableOpacity accessibilityLabel={`Text — ${card.title}`} onPress={() => cardContactAction(card, 'text')} style={styles.todayIconButton}>
+              <AppIcon name="chatbubble" size={14} color={COLORS.forest} />
+            </TouchableOpacity>
+            <TouchableOpacity accessibilityLabel={`Done — ${card.title}`} onPress={() => openDoneSheet(card)} style={styles.todayDoneButton}>
+              <Text style={styles.todayDoneButtonText}>Done</Text>
+            </TouchableOpacity>
+            <TouchableOpacity accessibilityLabel={`More actions — ${card.title}`} onPress={() => setSnoozeCard(card)} style={styles.todayIconButton}>
+              <AppIcon name="ellipsis-horizontal" size={16} color={COLORS.inkSoft} />
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    );
+  }
+
+  // Today Command Center — the prioritized daily operating list. The old
+  // home told you what happened; this one tells you WHAT TO DO NEXT.
   function HomeScreen() {
+    const loadLine = todayCounts.actions === 0
+      ? 'Nothing on the list — enjoy the quiet, or add something below.'
+      : `${todayCounts.actions} ${todayCounts.actions === 1 ? 'action' : 'actions'}${todayCounts.overdueCount > 0 ? ` · ${todayCounts.overdueCount} overdue` : ''}`;
     const giveBack = partners
       .filter((partner) => partner.inbound > partner.outbound)
       .sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound))
       .slice(0, 3);
-    const dueFollowUps = followUpsDue(followUps);
     const openCases = cases.filter(isOpenCase).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    const caseTitle = (caseId?: string) => (caseId ? cases.find((item) => item.id === caseId)?.title : undefined);
-    const todayStamp = localDateStamp();
-    const overdueDays = (dueOn: string) => {
-      const parsed = new Date(`${dueOn}T12:00:00`);
-      const dueDay = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
-      const today = new Date(`${todayStamp}T12:00:00`);
-      return Math.max(0, Math.round((today.getTime() - dueDay.getTime()) / 86400000));
-    };
     return (
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
-        {renderHeader()}
-        <View style={styles.welcomeRow}>
-          <View>
+      <View style={{ flex: 1 }}>
+        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
+          {renderHeader()}
+          <View style={styles.welcomeRow}>
             <Text style={styles.eyebrow}>{currentDateLabel()}</Text>
-            <Text style={styles.heroTitle}>{currentGreeting()}</Text>
-            <Text style={styles.heroSubtitle}>{partners.length ? 'Your referral network, in balance.' : 'Add your trusted referral partners to get started.'}</Text>
+            <Text style={styles.heroTitle}>Today</Text>
+            <Text style={styles.heroSubtitle}>{loadLine}</Text>
           </View>
-        </View>
 
-        {dueFollowUps.length ? (
-          <>
-            <SectionTitle title="Follow-ups" />
-            <View style={styles.followUpCard}>
-              {dueFollowUps.map((followUp, index) => {
-                const partner = partners.find((item) => item.id === followUp.partnerId);
-                const overdueBy = overdueDays(followUp.dueOn);
-                return (
-                  <View key={followUp.id} style={[styles.followUpRow, index === dueFollowUps.length - 1 && { borderBottomWidth: 0 }]}>
-                    <View style={styles.followUpIcon}><AppIcon name="alarm-outline" size={17} color={COLORS.coral} /></View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.followUpTitle}>{followUp.title}</Text>
-                      <Text style={styles.followUpMeta}>
-                        {partner ? `${partner.organization} · ` : ''}{followUp.caseId && caseTitle(followUp.caseId) ? `Case: ${caseTitle(followUp.caseId)} · ` : ''}{overdueBy > 0 ? `${overdueBy} ${overdueBy === 1 ? 'day' : 'days'} overdue` : 'Due today'}
-                      </Text>
-                      <View style={styles.followUpActions}>
-                        <TouchableOpacity style={styles.followUpActionDone} onPress={() => completeFollowUp(followUp)}><Text style={styles.followUpActionDoneText}>Done</Text></TouchableOpacity>
-                        <TouchableOpacity style={styles.followUpAction} onPress={() => skipFollowUp(followUp)}><Text style={styles.followUpActionText}>Skip</Text></TouchableOpacity>
-                        <TouchableOpacity style={styles.followUpAction} onPress={() => snoozeFollowUp(followUp, 2)}><Text style={styles.followUpActionText}>+2 days</Text></TouchableOpacity>
-                      </View>
-                    </View>
-                  </View>
-                );
-              })}
+          {todaySections.overdue.length ? (
+            <View style={styles.todaySection}>
+              <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderOverdue]}>🔴 OVERDUE</Text>
+              {todaySections.overdue.map((card) => <TodayCardRow key={card.id} card={card} overdue />)}
             </View>
-          </>
-        ) : null}
+          ) : null}
 
-        {openCases.length ? (
-          <>
-            <SectionTitle title="Active cases" action="View all" onPress={() => setTab('cases')} />
-            <View style={styles.followUpCard}>
-              {openCases.slice(0, 3).map((record, index) => {
-                const colors = CASE_STATUS_COLORS[record.status];
-                return (
-                  <TouchableOpacity key={record.id} onPress={() => openCase(record.id)} style={[styles.followUpRow, index === Math.min(openCases.length, 3) - 1 && { borderBottomWidth: 0 }]}>
-                    <View style={[styles.followUpIcon, { backgroundColor: colors.bg }]}><AppIcon name="folder" size={16} color={colors.fg} /></View>
+          {todaySections.today.length ? (
+            <View style={styles.todaySection}>
+              <Text style={styles.todaySectionHeader}>📞 TODAY</Text>
+              {todaySections.today.map((card) => <TodayCardRow key={card.id} card={card} />)}
+            </View>
+          ) : null}
+
+          {todaySections.partnersDue.length ? (
+            <View style={styles.todaySection}>
+              <Text style={styles.todaySectionHeader}>🤝 PARTNERS DUE</Text>
+              {todaySections.partnersDue.map((card) => <TodayCardRow key={card.id} card={card} />)}
+            </View>
+          ) : null}
+
+          {todayCounts.actions === 0 ? (
+            <EmptyState icon="checkmark-circle-outline" title="List is clear" body="No actions due and no partners past cadence. Log a touch, or capture the next thing with + below." />
+          ) : null}
+
+          {/* The old home content lives down here, collapsed. */}
+          <TouchableOpacity style={styles.closedToggle} onPress={() => setShowHomeMore((current) => !current)}>
+            <AppIcon name={showHomeMore ? 'chevron-down' : 'chevron-forward'} size={16} color={COLORS.gray} />
+            <Text style={styles.closedToggleText}>More — network snapshot & recent activity</Text>
+          </TouchableOpacity>
+          {showHomeMore ? (
+            <View>
+              <View style={styles.statRow}>
+                <View style={styles.statCard}>
+                  <Text style={styles.statNumber}>{partners.length}</Text>
+                  <Text style={styles.statLabel}>Network partners</Text>
+                  <View style={styles.statDetail}><AppIcon name="people" size={13} color={COLORS.forest} /><Text style={styles.statDetailText}>{partnerTypes.length} categories</Text></View>
+                </View>
+                <View style={styles.statCard}>
+                  <Text style={styles.statNumber}>{totals.inbound}</Text>
+                  <Text style={styles.statLabel}>Inbound referrals</Text>
+                  <View style={styles.statDetail}><AppIcon name="trending-up" size={13} color={COLORS.coral} /><Text style={styles.statDetailText}>Across your network</Text></View>
+                </View>
+              </View>
+
+              {openCases.length ? (
+                <>
+                  <SectionTitle title="Active cases" action="View all" onPress={() => setTab('cases')} />
+                  <View style={styles.followUpCard}>
+                    {openCases.slice(0, 3).map((record, index) => {
+                      const colors = CASE_STATUS_COLORS[record.status];
+                      return (
+                        <TouchableOpacity key={record.id} onPress={() => openCase(record.id)} style={[styles.followUpRow, index === Math.min(openCases.length, 3) - 1 && { borderBottomWidth: 0 }]}>
+                          <View style={[styles.followUpIcon, { backgroundColor: colors.bg }]}><AppIcon name="folder" size={16} color={colors.fg} /></View>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.followUpTitle} numberOfLines={1}>{record.title}</Text>
+                            <Text style={styles.followUpMeta}>{record.status} · active {relativeActivity(record.updatedAt)}</Text>
+                          </View>
+                          <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                </>
+              ) : null}
+
+              <SectionTitle title="Relationships to return" action="View all" onPress={() => setTab('referrals')} />
+              <View style={styles.returnCard}>
+                <View style={styles.returnIntro}>
+                  <View style={styles.returnIcon}><AppIcon name="heart-half" size={20} color={COLORS.coral} /></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.returnTitle}>{totals.reciprocal} partners have sent more than they’ve received</Text>
+                    <Text style={styles.returnBody}>Keep these relationships in mind only after client-fit factors are satisfied.</Text>
+                  </View>
+                </View>
+                {giveBack.map((partner, index) => (
+                  <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={[styles.returnPartner, index === giveBack.length - 1 && { borderBottomWidth: 0 }]}>
+                    <Initials name={partner.organization} size={36} />
                     <View style={{ flex: 1 }}>
-                      <Text style={styles.followUpTitle} numberOfLines={1}>{record.title}</Text>
-                      <Text style={styles.followUpMeta}>{record.status} · active {relativeActivity(record.updatedAt)}</Text>
+                      <Text style={styles.returnPartnerName}>{partner.organization}</Text>
+                      <Text numberOfLines={1} style={styles.returnPartnerType}>{partnerTypeLabel(partner)} · {partner.city}</Text>
                     </View>
+                    <Text style={styles.returnCount}>+{partner.inbound - partner.outbound}</Text>
                     <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
                   </TouchableOpacity>
-                );
-              })}
-            </View>
-          </>
-        ) : null}
-
-        <View style={styles.statRow}>
-          <View style={styles.statCard}>
-            <Text style={styles.statNumber}>{partners.length}</Text>
-            <Text style={styles.statLabel}>Network partners</Text>
-            <View style={styles.statDetail}><AppIcon name="people" size={13} color={COLORS.forest} /><Text style={styles.statDetailText}>{partnerTypes.length} categories</Text></View>
-          </View>
-          <View style={styles.statCard}>
-            <Text style={styles.statNumber}>{totals.inbound}</Text>
-            <Text style={styles.statLabel}>Inbound referrals</Text>
-            <View style={styles.statDetail}><AppIcon name="trending-up" size={13} color={COLORS.coral} /><Text style={styles.statDetailText}>Across your network</Text></View>
-          </View>
-        </View>
-
-        <SectionTitle title="Relationships to return" action="View all" onPress={() => setTab('referrals')} />
-        <View style={styles.returnCard}>
-          <View style={styles.returnIntro}>
-            <View style={styles.returnIcon}><AppIcon name="heart-half" size={20} color={COLORS.coral} /></View>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.returnTitle}>{totals.reciprocal} partners have sent more than they’ve received</Text>
-              <Text style={styles.returnBody}>Keep these relationships in mind only after client-fit factors are satisfied.</Text>
-            </View>
-          </View>
-          {giveBack.map((partner, index) => (
-            <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={[styles.returnPartner, index === giveBack.length - 1 && { borderBottomWidth: 0 }]}>
-              <Initials name={partner.organization} size={36} />
-              <View style={{ flex: 1 }}>
-                <Text style={styles.returnPartnerName}>{partner.organization}</Text>
-                <Text numberOfLines={1} style={styles.returnPartnerType}>{partnerTypeLabel(partner)} · {partner.city}</Text>
+                ))}
               </View>
-              <Text style={styles.returnCount}>+{partner.inbound - partner.outbound}</Text>
-              <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
-            </TouchableOpacity>
-          ))}
-        </View>
 
-        <SectionTitle title="Recent activity" action="Log referral" onPress={() => openReferral('Inbound')} />
-        <View style={styles.activityCard}>
-          {recentReferrals.length ? recentReferrals.slice(0, 3).map((referral, index) => {
-            const partner = partners.find((item) => item.id === referral.partnerId);
-            if (!partner) return null;
-            return (
-              <View key={referral.id} style={[styles.activityRow, index === 2 && { borderBottomWidth: 0 }]}>
-                <View style={[styles.directionIcon, referral.direction === 'Inbound' ? styles.inboundIcon : styles.outboundIcon]}>
-                  <AppIcon name={referral.direction === 'Inbound' ? 'arrow-down' : 'arrow-up'} size={16} color={referral.direction === 'Inbound' ? COLORS.forest : COLORS.blue} />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.activityTitle}>{referral.direction} · {referral.clientLabel}</Text>
-                  <Text style={styles.activityBody} numberOfLines={1}>{partner.organization}</Text>
-                </View>
-                <View style={{ alignItems: 'flex-end' }}>
-                  <Text style={styles.activityDate}>{shortDate(referral.date)}</Text>
-                  <Text style={styles.activityOutcome}>{referral.outcome}</Text>
-                </View>
+              <SectionTitle title="Recent activity" action="Log referral" onPress={() => openReferral('Inbound')} />
+              <View style={styles.activityCard}>
+                {recentReferrals.length ? recentReferrals.slice(0, 3).map((referral, index) => {
+                  const partner = partners.find((item) => item.id === referral.partnerId);
+                  if (!partner) return null;
+                  return (
+                    <View key={referral.id} style={[styles.activityRow, index === 2 && { borderBottomWidth: 0 }]}>
+                      <View style={[styles.directionIcon, referral.direction === 'Inbound' ? styles.inboundIcon : styles.outboundIcon]}>
+                        <AppIcon name={referral.direction === 'Inbound' ? 'arrow-down' : 'arrow-up'} size={16} color={referral.direction === 'Inbound' ? COLORS.forest : COLORS.blue} />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.activityTitle}>{referral.direction} · {referral.clientLabel}</Text>
+                        <Text style={styles.activityBody} numberOfLines={1}>{partner.organization}</Text>
+                      </View>
+                      <View style={{ alignItems: 'flex-end' }}>
+                        <Text style={styles.activityDate}>{shortDate(referral.date)}</Text>
+                        <Text style={styles.activityOutcome}>{referral.outcome}</Text>
+                      </View>
+                    </View>
+                  );
+                }) : <EmptyState icon="swap-horizontal-outline" title="No referrals yet" body="Your inbound and outbound activity will appear here." />}
               </View>
-            );
-          }) : <EmptyState icon="swap-horizontal-outline" title="No referrals yet" body="Your inbound and outbound activity will appear here." />}
-        </View>
-      </ScrollView>
+            </View>
+          ) : null}
+        </ScrollView>
+        <TouchableOpacity accessibilityLabel="Quick add — I need to" onPress={() => setShowQuickAdd(true)} style={styles.fab}>
+          <AppIcon name="add" size={26} color={COLORS.white} />
+        </TouchableOpacity>
+      </View>
     );
   }
 
@@ -2672,16 +3136,18 @@ export default function App() {
                 })}
                 {linkedFollowUps.map((followUp) => {
                   const partner = partners.find((item) => item.id === followUp.partnerId);
+                  const card = followUpToCard(followUp, new Date(), followUpContext(followUp));
                   return (
                     <View key={followUp.id} style={styles.caseLinkedRow}>
-                      <View style={[styles.followUpIcon, { width: 28, height: 28 }]}><AppIcon name="alarm-outline" size={14} color={COLORS.coral} /></View>
+                      <View style={[styles.followUpIcon, { width: 28, height: 28 }]}><AppIcon name={todayKindIcon(card)} size={14} color={COLORS.coral} /></View>
                       <View style={{ flex: 1 }}>
                         <Text style={styles.touchLogTitle}>{followUp.title}</Text>
-                        <Text style={styles.touchLogNote}>{partner ? `${partner.organization} · ` : ''}due {shortDate(followUp.dueOn)}</Text>
+                        <Text style={styles.touchLogNote}>{partner ? `${partner.organization} · ` : ''}due {shortDate(followUp.dueOn)}{followUp.dueTime ? ` ${followUp.dueTime}` : ''}</Text>
                         <View style={styles.followUpActions}>
-                          <TouchableOpacity style={styles.followUpActionDone} onPress={() => completeFollowUp(followUp)}><Text style={styles.followUpActionDoneText}>Done</Text></TouchableOpacity>
+                          <TouchableOpacity style={styles.followUpActionDone} onPress={() => openDoneSheet(card)}><Text style={styles.followUpActionDoneText}>Done</Text></TouchableOpacity>
+                          <TouchableOpacity style={styles.followUpAction} onPress={() => openNextStepSheet(card)}><Text style={styles.followUpActionText}>Next step</Text></TouchableOpacity>
+                          <TouchableOpacity style={styles.followUpAction} onPress={() => setSnoozeCard(card)}><Text style={styles.followUpActionText}>Snooze</Text></TouchableOpacity>
                           <TouchableOpacity style={styles.followUpAction} onPress={() => skipFollowUp(followUp)}><Text style={styles.followUpActionText}>Skip</Text></TouchableOpacity>
-                          <TouchableOpacity style={styles.followUpAction} onPress={() => snoozeFollowUp(followUp, 2)}><Text style={styles.followUpActionText}>+2 days</Text></TouchableOpacity>
                         </View>
                       </View>
                     </View>
@@ -3224,6 +3690,310 @@ export default function App() {
     );
   }
 
+  // ─── Today Command Center sheets ─────────────────────────────────────────
+
+  const WHEN_OPTIONS: { label: string; value: WhenChoice }[] = [
+    { label: 'Today', value: 'today' },
+    { label: 'Tomorrow', value: 'tomorrow' },
+    { label: 'In 3 days', value: 'in3days' },
+    { label: 'Next week', value: 'nextweek' },
+    { label: 'Pick a date', value: 'custom' },
+  ];
+  const STEP_KIND_OPTIONS: { label: string; value: FollowUpKind; hint: string }[] = [
+    { label: 'Call them back', value: 'promised_call', hint: 'You owe them a call' },
+    { label: 'Consult', value: 'consult', hint: 'A scheduled sit-down — set a time' },
+    { label: 'Waiting on them', value: 'waiting_on', hint: 'The ball is in their court' },
+    { label: 'Follow up', value: 'follow_up', hint: 'General check-in' },
+    { label: 'Partner touch', value: 'touch', hint: 'Keep the relationship warm' },
+  ];
+  // "Pick a date" without a calendar dependency: the next 21 days.
+  const customDateOptions = Array.from({ length: 21 }, (_, index) => {
+    const date = new Date();
+    date.setDate(date.getDate() + index + 1);
+    const value = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    return { label: shortDate(value), value };
+  });
+
+  // Kind + when + (waiting-on text / consult time) + optional note. Shared by
+  // Done → "Next step…" (completes current, creates next) and Set Next Step
+  // (reschedules/retypes current without completing).
+  function StepFormFields() {
+    return (
+      <>
+        <Text style={styles.fieldLabel}>WHAT'S THE NEXT STEP?</Text>
+        <View style={styles.dropdownOptions}>
+          {STEP_KIND_OPTIONS.map((option) => {
+            const active = stepForm.kind === option.value;
+            return (
+              <TouchableOpacity key={option.value} onPress={() => setStepForm((current) => ({ ...current, kind: option.value }))} style={[styles.dropdownOption, active && styles.dropdownOptionActive]}>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.dropdownOptionText, active && styles.dropdownOptionTextActive]}>{option.label}</Text>
+                  <Text style={styles.dropdownOptionDetail}>{option.hint}</Text>
+                </View>
+                {active ? <AppIcon name="checkmark-circle" size={20} color={COLORS.forest} /> : null}
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+        {stepForm.kind === 'waiting_on' ? (
+          <FormField label="WAITING ON" value={stepForm.waitingOn} onChangeText={(waitingOn) => setStepForm((current) => ({ ...current, waitingOn }))} placeholder="insurance verification, the wife's answer…" />
+        ) : null}
+        <Text style={styles.fieldLabel}>WHEN</Text>
+        <View style={styles.cadenceRow}>
+          {WHEN_OPTIONS.map((option) => (
+            <Pill key={option.value} label={option.label} active={stepForm.when === option.value} onPress={() => setStepForm((current) => ({ ...current, when: option.value }))} />
+          ))}
+        </View>
+        {stepForm.when === 'custom' ? (
+          <DropdownField label="DATE" value={stepForm.customDate || customDateOptions[0]?.value || ''} icon="calendar-outline" onChange={(customDate) => setStepForm((current) => ({ ...current, customDate }))} options={customDateOptions} />
+        ) : null}
+        {stepForm.kind === 'consult' ? (
+          <FormField label="TIME (OPTIONAL, 24H — e.g. 14:00)" value={stepForm.time} onChangeText={(time) => setStepForm((current) => ({ ...current, time: time.replace(/[^\d:]/g, '').slice(0, 5) }))} placeholder="14:00" keyboardType="number-pad" />
+        ) : null}
+        <FormField label="NOTE (OPTIONAL)" value={stepForm.note} onChangeText={(note) => setStepForm((current) => ({ ...current, note }))} placeholder="Anything to remember when this comes due" multiline />
+      </>
+    );
+  }
+
+  // "Done — what's next?" — completing anything forces a decision:
+  // (a) Next step… / (b) Close the loop. No bare done for linked items.
+  function DoneSheet() {
+    if (!doneCard) return null;
+    const close = () => { setDoneCard(null); setDoneStatusPicker(false); };
+    const referralAwaiting = Boolean(doneCard.referralId && doneCard.context.referralAwaitingAnswer);
+    const linkedCase = doneCard.caseId ? cases.find((item) => item.id === doneCard.caseId) : undefined;
+    if (doneStatusPicker && linkedCase) {
+      return (
+        <Modal visible transparent animationType="fade" onRequestClose={close}>
+          <Pressable style={styles.dropdownOverlay} onPress={close}>
+            <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+              <View style={styles.dropdownSheetHandle} />
+              <View style={styles.prePromptBody}>
+                <Text style={styles.prePromptTitle}>Close the loop — {linkedCase.title}</Text>
+                <Text style={styles.prePromptText}>Complete this item{doneCard.title ? ` (“${doneCard.title}”)` : ''} and set the case status. The change lands on the case timeline.</Text>
+                <View style={styles.cadenceRow}>
+                  {CASE_STATUSES.map((status) => (
+                    <Pill key={status} label={status} active={status === linkedCase.status} onPress={() => closeLoopWithStatus(status)} />
+                  ))}
+                </View>
+                <TouchableOpacity onPress={() => closeLoopWithStatus('keep')}><Text style={styles.saveText}>Just complete — keep “{linkedCase.status}”</Text></TouchableOpacity>
+              </View>
+            </Pressable>
+          </Pressable>
+        </Modal>
+      );
+    }
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={close}>
+        <Pressable style={styles.dropdownOverlay} onPress={close}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <View style={styles.prePromptBody}>
+              <View style={styles.prePromptIcon}><AppIcon name="checkmark-done" size={24} color={COLORS.forest} /></View>
+              <Text style={styles.prePromptTitle}>Done — what's next?</Text>
+              <Text style={styles.prePromptText}>{doneCard.title}{doneCard.context.caseTitle ? ` — ${doneCard.context.caseTitle}` : doneCard.context.partnerName ? ` — ${doneCard.context.partnerName}` : ''}</Text>
+              <TouchableOpacity style={styles.primaryButton} onPress={() => openDoneNextStepFlow(doneCard)}>
+                <Text style={styles.primaryButtonText}>Next step…</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.sheetSecondaryButton} onPress={confirmDoneCloseLoop}>
+                <Text style={styles.sheetSecondaryButtonText}>{referralAwaiting ? 'Close the loop — record the outcome' : doneCard.caseId ? 'Close the loop — complete & set case status' : 'Close the loop — just complete'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Not yet</Text></TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
+  // Set Next Step — reschedule/retype WITHOUT completing the current item.
+  // (When doneCard is set this same sheet is the Done → Next-step flow: its
+  // confirm completes the current item and creates the next one.)
+  function NextStepSheet() {
+    if (!nextStepCard) return null;
+    const close = () => { setNextStepCard(null); setDoneCard(null); };
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={close}>
+        <Pressable style={styles.dropdownOverlay} onPress={close}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.prePromptTitle}>{doneCard ? 'Done — set the next step' : 'Set next step'}</Text>
+              <Text style={styles.prePromptText}>{nextStepCard.title}{doneCard ? ' — completing this and creating what comes after.' : ' — rescheduling without completing it.'}</Text>
+              {StepFormFields()}
+              <TouchableOpacity style={styles.primaryButton} onPress={doneCard ? confirmDoneNextStep : confirmNextStep}>
+                <Text style={styles.primaryButtonText}>{doneCard ? 'Complete & schedule next' : 'Save next step'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel</Text></TouchableOpacity>
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
+  // The ⋯ overflow: Snooze (+1/+2/next week) and Set Next Step.
+  function SnoozeSheet() {
+    if (!snoozeCard) return null;
+    const close = () => setSnoozeCard(null);
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={close}>
+        <Pressable style={styles.dropdownOverlay} onPress={close}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <View style={styles.prePromptBody}>
+              <Text style={styles.prePromptTitle}>{snoozeCard.title}</Text>
+              <Text style={styles.prePromptText}>{snoozeCard.virtual ? 'Partner cadence — snoozing only affects this device; logging a touch resets it everywhere.' : 'Snooze hides it from Today until then.'}</Text>
+              <View style={styles.cadenceRow}>
+                <Pill label="+1 day" onPress={() => confirmSnooze('plus1')} />
+                <Pill label="+2 days" onPress={() => confirmSnooze('plus2')} />
+                <Pill label="Next week" onPress={() => confirmSnooze('nextweek')} />
+              </View>
+              <TouchableOpacity style={styles.sheetSecondaryButton} onPress={() => { const card = snoozeCard; setSnoozeCard(null); openNextStepSheet(card); }}>
+                <Text style={styles.sheetSecondaryButtonText}>Set next step…</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel</Text></TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
+  // "I need to…" — the 5-second capture.
+  function QuickAddSheet() {
+    if (!showQuickAdd) return null;
+    const close = () => setShowQuickAdd(false);
+    const needle = quickAddForm.targetSearch.trim().toLowerCase();
+    const caseOptions = cases.filter(isOpenCase).filter((record) => !needle || record.title.toLowerCase().includes(needle)).slice(0, 4);
+    const partnerOptions = partners.filter((partner) => !needle || `${partner.organization} ${partner.name}`.toLowerCase().includes(needle)).slice(0, 4);
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={close}>
+        <Pressable style={styles.dropdownOverlay} onPress={close}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.prePromptTitle}>I need to…</Text>
+              <FormField label="WHAT *" value={quickAddForm.title} onChangeText={(title) => setQuickAddForm((current) => ({ ...current, title }))} placeholder="I promised Sarah I'd call Thursday" />
+              <Text style={styles.fieldLabel}>KIND</Text>
+              <View style={styles.cadenceRow}>
+                {STEP_KIND_OPTIONS.map((option) => (
+                  <Pill key={option.value} label={option.label} active={quickAddForm.kind === option.value} onPress={() => setQuickAddForm((current) => ({ ...current, kind: option.value }))} />
+                ))}
+              </View>
+              {quickAddForm.kind === 'waiting_on' ? (
+                <FormField label="WAITING ON" value={quickAddForm.waitingOn} onChangeText={(waitingOn) => setQuickAddForm((current) => ({ ...current, waitingOn }))} placeholder="insurance verification…" />
+              ) : null}
+              <Text style={styles.fieldLabel}>WHO (OPTIONAL)</Text>
+              <View style={styles.cadenceRow}>
+                {(['none', 'case', 'partner'] as const).map((targetType) => (
+                  <Pill key={targetType} label={targetType === 'none' ? 'No one' : targetType === 'case' ? 'A case' : 'A partner'} active={quickAddForm.targetType === targetType} onPress={() => setQuickAddForm((current) => ({ ...current, targetType, targetId: '', targetSearch: '' }))} />
+                ))}
+              </View>
+              {quickAddForm.targetType !== 'none' ? (
+                <>
+                  <View style={styles.searchBox}>
+                    <AppIcon name="search" size={17} color={COLORS.gray} />
+                    <TextInput value={quickAddForm.targetSearch} onChangeText={(targetSearch) => setQuickAddForm((current) => ({ ...current, targetSearch }))} placeholder={quickAddForm.targetType === 'case' ? 'Search cases' : 'Search partners'} placeholderTextColor="#91A09B" style={styles.searchInput} />
+                  </View>
+                  <View style={{ marginTop: 8, marginBottom: 8 }}>
+                    {(quickAddForm.targetType === 'case' ? caseOptions : partnerOptions).map((option) => {
+                      const id = (option as CaseRecord).id;
+                      const label = quickAddForm.targetType === 'case' ? (option as CaseRecord).title : `${(option as Partner).organization} — ${(option as Partner).name}`;
+                      const active = quickAddForm.targetId === id;
+                      return (
+                        <TouchableOpacity key={id} onPress={() => setQuickAddForm((current) => ({ ...current, targetId: id }))} style={[styles.dropdownOption, active && styles.dropdownOptionActive]}>
+                          <Text numberOfLines={1} style={[styles.dropdownOptionText, active && styles.dropdownOptionTextActive, { flex: 1 }]}>{label}</Text>
+                          {active ? <AppIcon name="checkmark-circle" size={18} color={COLORS.forest} /> : null}
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                </>
+              ) : null}
+              <Text style={styles.fieldLabel}>WHEN</Text>
+              <View style={styles.cadenceRow}>
+                {WHEN_OPTIONS.map((option) => (
+                  <Pill key={option.value} label={option.label} active={quickAddForm.when === option.value} onPress={() => setQuickAddForm((current) => ({ ...current, when: option.value }))} />
+                ))}
+              </View>
+              {quickAddForm.when === 'custom' ? (
+                <DropdownField label="DATE" value={quickAddForm.customDate || customDateOptions[0]?.value || ''} icon="calendar-outline" onChange={(customDate) => setQuickAddForm((current) => ({ ...current, customDate }))} options={customDateOptions} />
+              ) : null}
+              {quickAddForm.kind === 'consult' ? (
+                <FormField label="TIME (OPTIONAL, 24H)" value={quickAddForm.time} onChangeText={(time) => setQuickAddForm((current) => ({ ...current, time: time.replace(/[^\d:]/g, '').slice(0, 5) }))} placeholder="14:00" keyboardType="number-pad" />
+              ) : null}
+              <TouchableOpacity style={styles.primaryButton} onPress={saveQuickAdd}><Text style={styles.primaryButtonText}>Add to the list</Text></TouchableOpacity>
+              <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel</Text></TouchableOpacity>
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
+  // Several contacts have numbers — pick who to reach.
+  function ContactPickSheet() {
+    if (!contactPick) return null;
+    const close = () => setContactPick(null);
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={close}>
+        <Pressable style={styles.dropdownOverlay} onPress={close}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <View style={styles.prePromptBody}>
+              <Text style={styles.prePromptTitle}>{contactPick.action === 'call' ? 'Call' : 'Text'} who?</Text>
+              {contactPick.contacts.map((contact) => (
+                <TouchableOpacity key={contact.id} style={styles.contactPickRow} onPress={() => {
+                  const pick = contactPick;
+                  setContactPick(null);
+                  Linking.openURL(`${pick.action === 'call' ? 'tel' : 'sms'}:${contact.phone.replace(/[^\d+]/g, '')}`).catch(() => Alert.alert('Unable to open', 'This device could not open that action.'));
+                  logCardContact(pick.card, pick.action, contact);
+                }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.contactPickName}>{contact.name}{contact.isPrimary ? ' · primary' : ''}</Text>
+                    <Text style={styles.contactPickMeta}>{[contact.relationship, contact.phone].filter(Boolean).join(' · ')}</Text>
+                  </View>
+                  <AppIcon name={contactPick.action === 'call' ? 'call' : 'chatbubble'} size={18} color={COLORS.forest} />
+                </TouchableOpacity>
+              ))}
+              <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel</Text></TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
+  // Same skippable quick-note the case file offers after a call/text.
+  function TodayQuickNoteSheet() {
+    if (!todayQuickNote) return null;
+    const close = () => { setTodayQuickNote(null); setQuickNoteText(''); };
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={close}>
+        <Pressable style={styles.dropdownOverlay} onPress={close}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <View style={styles.prePromptBody}>
+              <View style={styles.prePromptIcon}><AppIcon name={todayQuickNote.action === 'call' ? 'call' : 'chatbubble'} size={24} color={COLORS.forest} /></View>
+              <Text style={styles.prePromptTitle}>Add a note about this {todayQuickNote.action}?</Text>
+              <TextInput
+                value={quickNoteText}
+                onChangeText={setQuickNoteText}
+                placeholder={`What came out of it?${todayQuickNote.contact ? ` (${todayQuickNote.contact.name})` : ''}`}
+                placeholderTextColor="#99A6A1"
+                multiline
+                style={[styles.formInput, styles.multilineInput, { minHeight: 80 }]}
+              />
+              <TouchableOpacity style={styles.primaryButton} onPress={saveTodayQuickNote}><Text style={styles.primaryButtonText}>Save note</Text></TouchableOpacity>
+              <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Skip</Text></TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
   if (!loaded) {
     return (
       <SafeAreaView style={styles.safeArea}>
@@ -3261,6 +4031,12 @@ export default function App() {
       {CaseContactModal()}
       {QuickNoteModal()}
       {DocViewModal()}
+      {DoneSheet()}
+      {NextStepSheet()}
+      {SnoozeSheet()}
+      {QuickAddSheet()}
+      {ContactPickSheet()}
+      {TodayQuickNoteSheet()}
     </SafeAreaView>
   );
 }
@@ -3631,4 +4407,26 @@ const styles = StyleSheet.create({
   docViewHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: 54, paddingBottom: 10 },
   docViewTitle: { flex: 1, color: COLORS.white, fontSize: 15, fontWeight: '800' },
   docViewImage: { flex: 1, marginBottom: 30 },
+  // Today Command Center
+  todaySection: { marginBottom: 16 },
+  todaySectionHeader: { color: COLORS.gray, fontSize: 11, fontWeight: '800', letterSpacing: 1.1, marginBottom: 7, marginTop: 2 },
+  todaySectionHeaderOverdue: { color: COLORS.coral },
+  todayRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, backgroundColor: COLORS.white, borderRadius: 15, padding: 11, marginBottom: 7, borderWidth: 1, borderColor: '#E5E8E3' },
+  todayRowOverdue: { borderLeftWidth: 3, borderLeftColor: COLORS.coral },
+  todayKindIcon: { width: 30, height: 30, borderRadius: 9, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center' },
+  todayKindIconOverdue: { backgroundColor: COLORS.coralPale },
+  todayRowBody: { flex: 1 },
+  todayRowTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '700', lineHeight: 17 },
+  todayRowMeta: { color: COLORS.gray, fontSize: 10, marginTop: 2 },
+  todayOverdueBadge: { color: COLORS.coral, fontSize: 10, fontWeight: '800', marginTop: 3 },
+  todayActionRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 },
+  todayIconButton: { width: 30, height: 28, borderRadius: 9, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, alignItems: 'center', justifyContent: 'center' },
+  todayDoneButton: { flex: 1, height: 28, borderRadius: 9, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
+  todayDoneButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
+  fab: { position: 'absolute', right: 18, bottom: 18, width: 54, height: 54, borderRadius: 19, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', shadowColor: COLORS.ink, shadowOpacity: 0.25, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 8 },
+  sheetSecondaryButton: { minHeight: 46, borderRadius: 14, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center', marginTop: 10, paddingHorizontal: 12 },
+  sheetSecondaryButtonText: { color: COLORS.forest, fontSize: 12, fontWeight: '800', textAlign: 'center' },
+  contactPickRow: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: COLORS.white, borderRadius: 13, borderWidth: 1, borderColor: COLORS.line, padding: 12, marginBottom: 7 },
+  contactPickName: { color: COLORS.ink, fontSize: 13, fontWeight: '800' },
+  contactPickMeta: { color: COLORS.gray, fontSize: 10, marginTop: 2 },
 });

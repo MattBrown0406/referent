@@ -107,12 +107,26 @@ function dateStamp(date: Date): string {
   return `${year}-${month}-${day}`;
 }
 
-// Open follow-ups due today or earlier.
+// Open follow-ups whose effective due date (snooze-aware, mirroring the
+// today_actions view: coalesce(snoozed_until, due_on)) is today or earlier.
 export function followUpsDue(followUps: FollowUp[]): FollowUp[] {
   const today = dateStamp(startOfToday());
   return followUps
-    .filter((followUp) => followUp.status === 'open' && followUp.dueOn <= today)
-    .sort((a, b) => a.dueOn.localeCompare(b.dueOn));
+    .filter((followUp) => followUp.status === 'open' && (followUp.snoozedUntil || followUp.dueOn) <= today)
+    .sort((a, b) => (a.snoozedUntil || a.dueOn).localeCompare(b.snoozedUntil || b.dueOn));
+}
+
+// The home-screen action load: today actions (snooze-aware) + partners whose
+// cadence is due today or past (overdueBy >= 0 — the cadence cards).
+export function todayLoad(followUps: FollowUp[], partners: Partner[]): { actions: number; overdueCount: number } {
+  const today = dateStamp(startOfToday());
+  const due = followUpsDue(followUps);
+  const overdueCount = due.filter((followUp) => followUp.dueOn < today).length;
+  const cadenceDue = partners
+    .filter((partner) => partner.touchCadenceDays != null && partner.touchCadenceDays > 0)
+    .filter((partner) => daysSinceContact(partner) >= (partner.touchCadenceDays as number))
+    .length;
+  return { actions: due.length + cadenceDue, overdueCount };
 }
 
 // Recompute and reschedule everything: one daily 7 AM briefing (only when
@@ -127,31 +141,21 @@ export async function rescheduleNotifications({ partners, referralMatches, refer
     if (!granted) return;
     await Notifications.cancelAllScheduledNotificationsAsync();
 
-    const cold = partnersGoingCold(partners);
-    const matchesInProgress = referralMatches.filter((match) => match.status === 'Matching').length;
-    const pendingReferrals = referrals.filter((referral) => referral.outcome === 'Pending').length;
-    const dueFollowUps = followUpsDue(followUps);
-    const activeCases = cases.filter((record) => record.status !== 'closed' && record.status !== 'lost').length;
-
     let remaining = MAX_SCHEDULED;
+    const now = new Date();
 
-    // (a) Daily briefing at 7:00 AM — skip entirely when everything is zero.
-    if (cold.length > 0 || matchesInProgress > 0 || pendingReferrals > 0 || dueFollowUps.length > 0 || activeCases > 0) {
-      const parts = [
-        `${cold.length} ${cold.length === 1 ? 'partner' : 'partners'} going cold`,
-        `${matchesInProgress} ${matchesInProgress === 1 ? 'match' : 'matches'} in progress`,
-        `${pendingReferrals} pending ${pendingReferrals === 1 ? 'referral' : 'referrals'}`,
-      ];
-      if (dueFollowUps.length > 0) {
-        parts.push(`${dueFollowUps.length} ${dueFollowUps.length === 1 ? 'follow-up' : 'follow-ups'} due`);
-      }
-      if (activeCases > 0) {
-        parts.push(`${activeCases} active ${activeCases === 1 ? 'case' : 'cases'}`);
-      }
+    // (a) Daily briefing at 7:00 AM — the Today Command Center load:
+    // "N actions today · M overdue" (today_actions semantics + cadence
+    // cards). Skip entirely when there is nothing actionable.
+    const load = todayLoad(followUps, partners);
+    if (load.actions > 0) {
+      const body = load.overdueCount > 0
+        ? `${load.actions} ${load.actions === 1 ? 'action' : 'actions'} today · ${load.overdueCount} overdue`
+        : `${load.actions} ${load.actions === 1 ? 'action' : 'actions'} today`;
       await Notifications.scheduleNotificationAsync({
         content: {
           title: 'ReferralFit briefing',
-          body: parts.join(' · '),
+          body,
           data: { target: 'home' },
           ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
         },
@@ -159,6 +163,35 @@ export async function rescheduleNotifications({ partners, referralMatches, refer
           type: Notifications.SchedulableTriggerInputTypes.DAILY,
           hour: 7,
           minute: 0,
+          ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+        },
+      });
+      remaining -= 1;
+    }
+
+    // (a2) Consults with a due_time get their own reminder 30 minutes ahead —
+    // these are appointments, not nags. Only future ones are scheduled
+    // (today's already-passed consult is on the Home list anyway). Snoozed
+    // consults fire on the snooze date instead.
+    for (const followUp of followUps) {
+      if (remaining <= 0) break;
+      if (followUp.status !== 'open' || followUp.kind !== 'consult' || !followUp.dueTime) continue;
+      const effectiveDue = followUp.snoozedUntil || followUp.dueOn;
+      const parsed = new Date(`${effectiveDue}T12:00:00`);
+      if (Number.isNaN(parsed.getTime())) continue;
+      const [hour, minute] = followUp.dueTime.split(':').map(Number);
+      const when = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), hour || 0, (minute || 0) - 30, 0);
+      if (when.getTime() <= now.getTime()) continue;
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title: 'Consult in 30 minutes',
+          body: `${followUp.title} · ${followUp.dueTime}`,
+          data: { target: 'home' },
+          ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+        },
+        trigger: {
+          type: Notifications.SchedulableTriggerInputTypes.DATE,
+          date: when,
           ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
         },
       });
@@ -182,7 +215,6 @@ export async function rescheduleNotifications({ partners, referralMatches, refer
       // nags ordered by how soon they cross their cadence.
       .sort((a, b) => (b.overdueBy - a.overdueBy) || (a.daysSince - b.daysSince));
 
-    const now = new Date();
     for (const { partner, daysSince, overdueBy, due } of candidates) {
       if (remaining <= 0) break;
       const dates: Date[] = [];
@@ -220,17 +252,18 @@ export async function rescheduleNotifications({ partners, referralMatches, refer
       }
     }
 
-    // (c) One reminder per open follow-up at 9:00 AM on its due date. If the
-    // follow-up is already overdue (or 9 AM has passed on the due day), the
-    // reminder goes out at the next 9 AM. Taps route to the home tab, where
-    // the Follow-ups section lives.
+    // (c) One reminder per open follow-up at 9:00 AM on its effective due
+    // date (snooze-aware — a snoozed item nags on the snooze date). If that
+    // day has already passed (or 9 AM has), the reminder goes to the next
+    // 9 AM. Taps route to the home tab.
     const openFollowUps = followUps
       .filter((followUp) => followUp.status === 'open')
-      .sort((a, b) => a.dueOn.localeCompare(b.dueOn));
+      .sort((a, b) => (a.snoozedUntil || a.dueOn).localeCompare(b.snoozedUntil || b.dueOn));
     const partnerById = new Map(partners.map((partner) => [partner.id, partner]));
     for (const followUp of openFollowUps) {
       if (remaining <= 0) break;
-      const parsed = new Date(`${followUp.dueOn}T12:00:00`);
+      const effectiveDue = followUp.snoozedUntil || followUp.dueOn;
+      const parsed = new Date(`${effectiveDue}T12:00:00`);
       if (Number.isNaN(parsed.getTime())) continue;
       const dueDay = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
       let when = atTime(dueDay, 9, 0);
