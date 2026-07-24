@@ -77,8 +77,35 @@ import {
   PacketAudience,
   PacketFitInput,
 } from './src/lib/packet';
+import * as ImagePicker from 'expo-image-picker';
+import {
+  CaseContact,
+  CaseDocument,
+  CaseEvent,
+  CaseEventKind,
+  CaseRecord,
+  CaseSearchResult,
+  CaseStatus,
+  createCase,
+  createCaseFileSignedUrl,
+  createContact,
+  createDocumentRow,
+  deleteContact,
+  deleteDocumentRow,
+  fetchCaseData,
+  isOpenCase,
+  logCaseEvent,
+  newDocumentId,
+  PaymentStatus,
+  removeCaseFile,
+  searchCases,
+  updateCase,
+  updateContact,
+  uploadCaseFile,
+} from './src/lib/cases';
+import { updateMatchCase } from './src/lib/store';
 
-type Tab = 'home' | 'match' | 'directory' | 'referrals';
+type Tab = 'home' | 'match' | 'cases' | 'directory' | 'referrals';
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
 
 const COLORS = {
@@ -100,6 +127,89 @@ const COLORS = {
 
 function makeId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+// ─── Case files (v3) ────────────────────────────────────────────────────────
+
+const CASE_STATUSES: CaseStatus[] = ['inquiry', 'consult', 'deciding', 'engaged', 'intervention', 'placed', 'aftercare', 'closed', 'lost'];
+const PAYMENT_STATUSES: PaymentStatus[] = ['none', 'quoted', 'deposit', 'paid', 'partial', 'refunded'];
+
+// Color-coded by stage: early (inquiry/consult) sage, working (deciding/
+// engaged/intervention) blue, landed (placed/aftercare) forest, ended coral.
+const CASE_STATUS_COLORS: Record<CaseStatus, { bg: string; fg: string }> = {
+  inquiry: { bg: '#E9EFE6', fg: '#5A7261' },
+  consult: { bg: '#E9EFE6', fg: '#5A7261' },
+  deciding: { bg: '#E2EBEE', fg: '#3D6470' },
+  engaged: { bg: '#E2EBEE', fg: '#3D6470' },
+  intervention: { bg: '#E2EBEE', fg: '#3D6470' },
+  placed: { bg: '#DCEAE0', fg: '#1F5A49' },
+  aftercare: { bg: '#DCEAE0', fg: '#1F5A49' },
+  closed: { bg: '#F1EEEA', fg: '#73827D' },
+  lost: { bg: '#F7E7E1', fg: '#B0603F' },
+};
+
+type CaseFormState = {
+  title: string;
+  status: CaseStatus;
+  summary: string;
+  contactName: string;
+  contactRelationship: string;
+  contactPhone: string;
+  contactEmail: string;
+};
+
+function makeEmptyCaseForm(): CaseFormState {
+  return { title: '', status: 'inquiry', summary: '', contactName: '', contactRelationship: '', contactPhone: '', contactEmail: '' };
+}
+
+type CaseContactFormState = {
+  id: string | null; // null = adding a new contact
+  name: string;
+  relationship: string;
+  phone: string;
+  email: string;
+  note: string;
+  isPrimary: boolean;
+};
+
+function makeEmptyCaseContactForm(): CaseContactFormState {
+  return { id: null, name: '', relationship: '', phone: '', email: '', note: '', isPrimary: false };
+}
+
+function relativeActivity(iso: string): string {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '';
+  const diff = Date.now() - then;
+  if (diff < 60_000) return 'just now';
+  const hours = Math.floor(diff / 3_600_000);
+  if (hours < 1) return `${Math.max(1, Math.floor(diff / 60_000))}m ago`;
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  return `${months}mo ago`;
+}
+
+function caseEventIcon(kind: CaseEventKind): IconName {
+  switch (kind) {
+    case 'call': return 'call';
+    case 'text': return 'chatbubble';
+    case 'email': return 'mail';
+    case 'meeting': return 'people';
+    case 'voice_note': return 'mic';
+    case 'status_change': return 'flag';
+    case 'payment': return 'card';
+    case 'referral': return 'paper-plane';
+    case 'document': return 'document';
+    case 'system': return 'cog';
+    default: return 'create';
+  }
+}
+
+function documentIcon(mimeType: string): IconName {
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType === 'application/pdf') return 'document-text';
+  return 'document';
 }
 
 type PartnerForm = {
@@ -479,6 +589,29 @@ export default function App() {
   const [touchNote, setTouchNote] = useState('');
   const [followUps, setFollowUps] = useState<FollowUp[]>([]);
   const [scorecards, setScorecards] = useState<Record<string, PartnerScorecard>>({});
+  // Case files (v3): the family file behind the ledger. Loaded after sign-in
+  // from the cases tables; contacts/events/documents are per-case overlays
+  // fetched when a case file is opened (kept server-side until then).
+  const [cases, setCases] = useState<CaseRecord[]>([]);
+  const [activeCaseId, setActiveCaseId] = useState<string | null>(null);
+  const [caseContacts, setCaseContacts] = useState<CaseContact[]>([]);
+  const [caseEvents, setCaseEvents] = useState<CaseEvent[]>([]);
+  const [caseDocuments, setCaseDocuments] = useState<CaseDocument[]>([]);
+  const [showNewCase, setShowNewCase] = useState(false);
+  const [showClosedCases, setShowClosedCases] = useState(false);
+  const [caseSearch, setCaseSearch] = useState('');
+  const [caseSearchResults, setCaseSearchResults] = useState<CaseSearchResult[] | null>(null);
+  const [pendingCaseMatchId, setPendingCaseMatchId] = useState<string | null>(null);
+  const [caseSearching, setCaseSearching] = useState(false);
+  const [caseForm, setCaseForm] = useState(makeEmptyCaseForm);
+  const [caseContactForm, setCaseContactForm] = useState<CaseContactFormState | null>(null);
+  const [timelineDraft, setTimelineDraft] = useState('');
+  const [timelineKind, setTimelineKind] = useState<CaseEventKind>('note');
+  const [quickNoteContact, setQuickNoteContact] = useState<{ contact: CaseContact; kind: 'call' | 'text' | 'email' } | null>(null);
+  const [quickNoteText, setQuickNoteText] = useState('');
+  const [docLabel, setDocLabel] = useState('');
+  const [docUploading, setDocUploading] = useState(false);
+  const [docView, setDocView] = useState<{ url: string; mimeType: string; label: string } | null>(null);
   // Match Packet compose state: which partner + which match profile the
   // packet is for, and whether the assign-on-send flow should run.
   const [packetTarget, setPacketTarget] = useState<{ partner: Partner; match: ReferralMatch; assignOnSend: boolean } | null>(null);
@@ -510,14 +643,17 @@ export default function App() {
 
   // Push a snapshot of in-memory state to the offline cache, refresh the
   // offline indicator + queued-write count, and recompute notifications.
-  const syncDerived = useCallback(async (snapshot?: Snapshot) => {
+  // Cases are app-side state (not part of the store Snapshot) and are passed
+  // separately to the briefing scheduler.
+  const syncDerived = useCallback(async (snapshot?: Snapshot, caseList?: CaseRecord[]) => {
     const data = snapshot || { partners, referrals, referralMatches, touches, followUps, scorecards };
+    const activeCases = caseList ?? cases;
     const pending = await pendingWriteCount();
     setQueuedWrites(pending);
     setOffline(pending > 0);
     await persistCache(data);
-    rescheduleNotifications(data).catch(() => undefined);
-  }, [partners, referrals, referralMatches, touches, followUps, scorecards]);
+    rescheduleNotifications({ ...data, cases: activeCases }).catch(() => undefined);
+  }, [partners, referrals, referralMatches, touches, followUps, scorecards, cases]);
 
   // Apply a freshly loaded snapshot to state, restoring the match-form
   // selection exactly like the previous AsyncStorage loader did.
@@ -567,10 +703,14 @@ export default function App() {
         const result = await hydrate();
         if (!mounted) return;
         applySnapshot(result.snapshot);
+        const caseData = await fetchCaseData().catch(() => null);
+        if (!mounted) return;
+        if (caseData) setCases(caseData.cases);
+        const activeCaseList = caseData?.cases || [];
         const pending = await pendingWriteCount();
         setQueuedWrites(pending);
         setOffline(result.source === 'cache' || pending > 0);
-        rescheduleNotifications(result.snapshot).catch(() => undefined);
+        rescheduleNotifications({ ...result.snapshot, cases: activeCaseList }).catch(() => undefined);
         setNotifPrePromptVisible(true);
       }
       if (mounted) setLoaded(true);
@@ -739,6 +879,8 @@ export default function App() {
     }
     const existing = referralMatches.find((item) => item.id === selectedMatchId);
     const now = new Date().toISOString();
+    // A match started from a case file (Find placement) inherits its case.
+    const linkedCaseId = pendingCaseMatchId || existing?.caseId;
     const referralMatch: ReferralMatch = {
       id: existing?.id || makeId('m'),
       clientLabel: matchClientLabel.trim(),
@@ -753,10 +895,13 @@ export default function App() {
       updatedAt: now,
       assignedPartnerId: existing?.assignedPartnerId,
       referralId: existing?.referralId,
+      caseId: linkedCaseId || undefined,
     };
     const nextMatches = [referralMatch, ...referralMatches.filter((item) => item.id !== referralMatch.id)];
     setReferralMatches(nextMatches);
     setSelectedMatchId(referralMatch.id);
+    setPendingCaseMatchId(null);
+    if (linkedCaseId && !existing?.caseId) linkMatchToCase(referralMatch, linkedCaseId);
     (existing ? updateMatchProfile(referralMatch) : createMatchProfile(referralMatch))
       .then(() => syncDerived({ partners, referrals, referralMatches: nextMatches, touches, followUps, scorecards }))
       .catch((error) => {
@@ -896,6 +1041,8 @@ export default function App() {
     const { partner, match, assignOnSend } = packetTarget;
     const now = new Date();
     const todayStamp = localDateStamp();
+    // A packet sent on a case-linked profile links everything it creates.
+    const caseId = match.caseId;
     let nextMatches = referralMatches;
     let referral: Referral | null = null;
     let assignedMatch: ReferralMatch | null = null;
@@ -912,6 +1059,7 @@ export default function App() {
         note: 'Match packet sent',
         packetSentAt: now.toISOString(),
         matchProfileId: match.id,
+        caseId,
       };
       assignedMatch = {
         ...match,
@@ -931,7 +1079,7 @@ export default function App() {
       // Already assigned: stamp the packet fields onto the existing referral.
       referral = referrals.find((item) => item.id === match.referralId) || null;
       if (referral) {
-        referral = { ...referral, packetSentAt: now.toISOString(), matchProfileId: referral.matchProfileId || match.id };
+        referral = { ...referral, packetSentAt: now.toISOString(), matchProfileId: referral.matchProfileId || match.id, caseId: referral.caseId || caseId };
       }
     }
     if (!referral) {
@@ -951,6 +1099,7 @@ export default function App() {
       id: makeId('f'),
       partnerId: partner.id,
       referralId,
+      caseId,
       title: 'Check in — did they admit?',
       dueOn: addDaysStamp(3),
       status: 'open',
@@ -988,6 +1137,20 @@ export default function App() {
       writes.push(updateReferralPacketStamp(referralId, now.toISOString(), match.id));
     }
     writes.push(createTouch(touch), createFollowUp(followUp));
+    if (caseId) {
+      const linkedCaseId = caseId;
+      const eventId = makeId('e');
+      const event: CaseEvent = {
+        id: eventId,
+        caseId: linkedCaseId,
+        kind: 'referral',
+        body: `Sent packet to ${partner.organization}`,
+        referralId,
+        occurredAt: now.toISOString(),
+      };
+      applyCaseEvent(event);
+      writes.push(logCaseEvent(linkedCaseId, 'referral', event.body, { referralId }, eventId).then(() => undefined));
+    }
 
     Promise.all(writes)
       .then(() => {
@@ -998,6 +1161,423 @@ export default function App() {
         Alert.alert('Sync issue', `The packet was logged on this device but could not fully sync: ${error.message}`);
         syncDerived();
       });
+  }
+
+  // ─── Case files ─────────────────────────────────────────────────────────
+  // Every case mutation: optimistic local update first, then the server
+  // write; on failure the local update is rolled back and an alert explains.
+  // (Case data is deliberately not queued offline — see src/lib/cases.ts.)
+
+  const activeCase = cases.find((item) => item.id === activeCaseId) || null;
+
+  // Open a case file: fetch contacts + timeline + documents for just this
+  // case (lists stay server-side until the file is opened).
+  function openCase(caseId: string) {
+    setActiveCaseId(caseId);
+    setTimelineDraft('');
+    setTimelineKind('note');
+    setDocLabel('');
+    fetchCaseData()
+      .then((data) => {
+        setCaseContacts(data.caseContacts.filter((item) => item.caseId === caseId));
+        setCaseEvents(data.caseEvents.filter((item) => item.caseId === caseId));
+        setCaseDocuments(data.caseDocuments.filter((item) => item.caseId === caseId));
+      })
+      .catch(() => {
+        setCaseContacts([]);
+        setCaseEvents([]);
+        setCaseDocuments([]);
+      });
+  }
+
+  function closeCase() {
+    setActiveCaseId(null);
+    setCaseContacts([]);
+    setCaseEvents([]);
+    setCaseDocuments([]);
+    setCaseContactForm(null);
+    setQuickNoteContact(null);
+    setDocView(null);
+  }
+
+  // Insert or replace an event in the local timeline and reflect the
+  // activity on the case's updated_at ordering.
+  function applyCaseEvent(event: CaseEvent) {
+    setCaseEvents((current) => [event, ...current.filter((item) => item.id !== event.id)]);
+    setCases((current) => current.map((item) => item.id === event.caseId ? { ...item, updatedAt: event.occurredAt } : item));
+  }
+
+  function failCaseChange(message: string, rollback: () => void) {
+    rollback();
+    Alert.alert('Case file', message);
+  }
+
+  function saveNewCase() {
+    if (!caseForm.title.trim()) {
+      Alert.alert('Name the case', 'A title is required — the family name and who the case is about works well.');
+      return;
+    }
+    const now = new Date().toISOString();
+    const record: CaseRecord = {
+      id: makeId('c'),
+      title: caseForm.title.trim(),
+      status: caseForm.status,
+      summary: caseForm.summary.trim(),
+      paymentStatus: 'none',
+      quotedAmount: null,
+      paidAmount: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const hasPrimaryContact = Boolean(caseForm.contactName.trim() || caseForm.contactPhone.trim() || caseForm.contactEmail.trim());
+    const primaryContact: CaseContact | null = hasPrimaryContact ? {
+      id: makeId('cc'),
+      caseId: record.id,
+      name: caseForm.contactName.trim(),
+      relationship: caseForm.contactRelationship.trim(),
+      phone: caseForm.contactPhone.trim(),
+      email: caseForm.contactEmail.trim(),
+      isPrimary: true,
+      note: '',
+    } : null;
+    const previous = cases;
+    setCases([record, ...cases]);
+    setShowNewCase(false);
+    setCaseForm(makeEmptyCaseForm());
+    const writes: Promise<unknown>[] = [createCase(record)];
+    if (primaryContact) writes.push(createContact(primaryContact));
+    Promise.all(writes)
+      .then(() => {
+        syncDerived(undefined, [record, ...previous]);
+        openCase(record.id);
+      })
+      .catch((error) => failCaseChange(`The case could not be saved: ${error.message}`, () => setCases(previous)));
+  }
+
+  function changeCaseStatus(record: CaseRecord, status: CaseStatus) {
+    if (status === record.status) return;
+    const updated: CaseRecord = { ...record, status, updatedAt: new Date().toISOString() };
+    const previous = cases;
+    const next = previous.map((item) => (item.id === record.id ? updated : item));
+    setCases(next);
+    const eventId = makeId('e');
+    const event: CaseEvent = {
+      id: eventId,
+      caseId: record.id,
+      kind: 'status_change',
+      body: `${record.status} → ${status}`,
+      occurredAt: updated.updatedAt,
+    };
+    applyCaseEvent(event);
+    Promise.all([updateCase(updated), logCaseEvent(record.id, 'status_change', event.body, {}, eventId)])
+      .then(() => syncDerived(undefined, next))
+      .catch((error) => failCaseChange(`The status change could not be saved: ${error.message}`, () => {
+        setCases(previous);
+        setCaseEvents((current) => current.filter((item) => item.id !== eventId));
+      }));
+  }
+
+  function saveCasePayment(record: CaseRecord, patch: { paymentStatus?: PaymentStatus; quotedAmount?: number | null; paidAmount?: number }) {
+    const updated: CaseRecord = { ...record, ...patch, updatedAt: new Date().toISOString() };
+    const previous = cases;
+    const next = previous.map((item) => (item.id === record.id ? updated : item));
+    setCases(next);
+    const bits: string[] = [];
+    if (patch.paymentStatus && patch.paymentStatus !== record.paymentStatus) bits.push(`Payment: ${record.paymentStatus} → ${patch.paymentStatus}`);
+    if (patch.quotedAmount !== undefined && patch.quotedAmount !== record.quotedAmount) bits.push(`Quoted ${patch.quotedAmount != null ? formatMoney(patch.quotedAmount) : '—'}`);
+    if (patch.paidAmount !== undefined && patch.paidAmount !== record.paidAmount) bits.push(`Paid ${formatMoney(patch.paidAmount)}`);
+    const body = bits.join(' · ') || 'Payment updated';
+    const eventId = makeId('e');
+    applyCaseEvent({ id: eventId, caseId: record.id, kind: 'payment', body, occurredAt: updated.updatedAt });
+    Promise.all([updateCase(updated), logCaseEvent(record.id, 'payment', body, {}, eventId)])
+      .then(() => syncDerived(undefined, next))
+      .catch((error) => failCaseChange(`The payment change could not be saved: ${error.message}`, () => {
+        setCases(previous);
+        setCaseEvents((current) => current.filter((item) => item.id !== eventId));
+      }));
+  }
+
+  function saveCaseSummary(record: CaseRecord, summary: string) {
+    const updated: CaseRecord = { ...record, summary: summary.trim(), updatedAt: new Date().toISOString() };
+    const previous = cases;
+    const next = previous.map((item) => (item.id === record.id ? updated : item));
+    setCases(next);
+    updateCase(updated)
+      .then(() => syncDerived(undefined, next))
+      .catch((error) => failCaseChange(`The summary could not be saved: ${error.message}`, () => setCases(previous)));
+  }
+
+  function saveCaseContact() {
+    if (!caseContactForm || !activeCase) return;
+    if (!caseContactForm.name.trim()) {
+      Alert.alert('Name the contact', 'Add at least a name so you know who this is later.');
+      return;
+    }
+    const form = caseContactForm;
+    const existing = caseContacts.find((item) => item.id === form.id) || null;
+    const contact: CaseContact = {
+      id: form.id || makeId('cc'),
+      caseId: activeCase.id,
+      name: form.name.trim(),
+      relationship: form.relationship.trim(),
+      phone: form.phone.trim(),
+      email: form.email.trim(),
+      note: form.note.trim(),
+      isPrimary: form.isPrimary || (!existing && caseContacts.length === 0),
+    };
+    // Exactly one primary: setting a new primary clears the old client-side
+    // (and the clearing updates are written alongside).
+    const demoted = contact.isPrimary ? caseContacts.filter((item) => item.isPrimary && item.id !== contact.id) : [];
+    const previousContacts = caseContacts;
+    const nextContacts = [
+      ...(existing ? caseContacts.map((item) => (item.id === contact.id ? contact : item.isPrimary && contact.isPrimary ? { ...item, isPrimary: false } : item)) : [...caseContacts, contact]),
+    ];
+    setCaseContacts(nextContacts);
+    setCaseContactForm(null);
+    const writes: Promise<unknown>[] = [existing ? updateContact(contact) : createContact(contact)];
+    for (const old of demoted) writes.push(updateContact({ ...old, isPrimary: false }));
+    Promise.all(writes)
+      .catch((error) => failCaseChange(`The contact could not be saved: ${error.message}`, () => setCaseContacts(previousContacts)));
+  }
+
+  function removeCaseContact(contact: CaseContact) {
+    Alert.alert('Remove contact?', `${contact.name} will be removed from this case file.`, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Remove', style: 'destructive', onPress: () => {
+        const previousContacts = caseContacts;
+        setCaseContacts(caseContacts.filter((item) => item.id !== contact.id));
+        deleteContact(contact.id)
+          .catch((error) => failCaseChange(`The contact could not be removed: ${error.message}`, () => setCaseContacts(previousContacts)));
+      } },
+    ]);
+  }
+
+  // One-tap contact action: open the dialer/messages/mail AND log the
+  // timeline event, then offer the skippable quick note.
+  function contactAction(contact: CaseContact, kind: 'call' | 'text' | 'email') {
+    if (!activeCase) return;
+    const target = kind === 'call' ? contact.phone.replace(/[^\d+]/g, '') : kind === 'text' ? contact.phone.replace(/[^\d+]/g, '') : contact.email;
+    if (!target) {
+      Alert.alert('Nothing to send to', kind === 'email' ? 'This contact has no email address.' : 'This contact has no phone number.');
+      return;
+    }
+    const url = kind === 'call' ? `tel:${target}` : kind === 'text' ? `sms:${target}` : `mailto:${target}`;
+    Linking.openURL(url).catch(() => Alert.alert('Unable to open', 'This device could not open that action.'));
+    const verbs = { call: 'Called', text: 'Texted', email: 'Emailed' } as const;
+    const eventId = makeId('e');
+    const event: CaseEvent = {
+      id: eventId,
+      caseId: activeCase.id,
+      kind,
+      body: `${verbs[kind]} ${contact.name}${contact.relationship ? ` (${contact.relationship})` : ''}`,
+      contactId: contact.id,
+      occurredAt: new Date().toISOString(),
+    };
+    applyCaseEvent(event);
+    logCaseEvent(activeCase.id, kind, event.body, { contactId: contact.id }, eventId)
+      .catch((error) => failCaseChange(`The ${kind} could not be logged: ${error.message}`, () => {
+        setCaseEvents((current) => current.filter((item) => item.id !== eventId));
+      }));
+    setQuickNoteContact({ contact, kind });
+    setQuickNoteText('');
+  }
+
+  function saveQuickNote() {
+    if (!quickNoteContact || !activeCase || !quickNoteText.trim()) {
+      setQuickNoteContact(null);
+      setQuickNoteText('');
+      return;
+    }
+    const { contact } = quickNoteContact;
+    const eventId = makeId('e');
+    const event: CaseEvent = {
+      id: eventId,
+      caseId: activeCase.id,
+      kind: 'note',
+      body: quickNoteText.trim(),
+      contactId: contact.id,
+      occurredAt: new Date().toISOString(),
+    };
+    applyCaseEvent(event);
+    setQuickNoteContact(null);
+    setQuickNoteText('');
+    logCaseEvent(activeCase.id, 'note', event.body, { contactId: contact.id }, eventId)
+      .catch((error) => failCaseChange(`The note could not be saved: ${error.message}`, () => {
+        setCaseEvents((current) => current.filter((item) => item.id !== eventId));
+      }));
+  }
+
+  function addTimelineEntry() {
+    if (!activeCase || !timelineDraft.trim()) return;
+    const eventId = makeId('e');
+    const event: CaseEvent = {
+      id: eventId,
+      caseId: activeCase.id,
+      kind: timelineKind,
+      body: timelineDraft.trim(),
+      occurredAt: new Date().toISOString(),
+    };
+    applyCaseEvent(event);
+    setTimelineDraft('');
+    setTimelineKind('note');
+    logCaseEvent(activeCase.id, event.kind, event.body, {}, eventId)
+      .catch((error) => failCaseChange(`The entry could not be saved: ${error.message}`, () => {
+        setCaseEvents((current) => current.filter((item) => item.id !== eventId));
+      }));
+  }
+
+  // ─── Case documents (private bucket, signed URLs only) ───────────────────
+
+  async function pickCaseDocument() {
+    if (!activeCase || !session?.user?.id) return;
+    let result: ImagePicker.ImagePickerResult;
+    try {
+      result = await ImagePicker.launchImageLibraryAsync({ quality: 0.8, allowsMultipleSelection: false });
+    } catch {
+      Alert.alert('Photos unavailable', 'The photo library could not be opened. Case documents need a development build (expo-image-picker is a native module).');
+      return;
+    }
+    if (result.canceled || !result.assets?.length) return;
+    const asset = result.assets[0];
+    const documentId = newDocumentId();
+    const fileName = asset.fileName || `photo-${Date.now()}.jpg`;
+    const mimeType = asset.mimeType || 'image/jpeg';
+    const label = docLabel.trim() || fileName.replace(/\.[^.]+$/, '');
+    setDocUploading(true);
+    try {
+      const { storagePath } = await uploadCaseFile({
+        ownerId: session.user.id,
+        caseId: activeCase.id,
+        documentId,
+        localUri: asset.uri,
+        fileName,
+        mimeType,
+        sizeBytes: asset.fileSize ?? null,
+      });
+      const document: CaseDocument = {
+        id: documentId,
+        caseId: activeCase.id,
+        label,
+        storagePath,
+        mimeType,
+        sizeBytes: asset.fileSize ?? null,
+        createdAt: new Date().toISOString(),
+      };
+      await createDocumentRow(document);
+      setCaseDocuments((current) => [...current, document]);
+      setDocLabel('');
+      const eventId = makeId('e');
+      const event: CaseEvent = {
+        id: eventId,
+        caseId: activeCase.id,
+        kind: 'document',
+        body: `Added document: ${label}`,
+        documentId: document.id,
+        occurredAt: new Date().toISOString(),
+      };
+      applyCaseEvent(event);
+      logCaseEvent(activeCase.id, 'document', event.body, { documentId: document.id }, eventId).catch(() => undefined);
+    } catch (error) {
+      Alert.alert('Upload failed', `The document could not be uploaded: ${(error as Error).message}`);
+    } finally {
+      setDocUploading(false);
+    }
+  }
+
+  async function viewCaseDocument(document: CaseDocument) {
+    try {
+      const url = await createCaseFileSignedUrl(document.storagePath);
+      if (document.mimeType.startsWith('image/')) {
+        setDocView({ url, mimeType: document.mimeType, label: document.label });
+      } else {
+        Linking.openURL(url).catch(() => Alert.alert('Unable to open', 'This device could not open that document.'));
+      }
+    } catch (error) {
+      Alert.alert('Could not open', (error as Error).message);
+    }
+  }
+
+  function removeCaseDocument(document: CaseDocument) {
+    Alert.alert('Delete document?', `"${document.label}" will be permanently removed.`, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: async () => {
+        const previousDocs = caseDocuments;
+        setCaseDocuments(caseDocuments.filter((item) => item.id !== document.id));
+        try {
+          await deleteDocumentRow(document.id);
+          await removeCaseFile(document.storagePath);
+        } catch (error) {
+          failCaseChange(`The document could not be deleted: ${(error as Error).message}`, () => setCaseDocuments(previousDocs));
+        }
+      } },
+    ]);
+  }
+
+  // ─── Case search ("the 14 months ago moment") ────────────────────────────
+
+  useEffect(() => {
+    const query = caseSearch.trim();
+    if (!query) {
+      setCaseSearchResults(null);
+      setCaseSearching(false);
+      return;
+    }
+    setCaseSearching(true);
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      searchCases(query)
+        .then((results) => { if (!cancelled) { setCaseSearchResults(results); setCaseSearching(false); } })
+        .catch(() => { if (!cancelled) { setCaseSearchResults([]); setCaseSearching(false); } });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [caseSearch]);
+
+  // ─── Case → Match linkage ────────────────────────────────────────────────
+
+  // "Find placement" on a case file: pre-fill the match form with hints from
+  // the case summary (state code, insurance name, cash budget). When the new
+  // profile is saved on the Match tab it is linked back to the case
+  // (pendingCaseMatchId), and the case row points at the profile.
+  function startMatchForCase(record: CaseRecord) {
+    const existing = referralMatches.find((item) => item.id === record.matchProfileId);
+    if (existing) {
+      loadReferralMatch(existing);
+      setTab('match');
+      closeCase();
+      return;
+    }
+    const text = `${record.title} ${record.summary}`;
+    const stateHint = stateOptions.find((state) => new RegExp(`\\b${state.code}\\b`).test(text) || text.toLowerCase().includes(state.name.toLowerCase()));
+    const insuranceHint = nationalInsuranceProviders.find((provider) => provider !== 'Cash pay' && text.toLowerCase().includes(provider.toLowerCase()));
+    const budgetMatch = text.match(/\$\s?([\d,]{3,})/);
+    const budgetHint = budgetMatch ? String(Number(budgetMatch[1].replace(/,/g, '')) || '') : '';
+    setPendingCaseMatchId(record.id);
+    setSelectedMatchId(null);
+    setMatchClientLabel(record.title);
+    setMatchType('Any type');
+    setMatchState(stateHint?.code || 'ANY');
+    setMatchInsurance(insuranceHint || 'Cash pay');
+    setMatchNetworkPreferences(['In-network']);
+    setMatchBudget(insuranceHint ? '' : budgetHint);
+    setMatchTherapies([]);
+    setTab('match');
+    closeCase();
+  }
+
+  // Called from saveCurrentReferralMatch: stamp case_id on the saved match
+  // profile (queued match.update) and point the case's match_profile_id at it
+  // (direct case update — rolled back with an alert if it fails).
+  function linkMatchToCase(matchProfile: ReferralMatch, caseId: string) {
+    const stamped = { ...matchProfile, caseId };
+    updateMatchCase(matchProfile.id, caseId)
+      .then(() => syncDerived({ partners, referrals, referralMatches: referralMatches.map((item) => (item.id === stamped.id ? stamped : item)), touches, followUps, scorecards }, cases))
+      .catch(() => undefined);
+    const record = cases.find((item) => item.id === caseId);
+    if (!record || record.matchProfileId === matchProfile.id) return;
+    const updated: CaseRecord = { ...record, matchProfileId: matchProfile.id, updatedAt: new Date().toISOString() };
+    const previous = cases;
+    setCases(previous.map((item) => (item.id === caseId ? updated : item)));
+    updateCase(updated).catch((error) => failCaseChange(`The case link could not be saved: ${error.message}`, () => setCases(previous)));
   }
 
   // ─── Follow-ups ─────────────────────────────────────────────────────────
@@ -1329,6 +1909,8 @@ export default function App() {
       .sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound))
       .slice(0, 3);
     const dueFollowUps = followUpsDue(followUps);
+    const openCases = cases.filter(isOpenCase).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const caseTitle = (caseId?: string) => (caseId ? cases.find((item) => item.id === caseId)?.title : undefined);
     const todayStamp = localDateStamp();
     const overdueDays = (dueOn: string) => {
       const parsed = new Date(`${dueOn}T12:00:00`);
@@ -1360,7 +1942,7 @@ export default function App() {
                     <View style={{ flex: 1 }}>
                       <Text style={styles.followUpTitle}>{followUp.title}</Text>
                       <Text style={styles.followUpMeta}>
-                        {partner ? `${partner.organization} · ` : ''}{overdueBy > 0 ? `${overdueBy} ${overdueBy === 1 ? 'day' : 'days'} overdue` : 'Due today'}
+                        {partner ? `${partner.organization} · ` : ''}{followUp.caseId && caseTitle(followUp.caseId) ? `Case: ${caseTitle(followUp.caseId)} · ` : ''}{overdueBy > 0 ? `${overdueBy} ${overdueBy === 1 ? 'day' : 'days'} overdue` : 'Due today'}
                       </Text>
                       <View style={styles.followUpActions}>
                         <TouchableOpacity style={styles.followUpActionDone} onPress={() => completeFollowUp(followUp)}><Text style={styles.followUpActionDoneText}>Done</Text></TouchableOpacity>
@@ -1369,6 +1951,27 @@ export default function App() {
                       </View>
                     </View>
                   </View>
+                );
+              })}
+            </View>
+          </>
+        ) : null}
+
+        {openCases.length ? (
+          <>
+            <SectionTitle title="Active cases" action="View all" onPress={() => setTab('cases')} />
+            <View style={styles.followUpCard}>
+              {openCases.slice(0, 3).map((record, index) => {
+                const colors = CASE_STATUS_COLORS[record.status];
+                return (
+                  <TouchableOpacity key={record.id} onPress={() => openCase(record.id)} style={[styles.followUpRow, index === Math.min(openCases.length, 3) - 1 && { borderBottomWidth: 0 }]}>
+                    <View style={[styles.followUpIcon, { backgroundColor: colors.bg }]}><AppIcon name="folder" size={16} color={colors.fg} /></View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.followUpTitle} numberOfLines={1}>{record.title}</Text>
+                      <Text style={styles.followUpMeta}>{record.status} · active {relativeActivity(record.updatedAt)}</Text>
+                    </View>
+                    <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+                  </TouchableOpacity>
                 );
               })}
             </View>
@@ -1615,6 +2218,102 @@ export default function App() {
     );
   }
 
+  // Case list row shared by the main list and search results. The primary
+  // contact shown on the card comes from the shared caseContacts state
+  // (populated when any case file is opened).
+  function CaseRow({ record, lastInGroup }: { record: CaseRecord; lastInGroup?: boolean }) {
+    const colors = CASE_STATUS_COLORS[record.status];
+    const primary = caseContacts.find((item) => item.caseId === record.id && item.isPrimary);
+    return (
+      <TouchableOpacity onPress={() => openCase(record.id)} style={[styles.caseRow, lastInGroup && { borderBottomWidth: 0 }]}>
+        <View style={[styles.caseRowIcon, { backgroundColor: colors.bg }]}><AppIcon name="folder" size={17} color={colors.fg} /></View>
+        <View style={{ flex: 1 }}>
+          <Text numberOfLines={1} style={styles.caseRowTitle}>{record.title}</Text>
+          <View style={styles.caseRowMetaLine}>
+            <View style={[styles.caseChip, { backgroundColor: colors.bg }]}><Text style={[styles.caseChipText, { color: colors.fg }]}>{record.status}</Text></View>
+            <View style={[styles.caseChip, { backgroundColor: COLORS.mintPale }]}><Text style={[styles.caseChipText, { color: COLORS.forest }]}>{record.paymentStatus === 'none' ? 'no payment' : record.paymentStatus}</Text></View>
+          </View>
+          <Text numberOfLines={1} style={styles.caseRowMeta}>
+            {primary ? `${primary.name}${primary.phone ? ` · ${primary.phone}` : ''} · ` : ''}active {relativeActivity(record.updatedAt)}
+          </Text>
+        </View>
+        <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+      </TouchableOpacity>
+    );
+  }
+
+  function CasesScreen() {
+    const openCases = cases.filter(isOpenCase).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const closedCases = cases.filter((item) => !isOpenCase(item)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const searching = caseSearch.trim().length > 0;
+    const resultCases = searching && caseSearchResults
+      ? caseSearchResults.map((result) => cases.find((item) => item.id === result.caseId)).filter((item): item is CaseRecord => Boolean(item))
+      : [];
+    return (
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
+        {renderHeader('Cases')}
+        <View style={styles.directoryTitleRow}>
+          <View><Text style={styles.screenTitle}>Case files</Text><Text style={styles.screenSubtitle}>One family, one place — contacts, notes, documents, and the timeline.</Text></View>
+          <TouchableOpacity style={styles.addButton} onPress={() => { setCaseForm(makeEmptyCaseForm()); setShowNewCase(true); }}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>New case</Text></TouchableOpacity>
+        </View>
+        <View style={styles.searchBox}>
+          <AppIcon name="search" size={19} color={COLORS.gray} />
+          <TextInput
+            value={caseSearch}
+            onChangeText={setCaseSearch}
+            placeholder="Case title, contact name, or phone number"
+            placeholderTextColor="#91A09B"
+            style={styles.searchInput}
+          />
+          {caseSearch ? <TouchableOpacity onPress={() => setCaseSearch('')}><AppIcon name="close-circle" size={18} color={COLORS.gray} /></TouchableOpacity> : null}
+        </View>
+
+        {searching ? (
+          <View style={[styles.followUpCard, { marginTop: 14 }]}>
+            {caseSearching ? <Text style={styles.caseSearchHint}>Searching…</Text> : null}
+            {!caseSearching && resultCases.length === 0 ? (
+              <Text style={styles.caseSearchHint}>No cases match "{caseSearch.trim()}". Phone search matches on the last digits, so a local number still finds a +1 contact.</Text>
+            ) : null}
+            {resultCases.map((record, index) => (
+              <TouchableOpacity key={record.id} onPress={() => openCase(record.id)} style={[styles.caseRow, index === resultCases.length - 1 && { borderBottomWidth: 0 }]}>
+                <View style={[styles.caseRowIcon, { backgroundColor: CASE_STATUS_COLORS[record.status].bg }]}><AppIcon name="folder" size={17} color={CASE_STATUS_COLORS[record.status].fg} /></View>
+                <View style={{ flex: 1 }}>
+                  <Text numberOfLines={1} style={styles.caseRowTitle}>{record.title}</Text>
+                  <Text numberOfLines={1} style={styles.caseRowMeta}>{record.status} · last activity {relativeActivity(record.updatedAt)}</Text>
+                </View>
+                <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+              </TouchableOpacity>
+            ))}
+          </View>
+        ) : (
+          <>
+            <Text style={styles.directoryCount}>{openCases.length} OPEN {openCases.length === 1 ? 'CASE' : 'CASES'}</Text>
+            {openCases.length ? (
+              <View style={styles.followUpCard}>
+                {openCases.map((record, index) => <CaseRow key={record.id} record={record} lastInGroup={index === openCases.length - 1} />)}
+              </View>
+            ) : (
+              <EmptyState icon="folder-open-outline" title="No cases yet" body="A case file keeps one family's contacts, notes, documents, and timeline in a single place. Start one from the first call." />
+            )}
+            {closedCases.length ? (
+              <View style={{ marginTop: 18 }}>
+                <TouchableOpacity style={styles.closedToggle} onPress={() => setShowClosedCases((current) => !current)}>
+                  <AppIcon name={showClosedCases ? 'chevron-down' : 'chevron-forward'} size={16} color={COLORS.gray} />
+                  <Text style={styles.closedToggleText}>Closed ({closedCases.length})</Text>
+                </TouchableOpacity>
+                {showClosedCases ? (
+                  <View style={styles.followUpCard}>
+                    {closedCases.map((record, index) => <CaseRow key={record.id} record={record} lastInGroup={index === closedCases.length - 1} />)}
+                  </View>
+                ) : null}
+              </View>
+            ) : null}
+          </>
+        )}
+      </ScrollView>
+    );
+  }
+
   function DirectoryScreen() {
     return (
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
@@ -1712,6 +2411,7 @@ export default function App() {
     const items: { key: Tab; label: string; icon: IconName; activeIcon: IconName }[] = [
       { key: 'home', label: 'Home', icon: 'home-outline', activeIcon: 'home' },
       { key: 'match', label: 'Match', icon: 'sparkles-outline', activeIcon: 'sparkles' },
+      { key: 'cases', label: 'Cases', icon: 'folder-outline', activeIcon: 'folder' },
       { key: 'directory', label: 'Directory', icon: 'people-outline', activeIcon: 'people' },
       { key: 'referrals', label: 'Referrals', icon: 'swap-horizontal-outline', activeIcon: 'swap-horizontal' },
     ];
@@ -1727,6 +2427,388 @@ export default function App() {
           );
         })}
       </View>
+    );
+  }
+
+  // ─── Case file modals ────────────────────────────────────────────────────
+
+  // The file itself: header (status + payment), contacts with one-tap
+  // actions, the timeline, documents, and linked business objects.
+  function CaseDetailModal() {
+    if (!activeCase) return null;
+    const record = activeCase;
+    const colors = CASE_STATUS_COLORS[record.status];
+    const linkedMatch = referralMatches.find((item) => item.id === record.matchProfileId)
+      || referralMatches.find((item) => item.caseId === record.id)
+      || null;
+    const linkedReferrals = referrals.filter((item) => item.caseId === record.id || (linkedMatch ? item.matchProfileId === linkedMatch.id : false));
+    const linkedFollowUps = followUps.filter((item) => item.caseId === record.id && item.status === 'open');
+    const timeline = caseEvents.slice().sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={closeCase}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityLabel="Close case file" onPress={closeCase} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Case file</Text>
+              <View style={styles.closeButton} />
+            </View>
+            <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled">
+
+              {/* Header: title, status picker chip, payment row, summary */}
+              <View style={styles.profileHero}>
+                <Text style={styles.profileOrg}>{record.title}</Text>
+                <View style={styles.profileMeta}>
+                  <TouchableOpacity
+                    accessibilityLabel={`Status: ${record.status}. Tap to change.`}
+                    onPress={() => Alert.alert('Case status', 'Every change is written to the timeline.', [...CASE_STATUSES.map((status): { text: string; onPress: () => void } => ({ text: status, onPress: () => changeCaseStatus(record, status) })), { text: 'Cancel', style: 'cancel' }])}
+                    style={[styles.caseChip, styles.caseChipLarge, { backgroundColor: colors.bg }]}
+                  >
+                    <Text style={[styles.caseChipText, styles.caseChipLargeText, { color: colors.fg }]}>{record.status}</Text>
+                    <AppIcon name="chevron-down" size={12} color={colors.fg} />
+                  </TouchableOpacity>
+                </View>
+                <Text style={styles.profileName}>Opened {shortDate(record.createdAt.slice(0, 10))} · active {relativeActivity(record.updatedAt)}</Text>
+              </View>
+
+              <View style={styles.infoCard}>
+                <Text style={styles.infoTitle}>Payment</Text>
+                <View style={styles.casePaymentRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.infoLabel}>Status</Text>
+                    <TouchableOpacity
+                      onPress={() => Alert.alert('Payment status', undefined, [...PAYMENT_STATUSES.map((status): { text: string; onPress: () => void } => ({ text: status, onPress: () => saveCasePayment(record, { paymentStatus: status }) })), { text: 'Cancel', style: 'cancel' }])}
+                      style={styles.casePaymentPicker}
+                    >
+                      <Text style={styles.casePaymentPickerText}>{record.paymentStatus}</Text>
+                      <AppIcon name="chevron-down" size={14} color={COLORS.gray} />
+                    </TouchableOpacity>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.infoLabel}>Quoted</Text>
+                    <TextInput
+                      defaultValue={record.quotedAmount != null ? String(record.quotedAmount) : ''}
+                      onEndEditing={(event) => {
+                        const raw = event.nativeEvent.text.replace(/[^\d]/g, '');
+                        const amount = raw ? Number(raw) : null;
+                        if (amount !== record.quotedAmount) saveCasePayment(record, { quotedAmount: amount });
+                      }}
+                      keyboardType="number-pad"
+                      placeholder="$0"
+                      placeholderTextColor="#99A6A1"
+                      style={styles.caseAmountInput}
+                    />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.infoLabel}>Paid</Text>
+                    <TextInput
+                      defaultValue={record.paidAmount ? String(record.paidAmount) : ''}
+                      onEndEditing={(event) => {
+                        const raw = event.nativeEvent.text.replace(/[^\d]/g, '');
+                        const amount = raw ? Number(raw) : 0;
+                        if (amount !== record.paidAmount) saveCasePayment(record, { paidAmount: amount });
+                      }}
+                      keyboardType="number-pad"
+                      placeholder="$0"
+                      placeholderTextColor="#99A6A1"
+                      style={styles.caseAmountInput}
+                    />
+                  </View>
+                </View>
+                <Text style={styles.casePaymentHint}>Amounts save when you leave the field; every change lands on the timeline.</Text>
+              </View>
+
+              <View style={[styles.infoCard, { marginTop: 12 }]}>
+                <Text style={styles.infoTitle}>Summary</Text>
+                <TextInput
+                  defaultValue={record.summary}
+                  onEndEditing={(event) => { if (event.nativeEvent.text.trim() !== record.summary) saveCaseSummary(record, event.nativeEvent.text); }}
+                  placeholder="The situation in a few lines — who, what, where things stand."
+                  placeholderTextColor="#99A6A1"
+                  multiline
+                  style={[styles.formInput, styles.multilineInput, { minHeight: 70 }]}
+                />
+              </View>
+
+              {/* Contacts */}
+              <View style={styles.caseSectionHeader}>
+                <Text style={styles.infoTitleStandalone}>Contacts</Text>
+                <TouchableOpacity onPress={() => setCaseContactForm(makeEmptyCaseContactForm())} style={styles.caseSectionAction}>
+                  <AppIcon name="add" size={15} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Add</Text>
+                </TouchableOpacity>
+              </View>
+              {caseContacts.length ? (
+                <View style={styles.followUpCard}>
+                  {caseContacts.map((contact, index) => (
+                    <View key={contact.id} style={[styles.caseContactRow, index === caseContacts.length - 1 && { borderBottomWidth: 0 }]}>
+                      <View style={{ flex: 1 }}>
+                        <View style={styles.caseContactNameLine}>
+                          <Text style={styles.caseContactName}>{contact.name}</Text>
+                          {contact.isPrimary ? <View style={[styles.caseChip, { backgroundColor: COLORS.mint }]}><Text style={[styles.caseChipText, { color: COLORS.forest }]}>primary</Text></View> : null}
+                        </View>
+                        <Text style={styles.caseContactMeta}>{[contact.relationship, contact.phone, contact.email].filter(Boolean).join(' · ') || 'No details yet'}</Text>
+                        <View style={styles.caseContactActions}>
+                          <TouchableOpacity accessibilityLabel={`Call ${contact.name}`} onPress={() => contactAction(contact, 'call')} style={styles.caseContactAction}><AppIcon name="call" size={15} color={COLORS.forest} /><Text style={styles.caseContactActionText}>Call</Text></TouchableOpacity>
+                          <TouchableOpacity accessibilityLabel={`Text ${contact.name}`} onPress={() => contactAction(contact, 'text')} style={styles.caseContactAction}><AppIcon name="chatbubble" size={14} color={COLORS.forest} /><Text style={styles.caseContactActionText}>Text</Text></TouchableOpacity>
+                          <TouchableOpacity accessibilityLabel={`Email ${contact.name}`} onPress={() => contactAction(contact, 'email')} style={styles.caseContactAction}><AppIcon name="mail" size={15} color={COLORS.forest} /><Text style={styles.caseContactActionText}>Email</Text></TouchableOpacity>
+                          <TouchableOpacity accessibilityLabel={`Edit ${contact.name}`} onPress={() => setCaseContactForm({ id: contact.id, name: contact.name, relationship: contact.relationship, phone: contact.phone, email: contact.email, note: contact.note, isPrimary: contact.isPrimary })} style={styles.caseContactAction}><AppIcon name="create" size={14} color={COLORS.gray} /><Text style={[styles.caseContactActionText, { color: COLORS.gray }]}>Edit</Text></TouchableOpacity>
+                          <TouchableOpacity accessibilityLabel={`Remove ${contact.name}`} onPress={() => removeCaseContact(contact)} style={styles.caseContactAction}><AppIcon name="trash" size={14} color={COLORS.coral} /></TouchableOpacity>
+                        </View>
+                      </View>
+                    </View>
+                  ))}
+                </View>
+              ) : <Text style={styles.caseEmptyNote}>No contacts yet — add the mother, the stepdad, the referent. Calls, texts, and emails from here log straight to the timeline.</Text>}
+
+              {/* Timeline */}
+              <Text style={styles.infoTitleStandalone}>Timeline</Text>
+              <View style={styles.caseComposer}>
+                <View style={styles.caseComposerKinds}>
+                  {(['note', 'call', 'text', 'email', 'meeting'] as CaseEventKind[]).map((kind) => (
+                    <TouchableOpacity key={kind} onPress={() => setTimelineKind(kind)} style={[styles.caseKindPill, timelineKind === kind && styles.caseKindPillActive]}>
+                      <AppIcon name={caseEventIcon(kind)} size={12} color={timelineKind === kind ? COLORS.white : COLORS.inkSoft} />
+                      <Text style={[styles.caseKindPillText, timelineKind === kind && styles.caseKindPillTextActive]}>{kind}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+                <View style={styles.caseComposerRow}>
+                  <TextInput
+                    value={timelineDraft}
+                    onChangeText={setTimelineDraft}
+                    placeholder="Quick note about this case…"
+                    placeholderTextColor="#99A6A1"
+                    style={[styles.formInput, { flex: 1, minHeight: 44 }]}
+                  />
+                  <TouchableOpacity accessibilityLabel="Add timeline entry" onPress={addTimelineEntry} style={[styles.caseComposerSend, !timelineDraft.trim() && { opacity: 0.45 }]} disabled={!timelineDraft.trim()}>
+                    <AppIcon name="arrow-up" size={18} color={COLORS.white} />
+                  </TouchableOpacity>
+                </View>
+              </View>
+              {timeline.length ? (
+                <View style={styles.followUpCard}>
+                  {timeline.map((event, index) => {
+                    const contact = event.contactId ? caseContacts.find((item) => item.id === event.contactId) : undefined;
+                    return (
+                      <View key={event.id} style={[styles.followUpRow, index === timeline.length - 1 && { borderBottomWidth: 0 }]}>
+                        <View style={styles.touchLogIcon}><AppIcon name={caseEventIcon(event.kind)} size={14} color={COLORS.forest} /></View>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.touchLogTitle}>{event.body || event.kind.replace('_', ' ')}</Text>
+                          <Text style={styles.touchLogNote}>{event.kind.replace('_', ' ')}{contact ? ` · ${contact.name}` : ''} · {relativeActivity(event.occurredAt)}</Text>
+                        </View>
+                      </View>
+                    );
+                  })}
+                </View>
+              ) : <Text style={styles.caseEmptyNote}>Nothing on the timeline yet — notes, calls, status changes, payments, documents, and referrals all land here automatically.</Text>}
+
+              {/* Documents */}
+              <View style={styles.caseSectionHeader}>
+                <Text style={styles.infoTitleStandalone}>Documents</Text>
+              </View>
+              <View style={styles.caseDocAddRow}>
+                <TextInput
+                  value={docLabel}
+                  onChangeText={setDocLabel}
+                  placeholder="Label (e.g. Insurance card front)"
+                  placeholderTextColor="#99A6A1"
+                  style={[styles.formInput, { flex: 1, minHeight: 44 }]}
+                />
+                <TouchableOpacity accessibilityLabel="Add document from photos" onPress={pickCaseDocument} disabled={docUploading} style={[styles.caseComposerSend, docUploading && { opacity: 0.45 }]}>
+                  <AppIcon name={docUploading ? 'hourglass' : 'image'} size={17} color={COLORS.white} />
+                </TouchableOpacity>
+              </View>
+              <Text style={styles.casePaymentHint}>Photos only in v1 — stored in the private case-documents bucket, viewed through 60-second signed links. Never a public URL.</Text>
+              {caseDocuments.length ? (
+                <View style={styles.caseDocGrid}>
+                  {caseDocuments.map((document) => (
+                    <View key={document.id} style={styles.caseDocTile}>
+                      <TouchableOpacity onPress={() => viewCaseDocument(document)} style={styles.caseDocTileBody}>
+                        <AppIcon name={documentIcon(document.mimeType)} size={22} color={COLORS.forest} />
+                        <Text numberOfLines={2} style={styles.caseDocLabel}>{document.label}</Text>
+                        {document.sizeBytes ? <Text style={styles.caseDocSize}>{Math.max(1, Math.round(document.sizeBytes / 1024))} KB</Text> : null}
+                      </TouchableOpacity>
+                      <TouchableOpacity accessibilityLabel={`Delete ${document.label}`} onPress={() => removeCaseDocument(document)} style={styles.caseDocDelete}>
+                        <AppIcon name="trash" size={13} color={COLORS.coral} />
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </View>
+              ) : <Text style={styles.caseEmptyNote}>No documents yet — a photo of the insurance card is usually the first one.</Text>}
+
+              {/* Linked business objects */}
+              <Text style={styles.infoTitleStandalone}>Placement & referrals</Text>
+              <View style={styles.followUpCard}>
+                {linkedMatch ? (
+                  <TouchableOpacity onPress={() => { loadReferralMatch(linkedMatch); setTab('match'); closeCase(); }} style={styles.caseLinkedRow}>
+                    <View style={styles.touchLogIcon}><AppIcon name="sparkles" size={14} color={COLORS.forest} /></View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.touchLogTitle}>Match profile: {linkedMatch.clientLabel}</Text>
+                      <Text style={styles.touchLogNote}>{linkedMatch.status}{linkedMatch.assignedPartnerId ? ` · ${partners.find((item) => item.id === linkedMatch.assignedPartnerId)?.organization || ''}` : ''}</Text>
+                    </View>
+                    <Text style={styles.caseOpenInMatch}>Open in Match</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <TouchableOpacity onPress={() => startMatchForCase(record)} style={styles.caseLinkedRow}>
+                    <View style={styles.touchLogIcon}><AppIcon name="sparkles-outline" size={14} color={COLORS.forest} /></View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.touchLogTitle}>Find placement</Text>
+                      <Text style={styles.touchLogNote}>Start a match profile pre-filled from this case — packet sends will link back here.</Text>
+                    </View>
+                    <AppIcon name="chevron-forward" size={15} color={COLORS.gray} />
+                  </TouchableOpacity>
+                )}
+                {linkedReferrals.map((referral) => {
+                  const partner = partners.find((item) => item.id === referral.partnerId);
+                  return (
+                    <View key={referral.id} style={styles.caseLinkedRow}>
+                      <View style={styles.touchLogIcon}><AppIcon name="paper-plane" size={14} color={COLORS.blue} /></View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.touchLogTitle}>{referral.direction} referral · {referral.clientLabel}</Text>
+                        <Text style={styles.touchLogNote}>{partner ? `${partner.organization} · ` : ''}{referral.outcome} · {shortDate(referral.date)}</Text>
+                      </View>
+                    </View>
+                  );
+                })}
+                {linkedFollowUps.map((followUp) => {
+                  const partner = partners.find((item) => item.id === followUp.partnerId);
+                  return (
+                    <View key={followUp.id} style={styles.caseLinkedRow}>
+                      <View style={[styles.followUpIcon, { width: 28, height: 28 }]}><AppIcon name="alarm-outline" size={14} color={COLORS.coral} /></View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.touchLogTitle}>{followUp.title}</Text>
+                        <Text style={styles.touchLogNote}>{partner ? `${partner.organization} · ` : ''}due {shortDate(followUp.dueOn)}</Text>
+                        <View style={styles.followUpActions}>
+                          <TouchableOpacity style={styles.followUpActionDone} onPress={() => completeFollowUp(followUp)}><Text style={styles.followUpActionDoneText}>Done</Text></TouchableOpacity>
+                          <TouchableOpacity style={styles.followUpAction} onPress={() => skipFollowUp(followUp)}><Text style={styles.followUpActionText}>Skip</Text></TouchableOpacity>
+                          <TouchableOpacity style={styles.followUpAction} onPress={() => snoozeFollowUp(followUp, 2)}><Text style={styles.followUpActionText}>+2 days</Text></TouchableOpacity>
+                        </View>
+                      </View>
+                    </View>
+                  );
+                })}
+                {!linkedMatch && !linkedReferrals.length && !linkedFollowUps.length ? null : null}
+              </View>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function NewCaseModal() {
+    return (
+      <Modal visible={showNewCase} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setShowNewCase(false)}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityLabel="Close new case form" onPress={() => setShowNewCase(false)} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>New case</Text>
+              <TouchableOpacity onPress={saveNewCase}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>One family, one file. Everything else — more contacts, notes, documents, payments — gets added from the case file itself.</Text>
+              <FormField label="CASE TITLE *" value={caseForm.title} onChangeText={(title) => setCaseForm((current) => ({ ...current, title }))} placeholder="Henderson family — son Jake, 24" />
+              <DropdownField
+                label="STATUS"
+                value={caseForm.status}
+                icon="flag-outline"
+                onChange={(status) => setCaseForm((current) => ({ ...current, status: status as CaseStatus }))}
+                options={CASE_STATUSES.map((status) => ({ label: status, value: status }))}
+              />
+              <FormField label="SUMMARY (OPTIONAL)" value={caseForm.summary} onChangeText={(summary) => setCaseForm((current) => ({ ...current, summary }))} placeholder="The situation in a few lines" multiline />
+              <Text style={styles.fieldLabel}>PRIMARY CONTACT</Text>
+              <FormField label="NAME" value={caseForm.contactName} onChangeText={(contactName) => setCaseForm((current) => ({ ...current, contactName }))} placeholder="Mom, dad, referent…" />
+              <FormField label="RELATIONSHIP" value={caseForm.contactRelationship} onChangeText={(contactRelationship) => setCaseForm((current) => ({ ...current, contactRelationship }))} placeholder="mother, stepdad, referent" />
+              <FormField label="PHONE" value={caseForm.contactPhone} onChangeText={(contactPhone) => setCaseForm((current) => ({ ...current, contactPhone }))} placeholder="(541) 555-0142" keyboardType="phone-pad" />
+              <FormField label="EMAIL" value={caseForm.contactEmail} onChangeText={(contactEmail) => setCaseForm((current) => ({ ...current, contactEmail }))} placeholder="name@email.com" keyboardType="email-address" />
+              <TouchableOpacity style={styles.primaryButton} onPress={saveNewCase}><Text style={styles.primaryButtonText}>Create case file</Text></TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function CaseContactModal() {
+    if (!caseContactForm) return null;
+    const isEditing = Boolean(caseContactForm.id);
+    const close = () => setCaseContactForm(null);
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityLabel="Close contact form" onPress={close} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>{isEditing ? 'Edit contact' : 'Add contact'}</Text>
+              <TouchableOpacity onPress={saveCaseContact}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <FormField label="NAME *" value={caseContactForm.name} onChangeText={(name) => setCaseContactForm((current) => (current ? { ...current, name } : current))} placeholder="Contact name" />
+              <FormField label="RELATIONSHIP" value={caseContactForm.relationship} onChangeText={(relationship) => setCaseContactForm((current) => (current ? { ...current, relationship } : current))} placeholder="mother, stepdad, subject, referent" />
+              <FormField label="PHONE" value={caseContactForm.phone} onChangeText={(phone) => setCaseContactForm((current) => (current ? { ...current, phone } : current))} placeholder="(541) 555-0142" keyboardType="phone-pad" />
+              <FormField label="EMAIL" value={caseContactForm.email} onChangeText={(email) => setCaseContactForm((current) => (current ? { ...current, email } : current))} placeholder="name@email.com" keyboardType="email-address" />
+              <FormField label="NOTE (OPTIONAL)" value={caseContactForm.note} onChangeText={(note) => setCaseContactForm((current) => (current ? { ...current, note } : current))} placeholder="Best times to call, who to loop in…" multiline />
+              <TouchableOpacity
+                accessibilityRole="checkbox"
+                accessibilityState={{ checked: caseContactForm.isPrimary }}
+                onPress={() => setCaseContactForm((current) => (current ? { ...current, isPrimary: !current.isPrimary } : current))}
+                style={[styles.networkPreferenceOption, caseContactForm.isPrimary && styles.networkPreferenceOptionSelected, { marginBottom: 18 }]}
+              >
+                <AppIcon name={caseContactForm.isPrimary ? 'checkbox' : 'square-outline'} size={21} color={caseContactForm.isPrimary ? COLORS.forest : COLORS.gray} />
+                <Text style={[styles.networkPreferenceText, caseContactForm.isPrimary && styles.networkPreferenceTextSelected]}>Primary contact — replaces any current primary</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.primaryButton} onPress={saveCaseContact}><Text style={styles.primaryButtonText}>{isEditing ? 'Update contact' : 'Save contact'}</Text></TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  // Skippable quick note after a one-tap call/text/email action.
+  function QuickNoteModal() {
+    if (!quickNoteContact) return null;
+    const { contact, kind } = quickNoteContact;
+    const skip = () => { setQuickNoteContact(null); setQuickNoteText(''); };
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={skip}>
+        <Pressable style={styles.dropdownOverlay} onPress={skip}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <View style={styles.prePromptBody}>
+              <View style={styles.prePromptIcon}><AppIcon name={caseEventIcon(kind)} size={24} color={COLORS.forest} /></View>
+              <Text style={styles.prePromptTitle}>Add a note about this {kind}?</Text>
+              <TextInput
+                value={quickNoteText}
+                onChangeText={setQuickNoteText}
+                placeholder={`What came out of the ${kind} with ${contact.name}?`}
+                placeholderTextColor="#99A6A1"
+                multiline
+                style={[styles.formInput, styles.multilineInput, { minHeight: 80 }]}
+              />
+              <TouchableOpacity style={styles.primaryButton} onPress={saveQuickNote}><Text style={styles.primaryButtonText}>Save note</Text></TouchableOpacity>
+              <TouchableOpacity onPress={skip} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Skip</Text></TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
+  // In-app viewer for image documents (signed URL, 60s expiry).
+  function DocViewModal() {
+    if (!docView) return null;
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={() => setDocView(null)}>
+        <Pressable style={styles.docViewOverlay} onPress={() => setDocView(null)}>
+          <View style={styles.docViewHeader}>
+            <Text style={styles.docViewTitle} numberOfLines={1}>{docView.label}</Text>
+            <TouchableOpacity accessibilityLabel="Close document" onPress={() => setDocView(null)} style={styles.closeButton}><AppIcon name="close" size={24} color={COLORS.white} /></TouchableOpacity>
+          </View>
+          <Image source={{ uri: docView.url }} style={styles.docViewImage} resizeMode="contain" />
+        </Pressable>
+      </Modal>
     );
   }
 
@@ -2163,7 +3245,7 @@ export default function App() {
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
       <View style={styles.appShell}>
-        <View style={styles.screen}>{tab === 'home' ? HomeScreen() : tab === 'match' ? MatchScreen() : tab === 'directory' ? DirectoryScreen() : ReferralsScreen()}</View>
+        <View style={styles.screen}>{tab === 'home' ? HomeScreen() : tab === 'match' ? MatchScreen() : tab === 'cases' ? CasesScreen() : tab === 'directory' ? DirectoryScreen() : ReferralsScreen()}</View>
         {BottomNav()}
       </View>
       {PartnerDetailModal()}
@@ -2174,6 +3256,11 @@ export default function App() {
       {PacketComposeModal()}
       {PacketSendConfirmModal()}
       {OutcomeCaptureModal()}
+      {CaseDetailModal()}
+      {NewCaseModal()}
+      {CaseContactModal()}
+      {QuickNoteModal()}
+      {DocViewModal()}
     </SafeAreaView>
   );
 }
@@ -2494,4 +3581,54 @@ const styles = StyleSheet.create({
   outcomeNotYetText: { color: COLORS.blue, fontSize: 12, fontWeight: '700' },
   starRow: { flexDirection: 'row', gap: 8, marginBottom: 18 },
   starButton: { padding: 4 },
+  // Case files
+  caseRow: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
+  caseRowIcon: { width: 34, height: 34, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
+  caseRowTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '700' },
+  caseRowMetaLine: { flexDirection: 'row', gap: 6, marginTop: 5 },
+  caseRowMeta: { color: COLORS.gray, fontSize: 10, marginTop: 5 },
+  caseChip: { flexDirection: 'row', alignItems: 'center', gap: 3, borderRadius: 8, paddingHorizontal: 7, paddingVertical: 4, alignSelf: 'flex-start' },
+  caseChipText: { fontSize: 9, fontWeight: '800' },
+  caseChipLarge: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 12 },
+  caseChipLargeText: { fontSize: 12, textTransform: 'capitalize' },
+  caseSearchHint: { color: COLORS.gray, fontSize: 12, lineHeight: 18, padding: 14 },
+  closedToggle: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, paddingHorizontal: 2, marginBottom: 8 },
+  closedToggleText: { color: COLORS.gray, fontSize: 12, fontWeight: '800' },
+  caseSectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  caseSectionAction: { flexDirection: 'row', alignItems: 'center', gap: 3, paddingVertical: 6 },
+  caseSectionActionText: { color: COLORS.forest, fontSize: 12, fontWeight: '800' },
+  caseEmptyNote: { color: COLORS.gray, fontSize: 11, lineHeight: 17, backgroundColor: COLORS.white, borderRadius: 15, borderWidth: 1, borderColor: COLORS.line, padding: 13, marginTop: 9 },
+  caseContactRow: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
+  caseContactNameLine: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  caseContactName: { color: COLORS.ink, fontSize: 13, fontWeight: '800' },
+  caseContactMeta: { color: COLORS.gray, fontSize: 10, marginTop: 3 },
+  caseContactActions: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 9 },
+  caseContactAction: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  caseContactActionText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
+  caseComposer: { backgroundColor: COLORS.white, borderRadius: 17, padding: 10, borderWidth: 1, borderColor: COLORS.line, marginTop: 9, marginBottom: 4 },
+  caseComposerKinds: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 9 },
+  caseKindPill: { flexDirection: 'row', alignItems: 'center', gap: 4, borderRadius: 14, paddingHorizontal: 10, paddingVertical: 6, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line },
+  caseKindPillActive: { backgroundColor: COLORS.forest, borderColor: COLORS.forest },
+  caseKindPillText: { color: COLORS.inkSoft, fontSize: 10, fontWeight: '700' },
+  caseKindPillTextActive: { color: COLORS.white },
+  caseComposerRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  caseComposerSend: { width: 44, height: 44, borderRadius: 14, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
+  casePaymentRow: { flexDirection: 'row', gap: 10, marginTop: 6 },
+  casePaymentPicker: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 10, minHeight: 42, marginTop: 4 },
+  casePaymentPickerText: { color: COLORS.ink, fontSize: 12, fontWeight: '700', textTransform: 'capitalize' },
+  caseAmountInput: { backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 10, minHeight: 42, marginTop: 4, color: COLORS.ink, fontSize: 12, fontWeight: '700' },
+  casePaymentHint: { color: COLORS.gray, fontSize: 9, lineHeight: 14, marginTop: 9 },
+  caseDocAddRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 9 },
+  caseDocGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 9, marginTop: 11 },
+  caseDocTile: { width: '31%', backgroundColor: COLORS.white, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, padding: 10 },
+  caseDocTileBody: { alignItems: 'center', gap: 6, minHeight: 74 },
+  caseDocLabel: { color: COLORS.ink, fontSize: 10, fontWeight: '700', textAlign: 'center' },
+  caseDocSize: { color: COLORS.gray, fontSize: 9 },
+  caseDocDelete: { position: 'absolute', top: 4, right: 4, padding: 4 },
+  caseLinkedRow: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
+  caseOpenInMatch: { color: COLORS.forest, fontSize: 11, fontWeight: '800' },
+  docViewOverlay: { flex: 1, backgroundColor: 'rgba(11, 32, 27, 0.94)' },
+  docViewHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: 54, paddingBottom: 10 },
+  docViewTitle: { flex: 1, color: COLORS.white, fontSize: 15, fontWeight: '800' },
+  docViewImage: { flex: 1, marginBottom: 30 },
 });

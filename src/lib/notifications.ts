@@ -2,6 +2,7 @@ import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 
 import type { Partner, Referral, ReferralMatch } from '../data';
+import type { CaseRecord } from './cases';
 import type { FollowUp } from './store';
 
 // ─── Behavior ───────────────────────────────────────────────────────────────
@@ -96,6 +97,7 @@ export type NotificationInput = {
   referralMatches: ReferralMatch[];
   referrals: Referral[];
   followUps?: FollowUp[]; // optional so older call sites keep compiling
+  cases?: CaseRecord[]; // optional — active-case count in the briefing
 };
 
 function dateStamp(date: Date): string {
@@ -118,7 +120,7 @@ export function followUpsDue(followUps: FollowUp[]): FollowUp[] {
 // then one reminder per open follow-up at 9 AM on its due date.
 // Priority when capped: briefing first, then most-overdue partners, then
 // follow-ups by due date.
-export async function rescheduleNotifications({ partners, referralMatches, referrals, followUps = [] }: NotificationInput): Promise<void> {
+export async function rescheduleNotifications({ partners, referralMatches, referrals, followUps = [], cases = [] }: NotificationInput): Promise<void> {
   ensureNotificationHandler();
   try {
     const granted = await ensureNotificationSetup();
@@ -129,11 +131,12 @@ export async function rescheduleNotifications({ partners, referralMatches, refer
     const matchesInProgress = referralMatches.filter((match) => match.status === 'Matching').length;
     const pendingReferrals = referrals.filter((referral) => referral.outcome === 'Pending').length;
     const dueFollowUps = followUpsDue(followUps);
+    const activeCases = cases.filter((record) => record.status !== 'closed' && record.status !== 'lost').length;
 
     let remaining = MAX_SCHEDULED;
 
     // (a) Daily briefing at 7:00 AM — skip entirely when everything is zero.
-    if (cold.length > 0 || matchesInProgress > 0 || pendingReferrals > 0 || dueFollowUps.length > 0) {
+    if (cold.length > 0 || matchesInProgress > 0 || pendingReferrals > 0 || dueFollowUps.length > 0 || activeCases > 0) {
       const parts = [
         `${cold.length} ${cold.length === 1 ? 'partner' : 'partners'} going cold`,
         `${matchesInProgress} ${matchesInProgress === 1 ? 'match' : 'matches'} in progress`,
@@ -141,6 +144,9 @@ export async function rescheduleNotifications({ partners, referralMatches, refer
       ];
       if (dueFollowUps.length > 0) {
         parts.push(`${dueFollowUps.length} ${dueFollowUps.length === 1 ? 'follow-up' : 'follow-ups'} due`);
+      }
+      if (activeCases > 0) {
+        parts.push(`${activeCases} active ${activeCases === 1 ? 'case' : 'cases'}`);
       }
       await Notifications.scheduleNotificationAsync({
         content: {

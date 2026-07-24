@@ -27,6 +27,7 @@ export type FollowUp = {
   id: string;
   partnerId?: string;
   referralId?: string;
+  caseId?: string; // v3 case-files linkage
   title: string;
   dueOn: string; // YYYY-MM-DD
   status: FollowUpStatus;
@@ -242,6 +243,7 @@ type ReferralRow = {
   outcome_note: string | null;
   packet_sent_at: string | null;
   match_profile_id: string | null;
+  case_id: string | null; // v3 case-files linkage
 };
 
 type MatchRow = {
@@ -256,6 +258,7 @@ type MatchRow = {
   status: 'Matching' | 'Referred';
   assigned_partner_id: string | null;
   referral_id: string | null;
+  case_id: string | null; // v3 case-files linkage
   created_at: string;
   updated_at: string;
 };
@@ -278,6 +281,7 @@ type FollowUpRow = {
   id: string;
   partner_id: string | null;
   referral_id: string | null;
+  case_id: string | null; // v3 case-files linkage
   title: string;
   due_on: string;
   status: FollowUpStatus;
@@ -345,6 +349,7 @@ function mapReferralRow(row: ReferralRow): Referral {
     note: row.note || '',
     packetSentAt: row.packet_sent_at || undefined,
     matchProfileId: row.match_profile_id || undefined,
+    caseId: row.case_id || undefined,
     admitted: row.admitted,
     admittedOn: row.admitted_on || undefined,
     familyExperience: row.family_experience,
@@ -367,6 +372,7 @@ function mapMatchRow(row: MatchRow): ReferralMatch {
     updatedAt: row.updated_at,
     assignedPartnerId: row.assigned_partner_id || undefined,
     referralId: row.referral_id || undefined,
+    caseId: row.case_id || undefined,
   };
 }
 
@@ -385,6 +391,7 @@ function mapFollowUpRow(row: FollowUpRow): FollowUp {
     id: row.id,
     partnerId: row.partner_id || undefined,
     referralId: row.referral_id || undefined,
+    caseId: row.case_id || undefined,
     title: row.title,
     dueOn: row.due_on,
     status: row.status,
@@ -450,6 +457,7 @@ function referralToRow(referral: Referral): Record<string, unknown> {
     // v2 columns (deployed migration 20260724150000) — packet + outcome data
     packet_sent_at: referral.packetSentAt ?? null,
     match_profile_id: referral.matchProfileId ?? null,
+    case_id: referral.caseId ?? null,
     admitted: referral.admitted ?? null,
     admitted_on: referral.admittedOn ?? null,
     family_experience: referral.familyExperience ?? null,
@@ -470,6 +478,7 @@ function matchToRow(match: ReferralMatch): Record<string, unknown> {
     status: match.status,
     assigned_partner_id: match.assignedPartnerId ?? null,
     referral_id: match.referralId ?? null,
+    case_id: match.caseId ?? null,
   };
 }
 
@@ -488,6 +497,7 @@ function followUpToRow(followUp: FollowUp): Record<string, unknown> {
     id: followUp.id,
     partner_id: followUp.partnerId ?? null,
     referral_id: followUp.referralId ?? null,
+    case_id: followUp.caseId ?? null,
     title: followUp.title,
     due_on: followUp.dueOn,
     status: followUp.status,
@@ -730,6 +740,14 @@ export async function updateReferralPacketStamp(id: string, packetSentAt: string
   const patch = { packet_sent_at: packetSentAt, match_profile_id: matchProfileId };
   await runOrQueue({ kind: 'referral.update', id, patch }, () =>
     supabase.from('referrals').update(patch).eq('id', id));
+}
+
+// Attach (or detach) a case on a match profile — a narrow patch used by the
+// case detail's "Find placement" flow; caseId null detaches.
+export async function updateMatchCase(id: string, caseId: string | null): Promise<void> {
+  const patch = { case_id: caseId };
+  await runOrQueue({ kind: 'match.update', id, patch }, () =>
+    supabase.from('match_profiles').update(patch).eq('id', id));
 }
 
 // Re-hydrate from the server (used after flushing the offline queue so local

@@ -36,6 +36,12 @@
         {
           "defaultChannel": "referralfit"
         }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "ReferralFit attaches photos you choose (insurance cards, signed agreements) to private case files."
+        }
       ]
     ],
     "extra": {
