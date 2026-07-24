@@ -29,7 +29,14 @@
     },
     "scheme": "referralfit",
     "plugins": [
-      "expo-font"
+      "expo-font",
+      "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "defaultChannel": "referralfit"
+        }
+      ]
     ],
     "extra": {
       "eas": {

@@ -32,6 +32,8 @@ export type Partner = {
   outbound: number;
   lastContact: string;
   favorite?: boolean;
+  touchCadenceDays?: number;
+  createdAt?: string;
 };
 
 export type Referral = {

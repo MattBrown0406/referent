@@ -1,9 +1,9 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import { StatusBar } from 'expo-status-bar';
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
+  AppState,
   Image,
   KeyboardAvoidingView,
   Linking,
@@ -19,6 +19,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import type { Session } from '@supabase/supabase-js';
 import {
   formatMoney,
   initialPartners,
@@ -38,6 +39,29 @@ import {
   stateOptions,
   therapyOptions,
 } from './src/data';
+import { supabase } from './src/lib/supabase';
+import LoginScreen from './src/lib/LoginScreen';
+import {
+  assignMatchReferral,
+  createMatchProfile,
+  createPartner,
+  createReferral,
+  createTouch,
+  flushWriteQueue,
+  hydrate,
+  pendingWriteCount,
+  persistCache,
+  refreshSnapshot,
+  Touch,
+  TouchKind,
+  updateMatchProfile,
+  updatePartner,
+} from './src/lib/store';
+import {
+  partnersGoingCold,
+  rescheduleNotifications,
+  subscribeToNotificationResponses,
+} from './src/lib/notifications';
 
 type Tab = 'home' | 'match' | 'directory' | 'referrals';
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
@@ -59,7 +83,9 @@ const COLORS = {
   blue: '#507C86',
 };
 
-const STORAGE_KEY = 'referralfit-v2';
+function makeId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
 
 type PartnerForm = {
   name: string;
@@ -75,6 +101,7 @@ type PartnerForm = {
   insurance: string[];
   therapies: string[];
   note: string;
+  touchCadence: string;
 };
 
 function localDateStamp() {
@@ -113,6 +140,7 @@ function makeEmptyPartnerForm(): PartnerForm {
   insurance: [],
   therapies: [],
   note: '',
+  touchCadence: '',
   };
 }
 
@@ -413,11 +441,19 @@ export default function App() {
   const [referrals, setReferrals] = useState<Referral[]>(initialReferrals);
   const [referralMatches, setReferralMatches] = useState<ReferralMatch[]>(initialReferralMatches);
   const [loaded, setLoaded] = useState(false);
+  const [session, setSession] = useState<Session | null>(null);
+  const [offline, setOffline] = useState(false);
+  const [queuedWrites, setQueuedWrites] = useState(0);
+  const [touches, setTouches] = useState<Touch[]>([]);
   const [selectedPartner, setSelectedPartner] = useState<Partner | null>(null);
   const [showAddPartner, setShowAddPartner] = useState(false);
   const [editingPartnerId, setEditingPartnerId] = useState<string | null>(null);
   const [showAddReferral, setShowAddReferral] = useState(false);
   const [activeReferralMatchId, setActiveReferralMatchId] = useState<string | null>(null);
+  const [touchPartner, setTouchPartner] = useState<Partner | null>(null);
+  const [touchKind, setTouchKind] = useState<TouchKind>('call');
+  const [touchNote, setTouchNote] = useState('');
+  const [notifPrePromptVisible, setNotifPrePromptVisible] = useState(false);
   const [partnerForm, setPartnerForm] = useState<PartnerForm>(makeEmptyPartnerForm);
   const [referralForm, setReferralForm] = useState(emptyReferral);
   const [search, setSearch] = useState('');
@@ -432,50 +468,101 @@ export default function App() {
   const [matchTherapies, setMatchTherapies] = useState<string[]>([]);
   const matchClientLabelRef = useRef<TextInput>(null);
 
-  useEffect(() => {
-    async function loadStoredData() {
-      try {
-        const value = await AsyncStorage.getItem(STORAGE_KEY);
-        if (value) {
-          const stored = JSON.parse(value);
-          if (Array.isArray(stored.partners)) setPartners(stored.partners);
-          if (Array.isArray(stored.referrals)) setReferrals(stored.referrals);
-          if (Array.isArray(stored.referralMatches)) {
-            setReferralMatches(stored.referralMatches);
-            const firstMatch = (stored.referralMatches as ReferralMatch[]).find((item) => item.status === 'Matching');
-            setSelectedMatchId(firstMatch?.id || null);
-            if (firstMatch) {
-              setMatchClientLabel(firstMatch.clientLabel);
-              setMatchType(firstMatch.levelOfCare);
-              setMatchState(firstMatch.state);
-              setMatchInsurance(firstMatch.insurance);
-              setMatchNetworkPreferences(firstMatch.networkPreferences?.length ? firstMatch.networkPreferences : ['In-network']);
-              setMatchBudget(firstMatch.maxBudget ? String(firstMatch.maxBudget) : '');
-              setMatchTherapies(firstMatch.therapies);
-            } else {
-              setMatchClientLabel('');
-              setMatchType('Any type');
-              setMatchState('ANY');
-              setMatchInsurance('Cash pay');
-              setMatchNetworkPreferences(['In-network']);
-              setMatchBudget('');
-              setMatchTherapies([]);
-            }
-          }
-        }
-      } catch {
-        // Keep a clean first-run state if local storage cannot be read.
-      } finally {
-        setLoaded(true);
-      }
+  // Push a snapshot of in-memory state to the offline cache, refresh the
+  // offline indicator + queued-write count, and recompute notifications.
+  const syncDerived = useCallback(async (snapshot?: { partners: Partner[]; referrals: Referral[]; referralMatches: ReferralMatch[]; touches: Touch[] }) => {
+    const data = snapshot || { partners, referrals, referralMatches, touches };
+    const pending = await pendingWriteCount();
+    setQueuedWrites(pending);
+    setOffline(pending > 0);
+    await persistCache(data);
+    rescheduleNotifications(data).catch(() => undefined);
+  }, [partners, referrals, referralMatches, touches]);
+
+  // Apply a freshly loaded snapshot to state, restoring the match-form
+  // selection exactly like the previous AsyncStorage loader did.
+  const applySnapshot = useCallback((snapshot: { partners: Partner[]; referrals: Referral[]; referralMatches: ReferralMatch[]; touches: Touch[] }) => {
+    setPartners(snapshot.partners);
+    setReferrals(snapshot.referrals);
+    setTouches(snapshot.touches);
+    setReferralMatches(snapshot.referralMatches);
+    const firstMatch = snapshot.referralMatches.find((item) => item.status === 'Matching');
+    setSelectedMatchId(firstMatch?.id || null);
+    if (firstMatch) {
+      setMatchClientLabel(firstMatch.clientLabel);
+      setMatchType(firstMatch.levelOfCare);
+      setMatchState(firstMatch.state);
+      setMatchInsurance(firstMatch.insurance);
+      setMatchNetworkPreferences(firstMatch.networkPreferences?.length ? firstMatch.networkPreferences : ['In-network']);
+      setMatchBudget(firstMatch.maxBudget ? String(firstMatch.maxBudget) : '');
+      setMatchTherapies(firstMatch.therapies);
+    } else {
+      setMatchClientLabel('');
+      setMatchType('Any type');
+      setMatchState('ANY');
+      setMatchInsurance('Cash pay');
+      setMatchNetworkPreferences(['In-network']);
+      setMatchBudget('');
+      setMatchTherapies([]);
     }
-    loadStoredData();
   }, []);
 
+  // Auth session gate: restore the persisted session, then hydrate data.
   useEffect(() => {
-    if (!loaded) return;
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify({ partners, referrals, referralMatches })).catch(() => undefined);
-  }, [loaded, partners, referrals, referralMatches]);
+    let mounted = true;
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (mounted) setSession(nextSession);
+    });
+    supabase.auth.getSession().then(async ({ data }) => {
+      let active = data.session;
+      if (!active) {
+        const { data: refreshed } = await supabase.auth.refreshSession();
+        active = refreshed.session;
+      }
+      if (!mounted) return;
+      setSession(active);
+      if (active) {
+        const result = await hydrate();
+        if (!mounted) return;
+        applySnapshot(result.snapshot);
+        const pending = await pendingWriteCount();
+        setQueuedWrites(pending);
+        setOffline(result.source === 'cache' || pending > 0);
+        rescheduleNotifications(result.snapshot).catch(() => undefined);
+        setNotifPrePromptVisible(true);
+      }
+      if (mounted) setLoaded(true);
+    }).catch(() => {
+      if (mounted) setLoaded(true);
+    });
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, [applySnapshot]);
+
+  // Flush queued offline writes when the app returns to the foreground.
+  useEffect(() => {
+    if (!session) return undefined;
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') return;
+      (async () => {
+        const flushed = await flushWriteQueue();
+        if (flushed > 0) {
+          const fresh = await refreshSnapshot();
+          if (fresh) applySnapshot(fresh);
+        }
+        syncDerived();
+      })();
+    });
+    return () => subscription.remove();
+  }, [session, applySnapshot, syncDerived]);
+
+  // Tapping a notification jumps to the relevant tab (no router in this app).
+  useEffect(() => {
+    if (!session) return undefined;
+    return subscribeToNotificationResponses((target) => setTab(target));
+  }, [session]);
 
   const totals = useMemo(() => ({
     inbound: partners.reduce((sum, partner) => sum + partner.inbound, 0),
@@ -593,9 +680,9 @@ export default function App() {
       return null;
     }
     const existing = referralMatches.find((item) => item.id === selectedMatchId);
-    const today = localDateStamp();
+    const now = new Date().toISOString();
     const referralMatch: ReferralMatch = {
-      id: existing?.id || `m-${Date.now()}`,
+      id: existing?.id || makeId('m'),
       clientLabel: matchClientLabel.trim(),
       levelOfCare: matchType as ReferralMatch['levelOfCare'],
       state: matchState,
@@ -604,13 +691,20 @@ export default function App() {
       maxBudget: matchInsurance === 'Cash pay' && matchBudget.trim() ? Number(matchBudget) || undefined : undefined,
       therapies: matchTherapies,
       status: existing?.status || 'Matching',
-      createdAt: existing?.createdAt || today,
-      updatedAt: today,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
       assignedPartnerId: existing?.assignedPartnerId,
       referralId: existing?.referralId,
     };
-    setReferralMatches((current) => [referralMatch, ...current.filter((item) => item.id !== referralMatch.id)]);
+    const nextMatches = [referralMatch, ...referralMatches.filter((item) => item.id !== referralMatch.id)];
+    setReferralMatches(nextMatches);
     setSelectedMatchId(referralMatch.id);
+    (existing ? updateMatchProfile(referralMatch) : createMatchProfile(referralMatch))
+      .then(() => syncDerived({ partners, referrals, referralMatches: nextMatches, touches }))
+      .catch((error) => {
+        Alert.alert('Sync issue', `This match was saved on this device but could not sync: ${error.message}`);
+        syncDerived();
+      });
     return referralMatch;
   }
 
@@ -663,6 +757,7 @@ export default function App() {
       insurance: partner.insurance.filter((plan) => plan !== 'Cash pay'),
       therapies: partner.therapies,
       note: partner.note,
+      touchCadence: partner.touchCadenceDays ? String(partner.touchCadenceDays) : '',
     });
     setSelectedPartner(null);
     setShowAddPartner(true);
@@ -695,8 +790,9 @@ export default function App() {
       return;
     }
     const existing = partners.find((partner) => partner.id === editingPartnerId);
+    const cadence = partnerForm.touchCadence ? Number(partnerForm.touchCadence) : undefined;
     const partner: Partner = {
-      id: existing?.id || `p-${Date.now()}`,
+      id: existing?.id || makeId('p'),
       name: partnerForm.name.trim(),
       organization: partnerForm.organization.trim(),
       type: partnerForm.types[0],
@@ -718,14 +814,23 @@ export default function App() {
       outbound: existing?.outbound || 0,
       lastContact: existing?.lastContact || localDateStamp(),
       favorite: existing?.favorite,
+      touchCadenceDays: cadence && cadence > 0 ? cadence : undefined,
+      createdAt: existing?.createdAt || new Date().toISOString(),
     };
-    setPartners((current) => existing
-      ? current.map((item) => item.id === partner.id ? partner : item)
-      : [partner, ...current]);
+    const nextPartners = existing
+      ? partners.map((item) => item.id === partner.id ? partner : item)
+      : [partner, ...partners];
+    setPartners(nextPartners);
     setPartnerForm(makeEmptyPartnerForm());
     setShowAddPartner(false);
     setEditingPartnerId(null);
     setSelectedPartner(partner);
+    (existing ? updatePartner(partner) : createPartner(partner))
+      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches }))
+      .catch((error) => {
+        Alert.alert('Sync issue', `This partner was saved on this device but could not sync: ${error.message}`);
+        syncDerived();
+      });
   }
 
   function addReferral() {
@@ -734,7 +839,7 @@ export default function App() {
       return;
     }
     const referral: Referral = {
-      id: `r-${Date.now()}`,
+      id: makeId('r'),
       partnerId: referralForm.partnerId,
       direction: referralForm.direction,
       date: localDateStamp(),
@@ -742,39 +847,118 @@ export default function App() {
       outcome: referralForm.outcome,
       note: referralForm.note.trim(),
     };
-    setReferrals((current) => [referral, ...current]);
+    const nextReferrals = [referral, ...referrals];
+    setReferrals(nextReferrals);
+    let assignedMatch: ReferralMatch | null = null;
+    let nextMatches = referralMatches;
     if (activeReferralMatchId) {
       const nextActiveMatch = referralMatches.find((item) => item.status === 'Matching' && item.id !== activeReferralMatchId);
-      setReferralMatches((current) => current.map((item) => item.id === activeReferralMatchId
+      assignedMatch = referralMatches.find((item) => item.id === activeReferralMatchId) || null;
+      nextMatches = referralMatches.map((item) => item.id === activeReferralMatchId
         ? {
             ...item,
             clientLabel: referral.clientLabel,
-            status: 'Referred',
+            status: 'Referred' as const,
             assignedPartnerId: referral.partnerId,
             referralId: referral.id,
-            updatedAt: referral.date,
+            updatedAt: new Date().toISOString(),
           }
-        : item));
+        : item);
+      setReferralMatches(nextMatches);
       if (nextActiveMatch) loadReferralMatch(nextActiveMatch);
       else startNewReferralMatch();
     }
-    setPartners((current) => current.map((partner) => partner.id === referral.partnerId
+    const nextPartners = partners.map((partner) => partner.id === referral.partnerId
       ? {
           ...partner,
           inbound: partner.inbound + (referral.direction === 'Inbound' ? 1 : 0),
           outbound: partner.outbound + (referral.direction === 'Outbound' ? 1 : 0),
           lastContact: referral.date,
         }
-      : partner));
+      : partner);
+    setPartners(nextPartners);
     setShowAddReferral(false);
     setReferralForm(emptyReferral);
     if (activeReferralMatchId) setTab('referrals');
     setActiveReferralMatchId(null);
+    const snapshot = { partners: nextPartners, referrals: nextReferrals, referralMatches: nextMatches, touches };
+    // Assignment flow: referral first, then the match profile update.
+    const write = assignedMatch
+      ? assignMatchReferral(referral, { ...assignedMatch, clientLabel: referral.clientLabel, status: 'Referred', assignedPartnerId: referral.partnerId, referralId: referral.id, updatedAt: new Date().toISOString() })
+      : createReferral(referral);
+    write
+      .then(() => syncDerived(snapshot))
+      .catch((error) => {
+        Alert.alert('Sync issue', `This referral was saved on this device but could not sync: ${error.message}`);
+        syncDerived();
+      });
+  }
+
+  function openTouchLogger(partner: Partner) {
+    setTouchPartner(partner);
+    setTouchKind('call');
+    setTouchNote('');
+  }
+
+  function saveTouch() {
+    if (!touchPartner) return;
+    const now = new Date();
+    const touch: Touch = {
+      id: makeId('t'),
+      partnerId: touchPartner.id,
+      kind: touchKind,
+      note: touchNote.trim(),
+      occurredAt: now.toISOString(),
+    };
+    const nextTouches = [touch, ...touches];
+    setTouches(nextTouches);
+    // Reflect last contact locally right away; the server trigger keeps
+    // partners.last_contact_at in sync for the canonical value.
+    const todayStamp = localDateStamp();
+    const nextPartners = partners.map((partner) => partner.id === touchPartner.id
+      ? { ...partner, lastContact: todayStamp }
+      : partner);
+    setPartners(nextPartners);
+    setSelectedPartner((current) => current?.id === touchPartner.id ? { ...current, lastContact: todayStamp } : current);
+    setTouchPartner(null);
+    setTouchNote('');
+    setTouchKind('call');
+    createTouch(touch)
+      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches: nextTouches }))
+      .catch((error) => {
+        Alert.alert('Sync issue', `This touch was logged on this device but could not sync: ${error.message}`);
+        syncDerived();
+      });
   }
 
   function toggleFavorite(id: string) {
-    setPartners((current) => current.map((partner) => partner.id === id ? { ...partner, favorite: !partner.favorite } : partner));
+    const target = partners.find((partner) => partner.id === id);
+    if (!target) return;
+    const updated = { ...target, favorite: !target.favorite };
+    const nextPartners = partners.map((partner) => partner.id === id ? updated : partner);
+    setPartners(nextPartners);
     setSelectedPartner((current) => current?.id === id ? { ...current, favorite: !current.favorite } : current);
+    updatePartner(updated)
+      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches }))
+      .catch((error) => {
+        Alert.alert('Sync issue', `This change was saved on this device but could not sync: ${error.message}`);
+        syncDerived();
+      });
+  }
+
+  function confirmSignOut() {
+    Alert.alert('Sign out?', 'Cached data stays on this device and syncs again on the next sign-in.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Sign out', style: 'destructive', onPress: async () => {
+        await supabase.auth.signOut();
+        setPartners(initialPartners);
+        setReferrals(initialReferrals);
+        setReferralMatches(initialReferralMatches);
+        setTouches([]);
+        setSelectedPartner(null);
+        setTab('home');
+      } },
+    ]);
   }
 
   function renderHeader(title?: string) {
@@ -782,8 +966,16 @@ export default function App() {
       <View style={styles.header}>
         <View style={styles.brandRow}>
           <Image accessibilityLabel="ReferralFit Fit Point logo" source={require('./assets/icon-fit-point.png')} style={styles.brandMark} />
-          <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
+          <TouchableOpacity accessibilityLabel={title || 'ReferralFit'} activeOpacity={0.7} onLongPress={confirmSignOut} delayLongPress={1200}>
+            <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
+          </TouchableOpacity>
         </View>
+        {offline ? (
+          <View style={styles.offlineBadge}>
+            <AppIcon name="cloud-offline-outline" size={13} color={COLORS.gray} />
+            <Text style={styles.offlineBadgeText}>Offline — showing cached data{queuedWrites > 0 ? ` · ${queuedWrites} to sync` : ''}</Text>
+          </View>
+        ) : null}
       </View>
     );
   }
@@ -1171,6 +1363,7 @@ export default function App() {
               <TouchableOpacity style={styles.profileAction} onPress={() => selectedPartner.phone && Linking.openURL(`tel:${selectedPartner.phone.replace(/[^\d+]/g, '')}`)}><AppIcon name="call" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Call</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => selectedPartner.email && Linking.openURL(`mailto:${selectedPartner.email}`)}><AppIcon name="mail" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Email</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openReferral('Outbound', selectedPartner.id)}><AppIcon name="paper-plane" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Refer</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.profileAction} onPress={() => openTouchLogger(selectedPartner)}><AppIcon name="chatbox-ellipses" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Log touch</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => sharePartner(selectedPartner)}><AppIcon name="share-social" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Share</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openEditPartner(selectedPartner)}><AppIcon name="create" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Edit</Text></TouchableOpacity>
             </View>
@@ -1179,6 +1372,29 @@ export default function App() {
               <View><Text style={styles.fieldLabel}>RELATIONSHIP BALANCE</Text><Text style={styles.profileBalanceTitle}>{balance > 0 ? `They’ve sent ${balance} more` : balance < 0 ? `You’ve sent ${Math.abs(balance)} more` : 'Perfectly balanced'}</Text></View>
               <View style={styles.profileCounts}><Text style={styles.profileCount}><Text style={{ color: COLORS.forest }}>{selectedPartner.inbound}</Text> in</Text><Text style={styles.profileCount}><Text style={{ color: COLORS.blue }}>{selectedPartner.outbound}</Text> out</Text></View>
             </View>
+
+            <View style={styles.infoCard}>
+              <Text style={styles.infoTitle}>Staying in touch</Text>
+              <View style={styles.infoLine}><AppIcon name="calendar-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Cadence</Text><Text style={styles.infoValue}>{selectedPartner.touchCadenceDays ? `Every ${selectedPartner.touchCadenceDays} days` : 'No cadence set'}</Text></View></View>
+              <View style={[styles.infoLine, { borderBottomWidth: 0 }]}><AppIcon name="time-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Last contact</Text><Text style={styles.infoValue}>{selectedPartner.lastContact ? shortDate(selectedPartner.lastContact) : 'Not recorded'}</Text></View></View>
+            </View>
+            {(() => {
+              const partnerTouches = touches.filter((touch) => touch.partnerId === selectedPartner.id).slice(0, 5);
+              return partnerTouches.length ? (
+                <View style={styles.touchLogList}>
+                  {partnerTouches.map((touch) => (
+                    <View key={touch.id} style={styles.touchLogRow}>
+                      <View style={styles.touchLogIcon}><AppIcon name={touch.kind === 'call' ? 'call' : touch.kind === 'text' ? 'chatbubble' : touch.kind === 'email' ? 'mail' : touch.kind === 'meeting' ? 'people' : 'ellipsis-horizontal'} size={14} color={COLORS.forest} /></View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.touchLogTitle}>{touch.kind.charAt(0).toUpperCase() + touch.kind.slice(1)}</Text>
+                        {touch.note ? <Text numberOfLines={1} style={styles.touchLogNote}>{touch.note}</Text> : null}
+                      </View>
+                      <Text style={styles.touchLogDate}>{shortDate(touch.occurredAt.slice(0, 10))}</Text>
+                    </View>
+                  ))}
+                </View>
+              ) : null;
+            })()}
 
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Placement details</Text>
@@ -1251,6 +1467,21 @@ export default function App() {
                 emptyLabel="Select therapeutic needs"
               />
               <FormField label="NOTES" value={partnerForm.note} onChangeText={(note) => setPartnerForm((current) => ({ ...current, note }))} placeholder="Relationship and program notes" multiline />
+              <Text style={styles.fieldLabel}>STAY IN TOUCH EVERY ___ DAYS</Text>
+              <View style={styles.cadenceRow}>
+                {['7', '30', '60', '90'].map((preset) => (
+                  <Pill key={preset} label={preset} active={partnerForm.touchCadence === preset} onPress={() => setPartnerForm((current) => ({ ...current, touchCadence: preset }))} />
+                ))}
+                <Pill label="None" active={partnerForm.touchCadence === ''} onPress={() => setPartnerForm((current) => ({ ...current, touchCadence: '' }))} />
+              </View>
+              <TextInput
+                value={partnerForm.touchCadence}
+                onChangeText={(touchCadence) => setPartnerForm((current) => ({ ...current, touchCadence: touchCadence.replace(/[^\d]/g, '').slice(0, 3) }))}
+                keyboardType="number-pad"
+                placeholder="Custom days (optional)"
+                placeholderTextColor="#99A6A1"
+                style={[styles.formInput, { marginBottom: 15 }]}
+              />
               <TouchableOpacity style={styles.primaryButton} onPress={savePartner}><Text style={styles.primaryButtonText}>{isEditing ? 'Update partner' : 'Save partner'}</Text></TouchableOpacity>
             </ScrollView>
           </KeyboardAvoidingView>
@@ -1306,6 +1537,77 @@ export default function App() {
     );
   }
 
+  function LogTouchModal() {
+    if (!touchPartner) return null;
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setTouchPartner(null)}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityLabel="Close touch logger" onPress={() => setTouchPartner(null)} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Log a touch</Text>
+              <TouchableOpacity onPress={saveTouch}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>Record contact with {touchPartner.name} at {touchPartner.organization}. This updates their last-contact date and resets the cadence clock.</Text>
+              <Text style={styles.fieldLabel}>KIND</Text>
+              <View style={styles.cadenceRow}>
+                {(['call', 'text', 'email', 'meeting'] as TouchKind[]).map((kind) => (
+                  <Pill key={kind} label={kind.charAt(0).toUpperCase() + kind.slice(1)} active={touchKind === kind} onPress={() => setTouchKind(kind)} />
+                ))}
+              </View>
+              <FormField label="NOTE (OPTIONAL)" value={touchNote} onChangeText={setTouchNote} placeholder="Quick note about the conversation" multiline />
+              <TouchableOpacity style={styles.primaryButton} onPress={saveTouch}><Text style={styles.primaryButtonText}>Save touch</Text></TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function NotifPrePromptModal() {
+    if (!notifPrePromptVisible || !session) return null;
+    const dismiss = () => setNotifPrePromptVisible(false);
+    const enable = async () => {
+      dismiss();
+      await rescheduleNotifications({ partners, referrals, referralMatches });
+    };
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={dismiss}>
+        <Pressable style={styles.dropdownOverlay} onPress={dismiss}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <View style={styles.prePromptBody}>
+              <View style={styles.prePromptIcon}><AppIcon name="notifications-outline" size={24} color={COLORS.forest} /></View>
+              <Text style={styles.prePromptTitle}>Stay ahead of cold relationships</Text>
+              <Text style={styles.prePromptText}>ReferralFit can send a 7 AM briefing and a nudge when a partner passes their stay-in-touch cadence. Everything is scheduled on this device — no data leaves your phone.</Text>
+              <TouchableOpacity style={styles.primaryButton} onPress={enable}><Text style={styles.primaryButtonText}>Enable notifications</Text></TouchableOpacity>
+              <TouchableOpacity onPress={dismiss} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Not now</Text></TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
+  if (!loaded) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar style="dark" />
+      </SafeAreaView>
+    );
+  }
+
+  if (!session) {
+    return (
+      <>
+        <StatusBar style="dark" />
+        <LoginScreen onSignedIn={() => {}} />
+      </>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
@@ -1316,6 +1618,8 @@ export default function App() {
       {PartnerDetailModal()}
       {AddPartnerModal()}
       {AddReferralModal()}
+      {LogTouchModal()}
+      {NotifPrePromptModal()}
     </SafeAreaView>
   );
 }
@@ -1595,4 +1899,19 @@ const styles = StyleSheet.create({
   partnerPickText: { color: COLORS.inkSoft, fontSize: 9, lineHeight: 12, textAlign: 'center', fontWeight: '600', marginTop: 6 },
   partnerPickTextActive: { color: COLORS.forest, fontWeight: '800' },
   privacyHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: -6, marginBottom: 18 },
+  offlineBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 5, borderWidth: 1, borderColor: COLORS.line },
+  offlineBadgeText: { color: COLORS.gray, fontSize: 9, fontWeight: '700' },
+  cadenceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 },
+  touchLogList: { marginTop: 12, backgroundColor: COLORS.white, borderRadius: 17, paddingHorizontal: 14, borderWidth: 1, borderColor: COLORS.line },
+  touchLogRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: '#EEF0EE' },
+  touchLogIcon: { width: 28, height: 28, borderRadius: 9, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center' },
+  touchLogTitle: { color: COLORS.ink, fontSize: 12, fontWeight: '700' },
+  touchLogNote: { color: COLORS.gray, fontSize: 10, marginTop: 2 },
+  touchLogDate: { color: COLORS.gray, fontSize: 10 },
+  prePromptBody: { padding: 20, paddingBottom: 26 },
+  prePromptIcon: { width: 52, height: 52, borderRadius: 18, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center', marginBottom: 14 },
+  prePromptTitle: { color: COLORS.ink, fontSize: 18, fontWeight: '800', letterSpacing: -0.35, marginBottom: 8 },
+  prePromptText: { color: COLORS.gray, fontSize: 13, lineHeight: 19, marginBottom: 20 },
+  prePromptNotNow: { alignItems: 'center', paddingVertical: 12 },
+  prePromptNotNowText: { color: COLORS.gray, fontSize: 12, fontWeight: '700' },
 });
