@@ -107,6 +107,7 @@ import {
   isOpenCase,
   logCaseEvent,
   newDocumentId,
+  newUuid,
   PaymentStatus,
   removeCaseFile,
   searchCases,
@@ -136,8 +137,12 @@ const COLORS = {
   blue: '#507C86',
 };
 
-function makeId(prefix: string) {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+// Every table's PK is a Postgres `uuid` column, so client-generated ids MUST be
+// valid UUIDs — a prefixed string like `p-1785096121092-t1etoz4` is rejected with
+// "invalid input syntax for type uuid" on sync. The prefix argument is kept so
+// call sites read the same, but it is intentionally unused.
+function makeId(_prefix?: string) {
+  return newUuid();
 }
 
 // ─── Case files (v3) ────────────────────────────────────────────────────────

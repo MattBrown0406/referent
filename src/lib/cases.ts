@@ -355,7 +355,7 @@ export async function logCaseEvent(
   id?: string,
 ): Promise<CaseEvent> {
   const event: CaseEvent = {
-    id: id || `e-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    id: id || uuidish(),
     caseId,
     kind,
     body,
@@ -407,6 +407,11 @@ function uuidish(): string {
 }
 
 export function newDocumentId(): string {
+  return uuidish();
+}
+
+/** Client-generated primary key for any table (all PKs are Postgres uuid). */
+export function newUuid(): string {
   return uuidish();
 }
 

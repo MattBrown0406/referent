@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+import { newUuid } from './cases';
 import { supabase } from './supabase';
 import type {
   InsuranceNetworkPreference,
@@ -566,6 +567,94 @@ async function readCache(): Promise<Snapshot | null> {
   }
 }
 
+// ─── Legacy non-uuid id repair ───────────────────────────────────────────────
+// Builds up to 1.0.0(8) generated ids like `p-1785096121092-t1etoz4`, which the
+// uuid primary keys reject ("invalid input syntax for type uuid"). Any such row
+// is stranded in the local cache and its queued write can never succeed. This
+// pass rewrites those ids to real uuids (and repoints FK references) before the
+// cache is used or the queue is flushed, so the next sync heals itself.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isUuid(value: unknown): boolean {
+  return typeof value === 'string' && UUID_RE.test(value);
+}
+
+function repairSnapshotIds(snapshot: Snapshot): { snapshot: Snapshot; repaired: number } {
+  const remap = new Map<string, string>();
+  const idFor = (old: string | undefined | null): string | undefined => {
+    if (!old) return old ?? undefined;
+    if (isUuid(old)) return old;
+    let next = remap.get(old);
+    if (!next) {
+      next = newUuid();
+      remap.set(old, next);
+    }
+    return next;
+  };
+
+  const partners = snapshot.partners.map((p) => ({ ...p, id: idFor(p.id) as string }));
+  const referrals = snapshot.referrals.map((r) => ({
+    ...r,
+    id: idFor(r.id) as string,
+    partnerId: idFor(r.partnerId) as string,
+    matchProfileId: idFor(r.matchProfileId),
+    caseId: idFor(r.caseId),
+  }));
+  const referralMatches = snapshot.referralMatches.map((m) => ({
+    ...m,
+    id: idFor(m.id) as string,
+    assignedPartnerId: idFor(m.assignedPartnerId),
+    referralId: idFor(m.referralId),
+    caseId: idFor(m.caseId),
+  }));
+  const touches = snapshot.touches.map((t) => ({
+    ...t,
+    id: idFor(t.id) as string,
+    partnerId: idFor(t.partnerId) as string,
+  }));
+  const followUps = snapshot.followUps.map((f) => ({
+    ...f,
+    id: idFor(f.id) as string,
+    partnerId: idFor(f.partnerId),
+    referralId: idFor(f.referralId),
+    caseId: idFor(f.caseId),
+  }));
+
+  const scorecards: Snapshot['scorecards'] = {};
+  Object.entries(snapshot.scorecards || {}).forEach(([key, value]) => {
+    const mapped = idFor(key);
+    if (mapped) scorecards[mapped] = value;
+  });
+
+  return {
+    snapshot: { partners, referrals, referralMatches, touches, followUps, scorecards },
+    repaired: remap.size,
+  };
+}
+
+// Same treatment for anything already sitting in the write queue.
+async function repairWriteQueueIds(): Promise<number> {
+  try {
+    const raw = await AsyncStorage.getItem(QUEUE_KEY);
+    if (!raw) return 0;
+    const text = raw;
+    const bad = new Set<string>();
+    // ids look like p-<digits>-<alnum> / r- / m- / t- / f- / c- / cc- / e-
+    const re = /"((?:p|r|m|t|f|c|cc|e)-\d{10,}-[a-z0-9]{4,})"/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(text))) bad.add(match[1]);
+    if (!bad.size) return 0;
+    let patched = text;
+    bad.forEach((oldId) => {
+      patched = patched.split(`"${oldId}"`).join(`"${newUuid()}"`);
+    });
+    await AsyncStorage.setItem(QUEUE_KEY, patched);
+    return bad.size;
+  } catch {
+    return 0;
+  }
+}
+
 // One-shot import of the pre-Supabase AsyncStorage blob so existing installs
 // keep their data. Returns null when there is nothing worth importing.
 async function readLegacySnapshot(): Promise<Snapshot | null> {
@@ -640,6 +729,24 @@ async function fetchSnapshot(): Promise<Snapshot> {
 // them), and imports the legacy AsyncStorage blob on first authenticated run.
 export async function hydrate(): Promise<HydrateResult> {
   try {
+    // Heal ids written by builds <= 1.0.0(8) BEFORE anything is sent upstream,
+    // otherwise the same rows keep failing with "invalid input syntax for type
+    // uuid" forever (both the queued op and the cached row).
+    await repairWriteQueueIds();
+    const cachedBefore = await readCache();
+    if (cachedBefore) {
+      const { snapshot: fixed, repaired } = repairSnapshotIds(cachedBefore);
+      if (repaired > 0) {
+        await writeCache(fixed);
+        // Push the repaired rows up so the server gets the records that were
+        // stranded locally (upsert — safe if some already exist).
+        try {
+          await importLegacySnapshot(fixed);
+        } catch (error) {
+          if (!isNetworkError(error)) console.warn('[store] repaired-id upsert failed');
+        }
+      }
+    }
     await flushWriteQueue();
     const legacy = await readLegacySnapshot();
     if (legacy) {
