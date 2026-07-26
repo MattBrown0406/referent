@@ -189,22 +189,53 @@ async function applyQueueOp(op: QueueOp): Promise<void> {
 // Flush queued mutations FIFO. Stops at the first network failure (we are still
 // offline); throws only for genuine server-side errors so the caller can drop
 // the poisoned op. Returns the number of ops that were applied.
+// A foreign-key violation usually means the parent row (partner/referral/case)
+// simply has not been inserted yet — its own op may sit later in the queue, or
+// it failed on a previous pass. Those ops must be retried, never dropped, or a
+// referral whose partner failed once is lost forever.
+function isMissingParentError(error: unknown): boolean {
+  const err = error as { code?: string; message?: string } | null;
+  const code = err?.code ?? '';
+  const message = err?.message ?? '';
+  return code === '23503' || /foreign key constraint/i.test(message);
+}
+
 export async function flushWriteQueue(): Promise<number> {
   let flushed = 0;
   let ops = await readQueue();
+  const deferred: QueueOp[] = [];
   while (ops.length) {
     const [head, ...rest] = ops;
     try {
       await applyQueueOp(head);
+      flushed += 1;
     } catch (error) {
       if (isNetworkError(error)) break; // still offline — keep the queue as-is
-      // Server rejected the op (constraint, RLS, ...). Drop it rather than
-      // blocking the whole queue forever, and keep flushing the rest.
+      if (isMissingParentError(error)) {
+        // Parent not there yet — keep it for a second pass below.
+        deferred.push(head);
+      }
+      // Any other server rejection (check constraint, RLS, ...) is dropped so a
+      // single bad op can't block the queue forever.
     }
     ops = rest;
-    flushed += 1;
-    await writeQueue(ops);
+    await writeQueue([...ops, ...deferred]);
   }
+
+  // Second pass: parents that were queued after their children now exist.
+  let retry = deferred.splice(0, deferred.length);
+  for (const op of retry) {
+    try {
+      await applyQueueOp(op);
+      flushed += 1;
+    } catch (error) {
+      if (isNetworkError(error) || isMissingParentError(error)) {
+        // Still unresolvable — keep it queued and try again next launch.
+        deferred.push(op);
+      }
+    }
+  }
+  await writeQueue(deferred);
   return flushed;
 }
 
@@ -579,6 +610,27 @@ function isUuid(value: unknown): boolean {
   return typeof value === 'string' && UUID_RE.test(value);
 }
 
+// DETERMINISTIC old-id -> uuid mapping. This must be stable across both repair
+// passes (cache and write queue) and across launches: if the cached partner and
+// the queued referral that references it were given different random uuids, the
+// referral insert would fail with a foreign-key violation instead of syncing.
+function uuidFromLegacyId(oldId: string): string {
+  // 4 independent FNV-1a passes (different offsets) -> 32 hex chars.
+  const hex: string[] = [];
+  for (let pass = 0; pass < 4; pass += 1) {
+    let h = 0x811c9dc5 ^ (pass * 0x01000193);
+    for (let i = 0; i < oldId.length; i += 1) {
+      h ^= oldId.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    hex.push(h.toString(16).padStart(8, '0'));
+  }
+  const raw = hex.join('');
+  const version = `4${raw.slice(13, 16)}`;                        // RFC4122 v4
+  const variant = ((parseInt(raw[16], 16) & 0x3) | 0x8).toString(16) + raw.slice(17, 20);
+  return `${raw.slice(0, 8)}-${raw.slice(8, 12)}-${version}-${variant}-${raw.slice(20, 32)}`;
+}
+
 function repairSnapshotIds(snapshot: Snapshot): { snapshot: Snapshot; repaired: number } {
   const remap = new Map<string, string>();
   const idFor = (old: string | undefined | null): string | undefined => {
@@ -586,7 +638,7 @@ function repairSnapshotIds(snapshot: Snapshot): { snapshot: Snapshot; repaired: 
     if (isUuid(old)) return old;
     let next = remap.get(old);
     if (!next) {
-      next = newUuid();
+      next = uuidFromLegacyId(old);
       remap.set(old, next);
     }
     return next;
@@ -646,7 +698,9 @@ async function repairWriteQueueIds(): Promise<number> {
     if (!bad.size) return 0;
     let patched = text;
     bad.forEach((oldId) => {
-      patched = patched.split(`"${oldId}"`).join(`"${newUuid()}"`);
+      // Same deterministic mapping the cache pass uses, so FK references still
+      // line up between a queued child row and its repaired parent.
+      patched = patched.split(`"${oldId}"`).join(`"${uuidFromLegacyId(oldId)}"`);
     });
     await AsyncStorage.setItem(QUEUE_KEY, patched);
     return bad.size;
