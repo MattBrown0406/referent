@@ -141,6 +141,13 @@ const COLORS = {
 // valid UUIDs — a prefixed string like `p-1785096121092-t1etoz4` is rejected with
 // "invalid input syntax for type uuid" on sync. The prefix argument is kept so
 // call sites read the same, but it is intentionally unused.
+// Run write ops strictly in order. Foreign keys mean a child row can only be
+// inserted after its parent, so any batch that mixes parents and children must
+// be sequential — Promise.all fires them simultaneously and loses the race.
+async function runSequentially(ops: Array<() => Promise<unknown>>): Promise<void> {
+  for (const op of ops) await op();
+}
+
 function makeId(_prefix?: string) {
   return newUuid();
 }
@@ -1173,17 +1180,21 @@ export default function App() {
 
     const snapshot: Snapshot = { partners: nextPartners, referrals: nextReferrals, referralMatches: nextMatches, touches: nextTouches, followUps: nextFollowUps, scorecards };
     const referralAtSend = referral;
-    const writes: Promise<void>[] = [];
+    const writes: Array<() => Promise<unknown>> = [];
     if (assignOnSend && assignedMatch) {
       // Same code path as the manual assign flow: referral insert first,
       // then the match profile update (assignMatchReferral in the store).
-      writes.push(assignMatchReferral(referralAtSend, assignedMatch));
+      writes.push(() => assignMatchReferral(referralAtSend, assignedMatch));
     } else {
       // Already assigned: stamp packet_sent_at / match_profile_id onto the
       // existing referral via a targeted update op.
-      writes.push(updateReferralPacketStamp(referralId, now.toISOString(), match.id));
+      writes.push(() => updateReferralPacketStamp(referralId, now.toISOString(), match.id));
     }
-    writes.push(createTouch(touch), createFollowUp(followUp));
+    // NOTE: `writes` is executed SEQUENTIALLY below — the referral must exist
+    // before the follow-up (follow_ups.referral_id FK) and before the case
+    // event that references it. Parallel execution raced and produced
+    // "violates foreign key constraint" errors.
+    writes.push(() => createTouch(touch), () => createFollowUp(followUp));
     if (caseId) {
       const linkedCaseId = caseId;
       const eventId = makeId('e');
@@ -1196,10 +1207,10 @@ export default function App() {
         occurredAt: now.toISOString(),
       };
       applyCaseEvent(event);
-      writes.push(logCaseEvent(linkedCaseId, 'referral', event.body, { referralId }, eventId).then(() => undefined));
+      writes.push(() => logCaseEvent(linkedCaseId, 'referral', event.body, { referralId }, eventId));
     }
 
-    Promise.all(writes)
+    runSequentially(writes)
       .then(() => {
         syncDerived(snapshot);
         Alert.alert('Packet logged', `Referral logged, touch recorded, and a follow-up was set for ${shortDate(followUp.dueOn)}.`);
@@ -1291,13 +1302,12 @@ export default function App() {
     setCases([record, ...cases]);
     setShowNewCase(false);
     setCaseForm(makeEmptyCaseForm());
-    const writes: Promise<unknown>[] = [createCase(record)];
-    if (primaryContact) writes.push(createContact(primaryContact));
     let nextFollowUps = followUps;
+    let firstCall: FollowUp | null = null;
     if (record.status === 'inquiry') {
       // AUTO-CREATE (v4): a new inquiry is a new lead — the first call goes
       // on today's list automatically. Case-linked, due today.
-      const firstCall: FollowUp = {
+      firstCall = {
         id: makeId('f'),
         caseId: record.id,
         kind: 'first_call',
@@ -1308,9 +1318,16 @@ export default function App() {
       };
       nextFollowUps = [firstCall, ...followUps];
       setFollowUps(nextFollowUps);
-      writes.push(createFollowUp(firstCall));
     }
-    Promise.all(writes)
+    // ORDER MATTERS: case_contacts.case_id and follow_ups.case_id are foreign
+    // keys, so the case row must land BEFORE its children. Running these in
+    // parallel (Promise.all) raced and failed with
+    // "violates foreign key constraint case_contacts_case_id_fkey".
+    (async () => {
+      await createCase(record);
+      if (primaryContact) await createContact(primaryContact);
+      if (firstCall) await createFollowUp(firstCall);
+    })()
       .then(() => {
         syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }, [record, ...previous]);
         openCase(record.id);
@@ -1333,7 +1350,7 @@ export default function App() {
       occurredAt: updated.updatedAt,
     };
     applyCaseEvent(event);
-    Promise.all([updateCase(updated), logCaseEvent(record.id, 'status_change', event.body, {}, eventId)])
+    runSequentially([() => updateCase(updated), () => logCaseEvent(record.id, 'status_change', event.body, {}, eventId)])
       .then(() => syncDerived(undefined, next))
       .catch((error) => failCaseChange(`The status change could not be saved: ${error.message}`, () => {
         setCases(previous);
@@ -1353,7 +1370,7 @@ export default function App() {
     const body = bits.join(' · ') || 'Payment updated';
     const eventId = makeId('e');
     applyCaseEvent({ id: eventId, caseId: record.id, kind: 'payment', body, occurredAt: updated.updatedAt });
-    Promise.all([updateCase(updated), logCaseEvent(record.id, 'payment', body, {}, eventId)])
+    runSequentially([() => updateCase(updated), () => logCaseEvent(record.id, 'payment', body, {}, eventId)])
       .then(() => syncDerived(undefined, next))
       .catch((error) => failCaseChange(`The payment change could not be saved: ${error.message}`, () => {
         setCases(previous);
@@ -1398,9 +1415,9 @@ export default function App() {
     ];
     setCaseContacts(nextContacts);
     setCaseContactForm(null);
-    const writes: Promise<unknown>[] = [existing ? updateContact(contact) : createContact(contact)];
-    for (const old of demoted) writes.push(updateContact({ ...old, isPrimary: false }));
-    Promise.all(writes)
+    const writes: Array<() => Promise<unknown>> = [() => (existing ? updateContact(contact) : createContact(contact))];
+    for (const old of demoted) writes.push(() => updateContact({ ...old, isPrimary: false }));
+    runSequentially(writes)
       .catch((error) => failCaseChange(`The contact could not be saved: ${error.message}`, () => setCaseContacts(previousContacts)));
   }
 
@@ -1762,7 +1779,7 @@ export default function App() {
     setFollowUps(nextFollowUps);
     setDoneCard(null);
     if (followUp.caseId) logTodaySystemEvent(followUp.caseId, `Completed: ${followUp.title} — set next: ${next.title} (${shortDate(next.dueOn)}${next.dueTime ? ` ${next.dueTime}` : ''})`);
-    Promise.all([updateFollowUp(completed), createFollowUp(next)])
+    runSequentially([() => updateFollowUp(completed), () => createFollowUp(next)])
       .then(() => syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
       .catch((error) => {
         Alert.alert('Sync issue', `This was saved on this device but could not sync: ${error.message}`);
@@ -2054,19 +2071,20 @@ export default function App() {
     const completed: FollowUp = { ...followUp, status: 'done', completedAt: now };
     const nextFollowUps = followUps.map((item) => (item.id === followUp.id ? completed : item));
     setFollowUps(nextFollowUps);
-    const writes: Promise<void>[] = [updateFollowUp(completed)];
+    const writes: Array<() => Promise<unknown>> = [() => updateFollowUp(completed)];
     let nextReferrals = referrals;
     if (followUp.referralId) {
+      const outcomeReferralId = followUp.referralId;
       const stars = outcomeStars > 0 ? outcomeStars : null;
       const patch = outcomeAnswer === 'yes'
         ? { admitted: true, admittedOn: outcomeAdmittedOn || localDateStamp(), outcome: 'Placed' as Referral['outcome'], familyExperience: stars, outcomeNote: outcomeNote.trim() }
         : { admitted: false, outcomeNote: outcomeNote.trim() };
       nextReferrals = referrals.map((item) => (item.id === followUp.referralId ? { ...item, ...patch } : item));
       setReferrals(nextReferrals);
-      writes.push(updateReferralOutcome(followUp.referralId, patch));
+      writes.push(() => updateReferralOutcome(outcomeReferralId, patch));
     }
     closeOutcomeSheet();
-    Promise.all(writes)
+    runSequentially(writes)
       .then(() => syncDerived({ partners, referrals: nextReferrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
       .catch((error) => {
         Alert.alert('Sync issue', `This outcome was saved on this device but could not sync: ${error.message}`);
