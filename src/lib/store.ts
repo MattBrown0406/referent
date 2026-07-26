@@ -472,7 +472,7 @@ function mapScorecardRow(row: ScorecardRow): PartnerScorecard {
 function partnerToRow(partner: Partner): Record<string, unknown> {
   const types = partner.types?.length ? partner.types : [partner.type];
   return {
-    id: partner.id,
+    id: safeId(partner.id),
     name: partner.name,
     organization: partner.organization,
     types,
@@ -494,10 +494,18 @@ function partnerToRow(partner: Partner): Record<string, unknown> {
   };
 }
 
+// Last line of defence: every PK/FK sent upstream must be a uuid. If any code
+// path still yields a legacy prefixed id, map it deterministically here so the
+// write succeeds instead of erroring out in the user's face.
+function safeId(value: string | undefined | null): string | null {
+  if (!value) return null;
+  return isUuid(value) ? value : uuidFromLegacyId(value);
+}
+
 function referralToRow(referral: Referral): Record<string, unknown> {
   return {
-    id: referral.id,
-    partner_id: referral.partnerId,
+    id: safeId(referral.id),
+    partner_id: safeId(referral.partnerId),
     direction: referral.direction === 'Inbound' ? 'inbound' : 'outbound',
     referred_on: referral.date,
     client_label: referral.clientLabel,
@@ -505,8 +513,8 @@ function referralToRow(referral: Referral): Record<string, unknown> {
     note: referral.note,
     // v2 columns (deployed migration 20260724150000) — packet + outcome data
     packet_sent_at: referral.packetSentAt ?? null,
-    match_profile_id: referral.matchProfileId ?? null,
-    case_id: referral.caseId ?? null,
+    match_profile_id: safeId(referral.matchProfileId),
+    case_id: safeId(referral.caseId),
     admitted: referral.admitted ?? null,
     admitted_on: referral.admittedOn ?? null,
     family_experience: referral.familyExperience ?? null,
@@ -516,7 +524,7 @@ function referralToRow(referral: Referral): Record<string, unknown> {
 
 function matchToRow(match: ReferralMatch): Record<string, unknown> {
   return {
-    id: match.id,
+    id: safeId(match.id),
     client_label: match.clientLabel,
     level_of_care: match.levelOfCare,
     state: match.state,
@@ -525,16 +533,16 @@ function matchToRow(match: ReferralMatch): Record<string, unknown> {
     max_budget: match.maxBudget ?? null,
     therapies: match.therapies,
     status: match.status,
-    assigned_partner_id: match.assignedPartnerId ?? null,
-    referral_id: match.referralId ?? null,
-    case_id: match.caseId ?? null,
+    assigned_partner_id: safeId(match.assignedPartnerId),
+    referral_id: safeId(match.referralId),
+    case_id: safeId(match.caseId),
   };
 }
 
 function touchToRow(touch: Touch): Record<string, unknown> {
   return {
-    id: touch.id,
-    partner_id: touch.partnerId,
+    id: safeId(touch.id),
+    partner_id: safeId(touch.partnerId),
     kind: touch.kind,
     note: touch.note,
     occurred_at: touch.occurredAt,
@@ -543,10 +551,10 @@ function touchToRow(touch: Touch): Record<string, unknown> {
 
 function followUpToRow(followUp: FollowUp): Record<string, unknown> {
   return {
-    id: followUp.id,
-    partner_id: followUp.partnerId ?? null,
-    referral_id: followUp.referralId ?? null,
-    case_id: followUp.caseId ?? null,
+    id: safeId(followUp.id),
+    partner_id: safeId(followUp.partnerId),
+    referral_id: safeId(followUp.referralId),
+    case_id: safeId(followUp.caseId),
     title: followUp.title,
     due_on: followUp.dueOn,
     status: followUp.status,
@@ -709,6 +717,44 @@ async function repairWriteQueueIds(): Promise<number> {
   }
 }
 
+// Merge rows that exist only locally into a freshly fetched server snapshot, so
+// a read can never delete unsynced work. Server rows win on conflict (they are
+// canonical); local-only rows are appended and their inserts re-queued.
+function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null): Snapshot {
+  if (!local) return remote;
+  const merge = <T extends { id: string }>(r: T[], l: T[]): { rows: T[]; missing: T[] } => {
+    const have = new Set(r.map((x) => x.id));
+    const missing = l.filter((x) => x.id && !have.has(x.id));
+    return { rows: [...r, ...missing], missing };
+  };
+  const partners = merge(remote.partners, local.partners);
+  const referrals = merge(remote.referrals, local.referrals);
+  const matches = merge(remote.referralMatches, local.referralMatches);
+  const touches = merge(remote.touches, local.touches);
+  const followUps = merge(remote.followUps, local.followUps);
+
+  // Re-queue the local-only rows (parents first) so the next flush syncs them.
+  const requeue = async () => {
+    for (const p of partners.missing) await enqueueOp({ kind: 'partner.insert', row: partnerToRow(p) });
+    for (const r of referrals.missing) await enqueueOp({ kind: 'referral.insert', row: referralToRow(r) });
+    for (const m of matches.missing) await enqueueOp({ kind: 'match.insert', row: matchToRow(m) });
+    for (const t of touches.missing) await enqueueOp({ kind: 'touch.insert', row: touchToRow(t) });
+    for (const f of followUps.missing) await enqueueOp({ kind: 'follow_up.insert', row: followUpToRow(f) });
+  };
+  const anyMissing = partners.missing.length || referrals.missing.length || matches.missing.length
+    || touches.missing.length || followUps.missing.length;
+  if (anyMissing) void requeue();
+
+  return {
+    partners: partners.rows,
+    referrals: referrals.rows,
+    referralMatches: matches.rows,
+    touches: touches.rows,
+    followUps: followUps.rows,
+    scorecards: remote.scorecards,
+  };
+}
+
 // One-shot import of the pre-Supabase AsyncStorage blob so existing installs
 // keep their data. Returns null when there is nothing worth importing.
 async function readLegacySnapshot(): Promise<Snapshot | null> {
@@ -817,8 +863,14 @@ export async function hydrate(): Promise<HydrateResult> {
       }
     }
     const snapshot = await fetchSnapshot();
-    await writeCache(snapshot);
-    return { snapshot, source: 'remote' };
+    // NEVER let the server snapshot silently delete rows that exist only on this
+    // device (created while offline, or whose insert failed). Merge them back in
+    // and re-queue their writes so they get another chance, instead of wiping
+    // the user's work on relaunch.
+    const localBefore = await readCache();
+    const merged = mergeUnsyncedLocal(snapshot, localBefore);
+    await writeCache(merged);
+    return { snapshot: merged, source: 'remote' };
   } catch (error) {
     const cached = await readCache();
     if (cached) return { snapshot: cached, source: 'cache' };
