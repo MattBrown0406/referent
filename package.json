@@ -38,5 +38,17 @@
     "quality": "npm run typecheck && npm test",
     "eas-build-pre-install": "npm install --global npm@10.9.8"
   },
-  "private": true
+  "private": true,
+  "expo": {
+    "install": {
+      "exclude": [
+        "expo",
+        "expo-dev-client",
+        "expo-image-picker",
+        "expo-notifications",
+        "expo-updates",
+        "react-native"
+      ]
+    }
+  }
 }
