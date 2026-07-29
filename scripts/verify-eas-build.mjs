@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { readFileSync } from 'node:fs';
 
-const [file, expectedSha] = process.argv.slice(2);
-if (!file || !expectedSha) {
-  console.error('usage: verify-eas-build.mjs <build-list.json> <merged-sha>');
+const [file, expectedSha, expectedVersion, expectedBuildNumber] = process.argv.slice(2);
+if (!file || !expectedSha || !expectedVersion || !expectedBuildNumber) {
+  console.error('usage: verify-eas-build.mjs <build-list.json> <merged-sha> <app-version> <build-number>');
   process.exit(2);
 }
 
@@ -17,8 +17,8 @@ const expected = {
   platform: 'IOS',
   distribution: 'STORE',
   buildProfile: 'production',
-  appVersion: '1.0.1',
-  appBuildVersion: '10',
+  appVersion: expectedVersion,
+  appBuildVersion: expectedBuildNumber,
   gitCommitHash: expectedSha,
 };
 for (const [key, value] of Object.entries(expected)) {
