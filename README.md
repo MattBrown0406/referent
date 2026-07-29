@@ -67,10 +67,10 @@ test "$(git rev-parse HEAD)" = "$MERGED_SHA"
 test -z "$(git status --porcelain)"
 
 npx eas-cli@21.4.0 build --platform ios --profile production --freeze-credentials --non-interactive --wait
-npx eas-cli@21.4.0 build:list --platform ios --app-identifier com.mattbrown.referralfit --git-commit-hash "$MERGED_SHA" --build-profile production --distribution store --app-version 1.0.1 --app-build-version 11 --status finished --limit 10 --json --non-interactive > /tmp/referent-eas-build.json
+npx eas-cli@21.4.0 build:list --platform ios --app-identifier com.mattbrown.referralfit --git-commit-hash "$MERGED_SHA" --build-profile production --distribution store --app-version 1.0.0 --app-build-version 12 --status finished --limit 10 --json --non-interactive > /tmp/referent-eas-build.json
 # Require exactly one matching record and verify commit, profile, platform,
 # distribution, app version, and build number.
-VERIFIED_EAS_BUILD_ID="$(node scripts/verify-eas-build.mjs /tmp/referent-eas-build.json "$MERGED_SHA" 1.0.1 11)"
+VERIFIED_EAS_BUILD_ID="$(node scripts/verify-eas-build.mjs /tmp/referent-eas-build.json "$MERGED_SHA" 1.0.0 12)"
 
 # EAS build records do not expose CFBundleIdentifier. Verify the signed IPA
 # itself before submitting it to Apple.
