@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
 const source = await readFile(new URL('../src/lib/store.ts', import.meta.url), 'utf8');
+assert.match(source, /function sanitizeInsuranceNetworks\(value: unknown, insurance: string\[\]\)/);
+assert.match(source, /insuranceNetworkStatuses\.has/);
 const casesSource = await readFile(new URL('../src/lib/cases.ts', import.meta.url), 'utf8');
 const authSessionSource = await readFile(new URL('../src/lib/auth-session.ts', import.meta.url), 'utf8');
 

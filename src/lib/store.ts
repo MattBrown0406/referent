@@ -431,7 +431,7 @@ type PartnerRow = {
   email: string | null;
   website: string | null;
   monthly_cost: number | null;
-  insurance_networks: Record<string, InsuranceNetworkPreference[]> | null;
+  insurance_networks: unknown;
   cash_min: number | null;
   cash_max: number | null;
   insurance: string[] | null;
@@ -527,6 +527,25 @@ function toDateStamp(iso: string | null | undefined, fallback: string): string {
   return iso ? iso.slice(0, 10) : fallback;
 }
 
+const insuranceNetworkStatuses = new Set<InsuranceNetworkPreference>(['In-network', 'Out-of-network']);
+
+function sanitizeInsuranceNetworks(value: unknown, insurance: string[]): Partial<Record<string, InsuranceNetworkPreference[]>> {
+  const plans = insurance.filter((plan) => plan !== 'Cash pay');
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length === 0) {
+    return Object.fromEntries(plans.map((plan) => [plan, ['In-network' as InsuranceNetworkPreference]]));
+  }
+
+  const rawNetworks = value as Record<string, unknown>;
+  return Object.fromEntries(plans.flatMap((plan) => {
+    const rawStatuses = rawNetworks[plan];
+    if (!Array.isArray(rawStatuses)) return [];
+    const statuses = [...new Set(rawStatuses.filter(
+      (status): status is InsuranceNetworkPreference => typeof status === 'string' && insuranceNetworkStatuses.has(status as InsuranceNetworkPreference),
+    ))];
+    return statuses.length ? [[plan, statuses] as const] : [];
+  }));
+}
+
 function mapPartnerRow(row: PartnerRow, balance: BalanceRow | undefined): Partner {
   const types = (row.types || []) as PartnerType[];
   const primary = types[0] || 'Inpatient';
@@ -543,9 +562,7 @@ function mapPartnerRow(row: PartnerRow, balance: BalanceRow | undefined): Partne
     email: row.email || '',
     website: row.website || undefined,
     monthlyCost: toNumber(row.monthly_cost) || toNumber(row.cash_max) || toNumber(row.cash_min),
-    insuranceNetworks: row.insurance_networks && Object.keys(row.insurance_networks).length
-      ? row.insurance_networks
-      : Object.fromEntries((row.insurance || []).filter((plan) => plan !== 'Cash pay').map((plan) => [plan, ['In-network' as InsuranceNetworkPreference]])),
+    insuranceNetworks: sanitizeInsuranceNetworks(row.insurance_networks, row.insurance || []),
     cashMin: toNumber(row.cash_min),
     cashMax: toNumber(row.cash_max),
     insurance: row.insurance || [],

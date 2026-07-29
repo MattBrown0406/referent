@@ -2,7 +2,7 @@
 -- Run after a local migration reset with: supabase test db
 
 BEGIN;
-SELECT plan(58);
+SELECT plan(61);
 
 WITH expected(child_table, constraint_name, parent_table, child_columns, delete_action) AS (
   VALUES
@@ -597,6 +597,30 @@ SELECT is(
     WHERE id = '31000000-0000-0000-0000-000000000003'::uuid),
   '{"monthlyCost":4200,"networks":{"Aetna":["In-network"],"Cigna":["In-network"]}}'::jsonb,
   'legacy cash and insurance values synchronize into monthly cost and explicit network capabilities'
+);
+SELECT lives_ok(
+  $$ UPDATE public.partners
+     SET insurance_networks = '{"Aetna":["Out-of-network"]}'::jsonb
+     WHERE id = '31000000-0000-0000-0000-000000000003'::uuid;
+     UPDATE public.partners
+     SET insurance = ARRAY['Aetna', 'Cigna', 'UnitedHealthcare']
+     WHERE id = '31000000-0000-0000-0000-000000000003'::uuid $$,
+  'a legacy insurance edit preserves explicit network classifications'
+);
+SELECT is(
+  (SELECT insurance_networks
+     FROM public.partners
+    WHERE id = '31000000-0000-0000-0000-000000000003'::uuid),
+  '{"Aetna":["Out-of-network"],"Cigna":["In-network"],"UnitedHealthcare":["In-network"]}'::jsonb,
+  'retained carriers keep their status while newly added carriers default to in-network'
+);
+SELECT throws_ok(
+  $$ UPDATE public.partners
+     SET insurance_networks = '{"Aetna":"Out-of-network"}'::jsonb
+     WHERE id = '31000000-0000-0000-0000-000000000003'::uuid $$,
+  '23514',
+  NULL,
+  'malformed insurance network capabilities are rejected'
 );
 
 SELECT * FROM finish();
