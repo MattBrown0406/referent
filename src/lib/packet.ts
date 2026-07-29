@@ -43,11 +43,12 @@ export function buildFitReasons(matchProfile: ReferralMatch, partner: Partner, f
     reasons.push(`Provides ${matchProfile.levelOfCare} level of care`);
   }
   if (matchProfile.insurance === 'Cash pay') {
-    const withinBudget = matchProfile.maxBudget != null && partner.cashMin <= matchProfile.maxBudget;
+    const monthlyCost = partner.monthlyCost ?? partner.cashMax ?? partner.cashMin;
+    const withinBudget = matchProfile.maxBudget != null && monthlyCost <= matchProfile.maxBudget;
     reasons.push(
       withinBudget
-        ? `Cash rate starts at ${formatMoney(partner.cashMin)} — within the ${formatMoney(matchProfile.maxBudget as number)} budget`
-        : `Cash pay — rates ${formatMoney(partner.cashMin)}–${formatMoney(partner.cashMax)}`,
+        ? `Monthly cash cost is ${formatMoney(monthlyCost)} — within the ${formatMoney(matchProfile.maxBudget as number)} budget`
+        : `Monthly cash cost: ${formatMoney(monthlyCost)}`,
     );
   } else if (fit.networkStatus === 'In-network') {
     reasons.push(`In-network with ${matchProfile.insurance}`);

@@ -15,6 +15,11 @@ assert.match(source, /setPendingCaseMatchId\(previousPendingCaseMatchId\)/);
 assert.doesNotMatch(source, /<TouchableOpacity key=\{item\.id\}[\s\S]*?<TouchableOpacity style=\{styles\.savedMatchPacketButton\}/);
 assert.match(source, /accessibilityRole="radio"\s*accessibilityState=\{\{ selected \}\}/);
 assert.match(source, /const stillCurrent = \(\) => active[\s\S]*activeUserIdRef\.current === userId/);
+assert.match(source, /label="MONTHLY CASH COST"/);
+assert.doesNotMatch(source, /label="CASH MIN"|label="CASH MAX"/);
+assert.match(source, /accessibilityLabel=\{`\$\{plan\} \$\{status\}`\}/);
+assert.match(source, /insuranceNetworks: partnerForm\.insuranceNetworks/);
+assert.match(source, /isOutOfNetwork = networkCapabilities\.includes\('Out-of-network'\)/);
 
 for (const label of [
   'The match', 'The packet log', 'The case', 'The case status change',

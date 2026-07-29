@@ -261,9 +261,9 @@ type PartnerForm = {
   phone: string;
   email: string;
   website: string;
-  cashMin: string;
-  cashMax: string;
+  monthlyCost: string;
   insurance: string[];
+  insuranceNetworks: Partial<Record<string, InsuranceNetworkPreference[]>>;
   therapies: string[];
   note: string;
   touchCadence: string;
@@ -293,9 +293,9 @@ function makeEmptyPartnerForm(): PartnerForm {
   phone: '',
   email: '',
   website: '',
-  cashMin: '',
-  cashMax: '',
+  monthlyCost: '',
   insurance: [],
+  insuranceNetworks: {},
   therapies: [],
   note: '',
   touchCadence: '',
@@ -310,6 +310,16 @@ function typesForPartner(partner: Partner): Partner['type'][] {
 
 function partnerTypeLabel(partner: Partner) {
   return typesForPartner(partner).join(' · ');
+}
+
+function monthlyCostForPartner(partner: Partner): number {
+  return partner.monthlyCost ?? partner.cashMax ?? partner.cashMin ?? 0;
+}
+
+function networkCapabilitiesForPartner(partner: Partner, insurance: string): InsuranceNetworkPreference[] {
+  const explicit = partner.insuranceNetworks?.[insurance];
+  if (explicit?.length) return explicit;
+  return partner.insurance.includes(insurance) ? ['In-network'] : [];
 }
 
 function partnerShareMessage(partner: Partner) {
@@ -1051,14 +1061,18 @@ export default function App() {
     return partners
       .map((partner) => {
         const typeFit = matchType === 'Any type' || typesForPartner(partner).includes(matchType as Partner['type']);
-        const isInNetwork = matchInsurance !== 'Cash pay' && partner.insurance.includes(matchInsurance);
+        const networkCapabilities = matchInsurance === 'Cash pay' ? [] : networkCapabilitiesForPartner(partner, matchInsurance);
+        const isInNetwork = networkCapabilities.includes('In-network');
+        const isOutOfNetwork = networkCapabilities.includes('Out-of-network');
         const paymentFit = matchInsurance === 'Cash pay'
-          ? partner.cashMin <= budget
+          ? monthlyCostForPartner(partner) <= budget
           : (matchNetworkPreferences.includes('In-network') && isInNetwork)
-            || (matchNetworkPreferences.includes('Out-of-network') && !isInNetwork);
+            || (matchNetworkPreferences.includes('Out-of-network') && isOutOfNetwork);
         const matchNetworkStatus: InsuranceNetworkPreference | null = matchInsurance === 'Cash pay'
           ? null
-          : isInNetwork ? 'In-network' : 'Out-of-network';
+          : isInNetwork && matchNetworkPreferences.includes('In-network')
+            ? 'In-network'
+            : isOutOfNetwork ? 'Out-of-network' : null;
         const regionFit = matchState === 'ANY' || partner.state === matchState || partner.regions.includes('Nationwide');
         const matchesNeed = (need: string) => {
           if (need === 'Men only') return partner.therapies.includes(need) || (partner.populations.includes('Men') && !partner.populations.includes('Women'));
@@ -1091,7 +1105,7 @@ export default function App() {
         || (b.avgFamilyExperience ?? -1) - (a.avgFamilyExperience ?? -1)
         || (b.admitRate ?? -1) - (a.admitRate ?? -1)
         || b.reciprocity - a.reciprocity
-        || a.partner.cashMin - b.partner.cashMin);
+        || monthlyCostForPartner(a.partner) - monthlyCostForPartner(b.partner));
   }, [partners, matchType, matchInsurance, matchNetworkPreferences, matchState, matchBudget, matchTherapies, scorecards]);
 
   const recentReferrals = referrals
@@ -1225,15 +1239,19 @@ export default function App() {
   // Build the PacketFitInput the pure generator expects, using the same
   // formulas as the matches memo (they share PacketFitInput field names).
   function fitInputForMatch(matchProfile: ReferralMatch, partner: Partner): PacketFitInput {
-    const isInNetwork = matchProfile.insurance !== 'Cash pay' && partner.insurance.includes(matchProfile.insurance);
+    const capabilities = matchProfile.insurance === 'Cash pay' ? [] : networkCapabilitiesForPartner(partner, matchProfile.insurance);
+    const isInNetwork = capabilities.includes('In-network');
+    const isOutOfNetwork = capabilities.includes('Out-of-network');
     const preferences = matchProfile.networkPreferences?.length ? matchProfile.networkPreferences : (['In-network'] as InsuranceNetworkPreference[]);
     const paymentFit = matchProfile.insurance === 'Cash pay'
-      ? partner.cashMin <= (matchProfile.maxBudget ?? Infinity)
+      ? monthlyCostForPartner(partner) <= (matchProfile.maxBudget ?? Infinity)
       : (preferences.includes('In-network') && isInNetwork)
-        || (preferences.includes('Out-of-network') && !isInNetwork);
+        || (preferences.includes('Out-of-network') && isOutOfNetwork);
     const networkStatus: InsuranceNetworkPreference | null = matchProfile.insurance === 'Cash pay'
       ? null
-      : isInNetwork ? 'In-network' : 'Out-of-network';
+      : isInNetwork && preferences.includes('In-network')
+        ? 'In-network'
+        : isOutOfNetwork ? 'Out-of-network' : null;
     const regionFit = !matchProfile.state || matchProfile.state === 'ANY' || partner.state === matchProfile.state || partner.regions.includes('Nationwide');
     const matchesNeed = (need: string) => {
       if (need === 'Men only') return partner.therapies.includes(need) || (partner.populations.includes('Men') && !partner.populations.includes('Women'));
@@ -2496,9 +2514,11 @@ export default function App() {
       phone: partner.phone,
       email: partner.email,
       website: partner.website || '',
-      cashMin: partner.cashMin ? String(partner.cashMin) : '',
-      cashMax: partner.cashMax ? String(partner.cashMax) : '',
+      monthlyCost: monthlyCostForPartner(partner) ? String(monthlyCostForPartner(partner)) : '',
       insurance: partner.insurance.filter((plan) => plan !== 'Cash pay'),
+      insuranceNetworks: Object.fromEntries(
+        partner.insurance.filter((plan) => plan !== 'Cash pay').map((plan) => [plan, networkCapabilitiesForPartner(partner, plan)]),
+      ),
       therapies: partner.therapies,
       note: partner.note,
       touchCadence: partner.touchCadenceDays ? String(partner.touchCadenceDays) : '',
@@ -2533,6 +2553,11 @@ export default function App() {
       Alert.alert('Choose a partner type', 'Select at least one level of care or provider type.');
       return;
     }
+    const unclassifiedInsurance = partnerForm.insurance.find((plan) => !partnerForm.insuranceNetworks[plan]?.length);
+    if (unclassifiedInsurance) {
+      Alert.alert('Choose IN or OON', `Mark ${unclassifiedInsurance} as in-network, out-of-network, or both.`);
+      return;
+    }
     if (!mutationSlotAvailable('The partner')) return;
     const existing = partners.find((partner) => partner.id === editingPartnerId);
     const cadence = partnerForm.touchCadence ? Number(partnerForm.touchCadence) : undefined;
@@ -2548,9 +2573,11 @@ export default function App() {
       phone: partnerForm.phone.trim(),
       email: partnerForm.email.trim(),
       website: partnerForm.website.trim(),
-      cashMin: Number(partnerForm.cashMin) || 0,
-      cashMax: Number(partnerForm.cashMax) || Number(partnerForm.cashMin) || 0,
+      monthlyCost: Number(partnerForm.monthlyCost) || 0,
+      cashMin: Number(partnerForm.monthlyCost) || 0,
+      cashMax: Number(partnerForm.monthlyCost) || 0,
       insurance: partnerForm.insurance,
+      insuranceNetworks: partnerForm.insuranceNetworks,
       therapies: partnerForm.therapies,
       populations: existing?.populations || ['Adults'],
       levels: partnerForm.types,
@@ -3109,7 +3136,7 @@ export default function App() {
                   <Text numberOfLines={1} style={[styles.matchDetailText, styles.matchInsuranceText]}>{matchInsurance === 'Cash pay'
                     ? match.partner.insurance.slice(0, 2).join(' · ') || 'Cash pay'
                     : `${match.networkStatus} · ${matchInsurance}`}</Text>
-                  <Text numberOfLines={1} style={styles.matchPriceText}>{formatMoney(match.partner.cashMin)}–{formatMoney(match.partner.cashMax)}</Text>
+                  <Text numberOfLines={1} style={styles.matchPriceText}>{formatMoney(monthlyCostForPartner(match.partner))}/month</Text>
                 </View>
                 {match.reciprocity > 0 ? (
                   <View style={styles.reciprocityNote}><AppIcon name="heart" size={13} color={COLORS.coral} /><Text style={styles.reciprocityNoteText}>Tie-breaker: sent you {match.reciprocity} more than received</Text></View>
@@ -3808,8 +3835,8 @@ export default function App() {
 
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Placement details</Text>
-              <View style={styles.infoLine}><AppIcon name="wallet-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Cash range</Text><Text style={styles.infoValue}>{formatMoney(selectedPartner.cashMin)}–{formatMoney(selectedPartner.cashMax)}</Text></View></View>
-              <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Insurance</Text><Text style={styles.infoValue}>{selectedPartner.insurance.join(' · ') || 'Not recorded'}</Text></View></View>
+              <View style={styles.infoLine}><AppIcon name="wallet-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Monthly cash cost</Text><Text style={styles.infoValue}>{formatMoney(monthlyCostForPartner(selectedPartner))}</Text></View></View>
+              <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Insurance</Text><Text style={styles.infoValue}>{selectedPartner.insurance.map((plan) => `${plan} (${networkCapabilitiesForPartner(selectedPartner, plan).map((status) => status === 'In-network' ? 'IN' : 'OON').join(' + ')})`).join(' · ') || 'Not recorded'}</Text></View></View>
               <View style={styles.infoLine}><AppIcon name="location-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Service area</Text><Text style={styles.infoValue}>{selectedPartner.regions.join(' · ')}</Text></View></View>
             </View>
 
@@ -3858,16 +3885,45 @@ export default function App() {
               <FormField label="PHONE" value={partnerForm.phone} onChangeText={(phone) => setPartnerForm((current) => ({ ...current, phone }))} placeholder="Phone number" keyboardType="phone-pad" />
               <FormField label="EMAIL" value={partnerForm.email} onChangeText={(email) => setPartnerForm((current) => ({ ...current, email }))} placeholder="name@program.com" keyboardType="email-address" />
               <FormField label="WEBSITE" value={partnerForm.website} onChangeText={(website) => setPartnerForm((current) => ({ ...current, website }))} placeholder="https://program.com" keyboardType="url" />
-              <View style={styles.formRow}><View style={{ flex: 1 }}><FormField label="CASH MIN" value={partnerForm.cashMin} onChangeText={(cashMin) => setPartnerForm((current) => ({ ...current, cashMin }))} placeholder="$0" keyboardType="number-pad" /></View><View style={{ flex: 1 }}><FormField label="CASH MAX" value={partnerForm.cashMax} onChangeText={(cashMax) => setPartnerForm((current) => ({ ...current, cashMax }))} placeholder="$0" keyboardType="number-pad" /></View></View>
+              <FormField label="MONTHLY CASH COST" value={partnerForm.monthlyCost} onChangeText={(monthlyCost) => setPartnerForm((current) => ({ ...current, monthlyCost }))} placeholder="$0 per month" keyboardType="number-pad" />
               <MultiSelectDropdown
                 label="INSURANCES ACCEPTED"
                 values={partnerForm.insurance}
                 options={partnerInsuranceOptions}
-                onChange={(insurance) => setPartnerForm((current) => ({ ...current, insurance }))}
+                onChange={(insurance) => setPartnerForm((current) => ({
+                  ...current,
+                  insurance,
+                  insuranceNetworks: Object.fromEntries(insurance.map((plan) => [plan, current.insuranceNetworks[plan]?.length ? current.insuranceNetworks[plan] : ['In-network']])),
+                }))}
                 icon="shield-checkmark-outline"
                 emptyLabel="Select accepted insurance plans"
                 selectedNoun="plans"
               />
+              {partnerForm.insurance.map((plan) => (
+                <View key={plan} style={styles.networkPlanRow}>
+                  <Text style={styles.networkPlanName}>{plan}</Text>
+                  {(['In-network', 'Out-of-network'] as InsuranceNetworkPreference[]).map((status) => {
+                    const checked = partnerForm.insuranceNetworks[plan]?.includes(status) ?? false;
+                    return (
+                      <TouchableOpacity
+                        key={status}
+                        accessibilityRole="checkbox"
+                        accessibilityLabel={`${plan} ${status}`}
+                        accessibilityState={{ checked }}
+                        style={[styles.networkCheck, checked && styles.networkCheckActive]}
+                        onPress={() => setPartnerForm((current) => {
+                          const statuses = current.insuranceNetworks[plan] || [];
+                          const nextStatuses = statuses.includes(status) ? statuses.filter((item) => item !== status) : [...statuses, status];
+                          return { ...current, insuranceNetworks: { ...current.insuranceNetworks, [plan]: nextStatuses } };
+                        })}
+                      >
+                        <AppIcon name={checked ? 'checkbox' : 'square-outline'} size={18} color={checked ? COLORS.forest : COLORS.gray} />
+                        <Text style={[styles.networkCheckText, checked && styles.networkCheckTextActive]}>{status === 'In-network' ? 'IN' : 'OON'}</Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              ))}
               <MultiSelectDropdown
                 label="THERAPEUTIC NEEDS"
                 values={partnerForm.therapies}
@@ -4804,6 +4860,12 @@ const styles = StyleSheet.create({
   formInput: { backgroundColor: COLORS.white, minHeight: 48, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 14, color: COLORS.ink, fontSize: 13, outlineStyle: 'none' } as any,
   multilineInput: { minHeight: 94, paddingTop: 13, textAlignVertical: 'top' },
   formRow: { flexDirection: 'row', gap: 10 },
+  networkPlanRow: { minHeight: 52, flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, borderRadius: 14, paddingHorizontal: 12, marginTop: -7, marginBottom: 15 },
+  networkPlanName: { flex: 1, color: COLORS.ink, fontSize: 12, fontWeight: '700' },
+  networkCheck: { minWidth: 54, minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, borderRadius: 11, borderWidth: 1, borderColor: COLORS.line, backgroundColor: COLORS.white, paddingHorizontal: 8 },
+  networkCheckActive: { borderColor: COLORS.forest, backgroundColor: COLORS.mint },
+  networkCheckText: { color: COLORS.gray, fontSize: 11, fontWeight: '800' },
+  networkCheckTextActive: { color: COLORS.forest },
   primaryButton: { backgroundColor: COLORS.forest, borderRadius: 16, minHeight: 52, alignItems: 'center', justifyContent: 'center', marginTop: 10 },
   primaryButtonText: { color: COLORS.white, fontSize: 14, fontWeight: '800' },
   matchedReferralBanner: { flexDirection: 'row', gap: 11, alignItems: 'center', backgroundColor: COLORS.mint, borderRadius: 17, padding: 14, marginBottom: 20 },

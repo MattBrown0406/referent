@@ -21,6 +21,9 @@ export type Partner = {
   phone: string;
   email: string;
   website?: string;
+  monthlyCost?: number;
+  insuranceNetworks?: Partial<Record<string, InsuranceNetworkPreference[]>>;
+  /** Legacy fields retained so existing cached records remain readable. */
   cashMin: number;
   cashMax: number;
   insurance: string[];

@@ -5,6 +5,7 @@
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -48,6 +49,12 @@ const partnerA = {
   phone: '(541) 555-0142',
   email: 'admissions@riverstonerecovery.com',
   website: 'https://riverstonerecovery.com',
+  monthlyCost: 30000,
+  insuranceNetworks: {
+    Aetna: ['In-network'],
+    Cigna: ['Out-of-network'],
+    UnitedHealthcare: ['In-network', 'Out-of-network'],
+  },
   cashMin: 18000,
   cashMax: 42000,
   insurance: ['Aetna', 'Cigna', 'UnitedHealthcare', 'Regence BlueCross BlueShield of Oregon'],
@@ -71,6 +78,8 @@ const partnerB = {
   phone: '(541) 555-0198',
   email: 'marcus@highdesertsoberliving.org',
   website: '',
+  monthlyCost: 2400,
+  insuranceNetworks: {},
   cashMin: 1200,
   cashMax: 2400,
   insurance: [],
@@ -130,6 +139,8 @@ console.log(buildPacket(profileInsurance, partnerA, reasonsA, 'partner'));
 
 const fitB = { networkStatus: null, matchedTherapies: ['Men only'], regionFit: true, paymentFit: true };
 const reasonsB = buildFitReasons(profileCash, partnerB, fitB);
+assert(reasonsB.includes('Monthly cash cost is $2,400 — within the $2,500 budget'));
+assert(!reasonsB.some((reason) => reason.includes('starts at') || reason.includes('rates $')));
 console.log('\n' + '═'.repeat(64));
 console.log('PACKET 3 — audience: FAMILY (cash pay + budget fixture)');
 console.log('═'.repeat(64));

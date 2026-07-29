@@ -2,7 +2,7 @@
 -- Run after a local migration reset with: supabase test db
 
 BEGIN;
-SELECT plan(51);
+SELECT plan(58);
 
 WITH expected(child_table, constraint_name, parent_table, child_columns, delete_action) AS (
   VALUES
@@ -578,6 +578,25 @@ SELECT lives_ok(
     '{"id":"99000000-0000-0000-0000-000000000009","partner_id":"31000000-0000-0000-0000-000000000003","kind":"call","note":"Called family","occurred_at":"2026-07-29T17:00:00Z"}'::jsonb
   ) $$,
   'contact activity is idempotent on offline retry'
+);
+
+SELECT has_column('public', 'partners', 'monthly_cost', 'partners stores one monthly cash cost');
+SELECT col_type_is('public', 'partners', 'monthly_cost', 'integer', 'monthly cost is an integer');
+SELECT has_column('public', 'partners', 'insurance_networks', 'partners stores per-carrier network capabilities');
+SELECT col_type_is('public', 'partners', 'insurance_networks', 'jsonb', 'insurance network capabilities use jsonb');
+SELECT has_trigger('public', 'partners', 'partners_sync_payment_compatibility', 'legacy clients synchronize into the new payment fields');
+SELECT lives_ok(
+  $$ UPDATE public.partners
+     SET cash_min = 3500, cash_max = 4200, insurance = ARRAY['Aetna', 'Cigna']
+     WHERE id = '31000000-0000-0000-0000-000000000003'::uuid $$,
+  'legacy partner updates continue working after the migration'
+);
+SELECT is(
+  (SELECT jsonb_build_object('monthlyCost', monthly_cost, 'networks', insurance_networks)
+     FROM public.partners
+    WHERE id = '31000000-0000-0000-0000-000000000003'::uuid),
+  '{"monthlyCost":4200,"networks":{"Aetna":["In-network"],"Cigna":["In-network"]}}'::jsonb,
+  'legacy cash and insurance values synchronize into monthly cost and explicit network capabilities'
 );
 
 SELECT * FROM finish();

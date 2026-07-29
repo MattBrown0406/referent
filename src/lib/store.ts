@@ -430,6 +430,8 @@ type PartnerRow = {
   phone: string | null;
   email: string | null;
   website: string | null;
+  monthly_cost: number | null;
+  insurance_networks: Record<string, InsuranceNetworkPreference[]> | null;
   cash_min: number | null;
   cash_max: number | null;
   insurance: string[] | null;
@@ -540,6 +542,10 @@ function mapPartnerRow(row: PartnerRow, balance: BalanceRow | undefined): Partne
     phone: row.phone || '',
     email: row.email || '',
     website: row.website || undefined,
+    monthlyCost: toNumber(row.monthly_cost) || toNumber(row.cash_max) || toNumber(row.cash_min),
+    insuranceNetworks: row.insurance_networks && Object.keys(row.insurance_networks).length
+      ? row.insurance_networks
+      : Object.fromEntries((row.insurance || []).filter((plan) => plan !== 'Cash pay').map((plan) => [plan, ['In-network' as InsuranceNetworkPreference]])),
     cashMin: toNumber(row.cash_min),
     cashMax: toNumber(row.cash_max),
     insurance: row.insurance || [],
@@ -656,8 +662,11 @@ function partnerToRow(partner: Partner): Record<string, unknown> {
     phone: partner.phone,
     email: partner.email,
     website: partner.website || null,
-    cash_min: partner.cashMin,
-    cash_max: partner.cashMax,
+    monthly_cost: partner.monthlyCost ?? partner.cashMax ?? partner.cashMin ?? 0,
+    insurance_networks: partner.insuranceNetworks || {},
+    // Keep legacy clients coherent while the monthly-cost UI rolls out.
+    cash_min: partner.monthlyCost ?? partner.cashMin ?? 0,
+    cash_max: partner.monthlyCost ?? partner.cashMax ?? partner.cashMin ?? 0,
     insurance: partner.insurance,
     therapies: partner.therapies,
     populations: partner.populations,
