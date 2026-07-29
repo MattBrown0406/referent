@@ -169,7 +169,7 @@ check('cadence card never joins OVERDUE (daysOverdue 0)', cadenceCard.daysOverdu
 
 // ─── 4. todayLoad (the briefing + header count) ─────────────────────────────
 console.log('\n── todayLoad (briefing count) ──');
-const load = notifications.todayLoad(followUps, partners);
+const load = notifications.todayLoad(followUps, partners, NOW);
 eq('actions = snooze-aware due follow-ups + cadence due', load, { actions: 11, overdueCount: 3 });
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

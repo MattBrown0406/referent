@@ -52,15 +52,36 @@ Use `npm run web` for the browser preview (notifications are a no-op on web).
 
 ## EAS / App Store Connect
 
-After confirming the final bundle identifier and signing into the intended Expo account:
+Release builds must come from a clean detached checkout of the independently recorded commit merged into `main`. Build and submit are intentionally separate so the exact EAS build record is verified before TestFlight upload.
 
 ```sh
-npx eas-cli init
-npx eas-cli build --platform ios --profile production
-npx eas-cli submit --platform ios
+set -euo pipefail
+
+# Set this from the GitHub PR merge result; never derive it from the current checkout.
+: "${MERGED_SHA:?Set MERGED_SHA to the recorded GitHub merge commit}"
+git fetch origin main
+git cat-file -e "${MERGED_SHA}^{commit}"
+git merge-base --is-ancestor "$MERGED_SHA" origin/main
+git checkout --detach "$MERGED_SHA"
+test "$(git rev-parse HEAD)" = "$MERGED_SHA"
+test -z "$(git status --porcelain)"
+
+npx eas-cli@21.4.0 build --platform ios --profile production --freeze-credentials --non-interactive --wait
+npx eas-cli@21.4.0 build:list --platform ios --app-identifier com.mattbrown.referralfit --git-commit-hash "$MERGED_SHA" --build-profile production --distribution store --status finished --json --non-interactive > /tmp/referent-eas-build.json
+# Require exactly one matching record and verify commit, profile, platform,
+# distribution, appVersion=1.0.1, and appBuildVersion=10.
+VERIFIED_EAS_BUILD_ID="$(node scripts/verify-eas-build.mjs /tmp/referent-eas-build.json "$MERGED_SHA")"
+
+# EAS build records do not expose CFBundleIdentifier. Verify the signed IPA
+# itself before submitting it to Apple.
+IPA_URL="$(node -e 'const x=require("/tmp/referent-eas-build.json"); process.stdout.write(x[0].artifacts.applicationArchiveUrl)')"
+curl --fail --location "$IPA_URL" --output "/tmp/referent-${VERIFIED_EAS_BUILD_ID}.ipa"
+python3 scripts/verify-ios-ipa.py "/tmp/referent-${VERIFIED_EAS_BUILD_ID}.ipa" com.mattbrown.referralfit 1.0.1 10
+
+npx eas-cli@21.4.0 submit --platform ios --id "$VERIFIED_EAS_BUILD_ID" --non-interactive --wait
 ```
 
-The final App Store Connect app ID can be added to the `submit.production.ios.ascAppId` field in `eas.json` after the app record exists.
+Submission is TestFlight-only. Do not submit the app for public App Store review or release from this procedure.
 
 ## Privacy note
 

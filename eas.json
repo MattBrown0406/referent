@@ -1,6 +1,6 @@
 {
   "cli": {
-    "version": ">= 16.0.0",
+    "version": "21.4.0",
     "appVersionSource": "local"
   },
   "build": {
@@ -17,8 +17,13 @@
       "channel": "preview"
     },
     "production": {
-      "autoIncrement": true,
-      "channel": "production"
+      "distribution": "store",
+      "autoIncrement": false,
+      "channel": "production",
+      "node": "22.22.3",
+      "ios": {
+        "image": "macos-tahoe-26.5-xcode-26.6"
+      }
     }
   },
   "submit": {

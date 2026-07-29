@@ -44,29 +44,36 @@ import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import {
   assignMatchReferral,
+  completeFollowUpWithNext,
+  completeFollowUpWithOutcome,
   createFollowUp,
   createMatchProfile,
   createPartner,
   createReferral,
   createTouch,
   flushWriteQueue,
+  finalizeMatchPacket,
   FollowUp,
   FollowUpKind,
   hydrate,
+  logContactActivity,
   PartnerScorecard,
   pendingWriteCount,
   persistCache,
   refreshSnapshot,
+  saveMatchWithCase,
   Snapshot,
   Touch,
   TouchKind,
   updateFollowUp,
   updateMatchProfile,
   updatePartner,
-  updateReferralOutcome,
-  updateReferralPacketStamp,
 } from './src/lib/store';
 import {
+  activateReferralFitNotificationOwner,
+  cancelReferralFitNotifications,
+  getNotificationPermissionState,
+  requestNotificationPermission,
   rescheduleNotifications,
   subscribeToNotificationResponses,
   todayLoad,
@@ -97,10 +104,10 @@ import {
   CaseRecord,
   CaseSearchResult,
   CaseStatus,
-  createCase,
+  completeFollowUpWithCase,
+  createCaseBundle,
   createCaseFileSignedUrl,
-  createContact,
-  createDocumentRow,
+  saveDocumentWithEvent,
   deleteContact,
   deleteDocumentRow,
   fetchCaseData,
@@ -110,12 +117,13 @@ import {
   newUuid,
   PaymentStatus,
   removeCaseFile,
+  restoreDocumentRow,
+  saveContactAtomic,
   searchCases,
   updateCase,
-  updateContact,
+  updateCaseWithEvent,
   uploadCaseFile,
 } from './src/lib/cases';
-import { updateMatchCase } from './src/lib/store';
 
 type Tab = 'home' | 'match' | 'cases' | 'directory' | 'referrals';
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
@@ -137,17 +145,14 @@ const COLORS = {
   blue: '#507C86',
 };
 
+const notificationPromptKey = (userId: string) => `referralfit-notification-prompt-v2:${userId.toLowerCase()}`;
+const notificationScheduleKey = (userId: string) => `referralfit-notification-scheduling-v2:${userId.toLowerCase()}`;
+const partnerSnoozeKey = (userId: string) => `referralfit-partner-snooze-v2:${userId.toLowerCase()}`;
+
 // Every table's PK is a Postgres `uuid` column, so client-generated ids MUST be
 // valid UUIDs — a prefixed string like `p-1785096121092-t1etoz4` is rejected with
 // "invalid input syntax for type uuid" on sync. The prefix argument is kept so
 // call sites read the same, but it is intentionally unused.
-// Run write ops strictly in order. Foreign keys mean a child row can only be
-// inserted after its parent, so any batch that mixes parents and children must
-// be sequential — Promise.all fires them simultaneously and loses the race.
-async function runSequentially(ops: Array<() => Promise<unknown>>): Promise<void> {
-  for (const op of ops) await op();
-}
-
 function makeId(_prefix?: string) {
   return newUuid();
 }
@@ -350,6 +355,8 @@ function Pill({
 }) {
   return (
     <TouchableOpacity
+      accessibilityRole="button"
+      accessibilityState={{ selected: active }}
       activeOpacity={0.75}
       onPress={onPress}
       style={[styles.pill, active && styles.pillActive]}
@@ -406,6 +413,8 @@ function DropdownField({
                 return (
                   <TouchableOpacity
                     key={option.value}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: active }}
                     onPress={() => { onChange(option.value); setOpen(false); }}
                     style={[styles.dropdownOption, active && styles.dropdownOptionActive]}
                   >
@@ -485,13 +494,13 @@ function MultiSelectDropdown({
             </View>
             <View style={styles.multiSelectActions}>
               <Text style={styles.multiSelectSelectionText}>{draftValues.length ? `${draftValues.length} selected` : 'No filters selected'}</Text>
-              {draftValues.length ? <TouchableOpacity onPress={() => setDraftValues([])}><Text style={styles.multiSelectClear}>Clear all</Text></TouchableOpacity> : null}
+              {draftValues.length ? <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Clear all ${label} selections`} style={styles.multiSelectClearButton} onPress={() => setDraftValues([])}><Text style={styles.multiSelectClear}>Clear all</Text></TouchableOpacity> : null}
             </View>
             <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.dropdownOptions}>
               {options.map((option) => {
                 const active = draftValues.includes(option);
                 return (
-                  <TouchableOpacity key={option} onPress={() => toggle(option)} style={[styles.dropdownOption, active && styles.dropdownOptionActive]}>
+                  <TouchableOpacity key={option} accessibilityRole="checkbox" accessibilityState={{ checked: active }} onPress={() => toggle(option)} style={[styles.dropdownOption, active && styles.dropdownOptionActive]}>
                     <Text style={[styles.dropdownOptionText, styles.multiSelectOptionText, active && styles.dropdownOptionTextActive]}>{option}</Text>
                     <AppIcon name={active ? 'checkbox' : 'square-outline'} size={21} color={active ? COLORS.forest : COLORS.gray} />
                   </TouchableOpacity>
@@ -603,6 +612,7 @@ export default function App() {
   const [referrals, setReferrals] = useState<Referral[]>(initialReferrals);
   const [referralMatches, setReferralMatches] = useState<ReferralMatch[]>(initialReferralMatches);
   const [loaded, setLoaded] = useState(false);
+  const [authResolved, setAuthResolved] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
   const [offline, setOffline] = useState(false);
   const [queuedWrites, setQueuedWrites] = useState(0);
@@ -655,6 +665,10 @@ export default function App() {
   const [outcomeStars, setOutcomeStars] = useState(0);
   const [outcomeNote, setOutcomeNote] = useState('');
   const [notifPrePromptVisible, setNotifPrePromptVisible] = useState(false);
+  const [notificationPermissionState, setNotificationPermissionState] = useState<'authorized' | 'askable' | 'blocked' | 'unsupported'>('unsupported');
+  const [pendingNotificationPartnerId, setPendingNotificationPartnerId] = useState<string | null>(null);
+  const authGenerationRef = useRef(0);
+  const mutationActiveRef = useRef<symbol | null>(null);
   // Today Command Center (v4)
   const [partnerSnoozes, setPartnerSnoozes] = useState<Record<string, string>>({});
   const [showHomeMore, setShowHomeMore] = useState(false);
@@ -680,20 +694,89 @@ export default function App() {
   const [matchBudget, setMatchBudget] = useState('');
   const [matchTherapies, setMatchTherapies] = useState<string[]>([]);
   const matchClientLabelRef = useRef<TextInput>(null);
+  // Bind every mutation to the account from the render that initiated it. If
+  // auth changes mid-flight, store.ts rejects the stale account ID.
+  const activeUserId = session?.user?.id || '';
+  const activeUserIdRef = useRef(activeUserId);
+  const caseLoadGenerationRef = useRef(0);
+  activeUserIdRef.current = activeUserId;
 
   // Push a snapshot of in-memory state to the offline cache, refresh the
   // offline indicator + queued-write count, and recompute notifications.
   // Cases are app-side state (not part of the store Snapshot) and are passed
   // separately to the briefing scheduler.
   const syncDerived = useCallback(async (snapshot?: Snapshot, caseList?: CaseRecord[]) => {
+    const userId = session?.user?.id;
+    if (!userId) throw new Error('The account changed before local data could be saved.');
+    const generation = authGenerationRef.current;
+    const accountIsCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
     const data = snapshot || { partners, referrals, referralMatches, touches, followUps, scorecards };
     const activeCases = caseList ?? cases;
-    const pending = await pendingWriteCount();
+    await persistCache(data, userId);
+    if (!accountIsCurrent()) throw new Error('The account changed before local data could be saved.');
+    const pending = await pendingWriteCount(userId);
+    if (!accountIsCurrent()) throw new Error('The account changed before local data could be saved.');
     setQueuedWrites(pending);
     setOffline(pending > 0);
-    await persistCache(data);
-    rescheduleNotifications({ ...data, cases: activeCases }).catch(() => undefined);
-  }, [partners, referrals, referralMatches, touches, followUps, scorecards, cases]);
+    await rescheduleNotifications({ ...data, cases: activeCases }, userId);
+    if (!accountIsCurrent()) throw new Error('The account changed before notification scheduling completed.');
+  }, [session?.user?.id, partners, referrals, referralMatches, touches, followUps, scorecards, cases]);
+
+  async function settleOptimisticWrite(
+    operation: () => Promise<void>,
+    nextSnapshot: Snapshot,
+    previousSnapshot: Snapshot,
+    rollback: () => void,
+    label: string,
+    nextCaseList?: CaseRecord[],
+    previousCaseList?: CaseRecord[],
+  ): Promise<boolean> {
+    const userId = activeUserIdRef.current;
+    const generation = authGenerationRef.current;
+    const accountIsCurrent = () => Boolean(userId && activeUserIdRef.current === userId && authGenerationRef.current === generation);
+    if (mutationActiveRef.current) {
+      rollback();
+      Alert.alert('Save in progress', `Wait for the current save to finish, then retry ${label.toLowerCase()}.`);
+      return false;
+    }
+    const mutationToken = Symbol(label);
+    mutationActiveRef.current = mutationToken;
+    let accepted = false;
+    try {
+      if (!accountIsCurrent()) return false;
+      await operation();
+      if (!accountIsCurrent()) return false;
+      accepted = true; // Confirmed remotely or durably queued by store.ts.
+      await syncDerived(nextSnapshot, nextCaseList);
+      if (!accountIsCurrent()) return false;
+      return true;
+    } catch (error) {
+      if (!accountIsCurrent()) return false;
+      if (accepted) {
+        Alert.alert('Local status unavailable', `${label} was accepted, but local status/notification refresh failed: ${(error as Error).message}`);
+        return true;
+      }
+      rollback();
+      try {
+        await syncDerived(previousSnapshot, previousCaseList);
+        Alert.alert('Not saved', `${label} was rejected and has been rolled back: ${(error as Error).message}`);
+      } catch (persistenceError) {
+        Alert.alert('Not safely saved', `${label} was rejected (${(error as Error).message}) and the rollback cache could not be persisted (${(persistenceError as Error).message}). Refresh before continuing.`);
+      }
+      return false;
+    } finally {
+      if (mutationActiveRef.current === mutationToken) mutationActiveRef.current = null;
+    }
+  }
+
+  // Event handlers execute synchronously until their first await. Checking
+  // immediately before optimistic state changes guarantees the settlement call
+  // takes the slot before another user action can interleave.
+  function mutationSlotAvailable(label: string): boolean {
+    if (!mutationActiveRef.current) return true;
+    Alert.alert('Save in progress', `Wait for the current save to finish, then retry ${label.toLowerCase()}.`);
+    return false;
+  }
 
   // Apply a freshly loaded snapshot to state, restoring the match-form
   // selection exactly like the previous AsyncStorage loader did.
@@ -725,80 +808,203 @@ export default function App() {
     }
   }, []);
 
-  // Auth session gate: restore the persisted session, then hydrate data.
+  const resetAccountState = useCallback(() => {
+    caseLoadGenerationRef.current += 1;
+    applySnapshot({ partners: [], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} });
+    setCases([]);
+    setCaseContacts([]);
+    setCaseEvents([]);
+    setCaseDocuments([]);
+    setActiveCaseId(null);
+    setSelectedPartner(null);
+    setTouchPartner(null);
+    setTouchNote('');
+    setPartnerForm(makeEmptyPartnerForm());
+    setReferralForm(emptyReferral);
+    setCaseForm(makeEmptyCaseForm());
+    setCaseContactForm(null);
+    setPacketTarget(null);
+    setPacketText('');
+    setQuickNoteContact(null);
+    setTodayQuickNote(null);
+    setContactPick(null);
+    setPartnerSnoozes({});
+    setPendingNotificationPartnerId(null);
+    setQueuedWrites(0);
+    setOffline(false);
+    setNotifPrePromptVisible(false);
+    setNotificationPermissionState('unsupported');
+    setTab('home');
+  }, [applySnapshot]);
+
+  // Resolve authentication separately from account hydration. The hydration
+  // effect below runs on every user-id transition (including interactive sign
+  // in) and generation-fences all async work against rapid account switching.
+  // Auth session gate: resolve the current session; hydration is handled by
+  // the user-id keyed effect below so interactive sign-in follows the same path.
   useEffect(() => {
     let mounted = true;
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
-      if (mounted) setSession(nextSession);
-    });
-    supabase.auth.getSession().then(async ({ data }) => {
-      let active = data.session;
-      if (!active) {
-        const { data: refreshed } = await supabase.auth.refreshSession();
-        active = refreshed.session;
-      }
       if (!mounted) return;
-      setSession(active);
-      if (active) {
-        const result = await hydrate();
-        if (!mounted) return;
-        applySnapshot(result.snapshot);
-        const caseData = await fetchCaseData().catch(() => null);
-        if (!mounted) return;
-        if (caseData) setCases(caseData.cases);
-        const activeCaseList = caseData?.cases || [];
-        const pending = await pendingWriteCount();
-        setQueuedWrites(pending);
-        setOffline(result.source === 'cache' || pending > 0);
-        rescheduleNotifications({ ...result.snapshot, cases: activeCaseList }).catch(() => undefined);
-        setNotifPrePromptVisible(true);
-      }
-      if (mounted) setLoaded(true);
-    }).catch(() => {
-      if (mounted) setLoaded(true);
+      setSession(nextSession);
+      setAuthResolved(true);
     });
+    supabase.auth.getSession()
+      .then(({ data }) => {
+        if (!mounted) return;
+        setSession(data.session);
+        setAuthResolved(true);
+      })
+      .catch(() => {
+        if (mounted) setAuthResolved(true);
+      });
     return () => {
       mounted = false;
       subscription.unsubscribe();
     };
-  }, [applySnapshot]);
+  }, []);
+
+  useEffect(() => {
+    if (!authResolved) return undefined;
+    const generation = ++authGenerationRef.current;
+    mutationActiveRef.current = null;
+    const userId = session?.user?.id;
+    resetAccountState();
+
+    if (!userId) {
+      cancelReferralFitNotifications().catch(() => undefined);
+      setLoaded(true);
+      return undefined;
+    }
+
+    setLoaded(false);
+    let active = true;
+    (async () => {
+      try {
+        await activateReferralFitNotificationOwner(userId);
+        if (!active || generation !== authGenerationRef.current) return;
+        const result = await hydrate(userId);
+        if (!active || generation !== authGenerationRef.current) return;
+        applySnapshot(result.snapshot);
+
+        let caseData: Awaited<ReturnType<typeof fetchCaseData>> | null = null;
+        try {
+          caseData = await fetchCaseData();
+        } catch (error) {
+          if (active && generation === authGenerationRef.current) {
+            Alert.alert('Case files unavailable', `Case files could not be loaded: ${(error as Error).message}`);
+          }
+        }
+        if (!active || generation !== authGenerationRef.current) return;
+        const activeCaseList = caseData?.cases || [];
+        setCases(activeCaseList);
+
+        const pending = await pendingWriteCount(userId);
+        if (!active || generation !== authGenerationRef.current) return;
+        setQueuedWrites(pending);
+        setOffline(result.source === 'cache' || pending > 0);
+
+        const permission = await getNotificationPermissionState();
+        if (!active || generation !== authGenerationRef.current) return;
+        setNotificationPermissionState(permission);
+        if (permission === 'authorized') {
+          const scheduling = await AsyncStorage.getItem(notificationScheduleKey(userId));
+          if (!active || generation !== authGenerationRef.current) return;
+          if (scheduling !== 'disabled') {
+            rescheduleNotifications({ ...result.snapshot, cases: activeCaseList }, userId)
+              .catch((error) => {
+                if (active && generation === authGenerationRef.current) Alert.alert('Notifications unavailable', (error as Error).message);
+              });
+          }
+        } else if (permission === 'askable') {
+          const decision = await AsyncStorage.getItem(notificationPromptKey(userId));
+          if (active && generation === authGenerationRef.current && decision !== 'dismissed') {
+            setNotifPrePromptVisible(true);
+          }
+        }
+      } catch (error) {
+        if (active && generation === authGenerationRef.current) {
+          Alert.alert('Could not load account', (error as Error).message);
+        }
+      } finally {
+        if (active && generation === authGenerationRef.current) setLoaded(true);
+      }
+    })();
+
+    return () => {
+      active = false;
+      authGenerationRef.current += 1;
+    };
+  }, [authResolved, session?.user?.id, applySnapshot, resetAccountState]);
 
   // Flush queued offline writes when the app returns to the foreground.
   useEffect(() => {
-    if (!session) return undefined;
+    const userId = session?.user?.id;
+    if (!userId) return undefined;
+    const generation = authGenerationRef.current;
+    let active = true;
+    const stillCurrent = () => active
+      && generation === authGenerationRef.current
+      && activeUserIdRef.current === userId;
     const subscription = AppState.addEventListener('change', (state) => {
-      if (state !== 'active') return;
+      if (state !== 'active' || !stillCurrent()) return;
       (async () => {
-        const flushed = await flushWriteQueue();
+        const flushed = await flushWriteQueue(userId);
+        if (!stillCurrent()) return;
+        let refreshed: Snapshot | null = null;
         if (flushed > 0) {
-          const fresh = await refreshSnapshot();
-          if (fresh) applySnapshot(fresh);
+          refreshed = await refreshSnapshot(userId);
+          if (!stillCurrent()) return;
+          if (refreshed) applySnapshot(refreshed);
         }
-        syncDerived();
-      })();
+        if (!stillCurrent()) return;
+        await syncDerived(refreshed || undefined);
+      })().catch((error) => {
+        if (stillCurrent()) Alert.alert('Sync issue', (error as Error).message);
+      });
     });
-    return () => subscription.remove();
-  }, [session, applySnapshot, syncDerived]);
+    return () => {
+      active = false;
+      subscription.remove();
+    };
+  }, [session?.user?.id, applySnapshot, syncDerived]);
 
-  // Tapping a notification jumps to the relevant tab (no router in this app).
+  // Tapping a notification jumps to the relevant tab and, for cadence nudges,
+  // opens the named partner once that account's directory has hydrated.
   useEffect(() => {
-    if (!session) return undefined;
-    return subscribeToNotificationResponses((target) => setTab(target));
-  }, [session]);
+    if (!session?.user?.id) return undefined;
+    return subscribeToNotificationResponses((target, partnerId) => {
+      setTab(target);
+      if (partnerId) setPendingNotificationPartnerId(partnerId);
+    });
+  }, [session?.user?.id]);
 
-  // Local snooze map for the VIRTUAL partner-cadence cards. These cards are
-  // never materialized as follow_ups rows (a logged touch self-heals them),
-  // so their snooze lives on-device: { [partnerId]: YYYY-MM-DD }. Entries at
-  // or before today reappear, so expired ones are pruned on load.
   useEffect(() => {
-    AsyncStorage.getItem('referralfit-partner-snooze-v1')
+    if (!pendingNotificationPartnerId) return;
+    const partner = partners.find((item) => item.id === pendingNotificationPartnerId);
+    if (!partner) return;
+    setSelectedPartner(partner);
+    setPendingNotificationPartnerId(null);
+  }, [pendingNotificationPartnerId, partners]);
+
+  // Virtual cadence snoozes are namespaced by account. A global legacy snooze
+  // blob is never imported because it has no trustworthy owner metadata.
+  useEffect(() => {
+    const userId = session?.user?.id;
+    setPartnerSnoozes({});
+    if (!userId) return undefined;
+    let active = true;
+    AsyncStorage.getItem(partnerSnoozeKey(userId))
       .then((raw) => {
-        if (!raw) return;
+        if (!active || !raw) return;
         const parsed = JSON.parse(raw) as Record<string, string>;
         setPartnerSnoozes(prunePartnerSnoozes(parsed, new Date()));
       })
-      .catch(() => undefined);
-  }, []);
+      .catch((error) => {
+        if (active) Alert.alert('Snoozes unavailable', `Saved snoozes could not be loaded: ${(error as Error).message}`);
+      });
+    return () => { active = false; };
+  }, [session?.user?.id]);
 
   const totals = useMemo(() => ({
     inbound: partners.reduce((sum, partner) => sum + partner.inbound, 0),
@@ -893,7 +1099,7 @@ export default function App() {
     .sort((a, b) => b.date.localeCompare(a.date))
     .slice(0, 5);
 
-  const activeReferralMatches = referralMatches.filter((item) => item.status === 'Matching');
+  const activeReferralMatches = referralMatches.filter((item) => item.status === 'Matching' || item.status === 'Referred');
 
   function loadReferralMatch(referralMatch: ReferralMatch) {
     setSelectedMatchId(referralMatch.id);
@@ -926,11 +1132,12 @@ export default function App() {
     requestAnimationFrame(() => matchClientLabelRef.current?.focus());
   }
 
-  function saveCurrentReferralMatch() {
+  async function saveCurrentReferralMatch(): Promise<ReferralMatch | null> {
     if (!matchClientLabel.trim()) {
       Alert.alert('Name this match', 'Add a private client or family label so you can return to it later.');
       return null;
     }
+    if (!mutationSlotAvailable('The match')) return null;
     const existing = referralMatches.find((item) => item.id === selectedMatchId);
     const now = new Date().toISOString();
     // A match started from a case file (Find placement) inherits its case.
@@ -951,22 +1158,37 @@ export default function App() {
       referralId: existing?.referralId,
       caseId: linkedCaseId || undefined,
     };
-    const nextMatches = [referralMatch, ...referralMatches.filter((item) => item.id !== referralMatch.id)];
+    const previousMatches = referralMatches;
+    const previousCases = cases;
+    const previousSelectedMatchId = selectedMatchId;
+    const previousPendingCaseMatchId = pendingCaseMatchId;
+    const nextMatches = [referralMatch, ...previousMatches.filter((item) => item.id !== referralMatch.id)];
+    const nextCases = linkedCaseId
+      ? previousCases.map((item) => item.id === linkedCaseId ? { ...item, matchProfileId: referralMatch.id, updatedAt: now } : item)
+      : previousCases;
     setReferralMatches(nextMatches);
+    setCases(nextCases);
     setSelectedMatchId(referralMatch.id);
     setPendingCaseMatchId(null);
-    if (linkedCaseId && !existing?.caseId) linkMatchToCase(referralMatch, linkedCaseId);
-    (existing ? updateMatchProfile(referralMatch) : createMatchProfile(referralMatch))
-      .then(() => syncDerived({ partners, referrals, referralMatches: nextMatches, touches, followUps, scorecards }))
-      .catch((error) => {
-        Alert.alert('Sync issue', `This match was saved on this device but could not sync: ${error.message}`);
-        syncDerived();
-      });
-    return referralMatch;
+    const saved = await settleOptimisticWrite(
+      () => linkedCaseId
+        ? saveMatchWithCase(referralMatch, linkedCaseId, activeUserId)
+        : (existing ? updateMatchProfile(referralMatch, activeUserId) : createMatchProfile(referralMatch, activeUserId)),
+      { partners, referrals, referralMatches: nextMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches: previousMatches, touches, followUps, scorecards },
+      () => {
+        setReferralMatches(previousMatches);
+        setCases(previousCases);
+        setSelectedMatchId(previousSelectedMatchId);
+        setPendingCaseMatchId(previousPendingCaseMatchId);
+      },
+      'The match',
+    );
+    return saved ? referralMatch : null;
   }
 
-  function openMatchedReferral(partnerId: string) {
-    const referralMatch = saveCurrentReferralMatch();
+  async function openMatchedReferral(partnerId: string) {
+    const referralMatch = await saveCurrentReferralMatch();
     if (!referralMatch) return;
     setActiveReferralMatchId(referralMatch.id);
     setReferralForm({
@@ -996,9 +1218,7 @@ export default function App() {
 
   // Save the match profile as it currently stands (or reuse the saved one),
   // so the packet always reflects the same criteria the matcher used.
-  function currentOrSavedMatch(): ReferralMatch | null {
-    const existing = referralMatches.find((item) => item.id === selectedMatchId);
-    if (existing) return existing;
+  async function currentOrSavedMatch(): Promise<ReferralMatch | null> {
     return saveCurrentReferralMatch();
   }
 
@@ -1027,8 +1247,8 @@ export default function App() {
 
   // From a recommended match card: the profile only gets assigned (status →
   // Referred) if the packet is actually sent.
-  function openPacketComposer(partner: Partner, fitInput: PacketFitInput) {
-    const matchProfile = currentOrSavedMatch();
+  async function openPacketComposer(partner: Partner, fitInput: PacketFitInput) {
+    const matchProfile = await currentOrSavedMatch();
     if (!matchProfile) return;
     const reasons = buildFitReasons(matchProfile, partner, fitInput);
     setPacketTarget({ partner, match: matchProfile, assignOnSend: true });
@@ -1092,6 +1312,12 @@ export default function App() {
   // insert first, then the match profile update) — not a duplicate of it.
   function finalizePacketSend() {
     if (!packetTarget) return;
+    if (!mutationSlotAvailable('The packet log')) return;
+    const previousMatchUi = {
+      selectedMatchId, matchClientLabel, matchType, matchInsurance,
+      matchNetworkPreferences, matchState, matchBudget, matchTherapies,
+      tab, packetTarget, packetSendConfirm, packetAudience, packetText,
+    };
     const { partner, match, assignOnSend } = packetTarget;
     const now = new Date();
     const todayStamp = localDateStamp();
@@ -1178,47 +1404,48 @@ export default function App() {
     setPartners(nextPartners);
     closePacketComposer();
 
+    const previousSnapshot: Snapshot = { partners, referrals, referralMatches, touches, followUps, scorecards };
     const snapshot: Snapshot = { partners: nextPartners, referrals: nextReferrals, referralMatches: nextMatches, touches: nextTouches, followUps: nextFollowUps, scorecards };
-    const referralAtSend = referral;
-    const writes: Array<() => Promise<unknown>> = [];
-    if (assignOnSend && assignedMatch) {
-      // Same code path as the manual assign flow: referral insert first,
-      // then the match profile update (assignMatchReferral in the store).
-      writes.push(() => assignMatchReferral(referralAtSend, assignedMatch));
-    } else {
-      // Already assigned: stamp packet_sent_at / match_profile_id onto the
-      // existing referral via a targeted update op.
-      writes.push(() => updateReferralPacketStamp(referralId, now.toISOString(), match.id));
-    }
-    // NOTE: `writes` is executed SEQUENTIALLY below — the referral must exist
-    // before the follow-up (follow_ups.referral_id FK) and before the case
-    // event that references it. Parallel execution raced and produced
-    // "violates foreign key constraint" errors.
-    writes.push(() => createTouch(touch), () => createFollowUp(followUp));
+    let packetEvent: CaseEvent | null = null;
     if (caseId) {
-      const linkedCaseId = caseId;
       const eventId = makeId('e');
-      const event: CaseEvent = {
+      packetEvent = {
         id: eventId,
-        caseId: linkedCaseId,
+        caseId,
         kind: 'referral',
         body: `Sent packet to ${partner.organization}`,
         referralId,
         occurredAt: now.toISOString(),
       };
-      applyCaseEvent(event);
-      writes.push(() => logCaseEvent(linkedCaseId, 'referral', event.body, { referralId }, eventId));
+      applyCaseEvent(packetEvent);
     }
 
-    runSequentially(writes)
-      .then(() => {
-        syncDerived(snapshot);
-        Alert.alert('Packet logged', `Referral logged, touch recorded, and a follow-up was set for ${shortDate(followUp.dueOn)}.`);
-      })
-      .catch((error) => {
-        Alert.alert('Sync issue', `The packet was logged on this device but could not fully sync: ${error.message}`);
-        syncDerived();
-      });
+    void settleOptimisticWrite(
+      () => finalizeMatchPacket(referral, assignedMatch, touch, followUp, packetEvent, activeUserId),
+      snapshot,
+      previousSnapshot,
+      () => {
+        setPartners(partners); setReferrals(referrals); setReferralMatches(referralMatches);
+        setTouches(touches); setFollowUps(followUps);
+        if (packetEvent) setCaseEvents((current) => current.filter((item) => item.id !== packetEvent?.id));
+        setSelectedMatchId(previousMatchUi.selectedMatchId);
+        setMatchClientLabel(previousMatchUi.matchClientLabel);
+        setMatchType(previousMatchUi.matchType);
+        setMatchInsurance(previousMatchUi.matchInsurance);
+        setMatchNetworkPreferences(previousMatchUi.matchNetworkPreferences);
+        setMatchState(previousMatchUi.matchState);
+        setMatchBudget(previousMatchUi.matchBudget);
+        setMatchTherapies(previousMatchUi.matchTherapies);
+        setTab(previousMatchUi.tab);
+        setPacketTarget(previousMatchUi.packetTarget);
+        setPacketSendConfirm(previousMatchUi.packetSendConfirm);
+        setPacketAudience(previousMatchUi.packetAudience);
+        setPacketText(previousMatchUi.packetText);
+      },
+      'The packet log',
+    ).then((saved) => {
+      if (saved) Alert.alert('Packet logged', `Referral logged, touch recorded, and a follow-up was set for ${shortDate(followUp.dueOn)}.`);
+    });
   }
 
   // ─── Case files ─────────────────────────────────────────────────────────
@@ -1231,17 +1458,21 @@ export default function App() {
   // Open a case file: fetch contacts + timeline + documents for just this
   // case (lists stay server-side until the file is opened).
   function openCase(caseId: string) {
+    const userId = activeUserId;
+    const generation = ++caseLoadGenerationRef.current;
     setActiveCaseId(caseId);
     setTimelineDraft('');
     setTimelineKind('note');
     setDocLabel('');
     fetchCaseData()
       .then((data) => {
+        if (!userId || activeUserIdRef.current !== userId || caseLoadGenerationRef.current !== generation) return;
         setCaseContacts(data.caseContacts.filter((item) => item.caseId === caseId));
         setCaseEvents(data.caseEvents.filter((item) => item.caseId === caseId));
         setCaseDocuments(data.caseDocuments.filter((item) => item.caseId === caseId));
       })
       .catch(() => {
+        if (!userId || activeUserIdRef.current !== userId || caseLoadGenerationRef.current !== generation) return;
         setCaseContacts([]);
         setCaseEvents([]);
         setCaseDocuments([]);
@@ -1249,6 +1480,7 @@ export default function App() {
   }
 
   function closeCase() {
+    caseLoadGenerationRef.current += 1;
     setActiveCaseId(null);
     setCaseContacts([]);
     setCaseEvents([]);
@@ -1266,6 +1498,7 @@ export default function App() {
   }
 
   function failCaseChange(message: string, rollback: () => void) {
+    if (message.includes('Account changed before the case operation completed')) return;
     rollback();
     Alert.alert('Case file', message);
   }
@@ -1275,6 +1508,7 @@ export default function App() {
       Alert.alert('Name the case', 'A title is required — the family name and who the case is about works well.');
       return;
     }
+    if (!mutationSlotAvailable('The case')) return;
     const now = new Date().toISOString();
     const record: CaseRecord = {
       id: makeId('c'),
@@ -1319,24 +1553,23 @@ export default function App() {
       nextFollowUps = [firstCall, ...followUps];
       setFollowUps(nextFollowUps);
     }
-    // ORDER MATTERS: case_contacts.case_id and follow_ups.case_id are foreign
-    // keys, so the case row must land BEFORE its children. Running these in
-    // parallel (Promise.all) raced and failed with
-    // "violates foreign key constraint case_contacts_case_id_fkey".
-    (async () => {
-      await createCase(record);
-      if (primaryContact) await createContact(primaryContact);
-      if (firstCall) await createFollowUp(firstCall);
-    })()
-      .then(() => {
-        syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }, [record, ...previous]);
-        openCase(record.id);
-      })
-      .catch((error) => failCaseChange(`The case could not be saved: ${error.message}`, () => setCases(previous)));
+    void settleOptimisticWrite(
+      () => createCaseBundle(record, primaryContact, firstCall, activeUserId),
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => {
+        setCases(previous);
+        setFollowUps(followUps);
+      },
+      'The case',
+      [record, ...previous],
+      previous,
+    ).then((saved) => { if (saved) openCase(record.id); });
   }
 
   function changeCaseStatus(record: CaseRecord, status: CaseStatus) {
     if (status === record.status) return;
+    if (!mutationSlotAvailable('The case status change')) return;
     const updated: CaseRecord = { ...record, status, updatedAt: new Date().toISOString() };
     const previous = cases;
     const next = previous.map((item) => (item.id === record.id ? updated : item));
@@ -1350,15 +1583,20 @@ export default function App() {
       occurredAt: updated.updatedAt,
     };
     applyCaseEvent(event);
-    runSequentially([() => updateCase(updated), () => logCaseEvent(record.id, 'status_change', event.body, {}, eventId)])
-      .then(() => syncDerived(undefined, next))
-      .catch((error) => failCaseChange(`The status change could not be saved: ${error.message}`, () => {
+    void settleOptimisticWrite(
+      () => updateCaseWithEvent(updated, event),
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => {
         setCases(previous);
         setCaseEvents((current) => current.filter((item) => item.id !== eventId));
-      }));
+      },
+      'The case status change', next, previous,
+    );
   }
 
   function saveCasePayment(record: CaseRecord, patch: { paymentStatus?: PaymentStatus; quotedAmount?: number | null; paidAmount?: number }) {
+    if (!mutationSlotAvailable('The payment change')) return;
     const updated: CaseRecord = { ...record, ...patch, updatedAt: new Date().toISOString() };
     const previous = cases;
     const next = previous.map((item) => (item.id === record.id ? updated : item));
@@ -1369,23 +1607,33 @@ export default function App() {
     if (patch.paidAmount !== undefined && patch.paidAmount !== record.paidAmount) bits.push(`Paid ${formatMoney(patch.paidAmount)}`);
     const body = bits.join(' · ') || 'Payment updated';
     const eventId = makeId('e');
-    applyCaseEvent({ id: eventId, caseId: record.id, kind: 'payment', body, occurredAt: updated.updatedAt });
-    runSequentially([() => updateCase(updated), () => logCaseEvent(record.id, 'payment', body, {}, eventId)])
-      .then(() => syncDerived(undefined, next))
-      .catch((error) => failCaseChange(`The payment change could not be saved: ${error.message}`, () => {
+    const event: CaseEvent = { id: eventId, caseId: record.id, kind: 'payment', body, occurredAt: updated.updatedAt };
+    applyCaseEvent(event);
+    void settleOptimisticWrite(
+      () => updateCaseWithEvent(updated, event),
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => {
         setCases(previous);
         setCaseEvents((current) => current.filter((item) => item.id !== eventId));
-      }));
+      },
+      'The payment change', next, previous,
+    );
   }
 
   function saveCaseSummary(record: CaseRecord, summary: string) {
+    if (!mutationSlotAvailable('The case summary')) return;
     const updated: CaseRecord = { ...record, summary: summary.trim(), updatedAt: new Date().toISOString() };
     const previous = cases;
     const next = previous.map((item) => (item.id === record.id ? updated : item));
     setCases(next);
-    updateCase(updated)
-      .then(() => syncDerived(undefined, next))
-      .catch((error) => failCaseChange(`The summary could not be saved: ${error.message}`, () => setCases(previous)));
+    void settleOptimisticWrite(
+      () => updateCase(updated),
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => setCases(previous),
+      'The case summary', next, previous,
+    );
   }
 
   function saveCaseContact() {
@@ -1394,6 +1642,7 @@ export default function App() {
       Alert.alert('Name the contact', 'Add at least a name so you know who this is later.');
       return;
     }
+    if (!mutationSlotAvailable('The case contact')) return;
     const form = caseContactForm;
     const existing = caseContacts.find((item) => item.id === form.id) || null;
     const contact: CaseContact = {
@@ -1406,36 +1655,48 @@ export default function App() {
       note: form.note.trim(),
       isPrimary: form.isPrimary || (!existing && caseContacts.length === 0),
     };
-    // Exactly one primary: setting a new primary clears the old client-side
-    // (and the clearing updates are written alongside).
-    const demoted = contact.isPrimary ? caseContacts.filter((item) => item.isPrimary && item.id !== contact.id) : [];
+    // Exactly one primary: the RPC demotes the old primary and upserts this
+    // contact in one transaction; the same result is mirrored optimistically.
     const previousContacts = caseContacts;
-    const nextContacts = [
-      ...(existing ? caseContacts.map((item) => (item.id === contact.id ? contact : item.isPrimary && contact.isPrimary ? { ...item, isPrimary: false } : item)) : [...caseContacts, contact]),
-    ];
+    const baseContacts = contact.isPrimary
+      ? caseContacts.map((item) => ({ ...item, isPrimary: false }))
+      : caseContacts;
+    const nextContacts = existing
+      ? baseContacts.map((item) => item.id === contact.id ? contact : item)
+      : [...baseContacts, contact];
     setCaseContacts(nextContacts);
     setCaseContactForm(null);
-    const writes: Array<() => Promise<unknown>> = [() => (existing ? updateContact(contact) : createContact(contact))];
-    for (const old of demoted) writes.push(() => updateContact({ ...old, isPrimary: false }));
-    runSequentially(writes)
-      .catch((error) => failCaseChange(`The contact could not be saved: ${error.message}`, () => setCaseContacts(previousContacts)));
+    void settleOptimisticWrite(
+      () => saveContactAtomic(contact),
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => setCaseContacts(previousContacts),
+      'The case contact', cases, cases,
+    );
   }
 
   function removeCaseContact(contact: CaseContact) {
     Alert.alert('Remove contact?', `${contact.name} will be removed from this case file.`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Remove', style: 'destructive', onPress: () => {
+        if (!mutationSlotAvailable('The contact removal')) return;
         const previousContacts = caseContacts;
-        setCaseContacts(caseContacts.filter((item) => item.id !== contact.id));
-        deleteContact(contact.id)
-          .catch((error) => failCaseChange(`The contact could not be removed: ${error.message}`, () => setCaseContacts(previousContacts)));
+        const nextContacts = caseContacts.filter((item) => item.id !== contact.id);
+        setCaseContacts(nextContacts);
+        void settleOptimisticWrite(
+          () => deleteContact(contact.id),
+          { partners, referrals, referralMatches, touches, followUps, scorecards },
+          { partners, referrals, referralMatches, touches, followUps, scorecards },
+          () => setCaseContacts(previousContacts),
+          'The contact removal', cases, cases,
+        );
       } },
     ]);
   }
 
   // One-tap contact action: open the dialer/messages/mail AND log the
   // timeline event, then offer the skippable quick note.
-  function contactAction(contact: CaseContact, kind: 'call' | 'text' | 'email') {
+  async function contactAction(contact: CaseContact, kind: 'call' | 'text' | 'email') {
     if (!activeCase) return;
     const target = kind === 'call' ? contact.phone.replace(/[^\d+]/g, '') : kind === 'text' ? contact.phone.replace(/[^\d+]/g, '') : contact.email;
     if (!target) {
@@ -1443,7 +1704,14 @@ export default function App() {
       return;
     }
     const url = kind === 'call' ? `tel:${target}` : kind === 'text' ? `sms:${target}` : `mailto:${target}`;
-    Linking.openURL(url).catch(() => Alert.alert('Unable to open', 'This device could not open that action.'));
+    try {
+      const supported = await Linking.canOpenURL(url);
+      if (!supported) throw new Error('Unsupported contact action');
+      await Linking.openURL(url);
+    } catch {
+      Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
+      return;
+    }
     const verbs = { call: 'Called', text: 'Texted', email: 'Emailed' } as const;
     const eventId = makeId('e');
     const event: CaseEvent = {
@@ -1525,6 +1793,8 @@ export default function App() {
     const mimeType = asset.mimeType || 'image/jpeg';
     const label = docLabel.trim() || fileName.replace(/\.[^.]+$/, '');
     setDocUploading(true);
+    let uploadedPath: string | null = null;
+    let metadataSaved = false;
     try {
       const { storagePath } = await uploadCaseFile({
         ownerId: session.user.id,
@@ -1535,6 +1805,7 @@ export default function App() {
         mimeType,
         sizeBytes: asset.fileSize ?? null,
       });
+      uploadedPath = storagePath;
       const document: CaseDocument = {
         id: documentId,
         caseId: activeCase.id,
@@ -1544,9 +1815,6 @@ export default function App() {
         sizeBytes: asset.fileSize ?? null,
         createdAt: new Date().toISOString(),
       };
-      await createDocumentRow(document);
-      setCaseDocuments((current) => [...current, document]);
-      setDocLabel('');
       const eventId = makeId('e');
       const event: CaseEvent = {
         id: eventId,
@@ -1556,10 +1824,21 @@ export default function App() {
         documentId: document.id,
         occurredAt: new Date().toISOString(),
       };
+      await saveDocumentWithEvent(document, event);
+      metadataSaved = true;
+      setCaseDocuments((current) => [...current, document]);
+      setDocLabel('');
       applyCaseEvent(event);
-      logCaseEvent(activeCase.id, 'document', event.body, { documentId: document.id }, eventId).catch(() => undefined);
     } catch (error) {
-      Alert.alert('Upload failed', `The document could not be uploaded: ${(error as Error).message}`);
+      let cleanupWarning = '';
+      if (uploadedPath && !metadataSaved) {
+        try {
+          await removeCaseFile(uploadedPath);
+        } catch (cleanupError) {
+          cleanupWarning = ` The uploaded file also needs cleanup: ${(cleanupError as Error).message}`;
+        }
+      }
+      Alert.alert('Upload failed', `The document could not be uploaded: ${(error as Error).message}.${cleanupWarning}`);
     } finally {
       setDocUploading(false);
     }
@@ -1583,10 +1862,20 @@ export default function App() {
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete', style: 'destructive', onPress: async () => {
         const previousDocs = caseDocuments;
+        const linkedEventIds = caseEvents.filter((event) => event.documentId === document.id).map((event) => event.id);
         setCaseDocuments(caseDocuments.filter((item) => item.id !== document.id));
         try {
           await deleteDocumentRow(document.id);
-          await removeCaseFile(document.storagePath);
+          try {
+            await removeCaseFile(document.storagePath);
+          } catch (storageError) {
+            try {
+              await restoreDocumentRow(document, linkedEventIds);
+            } catch (restoreError) {
+              throw new Error(`File deletion failed (${(storageError as Error).message}) and document metadata recovery also failed (${(restoreError as Error).message}). Refresh the case before retrying.`);
+            }
+            throw storageError;
+          }
         } catch (error) {
           failCaseChange(`The document could not be deleted: ${(error as Error).message}`, () => setCaseDocuments(previousDocs));
         }
@@ -1605,13 +1894,14 @@ export default function App() {
     }
     setCaseSearching(true);
     let cancelled = false;
+    const userId = activeUserId;
     const timer = setTimeout(() => {
       searchCases(query)
-        .then((results) => { if (!cancelled) { setCaseSearchResults(results); setCaseSearching(false); } })
-        .catch(() => { if (!cancelled) { setCaseSearchResults([]); setCaseSearching(false); } });
+        .then((results) => { if (!cancelled && userId && activeUserIdRef.current === userId) { setCaseSearchResults(results); setCaseSearching(false); } })
+        .catch(() => { if (!cancelled && userId && activeUserIdRef.current === userId) { setCaseSearchResults([]); setCaseSearching(false); } });
     }, 300);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [caseSearch]);
+  }, [caseSearch, activeUserId]);
 
   // ─── Case → Match linkage ────────────────────────────────────────────────
 
@@ -1643,22 +1933,6 @@ export default function App() {
     setMatchTherapies([]);
     setTab('match');
     closeCase();
-  }
-
-  // Called from saveCurrentReferralMatch: stamp case_id on the saved match
-  // profile (queued match.update) and point the case's match_profile_id at it
-  // (direct case update — rolled back with an alert if it fails).
-  function linkMatchToCase(matchProfile: ReferralMatch, caseId: string) {
-    const stamped = { ...matchProfile, caseId };
-    updateMatchCase(matchProfile.id, caseId)
-      .then(() => syncDerived({ partners, referrals, referralMatches: referralMatches.map((item) => (item.id === stamped.id ? stamped : item)), touches, followUps, scorecards }, cases))
-      .catch(() => undefined);
-    const record = cases.find((item) => item.id === caseId);
-    if (!record || record.matchProfileId === matchProfile.id) return;
-    const updated: CaseRecord = { ...record, matchProfileId: matchProfile.id, updatedAt: new Date().toISOString() };
-    const previous = cases;
-    setCases(previous.map((item) => (item.id === caseId ? updated : item)));
-    updateCase(updated).catch((error) => failCaseChange(`The case link could not be saved: ${error.message}`, () => setCases(previous)));
   }
 
   // ─── Today Command Center ───────────────────────────────────────────────
@@ -1742,14 +2016,16 @@ export default function App() {
     persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
   }
 
-  // Log a 'system' timeline event on a case-linked card action, e.g.
-  // "Completed: First call — set next: Consult Thu 2pm". Best-effort: a
-  // failure here never blocks the follow-up write.
+  // Log a 'system' timeline event on a case-linked card action. Timeline
+  // failures are visible and the optimistic event is removed.
   function logTodaySystemEvent(caseId: string, body: string) {
     const eventId = makeId('e');
     const event: CaseEvent = { id: eventId, caseId, kind: 'system', body, occurredAt: new Date().toISOString() };
     applyCaseEvent(event);
-    logCaseEvent(caseId, 'system', body, {}, eventId).catch(() => undefined);
+    logCaseEvent(caseId, 'system', body, {}, eventId).catch((error) => {
+      setCaseEvents((current) => current.filter((item) => item.id !== eventId));
+      Alert.alert('Timeline not saved', `The main action was saved, but its case timeline entry failed: ${error.message}`);
+    });
   }
 
   // Done → "Next step…": complete the current item AND create the next
@@ -1757,6 +2033,7 @@ export default function App() {
   function confirmDoneNextStep() {
     const card = doneCard;
     if (!card?.followUp) return;
+    if (!mutationSlotAvailable('The completed step and its next step')) return;
     const followUp = card.followUp;
     const now = new Date().toISOString();
     const dueOn = nextStepDate(stepForm.when, new Date(), stepForm.customDate);
@@ -1778,13 +2055,24 @@ export default function App() {
     const nextFollowUps = [next, ...followUps.map((item) => (item.id === followUp.id ? completed : item))];
     setFollowUps(nextFollowUps);
     setDoneCard(null);
-    if (followUp.caseId) logTodaySystemEvent(followUp.caseId, `Completed: ${followUp.title} — set next: ${next.title} (${shortDate(next.dueOn)}${next.dueTime ? ` ${next.dueTime}` : ''})`);
-    runSequentially([() => updateFollowUp(completed), () => createFollowUp(next)])
-      .then(() => syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
-      .catch((error) => {
-        Alert.alert('Sync issue', `This was saved on this device but could not sync: ${error.message}`);
-        syncDerived();
-      });
+    const event: CaseEvent | null = followUp.caseId ? {
+      id: makeId('e'),
+      caseId: followUp.caseId,
+      kind: 'system',
+      body: `Completed: ${followUp.title} — set next: ${next.title} (${shortDate(next.dueOn)}${next.dueTime ? ` ${next.dueTime}` : ''})`,
+      occurredAt: now,
+    } : null;
+    if (event) applyCaseEvent(event);
+    void settleOptimisticWrite(
+      () => completeFollowUpWithNext(completed, next, event, activeUserId),
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => {
+        setFollowUps(followUps);
+        if (event) setCaseEvents((current) => current.filter((item) => item.id !== event.id));
+      },
+      'The completed step and its next step',
+    );
   }
 
   function nextStepTitle(kind: FollowUpKind, card: TodayCard): string {
@@ -1829,13 +2117,49 @@ export default function App() {
   function closeLoopWithStatus(status: CaseStatus | 'keep') {
     const card = doneCard;
     if (!card?.followUp) return;
+    if (!mutationSlotAvailable('The follow-up and case status')) return;
     const followUp = card.followUp;
     const record = cases.find((item) => item.id === followUp.caseId);
+    if (!record) {
+      Alert.alert('Case file', 'The linked case could not be found. Refresh before closing this step.');
+      return;
+    }
+    const now = new Date().toISOString();
+    const completed: FollowUp = { ...followUp, status: 'done', completedAt: now, snoozedUntil: undefined };
+    const updatedCase: CaseRecord = {
+      ...record,
+      status: status === 'keep' ? record.status : status,
+      updatedAt: now,
+    };
+    const event: CaseEvent = {
+      id: makeId('e'),
+      caseId: record.id,
+      kind: 'system',
+      body: `Completed: ${followUp.title} — closed the loop${status !== 'keep' ? ` (case → ${status})` : ''}`,
+      occurredAt: now,
+    };
+    const previousCases = cases;
+    const previousFollowUps = followUps;
+    const nextCases = cases.map((item) => item.id === record.id ? updatedCase : item);
+    const nextFollowUps = followUps.map((item) => item.id === followUp.id ? completed : item);
     setDoneCard(null);
     setDoneStatusPicker(false);
-    completePlainFollowUp(followUp);
-    logTodaySystemEvent(followUp.caseId as string, `Completed: ${followUp.title} — closed the loop${record && status !== 'keep' ? ` (case → ${status})` : ''}`);
-    if (record && status !== 'keep' && status !== record.status) changeCaseStatus(record, status);
+    setCases(nextCases);
+    setFollowUps(nextFollowUps);
+    applyCaseEvent(event);
+    void settleOptimisticWrite(
+      () => completeFollowUpWithCase(completed, updatedCase, event),
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps: previousFollowUps, scorecards },
+      () => {
+        setCases(previousCases);
+        setFollowUps(previousFollowUps);
+        setCaseEvents((current) => current.filter((item) => item.id !== event.id));
+      },
+      'The follow-up and case status',
+      nextCases,
+      previousCases,
+    );
   }
 
   // Set Next Step WITHOUT completing: retype/reschedule the current item
@@ -1845,6 +2169,7 @@ export default function App() {
   function confirmNextStep() {
     const card = nextStepCard;
     if (!card) return;
+    if (!mutationSlotAvailable('The next step')) return;
     const dueOn = nextStepDate(stepForm.when, new Date(), stepForm.customDate);
     const dueTime = stepForm.kind === 'consult' && stepForm.time ? stepForm.time : undefined;
     const waitingOn = stepForm.kind === 'waiting_on' ? stepForm.waitingOn.trim() : undefined;
@@ -1863,12 +2188,12 @@ export default function App() {
       };
       const nextFollowUps = [created, ...followUps];
       setFollowUps(nextFollowUps);
-      createFollowUp(created)
-        .then(() => syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
-        .catch((error) => {
-          Alert.alert('Sync issue', `This next step was saved on this device but could not sync: ${error.message}`);
-          syncDerived();
-        });
+      void settleOptimisticWrite(
+        () => createFollowUp(created, activeUserId),
+        { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+        { partners, referrals, referralMatches, touches, followUps, scorecards },
+        () => setFollowUps(followUps), 'The next step',
+      );
       return;
     }
     const followUp = card.followUp as FollowUp;
@@ -1888,15 +2213,29 @@ export default function App() {
   // Snooze: backed items write snoozed_until (today_actions hides them until
   // then); virtual partner cards use the local AsyncStorage snooze map and
   // materialize nothing.
-  function confirmSnooze(choice: 'plus1' | 'plus2' | 'nextweek') {
+  async function confirmSnooze(choice: 'plus1' | 'plus2' | 'nextweek') {
     const card = snoozeCard;
     if (!card) return;
     const until = snoozeDate(choice, new Date());
     setSnoozeCard(null);
     if (card.virtual) {
+      const userId = session?.user?.id;
+      const generation = authGenerationRef.current;
+      if (!userId) {
+        Alert.alert('Snooze not saved', 'Sign in again before snoozing this partner.');
+        return;
+      }
+      const previous = partnerSnoozes;
       const next = prunePartnerSnoozes({ ...partnerSnoozes, [card.virtual.partnerId]: until }, new Date());
       setPartnerSnoozes(next);
-      AsyncStorage.setItem('referralfit-partner-snooze-v1', JSON.stringify(next)).catch(() => undefined);
+      try {
+        await AsyncStorage.setItem(partnerSnoozeKey(userId), JSON.stringify(next));
+      } catch (error) {
+        if (activeUserIdRef.current === userId && authGenerationRef.current === generation) {
+          setPartnerSnoozes(previous);
+          Alert.alert('Snooze not saved', `The on-device snooze could not be stored: ${(error as Error).message}`);
+        }
+      }
       return;
     }
     const followUp = card.followUp as FollowUp;
@@ -1909,8 +2248,17 @@ export default function App() {
   // → the partner's phone. Every completed action logs (case_event and/or
   // partner touch) and offers the same quick-note prompt the case file uses.
   function cardContactAction(card: TodayCard, action: 'call' | 'text') {
-    const launch = (digits: string) => {
-      Linking.openURL(`${action === 'call' ? 'tel' : 'sms'}:${digits}`).catch(() => Alert.alert('Unable to open', 'This device could not open that action.'));
+    const launch = async (digits: string): Promise<boolean> => {
+      const url = `${action === 'call' ? 'tel' : 'sms'}:${digits}`;
+      try {
+        const supported = await Linking.canOpenURL(url);
+        if (!supported) throw new Error('Unsupported contact action');
+        await Linking.openURL(url);
+        return true;
+      } catch {
+        Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
+        return false;
+      }
     };
     const clean = (phone: string) => phone.replace(/[^\d+]/g, '');
     if (card.caseId) {
@@ -1927,8 +2275,9 @@ export default function App() {
             setContactPick({ card, action, contacts });
             return;
           }
-          launch(clean(primary.phone));
-          logCardContact(card, action, primary);
+          launch(clean(primary.phone)).then((opened) => {
+            if (opened) logCardContact(card, action, primary);
+          });
         })
         .catch(() => Alert.alert('Offline', 'Case contacts load from the server — try again with a connection.'));
       return;
@@ -1940,68 +2289,90 @@ export default function App() {
         Alert.alert('No phone on file', `${partner?.organization || 'This partner'} has no phone number — add one in the Directory.`);
         return;
       }
-      launch(digits);
-      logCardContact(card, action, undefined);
+      launch(digits).then((opened) => {
+        if (opened) logCardContact(card, action, undefined);
+      });
       return;
     }
     Alert.alert('No one to reach', 'Link this item to a case or partner to call or text from here.');
   }
 
-  // The logging half of a card call/text: case_event for case-linked items
-  // (via the same path case detail uses), a partner touch when a partner is
-  // involved, then the skippable quick note.
+  // The logging half of a card call/text. A case event and partner touch are
+  // committed/queued as one owner-fenced operation after the OS handoff succeeds.
   function logCardContact(card: TodayCard, action: 'call' | 'text', contact?: CaseContact) {
+    if (!mutationSlotAvailable('The contact log')) return;
     const now = new Date().toISOString();
     const verb = action === 'call' ? 'Called' : 'Texted';
-    if (card.caseId && contact) {
-      const eventId = makeId('e');
-      const event: CaseEvent = {
-        id: eventId,
-        caseId: card.caseId,
-        kind: action,
-        body: `${verb} ${contact.name}${contact.relationship ? ` (${contact.relationship})` : ''} — ${card.title}`,
-        contactId: contact.id,
-        occurredAt: now,
-      };
-      applyCaseEvent(event);
-      logCaseEvent(card.caseId, action, event.body, { contactId: contact.id }, eventId).catch(() => undefined);
-    }
-    if (card.partnerId) {
-      const touch: Touch = { id: makeId('t'), partnerId: card.partnerId, kind: action, note: card.title, occurredAt: now };
-      const nextTouches = [touch, ...touches];
-      const todayStamp = localDateStamp();
-      const nextPartners = partners.map((partner) => partner.id === card.partnerId ? { ...partner, lastContact: todayStamp } : partner);
+    const previousCaseEvents = caseEvents;
+    const previousTouches = touches;
+    const previousPartners = partners;
+    const event: CaseEvent | null = card.caseId && contact ? {
+      id: makeId('e'),
+      caseId: card.caseId,
+      kind: action,
+      body: `${verb} ${contact.name}${contact.relationship ? ` (${contact.relationship})` : ''} — ${card.title}`,
+      contactId: contact.id,
+      occurredAt: now,
+    } : null;
+    const touch: Touch | null = card.partnerId
+      ? { id: makeId('t'), partnerId: card.partnerId, kind: action, note: card.title, occurredAt: now }
+      : null;
+    if (event) applyCaseEvent(event);
+    const nextTouches = touch ? [touch, ...previousTouches] : previousTouches;
+    const todayStamp = localDateStamp();
+    const nextPartners = touch
+      ? previousPartners.map((partner) => partner.id === touch.partnerId ? { ...partner, lastContact: todayStamp } : partner)
+      : previousPartners;
+    if (touch) {
       setTouches(nextTouches);
       setPartners(nextPartners);
-      createTouch(touch)
-        .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches: nextTouches, followUps, scorecards }))
-        .catch(() => syncDerived());
     }
     setQuickNoteText('');
     setTodayQuickNote({ card, action, contact });
+    if (!event && !touch) return;
+    void settleOptimisticWrite(
+      () => logContactActivity(event, touch, activeUserId),
+      { partners: nextPartners, referrals, referralMatches, touches: nextTouches, followUps, scorecards },
+      { partners: previousPartners, referrals, referralMatches, touches: previousTouches, followUps, scorecards },
+      () => {
+        setCaseEvents(previousCaseEvents);
+        setTouches(previousTouches);
+        setPartners(previousPartners);
+      },
+      'The contact log',
+    );
   }
 
   function saveTodayQuickNote() {
     const note = quickNoteText.trim();
     const target = todayQuickNote;
+    if (!note || !target) return;
+    if (!mutationSlotAvailable('The contact note')) return;
     setTodayQuickNote(null);
     setQuickNoteText('');
-    if (!note || !target) return;
     const now = new Date().toISOString();
-    if (target.card.caseId && target.contact) {
-      const eventId = makeId('e');
-      const event: CaseEvent = { id: eventId, caseId: target.card.caseId, kind: 'note', body: note, contactId: target.contact.id, occurredAt: now };
-      applyCaseEvent(event);
-      logCaseEvent(target.card.caseId, 'note', note, { contactId: target.contact.id }, eventId).catch(() => undefined);
-    }
-    if (target.card.partnerId) {
-      const touch: Touch = { id: makeId('t'), partnerId: target.card.partnerId, kind: 'other', note, occurredAt: now };
-      const nextTouches = [touch, ...touches];
-      setTouches(nextTouches);
-      createTouch(touch)
-        .then(() => syncDerived({ partners, referrals, referralMatches, touches: nextTouches, followUps, scorecards }))
-        .catch(() => syncDerived());
-    }
+    const previousCaseEvents = caseEvents;
+    const previousTouches = touches;
+    const event: CaseEvent | null = target.card.caseId && target.contact
+      ? { id: makeId('e'), caseId: target.card.caseId, kind: 'note', body: note, contactId: target.contact.id, occurredAt: now }
+      : null;
+    const touch: Touch | null = target.card.partnerId
+      ? { id: makeId('t'), partnerId: target.card.partnerId, kind: 'other', note, occurredAt: now }
+      : null;
+    if (event) applyCaseEvent(event);
+    const nextTouches = touch ? [touch, ...previousTouches] : previousTouches;
+    if (touch) setTouches(nextTouches);
+    if (!event && !touch) return;
+    void settleOptimisticWrite(
+      () => logContactActivity(event, touch, activeUserId),
+      { partners, referrals, referralMatches, touches: nextTouches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches: previousTouches, followUps, scorecards },
+      () => {
+        setCaseEvents(previousCaseEvents);
+        setTouches(previousTouches);
+      },
+      'The contact note',
+    );
   }
 
   // Quick-add ("I need to…"): the 5-second capture. kind + who + when →
@@ -2011,6 +2382,7 @@ export default function App() {
       Alert.alert('Say what it is', 'One line is enough — "I promised Sarah I\'d call Thursday".');
       return;
     }
+    if (!mutationSlotAvailable('The follow-up')) return;
     const linkedCase = quickAddForm.targetType === 'case' ? cases.find((item) => item.id === quickAddForm.targetId) : undefined;
     const linkedPartner = quickAddForm.targetType === 'partner' ? partners.find((item) => item.id === quickAddForm.targetId) : undefined;
     const followUp: FollowUp = {
@@ -2029,22 +2401,24 @@ export default function App() {
     setFollowUps(nextFollowUps);
     setShowQuickAdd(false);
     setQuickAddForm({ kind: 'follow_up', title: '', targetType: 'none', targetId: '', targetSearch: '', when: 'today', customDate: '', time: '', waitingOn: '' });
-    createFollowUp(followUp)
-      .then(() => syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
-      .catch((error) => {
-        Alert.alert('Sync issue', `This was saved on this device but could not sync: ${error.message}`);
-        syncDerived();
-      });
+    void settleOptimisticWrite(
+      () => createFollowUp(followUp, activeUserId),
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => setFollowUps(followUps), 'The follow-up',
+    );
   }
 
   function persistFollowUpChange(updated: FollowUp, nextFollowUps: FollowUp[]) {
+    if (!mutationSlotAvailable('The follow-up change')) return;
+    const previousFollowUps = followUps;
     setFollowUps(nextFollowUps);
-    updateFollowUp(updated)
-      .then(() => syncDerived({ partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
-      .catch((error) => {
-        Alert.alert('Sync issue', `This follow-up was updated on this device but could not sync: ${error.message}`);
-        syncDerived();
-      });
+    void settleOptimisticWrite(
+      () => updateFollowUp(updated, activeUserId),
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps: previousFollowUps, scorecards },
+      () => setFollowUps(previousFollowUps), 'The follow-up change',
+    );
   }
 
   function skipFollowUp(followUp: FollowUp) {
@@ -2067,29 +2441,35 @@ export default function App() {
   function saveOutcome() {
     const followUp = outcomeFollowUp;
     if (!followUp || !outcomeAnswer) return;
+    if (!mutationSlotAvailable('The outcome')) return;
     const now = new Date().toISOString();
     const completed: FollowUp = { ...followUp, status: 'done', completedAt: now };
     const nextFollowUps = followUps.map((item) => (item.id === followUp.id ? completed : item));
     setFollowUps(nextFollowUps);
-    const writes: Array<() => Promise<unknown>> = [() => updateFollowUp(completed)];
     let nextReferrals = referrals;
+    let write: () => Promise<void>;
     if (followUp.referralId) {
-      const outcomeReferralId = followUp.referralId;
       const stars = outcomeStars > 0 ? outcomeStars : null;
       const patch = outcomeAnswer === 'yes'
         ? { admitted: true, admittedOn: outcomeAdmittedOn || localDateStamp(), outcome: 'Placed' as Referral['outcome'], familyExperience: stars, outcomeNote: outcomeNote.trim() }
         : { admitted: false, outcomeNote: outcomeNote.trim() };
       nextReferrals = referrals.map((item) => (item.id === followUp.referralId ? { ...item, ...patch } : item));
       setReferrals(nextReferrals);
-      writes.push(() => updateReferralOutcome(outcomeReferralId, patch));
+      write = () => completeFollowUpWithOutcome(completed, followUp.referralId!, patch, activeUserId);
+    } else {
+      write = () => updateFollowUp(completed, activeUserId);
     }
     closeOutcomeSheet();
-    runSequentially(writes)
-      .then(() => syncDerived({ partners, referrals: nextReferrals, referralMatches, touches, followUps: nextFollowUps, scorecards }))
-      .catch((error) => {
-        Alert.alert('Sync issue', `This outcome was saved on this device but could not sync: ${error.message}`);
-        syncDerived();
-      });
+    void settleOptimisticWrite(
+      write,
+      { partners, referrals: nextReferrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => {
+        setFollowUps(followUps);
+        setReferrals(referrals);
+      },
+      'The outcome',
+    );
   }
 
   function outcomeNotYet() {
@@ -2153,6 +2533,7 @@ export default function App() {
       Alert.alert('Choose a partner type', 'Select at least one level of care or provider type.');
       return;
     }
+    if (!mutationSlotAvailable('The partner')) return;
     const existing = partners.find((partner) => partner.id === editingPartnerId);
     const cadence = partnerForm.touchCadence ? Number(partnerForm.touchCadence) : undefined;
     const partner: Partner = {
@@ -2189,12 +2570,13 @@ export default function App() {
     setShowAddPartner(false);
     setEditingPartnerId(null);
     setSelectedPartner(partner);
-    (existing ? updatePartner(partner) : createPartner(partner))
-      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards }))
-      .catch((error) => {
-        Alert.alert('Sync issue', `This partner was saved on this device but could not sync: ${error.message}`);
-        syncDerived();
-      });
+    void settleOptimisticWrite(
+      () => existing ? updatePartner(partner, activeUserId) : createPartner(partner, activeUserId),
+      { partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => { setPartners(partners); setSelectedPartner(existing || null); },
+      'The partner',
+    );
   }
 
   function addReferral() {
@@ -2202,6 +2584,12 @@ export default function App() {
       Alert.alert('A little more detail', 'Choose a partner and add a client or family label.');
       return;
     }
+    if (!mutationSlotAvailable('The referral')) return;
+    const previousReferralUi = {
+      referralForm, showAddReferral, activeReferralMatchId, tab,
+      selectedMatchId, matchClientLabel, matchType, matchInsurance,
+      matchNetworkPreferences, matchState, matchBudget, matchTherapies,
+    };
     const referral: Referral = {
       id: makeId('r'),
       partnerId: referralForm.partnerId,
@@ -2247,15 +2635,29 @@ export default function App() {
     setActiveReferralMatchId(null);
     const snapshot: Snapshot = { partners: nextPartners, referrals: nextReferrals, referralMatches: nextMatches, touches, followUps, scorecards };
     // Assignment flow: referral first, then the match profile update.
-    const write = assignedMatch
-      ? assignMatchReferral(referral, { ...assignedMatch, clientLabel: referral.clientLabel, status: 'Referred', assignedPartnerId: referral.partnerId, referralId: referral.id, updatedAt: new Date().toISOString() })
-      : createReferral(referral);
-    write
-      .then(() => syncDerived(snapshot))
-      .catch((error) => {
-        Alert.alert('Sync issue', `This referral was saved on this device but could not sync: ${error.message}`);
-        syncDerived();
-      });
+    void settleOptimisticWrite(
+      () => assignedMatch
+        ? assignMatchReferral(referral, { ...assignedMatch, clientLabel: referral.clientLabel, status: 'Referred', assignedPartnerId: referral.partnerId, referralId: referral.id, updatedAt: new Date().toISOString() }, activeUserId)
+        : createReferral(referral, activeUserId),
+      snapshot,
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => {
+        setPartners(partners); setReferrals(referrals); setReferralMatches(referralMatches);
+        setReferralForm(previousReferralUi.referralForm);
+        setShowAddReferral(previousReferralUi.showAddReferral);
+        setActiveReferralMatchId(previousReferralUi.activeReferralMatchId);
+        setTab(previousReferralUi.tab);
+        setSelectedMatchId(previousReferralUi.selectedMatchId);
+        setMatchClientLabel(previousReferralUi.matchClientLabel);
+        setMatchType(previousReferralUi.matchType);
+        setMatchInsurance(previousReferralUi.matchInsurance);
+        setMatchNetworkPreferences(previousReferralUi.matchNetworkPreferences);
+        setMatchState(previousReferralUi.matchState);
+        setMatchBudget(previousReferralUi.matchBudget);
+        setMatchTherapies(previousReferralUi.matchTherapies);
+      },
+      'The referral',
+    );
   }
 
   function openTouchLogger(partner: Partner) {
@@ -2266,6 +2668,7 @@ export default function App() {
 
   function saveTouch() {
     if (!touchPartner) return;
+    if (!mutationSlotAvailable('The touch')) return;
     const now = new Date();
     const touch: Touch = {
       id: makeId('t'),
@@ -2287,40 +2690,44 @@ export default function App() {
     setTouchPartner(null);
     setTouchNote('');
     setTouchKind('call');
-    createTouch(touch)
-      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches: nextTouches, followUps, scorecards }))
-      .catch((error) => {
-        Alert.alert('Sync issue', `This touch was logged on this device but could not sync: ${error.message}`);
-        syncDerived();
-      });
+    void settleOptimisticWrite(
+      () => createTouch(touch, activeUserId),
+      { partners: nextPartners, referrals, referralMatches, touches: nextTouches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => { setTouches(touches); setPartners(partners); setSelectedPartner((current) => current?.id === touch.partnerId ? partners.find((item) => item.id === touch.partnerId) || current : current); },
+      'The touch',
+    );
   }
 
   function toggleFavorite(id: string) {
     const target = partners.find((partner) => partner.id === id);
     if (!target) return;
+    if (!mutationSlotAvailable('The favorite change')) return;
     const updated = { ...target, favorite: !target.favorite };
     const nextPartners = partners.map((partner) => partner.id === id ? updated : partner);
     setPartners(nextPartners);
     setSelectedPartner((current) => current?.id === id ? { ...current, favorite: !current.favorite } : current);
-    updatePartner(updated)
-      .then(() => syncDerived({ partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards }))
-      .catch((error) => {
-        Alert.alert('Sync issue', `This change was saved on this device but could not sync: ${error.message}`);
-        syncDerived();
-      });
+    void settleOptimisticWrite(
+      () => updatePartner(updated, activeUserId),
+      { partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => { setPartners(partners); setSelectedPartner((current) => current?.id === id ? target : current); },
+      'The favorite change',
+    );
   }
 
   function confirmSignOut() {
-    Alert.alert('Sign out?', 'Cached data stays on this device and syncs again on the next sign-in.', [
+    Alert.alert('Sign out?', 'Offline data remains in this account’s isolated on-device cache.', [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Sign out', style: 'destructive', onPress: async () => {
-        await supabase.auth.signOut();
-        setPartners(initialPartners);
-        setReferrals(initialReferrals);
-        setReferralMatches(initialReferralMatches);
-        setTouches([]);
-        setSelectedPartner(null);
-        setTab('home');
+        try {
+          await cancelReferralFitNotifications();
+          const { error } = await supabase.auth.signOut();
+          if (error) throw error;
+          resetAccountState();
+        } catch (error) {
+          Alert.alert('Could not sign out', (error as Error).message);
+        }
       } },
     ]);
   }
@@ -2334,12 +2741,24 @@ export default function App() {
             <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
           </TouchableOpacity>
         </View>
-        {offline ? (
-          <View style={styles.offlineBadge}>
-            <AppIcon name="cloud-offline-outline" size={13} color={COLORS.gray} />
-            <Text style={styles.offlineBadgeText}>Offline — showing cached data{queuedWrites > 0 ? ` · ${queuedWrites} to sync` : ''}</Text>
-          </View>
-        ) : null}
+        <View style={styles.headerActions}>
+          {notificationPermissionState === 'blocked' ? (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Notifications are off. Open device settings"
+              style={styles.headerIconButton}
+              onPress={() => Linking.openSettings().catch((error) => Alert.alert('Settings unavailable', (error as Error).message))}
+            >
+              <AppIcon name="notifications-off-outline" size={20} color={COLORS.coral} />
+            </TouchableOpacity>
+          ) : null}
+          {offline ? (
+            <View style={styles.offlineBadge}>
+              <AppIcon name="cloud-offline-outline" size={13} color={COLORS.gray} />
+              <Text numberOfLines={2} style={styles.offlineBadgeText}>Offline — showing cached data{queuedWrites > 0 ? ` · ${queuedWrites} to sync` : ''}</Text>
+            </View>
+          ) : null}
+        </View>
       </View>
     );
   }
@@ -2432,7 +2851,7 @@ export default function App() {
           ) : null}
 
           {/* The old home content lives down here, collapsed. */}
-          <TouchableOpacity style={styles.closedToggle} onPress={() => setShowHomeMore((current) => !current)}>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="More network snapshot and recent activity" accessibilityState={{ expanded: showHomeMore }} style={styles.closedToggle} onPress={() => setShowHomeMore((current) => !current)}>
             <AppIcon name={showHomeMore ? 'chevron-down' : 'chevron-forward'} size={16} color={COLORS.gray} />
             <Text style={styles.closedToggleText}>More — network snapshot & recent activity</Text>
           </TouchableOpacity>
@@ -2740,7 +3159,7 @@ export default function App() {
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
         {renderHeader('Cases')}
         <View style={styles.directoryTitleRow}>
-          <View><Text style={styles.screenTitle}>Case files</Text><Text style={styles.screenSubtitle}>One family, one place — contacts, notes, documents, and the timeline.</Text></View>
+          <View style={styles.directoryTitleCopy}><Text style={styles.screenTitle}>Case files</Text><Text style={styles.screenSubtitle}>One family, one place — contacts, notes, documents, and the timeline.</Text></View>
           <TouchableOpacity style={styles.addButton} onPress={() => { setCaseForm(makeEmptyCaseForm()); setShowNewCase(true); }}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>New case</Text></TouchableOpacity>
         </View>
         <View style={styles.searchBox}>
@@ -2752,7 +3171,7 @@ export default function App() {
             placeholderTextColor="#91A09B"
             style={styles.searchInput}
           />
-          {caseSearch ? <TouchableOpacity onPress={() => setCaseSearch('')}><AppIcon name="close-circle" size={18} color={COLORS.gray} /></TouchableOpacity> : null}
+          {caseSearch ? <TouchableOpacity accessibilityRole="button" accessibilityLabel="Clear case search" style={styles.searchClearButton} onPress={() => setCaseSearch('')}><AppIcon name="close-circle" size={18} color={COLORS.gray} /></TouchableOpacity> : null}
         </View>
 
         {searching ? (
@@ -2784,7 +3203,7 @@ export default function App() {
             )}
             {closedCases.length ? (
               <View style={{ marginTop: 18 }}>
-                <TouchableOpacity style={styles.closedToggle} onPress={() => setShowClosedCases((current) => !current)}>
+                <TouchableOpacity accessibilityRole="button" accessibilityLabel={`${showClosedCases ? 'Collapse' : 'Expand'} closed cases`} accessibilityState={{ expanded: showClosedCases }} style={styles.closedToggle} onPress={() => setShowClosedCases((current) => !current)}>
                   <AppIcon name={showClosedCases ? 'chevron-down' : 'chevron-forward'} size={16} color={COLORS.gray} />
                   <Text style={styles.closedToggleText}>Closed ({closedCases.length})</Text>
                 </TouchableOpacity>
@@ -2806,13 +3225,13 @@ export default function App() {
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
         {renderHeader('Directory')}
         <View style={styles.directoryTitleRow}>
-          <View><Text style={styles.screenTitle}>Your network</Text><Text style={styles.screenSubtitle}>{partners.length} people and programs</Text></View>
+          <View style={styles.directoryTitleCopy}><Text style={styles.screenTitle}>Your network</Text><Text style={styles.screenSubtitle}>{partners.length} people and programs</Text></View>
           <TouchableOpacity style={styles.addButton} onPress={openNewPartner}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>Add</Text></TouchableOpacity>
         </View>
         <View style={styles.searchBox}>
           <AppIcon name="search" size={19} color={COLORS.gray} />
           <TextInput value={search} onChangeText={setSearch} placeholder="Name, program, location, specialty" placeholderTextColor="#91A09B" style={styles.searchInput} />
-          {search ? <TouchableOpacity onPress={() => setSearch('')}><AppIcon name="close-circle" size={18} color={COLORS.gray} /></TouchableOpacity> : null}
+          {search ? <TouchableOpacity accessibilityRole="button" accessibilityLabel="Clear directory search" style={styles.searchClearButton} onPress={() => setSearch('')}><AppIcon name="close-circle" size={18} color={COLORS.gray} /></TouchableOpacity> : null}
         </View>
         <View style={styles.directoryDropdown}>
           <DropdownField
@@ -2836,7 +3255,7 @@ export default function App() {
         {renderHeader('Referral ledger')}
         <View style={styles.directoryTitleRow}>
           <View><Text style={styles.screenTitle}>Give & receive</Text><Text style={styles.screenSubtitle}>Relationship history at a glance</Text></View>
-          <TouchableOpacity style={styles.roundAdd} onPress={() => openReferral('Inbound')}><AppIcon name="add" size={24} color={COLORS.white} /></TouchableOpacity>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Add inbound referral" style={styles.roundAdd} onPress={() => openReferral('Inbound')}><AppIcon name="add" size={24} color={COLORS.white} /></TouchableOpacity>
         </View>
 
         <View style={styles.ledgerSummary}>
@@ -2907,7 +3326,7 @@ export default function App() {
         {items.map((item) => {
           const active = tab === item.key;
           return (
-            <TouchableOpacity key={item.key} accessibilityLabel={`${item.label} tab`} onPress={() => setTab(item.key)} style={styles.navItem}>
+            <TouchableOpacity key={item.key} accessibilityRole="tab" accessibilityState={{ selected: active }} accessibilityLabel={`${item.label} tab`} onPress={() => setTab(item.key)} style={styles.navItem}>
               <View style={[styles.navIconWrap, active && styles.navIconActive]}><AppIcon name={active ? item.activeIcon : item.icon} size={21} color={active ? COLORS.white : COLORS.gray} /></View>
               <Text style={[styles.navLabel, active && styles.navLabelActive]}>{item.label}</Text>
             </TouchableOpacity>
@@ -3053,7 +3472,7 @@ export default function App() {
               <View style={styles.caseComposer}>
                 <View style={styles.caseComposerKinds}>
                   {(['note', 'call', 'text', 'email', 'meeting'] as CaseEventKind[]).map((kind) => (
-                    <TouchableOpacity key={kind} onPress={() => setTimelineKind(kind)} style={[styles.caseKindPill, timelineKind === kind && styles.caseKindPillActive]}>
+                    <TouchableOpacity key={kind} accessibilityRole="button" accessibilityState={{ selected: timelineKind === kind }} onPress={() => setTimelineKind(kind)} style={[styles.caseKindPill, timelineKind === kind && styles.caseKindPillActive]}>
                       <AppIcon name={caseEventIcon(kind)} size={12} color={timelineKind === kind ? COLORS.white : COLORS.inkSoft} />
                       <Text style={[styles.caseKindPillText, timelineKind === kind && styles.caseKindPillTextActive]}>{kind}</Text>
                     </TouchableOpacity>
@@ -3193,7 +3612,7 @@ export default function App() {
             <View style={styles.modalHeader}>
               <TouchableOpacity accessibilityLabel="Close new case form" onPress={() => setShowNewCase(false)} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
               <Text style={styles.modalHeaderTitle}>New case</Text>
-              <TouchableOpacity onPress={saveNewCase}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={saveNewCase}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               <Text style={styles.formIntro}>One family, one file. Everything else — more contacts, notes, documents, payments — gets added from the case file itself.</Text>
@@ -3230,7 +3649,7 @@ export default function App() {
             <View style={styles.modalHeader}>
               <TouchableOpacity accessibilityLabel="Close contact form" onPress={close} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
               <Text style={styles.modalHeaderTitle}>{isEditing ? 'Edit contact' : 'Add contact'}</Text>
-              <TouchableOpacity onPress={saveCaseContact}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={saveCaseContact}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               <FormField label="NAME *" value={caseContactForm.name} onChangeText={(name) => setCaseContactForm((current) => (current ? { ...current, name } : current))} placeholder="Contact name" />
@@ -3262,25 +3681,27 @@ export default function App() {
     const skip = () => { setQuickNoteContact(null); setQuickNoteText(''); };
     return (
       <Modal visible transparent animationType="fade" onRequestClose={skip}>
-        <Pressable style={styles.dropdownOverlay} onPress={skip}>
-          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
-            <View style={styles.dropdownSheetHandle} />
-            <View style={styles.prePromptBody}>
-              <View style={styles.prePromptIcon}><AppIcon name={caseEventIcon(kind)} size={24} color={COLORS.forest} /></View>
-              <Text style={styles.prePromptTitle}>Add a note about this {kind}?</Text>
-              <TextInput
-                value={quickNoteText}
-                onChangeText={setQuickNoteText}
-                placeholder={`What came out of the ${kind} with ${contact.name}?`}
-                placeholderTextColor="#99A6A1"
-                multiline
-                style={[styles.formInput, styles.multilineInput, { minHeight: 80 }]}
-              />
-              <TouchableOpacity style={styles.primaryButton} onPress={saveQuickNote}><Text style={styles.primaryButtonText}>Save note</Text></TouchableOpacity>
-              <TouchableOpacity onPress={skip} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Skip</Text></TouchableOpacity>
-            </View>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+          <Pressable style={styles.dropdownOverlay} onPress={skip}>
+            <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+              <View style={styles.dropdownSheetHandle} />
+              <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
+                <View style={styles.prePromptIcon}><AppIcon name={caseEventIcon(kind)} size={24} color={COLORS.forest} /></View>
+                <Text style={styles.prePromptTitle}>Add a note about this {kind}?</Text>
+                <TextInput
+                  value={quickNoteText}
+                  onChangeText={setQuickNoteText}
+                  placeholder={`What came out of the ${kind} with ${contact.name}?`}
+                  placeholderTextColor="#99A6A1"
+                  multiline
+                  style={[styles.formInput, styles.multilineInput, { minHeight: 80 }]}
+                />
+                <TouchableOpacity style={styles.primaryButton} onPress={saveQuickNote}><Text style={styles.primaryButtonText}>Save note</Text></TouchableOpacity>
+                <TouchableOpacity onPress={skip} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Skip</Text></TouchableOpacity>
+              </ScrollView>
+            </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
     );
   }
@@ -3311,7 +3732,7 @@ export default function App() {
           <View style={styles.modalHeader}>
             <TouchableOpacity accessibilityLabel="Close partner profile" onPress={() => setSelectedPartner(null)} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
             <Text style={styles.modalHeaderTitle}>Partner profile</Text>
-            <TouchableOpacity onPress={() => toggleFavorite(selectedPartner.id)} style={styles.closeButton}><AppIcon name={selectedPartner.favorite ? 'heart' : 'heart-outline'} size={21} color={selectedPartner.favorite ? COLORS.coral : COLORS.ink} /></TouchableOpacity>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={selectedPartner.favorite ? 'Remove partner from favorites' : 'Add partner to favorites'} accessibilityState={{ selected: selectedPartner.favorite }} onPress={() => toggleFavorite(selectedPartner.id)} style={styles.closeButton}><AppIcon name={selectedPartner.favorite ? 'heart' : 'heart-outline'} size={21} color={selectedPartner.favorite ? COLORS.coral : COLORS.ink} /></TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={styles.modalContent}>
             <View style={styles.profileHero}>
@@ -3410,7 +3831,7 @@ export default function App() {
             <View style={styles.modalHeader}>
               <TouchableOpacity accessibilityLabel="Close partner form" onPress={closePartnerForm} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
               <Text style={styles.modalHeaderTitle}>{isEditing ? 'Edit partner' : 'Add a partner'}</Text>
-              <TouchableOpacity onPress={savePartner}><Text style={styles.saveText}>{isEditing ? 'Update' : 'Save'}</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={savePartner}><Text style={styles.saveText}>{isEditing ? 'Update' : 'Save'}</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               <Text style={styles.formIntro}>{isEditing ? 'Update this record so future searches use the latest program details.' : 'Build a useful relationship record now. You can fill in more details as you learn them.'}</Text>
@@ -3484,7 +3905,7 @@ export default function App() {
             <View style={styles.modalHeader}>
               <TouchableOpacity accessibilityLabel="Close referral form" onPress={closeReferralModal} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
               <Text style={styles.modalHeaderTitle}>{matchedReferral ? 'Assign referral' : 'Log a referral'}</Text>
-              <TouchableOpacity onPress={addReferral}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={addReferral}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               {matchedReferral ? (
@@ -3496,7 +3917,7 @@ export default function App() {
                 <>
                   <Text style={styles.fieldLabel}>DIRECTION</Text>
                   <View style={styles.segmented}>
-                    {(['Inbound', 'Outbound'] as ReferralDirection[]).map((direction) => <TouchableOpacity key={direction} onPress={() => setReferralForm({ ...referralForm, direction })} style={[styles.segment, referralForm.direction === direction && styles.segmentActive]}><AppIcon name={direction === 'Inbound' ? 'arrow-down' : 'arrow-up'} size={16} color={referralForm.direction === direction ? COLORS.white : COLORS.inkSoft} /><Text style={[styles.segmentText, referralForm.direction === direction && styles.segmentTextActive]}>{direction}</Text></TouchableOpacity>)}
+                    {(['Inbound', 'Outbound'] as ReferralDirection[]).map((direction) => <TouchableOpacity key={direction} accessibilityRole="button" accessibilityState={{ selected: referralForm.direction === direction }} onPress={() => setReferralForm({ ...referralForm, direction })} style={[styles.segment, referralForm.direction === direction && styles.segmentActive]}><AppIcon name={direction === 'Inbound' ? 'arrow-down' : 'arrow-up'} size={16} color={referralForm.direction === direction ? COLORS.white : COLORS.inkSoft} /><Text style={[styles.segmentText, referralForm.direction === direction && styles.segmentTextActive]}>{direction}</Text></TouchableOpacity>)}
                   </View>
                   <Text style={styles.directionExplainer}>{referralForm.direction === 'Inbound' ? 'A professional or program sent a family to you.' : 'You sent a client or family to a professional or program.'}</Text>
                 </>
@@ -3528,7 +3949,7 @@ export default function App() {
             <View style={styles.modalHeader}>
               <TouchableOpacity accessibilityLabel="Close touch logger" onPress={() => setTouchPartner(null)} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
               <Text style={styles.modalHeaderTitle}>Log a touch</Text>
-              <TouchableOpacity onPress={saveTouch}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={saveTouch}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               <Text style={styles.formIntro}>Record contact with {touchPartner.name} at {touchPartner.organization}. This updates their last-contact date and resets the cadence clock.</Text>
@@ -3549,23 +3970,57 @@ export default function App() {
 
   function NotifPrePromptModal() {
     if (!notifPrePromptVisible || !session) return null;
-    const dismiss = () => setNotifPrePromptVisible(false);
+    const userId = session.user.id;
+    const generation = authGenerationRef.current;
+    const accountIsCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
+    const dismiss = async () => {
+      setNotifPrePromptVisible(false);
+      try {
+        if (!accountIsCurrent()) return;
+        await AsyncStorage.setItem(notificationPromptKey(userId), 'dismissed');
+        if (!accountIsCurrent()) return;
+      } catch (error) {
+        if (accountIsCurrent()) Alert.alert('Preference not saved', `Notification preference could not be saved: ${(error as Error).message}`);
+      }
+    };
     const enable = async () => {
-      dismiss();
-      await rescheduleNotifications({ partners, referrals, referralMatches, followUps });
+      setNotifPrePromptVisible(false);
+      if (!accountIsCurrent()) return;
+      const granted = await requestNotificationPermission();
+      if (!accountIsCurrent()) return;
+      if (!granted) {
+        const permission = await getNotificationPermissionState();
+        if (!accountIsCurrent()) return;
+        if (permission === 'blocked') {
+          Alert.alert('Notifications are off', 'You can enable ReferralFit notifications in your device settings.', [
+            { text: 'Not now', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => Linking.openSettings().catch((error) => Alert.alert('Settings unavailable', (error as Error).message)) },
+          ]);
+        }
+        return;
+      }
+      try {
+        if (!accountIsCurrent()) return;
+        await AsyncStorage.setItem(notificationScheduleKey(userId), 'enabled');
+        if (!accountIsCurrent()) return;
+        await rescheduleNotifications({ partners, referrals, referralMatches, followUps, cases }, userId);
+        if (!accountIsCurrent()) return;
+      } catch (error) {
+        if (accountIsCurrent()) Alert.alert('Notifications not scheduled', (error as Error).message);
+      }
     };
     return (
       <Modal visible transparent animationType="fade" onRequestClose={dismiss}>
         <Pressable style={styles.dropdownOverlay} onPress={dismiss}>
           <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
-            <View style={styles.prePromptBody}>
+            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
               <View style={styles.prePromptIcon}><AppIcon name="notifications-outline" size={24} color={COLORS.forest} /></View>
               <Text style={styles.prePromptTitle}>Stay ahead of cold relationships</Text>
               <Text style={styles.prePromptText}>ReferralFit can send a 7 AM briefing and a nudge when a partner passes their stay-in-touch cadence. Everything is scheduled on this device — no data leaves your phone.</Text>
               <TouchableOpacity style={styles.primaryButton} onPress={enable}><Text style={styles.primaryButtonText}>Enable notifications</Text></TouchableOpacity>
               <TouchableOpacity onPress={dismiss} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Not now</Text></TouchableOpacity>
-            </View>
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>
@@ -3630,13 +4085,13 @@ export default function App() {
         <Pressable style={styles.dropdownOverlay} onPress={() => setPacketSendConfirm(false)}>
           <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
-            <View style={styles.prePromptBody}>
+            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
               <View style={styles.prePromptIcon}><AppIcon name="paper-plane" size={24} color={COLORS.forest} /></View>
               <Text style={styles.prePromptTitle}>Did you send it?</Text>
               <Text style={styles.prePromptText}>iOS can't always tell us whether the packet actually went out. Confirming logs the referral, records the touch, and sets the check-in follow-up.</Text>
               <TouchableOpacity style={styles.primaryButton} onPress={finalizePacketSend}><Text style={styles.primaryButtonText}>Sent — log it</Text></TouchableOpacity>
               <TouchableOpacity onPress={() => setPacketSendConfirm(false)} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel — don't log</Text></TouchableOpacity>
-            </View>
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>
@@ -3663,7 +4118,7 @@ export default function App() {
               <Text style={styles.fieldLabel}>DID THEY ADMIT?</Text>
               <View style={styles.segmented}>
                 {([['yes', 'Yes'], ['no', 'No']] as const).map(([answer, label]) => (
-                  <TouchableOpacity key={answer} onPress={() => setOutcomeAnswer(answer)} style={[styles.segment, outcomeAnswer === answer && styles.segmentActive]}>
+                  <TouchableOpacity key={answer} accessibilityRole="radio" accessibilityLabel={`${label}, admitted`} accessibilityState={{ selected: outcomeAnswer === answer, checked: outcomeAnswer === answer }} onPress={() => setOutcomeAnswer(answer)} style={[styles.segment, outcomeAnswer === answer && styles.segmentActive]}>
                     <AppIcon name={answer === 'yes' ? 'checkmark-circle' : 'close-circle'} size={16} color={outcomeAnswer === answer ? COLORS.white : COLORS.inkSoft} />
                     <Text style={[styles.segmentText, outcomeAnswer === answer && styles.segmentTextActive]}>{label}</Text>
                   </TouchableOpacity>
@@ -3791,7 +4246,7 @@ export default function App() {
           <Pressable style={styles.dropdownOverlay} onPress={close}>
             <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
               <View style={styles.dropdownSheetHandle} />
-              <View style={styles.prePromptBody}>
+              <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
                 <Text style={styles.prePromptTitle}>Close the loop — {linkedCase.title}</Text>
                 <Text style={styles.prePromptText}>Complete this item{doneCard.title ? ` (“${doneCard.title}”)` : ''} and set the case status. The change lands on the case timeline.</Text>
                 <View style={styles.cadenceRow}>
@@ -3799,8 +4254,8 @@ export default function App() {
                     <Pill key={status} label={status} active={status === linkedCase.status} onPress={() => closeLoopWithStatus(status)} />
                   ))}
                 </View>
-                <TouchableOpacity onPress={() => closeLoopWithStatus('keep')}><Text style={styles.saveText}>Just complete — keep “{linkedCase.status}”</Text></TouchableOpacity>
-              </View>
+                <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => closeLoopWithStatus('keep')}><Text style={styles.saveText}>Just complete — keep “{linkedCase.status}”</Text></TouchableOpacity>
+              </ScrollView>
             </Pressable>
           </Pressable>
         </Modal>
@@ -3811,7 +4266,7 @@ export default function App() {
         <Pressable style={styles.dropdownOverlay} onPress={close}>
           <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
-            <View style={styles.prePromptBody}>
+            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
               <View style={styles.prePromptIcon}><AppIcon name="checkmark-done" size={24} color={COLORS.forest} /></View>
               <Text style={styles.prePromptTitle}>Done — what's next?</Text>
               <Text style={styles.prePromptText}>{doneCard.title}{doneCard.context.caseTitle ? ` — ${doneCard.context.caseTitle}` : doneCard.context.partnerName ? ` — ${doneCard.context.partnerName}` : ''}</Text>
@@ -3822,7 +4277,7 @@ export default function App() {
                 <Text style={styles.sheetSecondaryButtonText}>{referralAwaiting ? 'Close the loop — record the outcome' : doneCard.caseId ? 'Close the loop — complete & set case status' : 'Close the loop — just complete'}</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Not yet</Text></TouchableOpacity>
-            </View>
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>
@@ -3837,10 +4292,11 @@ export default function App() {
     const close = () => { setNextStepCard(null); setDoneCard(null); };
     return (
       <Modal visible transparent animationType="fade" onRequestClose={close}>
-        <Pressable style={styles.dropdownOverlay} onPress={close}>
-          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+          <Pressable style={styles.dropdownOverlay} onPress={close}>
+            <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
-            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               <Text style={styles.prePromptTitle}>{doneCard ? 'Done — set the next step' : 'Set next step'}</Text>
               <Text style={styles.prePromptText}>{nextStepCard.title}{doneCard ? ' — completing this and creating what comes after.' : ' — rescheduling without completing it.'}</Text>
               {StepFormFields()}
@@ -3849,8 +4305,9 @@ export default function App() {
               </TouchableOpacity>
               <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel</Text></TouchableOpacity>
             </ScrollView>
+            </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
     );
   }
@@ -3864,7 +4321,7 @@ export default function App() {
         <Pressable style={styles.dropdownOverlay} onPress={close}>
           <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
-            <View style={styles.prePromptBody}>
+            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
               <Text style={styles.prePromptTitle}>{snoozeCard.title}</Text>
               <Text style={styles.prePromptText}>{snoozeCard.virtual ? 'Partner cadence — snoozing only affects this device; logging a touch resets it everywhere.' : 'Snooze hides it from Today until then.'}</Text>
               <View style={styles.cadenceRow}>
@@ -3876,7 +4333,7 @@ export default function App() {
                 <Text style={styles.sheetSecondaryButtonText}>Set next step…</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel</Text></TouchableOpacity>
-            </View>
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>
@@ -3892,10 +4349,11 @@ export default function App() {
     const partnerOptions = partners.filter((partner) => !needle || `${partner.organization} ${partner.name}`.toLowerCase().includes(needle)).slice(0, 4);
     return (
       <Modal visible transparent animationType="fade" onRequestClose={close}>
-        <Pressable style={styles.dropdownOverlay} onPress={close}>
-          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+          <Pressable style={styles.dropdownOverlay} onPress={close}>
+            <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
-            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               <Text style={styles.prePromptTitle}>I need to…</Text>
               <FormField label="WHAT *" value={quickAddForm.title} onChangeText={(title) => setQuickAddForm((current) => ({ ...current, title }))} placeholder="I promised Sarah I'd call Thursday" />
               <Text style={styles.fieldLabel}>KIND</Text>
@@ -3949,8 +4407,9 @@ export default function App() {
               <TouchableOpacity style={styles.primaryButton} onPress={saveQuickAdd}><Text style={styles.primaryButtonText}>Add to the list</Text></TouchableOpacity>
               <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel</Text></TouchableOpacity>
             </ScrollView>
+            </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
     );
   }
@@ -3964,14 +4423,21 @@ export default function App() {
         <Pressable style={styles.dropdownOverlay} onPress={close}>
           <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
-            <View style={styles.prePromptBody}>
+            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
               <Text style={styles.prePromptTitle}>{contactPick.action === 'call' ? 'Call' : 'Text'} who?</Text>
               {contactPick.contacts.map((contact) => (
-                <TouchableOpacity key={contact.id} style={styles.contactPickRow} onPress={() => {
+                <TouchableOpacity key={contact.id} style={styles.contactPickRow} onPress={async () => {
                   const pick = contactPick;
                   setContactPick(null);
-                  Linking.openURL(`${pick.action === 'call' ? 'tel' : 'sms'}:${contact.phone.replace(/[^\d+]/g, '')}`).catch(() => Alert.alert('Unable to open', 'This device could not open that action.'));
-                  logCardContact(pick.card, pick.action, contact);
+                  const url = `${pick.action === 'call' ? 'tel' : 'sms'}:${contact.phone.replace(/[^\d+]/g, '')}`;
+                  try {
+                    const supported = await Linking.canOpenURL(url);
+                    if (!supported) throw new Error('Unsupported contact action');
+                    await Linking.openURL(url);
+                    logCardContact(pick.card, pick.action, contact);
+                  } catch {
+                    Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
+                  }
                 }}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.contactPickName}>{contact.name}{contact.isPrimary ? ' · primary' : ''}</Text>
@@ -3981,7 +4447,7 @@ export default function App() {
                 </TouchableOpacity>
               ))}
               <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel</Text></TouchableOpacity>
-            </View>
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>
@@ -3994,25 +4460,27 @@ export default function App() {
     const close = () => { setTodayQuickNote(null); setQuickNoteText(''); };
     return (
       <Modal visible transparent animationType="fade" onRequestClose={close}>
-        <Pressable style={styles.dropdownOverlay} onPress={close}>
-          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
-            <View style={styles.dropdownSheetHandle} />
-            <View style={styles.prePromptBody}>
-              <View style={styles.prePromptIcon}><AppIcon name={todayQuickNote.action === 'call' ? 'call' : 'chatbubble'} size={24} color={COLORS.forest} /></View>
-              <Text style={styles.prePromptTitle}>Add a note about this {todayQuickNote.action}?</Text>
-              <TextInput
-                value={quickNoteText}
-                onChangeText={setQuickNoteText}
-                placeholder={`What came out of it?${todayQuickNote.contact ? ` (${todayQuickNote.contact.name})` : ''}`}
-                placeholderTextColor="#99A6A1"
-                multiline
-                style={[styles.formInput, styles.multilineInput, { minHeight: 80 }]}
-              />
-              <TouchableOpacity style={styles.primaryButton} onPress={saveTodayQuickNote}><Text style={styles.primaryButtonText}>Save note</Text></TouchableOpacity>
-              <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Skip</Text></TouchableOpacity>
-            </View>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+          <Pressable style={styles.dropdownOverlay} onPress={close}>
+            <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+              <View style={styles.dropdownSheetHandle} />
+              <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
+                <View style={styles.prePromptIcon}><AppIcon name={todayQuickNote.action === 'call' ? 'call' : 'chatbubble'} size={24} color={COLORS.forest} /></View>
+                <Text style={styles.prePromptTitle}>Add a note about this {todayQuickNote.action}?</Text>
+                <TextInput
+                  value={quickNoteText}
+                  onChangeText={setQuickNoteText}
+                  placeholder={`What came out of it?${todayQuickNote.contact ? ` (${todayQuickNote.contact.name})` : ''}`}
+                  placeholderTextColor="#99A6A1"
+                  multiline
+                  style={[styles.formInput, styles.multilineInput, { minHeight: 80 }]}
+                />
+                <TouchableOpacity style={styles.primaryButton} onPress={saveTodayQuickNote}><Text style={styles.primaryButtonText}>Save note</Text></TouchableOpacity>
+                <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Skip</Text></TouchableOpacity>
+              </ScrollView>
+            </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
     );
   }
@@ -4087,9 +4555,11 @@ const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: COLORS.cream },
   appShell: { flex: 1, alignSelf: 'center', width: '100%', maxWidth: 520, backgroundColor: COLORS.cream, overflow: 'hidden' },
   screen: { flex: 1 },
-  scrollContent: { paddingHorizontal: 20, paddingTop: Platform.OS === 'android' ? 18 : 8, paddingBottom: 28 },
-  header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 10, marginBottom: 22 },
-  brandRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  scrollContent: { paddingHorizontal: 16, paddingTop: Platform.OS === 'android' ? 18 : 8, paddingBottom: 28 },
+  header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, paddingVertical: 10, marginBottom: 22 },
+  headerActions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 6, flexShrink: 1 },
+  headerIconButton: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center', borderRadius: 12 },
+  brandRow: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 10 },
   brandMark: { width: 36, height: 36, borderRadius: 12 },
   brandName: { fontSize: 19, fontWeight: '800', color: COLORS.ink, letterSpacing: -0.4 },
   welcomeRow: { marginBottom: 22 },
@@ -4104,7 +4574,7 @@ const styles = StyleSheet.create({
   statDetailText: { fontSize: 10, color: COLORS.gray, fontWeight: '600' },
   sectionTitleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, marginTop: 2 },
   sectionTitle: { color: COLORS.ink, fontSize: 18, fontWeight: '800', letterSpacing: -0.35 },
-  textAction: { flexDirection: 'row', alignItems: 'center', gap: 2, paddingVertical: 4 },
+  textAction: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 2, paddingVertical: 4 },
   textActionLabel: { color: COLORS.forest, fontSize: 12, fontWeight: '800' },
   returnCard: { backgroundColor: COLORS.white, borderRadius: 22, padding: 16, borderWidth: 1, borderColor: '#E5E8E3', marginBottom: 27 },
   returnIntro: { flexDirection: 'row', gap: 12, paddingBottom: 14, borderBottomWidth: 1, borderBottomColor: COLORS.line },
@@ -4130,7 +4600,7 @@ const styles = StyleSheet.create({
   savedMatchesSection: { marginBottom: 18 },
   savedMatchesHeader: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 12 },
   savedMatchesSubtitle: { color: COLORS.gray, fontSize: 10, lineHeight: 14, marginTop: 3 },
-  newMatchButton: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.forest, borderRadius: 14, paddingHorizontal: 12, paddingVertical: 9 },
+  newMatchButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.forest, borderRadius: 14, paddingHorizontal: 12, paddingVertical: 9 },
   newMatchButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
   savedMatchList: { gap: 9, paddingRight: 20 },
   savedMatchCard: { width: 225, backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.line, borderRadius: 17, padding: 12 },
@@ -4147,15 +4617,15 @@ const styles = StyleSheet.create({
   matchEditorHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 16 },
   matchEditorTitle: { color: COLORS.ink, fontSize: 16, fontWeight: '800' },
   matchEditorStatus: { color: COLORS.gray, fontSize: 10, marginTop: 3 },
-  saveMatchButton: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: COLORS.mint, borderRadius: 13, paddingHorizontal: 11, paddingVertical: 9 },
+  saveMatchButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: COLORS.mint, borderRadius: 13, paddingHorizontal: 11, paddingVertical: 9 },
   saveMatchButtonText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
   fieldLabel: { color: COLORS.gray, fontSize: 10, fontWeight: '800', letterSpacing: 1.05, marginBottom: 9, marginTop: 5 },
   dropdownField: { marginBottom: 15 },
   dropdownButton: { minHeight: 52, flexDirection: 'row', alignItems: 'center', gap: 11, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, borderRadius: 15, paddingHorizontal: 12 },
   dropdownLeading: { width: 34, height: 34, borderRadius: 10, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center' },
   dropdownValue: { flex: 1, flexShrink: 1, color: COLORS.ink, fontSize: 13, fontWeight: '700' },
-  dropdownOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(11, 32, 27, 0.42)' },
-  dropdownSheet: { maxHeight: '82%', backgroundColor: COLORS.cream, borderTopLeftRadius: 26, borderTopRightRadius: 26, paddingBottom: 22, shadowColor: COLORS.ink, shadowOpacity: 0.18, shadowRadius: 20, shadowOffset: { width: 0, height: -5 }, elevation: 12 },
+  dropdownOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(11, 32, 27, 0.42)', paddingBottom: Platform.OS === 'ios' ? 16 : 0 },
+  dropdownSheet: { maxHeight: '82%', backgroundColor: COLORS.cream, borderTopLeftRadius: 26, borderTopRightRadius: 26, paddingBottom: Platform.OS === 'ios' ? 26 : 22, shadowColor: COLORS.ink, shadowOpacity: 0.18, shadowRadius: 20, shadowOffset: { width: 0, height: -5 }, elevation: 12 },
   dropdownSheetHandle: { width: 42, height: 5, borderRadius: 3, backgroundColor: '#C4CEC9', alignSelf: 'center', marginTop: 9 },
   dropdownSheetHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: COLORS.line },
   dropdownSheetEyebrow: { color: COLORS.gray, fontSize: 9, fontWeight: '800', letterSpacing: 1.1, marginBottom: 3 },
@@ -4168,10 +4638,11 @@ const styles = StyleSheet.create({
   dropdownOptionDetail: { color: COLORS.gray, fontSize: 9, marginTop: 2 },
   multiSelectCount: { minWidth: 23, height: 23, borderRadius: 12, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6 },
   multiSelectCountText: { color: COLORS.white, fontSize: 10, fontWeight: '800' },
-  multiSelectDone: { backgroundColor: COLORS.forest, borderRadius: 12, paddingHorizontal: 13, paddingVertical: 8 },
+  multiSelectDone: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.forest, borderRadius: 12, paddingHorizontal: 13, paddingVertical: 8 },
   multiSelectDoneText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
   multiSelectActions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingTop: 13 },
   multiSelectSelectionText: { color: COLORS.gray, fontSize: 10, fontWeight: '700' },
+  multiSelectClearButton: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center', marginVertical: -12 },
   multiSelectClear: { color: COLORS.coral, fontSize: 10, fontWeight: '800' },
   multiSelectOptionText: { flex: 1 },
   insuranceHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: -8, marginBottom: 14, paddingHorizontal: 2 },
@@ -4182,7 +4653,7 @@ const styles = StyleSheet.create({
   networkPreferenceTextSelected: { color: COLORS.forest, fontWeight: '800' },
   networkPreferenceHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginBottom: 14, paddingHorizontal: 2 },
   wrapPills: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  pill: { flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 20, paddingHorizontal: 13, paddingVertical: 9, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line },
+  pill: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 20, paddingHorizontal: 13, paddingVertical: 9, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line },
   pillActive: { backgroundColor: COLORS.forest, borderColor: COLORS.forest },
   pillText: { color: COLORS.inkSoft, fontSize: 12, fontWeight: '700' },
   pillTextActive: { color: COLORS.white },
@@ -4215,14 +4686,16 @@ const styles = StyleSheet.create({
   matchPriceText: { flexShrink: 0, color: COLORS.gray, fontSize: 10, fontWeight: '600', textAlign: 'right' },
   reciprocityNote: { flexDirection: 'row', gap: 5, alignItems: 'center', marginTop: 9 },
   reciprocityNoteText: { flex: 1, flexShrink: 1, color: COLORS.coral, fontSize: 10, lineHeight: 14, fontWeight: '700' },
-  assignReferralButton: { minHeight: 42, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: COLORS.forest, borderRadius: 13, marginTop: 13 },
+  assignReferralButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: COLORS.forest, borderRadius: 13, marginTop: 13 },
   assignReferralButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
-  directoryTitleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 },
-  addButton: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.forest, borderRadius: 15, paddingHorizontal: 14, paddingVertical: 10 },
+  directoryTitleRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 18 },
+  directoryTitleCopy: { flex: 1, minWidth: 0 },
+  addButton: { minHeight: 44, flexShrink: 0, flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.forest, borderRadius: 15, paddingHorizontal: 12, paddingVertical: 10 },
   addButtonText: { color: COLORS.white, fontSize: 12, fontWeight: '800' },
-  roundAdd: { width: 42, height: 42, borderRadius: 15, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
+  roundAdd: { width: 44, height: 44, borderRadius: 15, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
   searchBox: { flexDirection: 'row', alignItems: 'center', gap: 9, backgroundColor: COLORS.white, borderRadius: 16, paddingHorizontal: 14, height: 50, borderWidth: 1, borderColor: COLORS.line },
   searchInput: { flex: 1, color: COLORS.ink, fontSize: 13, outlineStyle: 'none' } as any,
+  searchClearButton: { width: 44, height: 44, marginRight: -12, alignItems: 'center', justifyContent: 'center' },
   directoryDropdown: { marginTop: 14 },
   directoryCountRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 9, paddingHorizontal: 2 },
   directoryCount: { color: COLORS.gray, fontSize: 10, fontWeight: '800', letterSpacing: 1 },
@@ -4249,7 +4722,7 @@ const styles = StyleSheet.create({
   balanceBadgeWarm: { backgroundColor: COLORS.coralPale },
   balanceText: { color: COLORS.forest, fontSize: 9, fontWeight: '800' },
   balanceTextWarm: { color: COLORS.coral },
-  cardShareButton: { width: 32, height: 32, borderRadius: 11, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.mint },
+  cardShareButton: { width: 44, height: 44, borderRadius: 11, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.mint },
   emptyState: { alignItems: 'center', paddingVertical: 36, paddingHorizontal: 28 },
   emptyIcon: { width: 52, height: 52, borderRadius: 18, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
   emptyTitle: { color: COLORS.ink, fontSize: 16, fontWeight: '800' },
@@ -4279,25 +4752,26 @@ const styles = StyleSheet.create({
   balanceTrack: { height: 7, borderRadius: 4, backgroundColor: '#DCE7EA', overflow: 'hidden' },
   balanceInbound: { height: '100%', borderRadius: 4, backgroundColor: COLORS.sage },
   bottomNav: { flexDirection: 'row', paddingTop: 8, paddingBottom: Platform.OS === 'ios' ? 7 : 10, backgroundColor: COLORS.white, borderTopWidth: 1, borderTopColor: COLORS.line, shadowColor: COLORS.ink, shadowOpacity: 0.06, shadowRadius: 10, shadowOffset: { width: 0, height: -4 } },
-  navItem: { flex: 1, alignItems: 'center', gap: 3 },
-  navIconWrap: { width: 36, height: 28, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
+  navItem: { flex: 1, minHeight: 48, alignItems: 'center', justifyContent: 'center', gap: 3 },
+  navIconWrap: { width: 40, height: 32, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
   navIconActive: { backgroundColor: COLORS.forest },
   navLabel: { color: COLORS.gray, fontSize: 9, fontWeight: '600' },
   navLabelActive: { color: COLORS.forest, fontWeight: '800' },
   modalPage: { flex: 1, backgroundColor: COLORS.cream },
   modalHandle: { width: 42, height: 5, borderRadius: 3, backgroundColor: '#C8D0CC', alignSelf: 'center', marginTop: 8 },
-  modalHeader: { minHeight: 58, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 18, borderBottomWidth: 1, borderBottomColor: COLORS.line },
-  modalHeaderTitle: { color: COLORS.ink, fontSize: 15, fontWeight: '800' },
-  closeButton: { width: 36, height: 36, alignItems: 'center', justifyContent: 'center' },
+  modalHeader: { minHeight: 58, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, paddingHorizontal: 14, paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: COLORS.line },
+  modalHeaderTitle: { flex: 1, flexShrink: 1, textAlign: 'center', color: COLORS.ink, fontSize: 15, fontWeight: '800' },
+  closeButton: { width: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
+  modalHeaderAction: { minWidth: 44, minHeight: 44, paddingHorizontal: 4, alignItems: 'center', justifyContent: 'center' },
   saveText: { color: COLORS.forest, fontSize: 14, fontWeight: '800' },
   modalContent: { paddingHorizontal: 20, paddingBottom: 34 },
   profileHero: { alignItems: 'center', paddingVertical: 24 },
   profileOrg: { color: COLORS.ink, fontSize: 22, fontWeight: '800', letterSpacing: -0.5, marginTop: 12 },
   profileName: { color: COLORS.gray, fontSize: 13, marginTop: 4 },
   profileMeta: { flexDirection: 'row', gap: 9, alignItems: 'center', marginTop: 11 },
-  profileActions: { flexDirection: 'row', gap: 6, marginBottom: 18 },
-  profileAction: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: COLORS.white, borderRadius: 16, paddingVertical: 12, borderWidth: 1, borderColor: COLORS.line },
-  profileActionText: { color: COLORS.inkSoft, fontSize: 9, fontWeight: '700' },
+  profileActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 18 },
+  profileAction: { flexGrow: 1, flexBasis: '30%', minWidth: 80, minHeight: 64, alignItems: 'center', justifyContent: 'center', gap: 5, backgroundColor: COLORS.white, borderRadius: 16, paddingHorizontal: 6, paddingVertical: 10, borderWidth: 1, borderColor: COLORS.line },
+  profileActionText: { color: COLORS.inkSoft, fontSize: 11, lineHeight: 15, textAlign: 'center', fontWeight: '700' },
   profileBalanceCard: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: COLORS.coralPale, borderRadius: 18, padding: 16, marginBottom: 18 },
   profileBalanceTitle: { color: COLORS.ink, fontSize: 14, fontWeight: '800' },
   profileCounts: { alignItems: 'flex-end', gap: 3 },
@@ -4339,8 +4813,8 @@ const styles = StyleSheet.create({
   partnerPickText: { color: COLORS.inkSoft, fontSize: 9, lineHeight: 12, textAlign: 'center', fontWeight: '600', marginTop: 6 },
   partnerPickTextActive: { color: COLORS.forest, fontWeight: '800' },
   privacyHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: -6, marginBottom: 18 },
-  offlineBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 5, borderWidth: 1, borderColor: COLORS.line },
-  offlineBadgeText: { color: COLORS.gray, fontSize: 9, fontWeight: '700' },
+  offlineBadge: { maxWidth: '58%', flexShrink: 1, flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 5, borderWidth: 1, borderColor: COLORS.line },
+  offlineBadgeText: { flexShrink: 1, color: COLORS.gray, fontSize: 9, lineHeight: 12, fontWeight: '700' },
   cadenceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 },
   touchLogList: { marginTop: 12, backgroundColor: COLORS.white, borderRadius: 17, paddingHorizontal: 14, borderWidth: 1, borderColor: COLORS.line },
   touchLogRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: '#EEF0EE' },
@@ -4349,6 +4823,7 @@ const styles = StyleSheet.create({
   touchLogNote: { color: COLORS.gray, fontSize: 10, marginTop: 2 },
   touchLogDate: { color: COLORS.gray, fontSize: 10 },
   prePromptBody: { padding: 20, paddingBottom: 26 },
+  keyboardSheetScroll: { maxHeight: '82%' },
   prePromptIcon: { width: 52, height: 52, borderRadius: 18, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center', marginBottom: 14 },
   prePromptTitle: { color: COLORS.ink, fontSize: 18, fontWeight: '800', letterSpacing: -0.35, marginBottom: 8 },
   prePromptText: { color: COLORS.gray, fontSize: 13, lineHeight: 19, marginBottom: 20 },
@@ -4357,9 +4832,9 @@ const styles = StyleSheet.create({
   // Match Packet
   matchActionRow: { flexDirection: 'row', gap: 8, marginTop: 13 },
   matchActionFlex: { flex: 1, marginTop: 0 },
-  packetButton: { minHeight: 42, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: COLORS.mint, borderRadius: 13, paddingHorizontal: 13 },
+  packetButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: COLORS.mint, borderRadius: 13, paddingHorizontal: 13 },
   packetButtonText: { color: COLORS.forest, fontSize: 11, fontWeight: '800' },
-  savedMatchPacketButton: { flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 9, backgroundColor: COLORS.mint, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 6, alignSelf: 'flex-start' },
+  savedMatchPacketButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 9, backgroundColor: COLORS.mint, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 6, alignSelf: 'flex-start' },
   savedMatchPacketButtonText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
   packetReminder: { color: COLORS.coral, fontSize: 10, lineHeight: 15, marginTop: -4, marginBottom: 14, fontWeight: '700' },
   packetEditor: { minHeight: 260, paddingTop: 13, textAlignVertical: 'top', lineHeight: 19 },
@@ -4370,16 +4845,16 @@ const styles = StyleSheet.create({
   followUpIcon: { width: 34, height: 34, borderRadius: 11, backgroundColor: COLORS.coralPale, alignItems: 'center', justifyContent: 'center' },
   followUpTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '700' },
   followUpMeta: { color: COLORS.gray, fontSize: 11, marginTop: 3 },
-  followUpActions: { flexDirection: 'row', gap: 7, marginTop: 9 },
-  followUpActionDone: { backgroundColor: COLORS.forest, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7 },
+  followUpActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 7, marginTop: 9 },
+  followUpActionDone: { minHeight: 44, justifyContent: 'center', backgroundColor: COLORS.forest, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7 },
   followUpActionDoneText: { color: COLORS.white, fontSize: 10, fontWeight: '800' },
-  followUpAction: { backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7, borderWidth: 1, borderColor: COLORS.line },
+  followUpAction: { minHeight: 44, justifyContent: 'center', backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7, borderWidth: 1, borderColor: COLORS.line },
   followUpActionText: { color: COLORS.inkSoft, fontSize: 10, fontWeight: '700' },
   // Outcome capture
   outcomeNotYet: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 12, marginBottom: 10 },
   outcomeNotYetText: { color: COLORS.blue, fontSize: 12, fontWeight: '700' },
   starRow: { flexDirection: 'row', gap: 8, marginBottom: 18 },
-  starButton: { padding: 4 },
+  starButton: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center', padding: 4 },
   // Case files
   caseRow: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   caseRowIcon: { width: 34, height: 34, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
@@ -4388,34 +4863,34 @@ const styles = StyleSheet.create({
   caseRowMeta: { color: COLORS.gray, fontSize: 10, marginTop: 5 },
   caseChip: { flexDirection: 'row', alignItems: 'center', gap: 3, borderRadius: 8, paddingHorizontal: 7, paddingVertical: 4, alignSelf: 'flex-start' },
   caseChipText: { fontSize: 9, fontWeight: '800' },
-  caseChipLarge: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 12 },
+  caseChipLarge: { minHeight: 44, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 12, justifyContent: 'center' },
   caseChipLargeText: { fontSize: 12, textTransform: 'capitalize' },
   caseSearchHint: { color: COLORS.gray, fontSize: 12, lineHeight: 18, padding: 14 },
-  closedToggle: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, paddingHorizontal: 2, marginBottom: 8 },
+  closedToggle: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, paddingHorizontal: 2, marginBottom: 8 },
   closedToggleText: { color: COLORS.gray, fontSize: 12, fontWeight: '800' },
   caseSectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  caseSectionAction: { flexDirection: 'row', alignItems: 'center', gap: 3, paddingVertical: 6 },
+  caseSectionAction: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 3, paddingVertical: 6 },
   caseSectionActionText: { color: COLORS.forest, fontSize: 12, fontWeight: '800' },
   caseEmptyNote: { color: COLORS.gray, fontSize: 11, lineHeight: 17, backgroundColor: COLORS.white, borderRadius: 15, borderWidth: 1, borderColor: COLORS.line, padding: 13, marginTop: 9 },
   caseContactRow: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   caseContactNameLine: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   caseContactName: { color: COLORS.ink, fontSize: 13, fontWeight: '800' },
   caseContactMeta: { color: COLORS.gray, fontSize: 10, marginTop: 3 },
-  caseContactActions: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 9 },
-  caseContactAction: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  caseContactActions: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 9 },
+  caseContactAction: { minWidth: 44, minHeight: 44, paddingHorizontal: 7, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4 },
   caseContactActionText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
   caseComposer: { backgroundColor: COLORS.white, borderRadius: 17, padding: 10, borderWidth: 1, borderColor: COLORS.line, marginTop: 9, marginBottom: 4 },
   caseComposerKinds: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 9 },
-  caseKindPill: { flexDirection: 'row', alignItems: 'center', gap: 4, borderRadius: 14, paddingHorizontal: 10, paddingVertical: 6, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line },
+  caseKindPill: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4, borderRadius: 14, paddingHorizontal: 10, paddingVertical: 6, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line },
   caseKindPillActive: { backgroundColor: COLORS.forest, borderColor: COLORS.forest },
   caseKindPillText: { color: COLORS.inkSoft, fontSize: 10, fontWeight: '700' },
   caseKindPillTextActive: { color: COLORS.white },
   caseComposerRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   caseComposerSend: { width: 44, height: 44, borderRadius: 14, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
   casePaymentRow: { flexDirection: 'row', gap: 10, marginTop: 6 },
-  casePaymentPicker: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 10, minHeight: 42, marginTop: 4 },
+  casePaymentPicker: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 10, minHeight: 44, marginTop: 4 },
   casePaymentPickerText: { color: COLORS.ink, fontSize: 12, fontWeight: '700', textTransform: 'capitalize' },
-  caseAmountInput: { backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 10, minHeight: 42, marginTop: 4, color: COLORS.ink, fontSize: 12, fontWeight: '700' },
+  caseAmountInput: { backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 10, minHeight: 44, marginTop: 4, color: COLORS.ink, fontSize: 12, fontWeight: '700' },
   casePaymentHint: { color: COLORS.gray, fontSize: 9, lineHeight: 14, marginTop: 9 },
   caseDocAddRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 9 },
   caseDocGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 9, marginTop: 11 },
@@ -4423,7 +4898,7 @@ const styles = StyleSheet.create({
   caseDocTileBody: { alignItems: 'center', gap: 6, minHeight: 74 },
   caseDocLabel: { color: COLORS.ink, fontSize: 10, fontWeight: '700', textAlign: 'center' },
   caseDocSize: { color: COLORS.gray, fontSize: 9 },
-  caseDocDelete: { position: 'absolute', top: 4, right: 4, padding: 4 },
+  caseDocDelete: { position: 'absolute', top: -8, right: -8, width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
   caseLinkedRow: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   caseOpenInMatch: { color: COLORS.forest, fontSize: 11, fontWeight: '800' },
   docViewOverlay: { flex: 1, backgroundColor: 'rgba(11, 32, 27, 0.94)' },
@@ -4443,8 +4918,8 @@ const styles = StyleSheet.create({
   todayRowMeta: { color: COLORS.gray, fontSize: 10, marginTop: 2 },
   todayOverdueBadge: { color: COLORS.coral, fontSize: 10, fontWeight: '800', marginTop: 3 },
   todayActionRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 },
-  todayIconButton: { width: 30, height: 28, borderRadius: 9, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, alignItems: 'center', justifyContent: 'center' },
-  todayDoneButton: { flex: 1, height: 28, borderRadius: 9, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
+  todayIconButton: { width: 44, height: 44, borderRadius: 12, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, alignItems: 'center', justifyContent: 'center' },
+  todayDoneButton: { flex: 1, minHeight: 44, borderRadius: 12, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
   todayDoneButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
   fab: { position: 'absolute', right: 18, bottom: 18, width: 54, height: 54, borderRadius: 19, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', shadowColor: COLORS.ink, shadowOpacity: 0.25, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 8 },
   sheetSecondaryButton: { minHeight: 46, borderRadius: 14, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center', marginTop: 10, paddingHorizontal: 12 },

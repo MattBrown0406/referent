@@ -1,9 +1,12 @@
 import { decode } from 'base64-arraybuffer';
+import * as Crypto from 'expo-crypto';
 import * as FileSystem from 'expo-file-system/legacy';
 
+import { StoreError } from './errors';
+import { currentAuthSessionIdentity, type AuthSessionIdentity } from './auth-session';
 import { phoneSearchSuffix } from './phone';
 import { supabase } from './supabase';
-import { StoreError } from './store';
+import type { FollowUp } from './store';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -228,6 +231,24 @@ function eventToRow(event: CaseEvent): Record<string, unknown> {
   };
 }
 
+function followUpToRpcRow(followUp: FollowUp): Record<string, unknown> {
+  return {
+    id: followUp.id,
+    partner_id: followUp.partnerId ?? null,
+    referral_id: followUp.referralId ?? null,
+    case_id: followUp.caseId ?? null,
+    title: followUp.title,
+    due_on: followUp.dueOn,
+    status: followUp.status,
+    completed_at: followUp.completedAt ?? null,
+    note: followUp.note,
+    kind: followUp.kind,
+    due_time: followUp.dueTime ?? null,
+    waiting_on: followUp.waitingOn ?? null,
+    snoozed_until: followUp.snoozedUntil ?? null,
+  };
+}
+
 function documentToRow(document: CaseDocument): Record<string, unknown> {
   return {
     id: document.id,
@@ -248,21 +269,53 @@ export type CaseFileData = {
   caseDocuments: CaseDocument[];
 };
 
+type CaseAccountFence = AuthSessionIdentity;
+
+async function currentCaseAccount(): Promise<CaseAccountFence> {
+  const identity = await currentAuthSessionIdentity();
+  if (!identity) throw new StoreError('No authenticated account is available for this case operation.', false);
+  return identity;
+}
+
+async function assertCaseAccount(expected: CaseAccountFence): Promise<void> {
+  try {
+    const current = await currentCaseAccount();
+    if (current.userId === expected.userId && current.sessionId === expected.sessionId) return;
+  } catch {
+    // Normalize sign-out/session replacement into the same stale-operation error.
+  }
+  throw new StoreError('Account changed before the case operation completed.', false);
+}
+
+async function withStableCaseAccount<T>(operation: (userId: string) => Promise<T>): Promise<T> {
+  const fence = await currentCaseAccount();
+  try {
+    const result = await operation(fence.userId);
+    await assertCaseAccount(fence);
+    return result;
+  } catch (error) {
+    await assertCaseAccount(fence);
+    throw error;
+  }
+}
+
 export async function fetchCaseData(): Promise<CaseFileData> {
-  const [casesRes, contactsRes, eventsRes, documentsRes] = await Promise.all([
-    supabase.from('cases').select('*').order('updated_at', { ascending: false }),
-    supabase.from('case_contacts').select('*').order('created_at', { ascending: true }),
-    supabase.from('case_events').select('*').order('occurred_at', { ascending: false }),
-    supabase.from('case_documents').select('*').order('created_at', { ascending: true }),
-  ]);
-  const firstError = casesRes.error || contactsRes.error || eventsRes.error || documentsRes.error;
-  if (firstError) throw firstError;
-  return {
-    cases: ((casesRes.data || []) as CaseRow[]).map(mapCaseRow),
-    caseContacts: ((contactsRes.data || []) as CaseContactRow[]).map(mapContactRow),
-    caseEvents: ((eventsRes.data || []) as CaseEventRow[]).map(mapEventRow),
-    caseDocuments: ((documentsRes.data || []) as CaseDocumentRow[]).map(mapDocumentRow),
-  };
+  return withStableCaseAccount(async (userId) => {
+    const [casesRes, contactsRes, eventsRes, documentsRes] = await Promise.all([
+      supabase.from('cases').select('*').eq('owner_id', userId).order('updated_at', { ascending: false }),
+      supabase.from('case_contacts').select('*').eq('owner_id', userId).order('created_at', { ascending: true }),
+      supabase.from('case_events').select('*').eq('owner_id', userId).order('occurred_at', { ascending: false }),
+      supabase.from('case_documents').select('*').eq('owner_id', userId).order('created_at', { ascending: true }),
+    ]);
+    const firstError = casesRes.error || contactsRes.error || eventsRes.error || documentsRes.error;
+    if (firstError) throw firstError;
+    return {
+      cases: ((casesRes.data || []) as CaseRow[]).map(mapCaseRow),
+      caseContacts: ((contactsRes.data || []) as CaseContactRow[]).map(mapContactRow),
+      caseEvents: ((eventsRes.data || []) as CaseEventRow[]).map(mapEventRow),
+      caseDocuments: ((documentsRes.data || []) as CaseDocumentRow[]).map(mapDocumentRow),
+    };
+  });
 }
 
 // ─── The "14 months ago" lookup ─────────────────────────────────────────────
@@ -275,16 +328,18 @@ function escapeIlike(value: string): string {
 }
 
 export async function searchCases(query: string): Promise<CaseSearchResult[]> {
+  const fence = await currentCaseAccount();
+  const userId = fence.userId;
   const text = query.trim();
   const suffix = phoneSearchSuffix(text);
   const textPattern = `%${escapeIlike(text)}%`;
   const requests: PromiseLike<{ data: unknown[] | null; error: { message: string } | null }>[] = [];
   if (text) {
-    requests.push(supabase.from('cases').select('id').or(`title.ilike.${textPattern}`));
-    requests.push(supabase.from('case_contacts').select('case_id').or(`name.ilike.${textPattern}`));
+    requests.push(supabase.from('cases').select('id').eq('owner_id', userId).or(`title.ilike.${textPattern}`));
+    requests.push(supabase.from('case_contacts').select('case_id').eq('owner_id', userId).or(`name.ilike.${textPattern}`));
   }
   if (suffix) {
-    requests.push(supabase.from('case_contacts').select('case_id').or(`phone_e164.ilike.${suffix}`));
+    requests.push(supabase.from('case_contacts').select('case_id').eq('owner_id', userId).or(`phone_e164.ilike.${suffix}`));
   }
   if (!requests.length) return [];
   const [titleRes, nameRes, phoneRes] = await Promise.all(requests);
@@ -301,6 +356,7 @@ export async function searchCases(query: string): Promise<CaseSearchResult[]> {
   for (const row of ((phoneRes?.data || []) as { case_id: string }[])) {
     if (!results.has(row.case_id)) results.set(row.case_id, { caseId: row.case_id, matchedBy: 'phone' });
   }
+  await assertCaseAccount(fence);
   return [...results.values()];
 }
 
@@ -311,19 +367,62 @@ export async function searchCases(query: string): Promise<CaseSearchResult[]> {
 // error — no queue means no phantom timeline entries after a rejected write.
 
 async function runOrThrow(execute: () => PromiseLike<{ error: { message: string } | null }>): Promise<void> {
-  const { error } = await execute();
-  if (error) throw new StoreError(error.message, false);
+  await withStableCaseAccount(async () => {
+    const { error } = await execute();
+    if (error) throw new StoreError(error.message, false);
+  });
 }
 
-export async function createCase(record: CaseRecord): Promise<void> {
-  const row = caseToRow(record);
+export async function createCase(record: CaseRecord, expectedUserId: string): Promise<void> {
+  const row = { ...caseToRow(record), owner_id: expectedUserId };
   await runOrThrow(() => supabase.from('cases').insert(row));
+}
+
+// The case and its initial children are one user action. The matching RPC is a
+// single Postgres transaction, so a failed contact or first-call insert cannot
+// leave a ghost case behind on the server.
+export async function createCaseBundle(
+  record: CaseRecord,
+  primaryContact: CaseContact | null,
+  firstFollowUp: FollowUp | null,
+  expectedUserId: string,
+): Promise<void> {
+  const followUpRow = firstFollowUp ? followUpToRpcRow(firstFollowUp) : null;
+  await runOrThrow(() => supabase.rpc('create_case_bundle', {
+    p_expected_owner_id: expectedUserId,
+    p_case: caseToRow(record),
+    p_contact: primaryContact ? contactToRow(primaryContact) : null,
+    p_follow_up: followUpRow,
+  }));
 }
 
 export async function updateCase(record: CaseRecord): Promise<void> {
   const row = caseToRow(record);
   const { id, ...patch } = row;
   await runOrThrow(() => supabase.from('cases').update(patch).eq('id', record.id));
+}
+
+export async function updateCaseWithEvent(record: CaseRecord, event: CaseEvent): Promise<void> {
+  await runOrThrow(() => supabase.rpc('update_case_with_event', {
+    p_case: caseToRow(record),
+    p_event: eventToRow(event),
+  }));
+}
+
+export async function completeFollowUpWithCase(
+  completed: FollowUp,
+  record: CaseRecord,
+  event: CaseEvent,
+): Promise<void> {
+  await runOrThrow(() => supabase.rpc('complete_follow_up_with_case', {
+    p_completed: followUpToRpcRow(completed),
+    p_case: caseToRow(record),
+    p_event: eventToRow(event),
+  }));
+}
+
+export async function saveContactAtomic(contact: CaseContact): Promise<void> {
+  await runOrThrow(() => supabase.rpc('save_case_contact', { p_contact: contactToRow(contact) }));
 }
 
 export async function createContact(contact: CaseContact): Promise<void> {
@@ -373,8 +472,22 @@ export async function createDocumentRow(document: CaseDocument): Promise<void> {
   await runOrThrow(() => supabase.from('case_documents').insert(row));
 }
 
+export async function saveDocumentWithEvent(document: CaseDocument, event: CaseEvent): Promise<void> {
+  await runOrThrow(() => supabase.rpc('save_case_document_with_event', {
+    p_document: documentToRow(document),
+    p_event: eventToRow(event),
+  }));
+}
+
 export async function deleteDocumentRow(id: string): Promise<void> {
   await runOrThrow(() => supabase.from('case_documents').delete().eq('id', id));
+}
+
+export async function restoreDocumentRow(document: CaseDocument, eventIds: string[] = []): Promise<void> {
+  await runOrThrow(() => supabase.rpc('restore_case_document', {
+    p_document: documentToRow(document),
+    p_event_ids: eventIds,
+  }));
 }
 
 // ─── Storage — private bucket 'case-documents', signed URLs only ────────────
@@ -400,10 +513,7 @@ function sanitizeExt(fileName: string, mimeType: string): string {
 }
 
 function uuidish(): string {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char) => {
-    const rand = Math.floor(Math.random() * 16);
-    return (char === 'x' ? rand : (rand & 0x3) | 0x8).toString(16);
-  });
+  return Crypto.randomUUID();
 }
 
 export function newDocumentId(): string {
@@ -432,6 +542,8 @@ async function readAsBase64(localUri: string): Promise<string> {
 }
 
 export async function uploadCaseFile(input: UploadCaseFileInput): Promise<{ storagePath: string }> {
+  return withStableCaseAccount(async (userId) => {
+  if (input.ownerId !== userId) throw new StoreError('The document owner does not match the active account.', false);
   const storagePath = `${input.ownerId}/${input.caseId}/${input.documentId}.${sanitizeExt(input.fileName, input.mimeType)}`;
   const base64 = await readAsBase64(input.localUri);
   const { error } = await supabase.storage
@@ -439,16 +551,21 @@ export async function uploadCaseFile(input: UploadCaseFileInput): Promise<{ stor
     .upload(storagePath, decode(base64), { contentType: input.mimeType, upsert: false });
   if (error) throw new StoreError(error.message, false);
   return { storagePath };
+  });
 }
 
 // 60-second signed URL for viewing. The URL expires; the row never stores it.
 export async function createCaseFileSignedUrl(storagePath: string): Promise<string> {
+  return withStableCaseAccount(async () => {
   const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(storagePath, 60);
   if (error || !data?.signedUrl) throw new StoreError(error?.message || 'Could not sign the file URL', false);
   return data.signedUrl;
+  });
 }
 
 export async function removeCaseFile(storagePath: string): Promise<void> {
+  await withStableCaseAccount(async () => {
   const { error } = await supabase.storage.from(BUCKET).remove([storagePath]);
   if (error) throw new StoreError(error.message, false);
+  });
 }
