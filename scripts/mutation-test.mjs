@@ -12,6 +12,8 @@ assert.match(source, /const matchProfile = await currentOrSavedMatch\(\)/);
 assert.match(source, /async function currentOrSavedMatch\(\): Promise<ReferralMatch \| null> \{\s*return saveCurrentReferralMatch\(\);\s*\}/);
 assert.match(source, /setSelectedMatchId\(previousSelectedMatchId\)/);
 assert.match(source, /setPendingCaseMatchId\(previousPendingCaseMatchId\)/);
+assert.doesNotMatch(source, /<TouchableOpacity key=\{item\.id\}[\s\S]*?<TouchableOpacity style=\{styles\.savedMatchPacketButton\}/);
+assert.match(source, /accessibilityRole="radio"\s*accessibilityState=\{\{ selected \}\}/);
 assert.match(source, /const stillCurrent = \(\) => active[\s\S]*activeUserIdRef\.current === userId/);
 
 for (const label of [
