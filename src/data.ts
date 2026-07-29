@@ -32,6 +32,8 @@ export type Partner = {
   outbound: number;
   lastContact: string;
   favorite?: boolean;
+  touchCadenceDays?: number;
+  createdAt?: string;
 };
 
 export type Referral = {
@@ -42,6 +44,14 @@ export type Referral = {
   clientLabel: string;
   outcome: 'Placed' | 'Introduced' | 'Consulted' | 'Pending';
   note: string;
+  // v2 outcome-enrichment columns (migration 20260724150000)
+  packetSentAt?: string; // ISO timestamptz, set when a Match Packet is shared
+  matchProfileId?: string;
+  caseId?: string; // v3 case-files linkage
+  admitted?: boolean | null;
+  admittedOn?: string; // YYYY-MM-DD
+  familyExperience?: number | null; // 1-5
+  outcomeNote?: string;
 };
 
 export type ReferralMatch = {
@@ -58,6 +68,7 @@ export type ReferralMatch = {
   updatedAt: string;
   assignedPartnerId?: string;
   referralId?: string;
+  caseId?: string; // v3 case-files linkage
 };
 
 export const partnerTypes: PartnerType[] = [
