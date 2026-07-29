@@ -2972,20 +2972,28 @@ export default function App() {
                 const assignedPartner = partners.find((partner) => partner.id === item.assignedPartnerId);
                 const selected = item.id === selectedMatchId;
                 return (
-                  <TouchableOpacity key={item.id} onPress={() => loadReferralMatch(item)} style={[styles.savedMatchCard, selected && styles.savedMatchCardActive]}>
-                    <View style={styles.savedMatchTop}>
-                      <View style={[styles.savedMatchIcon, item.status === 'Referred' && styles.savedMatchIconComplete]}><AppIcon name={item.status === 'Referred' ? 'checkmark' : 'person-outline'} size={16} color={item.status === 'Referred' ? COLORS.white : COLORS.forest} /></View>
-                      <Text numberOfLines={1} style={styles.savedMatchName}>{item.clientLabel}</Text>
-                    </View>
-                    <Text numberOfLines={1} style={styles.savedMatchMeta}>{item.levelOfCare === 'Any type' ? 'Any level' : item.levelOfCare} · {item.state === 'ANY' ? 'Any location' : item.state}</Text>
-                    <Text style={[styles.savedMatchStatus, item.status === 'Referred' && styles.savedMatchStatusComplete]}>{assignedPartner ? `Referred to ${assignedPartner.organization}` : 'Matching in progress'}</Text>
+                  <View key={item.id} style={[styles.savedMatchCard, selected && styles.savedMatchCardActive]}>
+                    <TouchableOpacity
+                      accessibilityLabel={`Select referral match for ${item.clientLabel}`}
+                      accessibilityRole="radio"
+                      accessibilityState={{ selected }}
+                      onPress={() => loadReferralMatch(item)}
+                      style={styles.savedMatchSelectButton}
+                    >
+                      <View style={styles.savedMatchTop}>
+                        <View style={[styles.savedMatchIcon, item.status === 'Referred' && styles.savedMatchIconComplete]}><AppIcon name={item.status === 'Referred' ? 'checkmark' : 'person-outline'} size={16} color={item.status === 'Referred' ? COLORS.white : COLORS.forest} /></View>
+                        <Text numberOfLines={1} style={styles.savedMatchName}>{item.clientLabel}</Text>
+                      </View>
+                      <Text numberOfLines={1} style={styles.savedMatchMeta}>{item.levelOfCare === 'Any type' ? 'Any level' : item.levelOfCare} · {item.state === 'ANY' ? 'Any location' : item.state}</Text>
+                      <Text style={[styles.savedMatchStatus, item.status === 'Referred' && styles.savedMatchStatusComplete]}>{assignedPartner ? `Referred to ${assignedPartner.organization}` : 'Matching in progress'}</Text>
+                    </TouchableOpacity>
                     {item.status === 'Referred' && assignedPartner ? (
-                      <TouchableOpacity style={styles.savedMatchPacketButton} onPress={() => openPacketForAssigned(item)}>
+                      <TouchableOpacity accessibilityLabel={`Send packet for ${item.clientLabel}`} accessibilityRole="button" style={styles.savedMatchPacketButton} onPress={() => openPacketForAssigned(item)}>
                         <AppIcon name="paper-plane-outline" size={13} color={COLORS.forest} />
                         <Text style={styles.savedMatchPacketButtonText}>Send packet</Text>
                       </TouchableOpacity>
                     ) : null}
-                  </TouchableOpacity>
+                  </View>
                 );
               })}
             </ScrollView>
@@ -4605,6 +4613,7 @@ const styles = StyleSheet.create({
   savedMatchList: { gap: 9, paddingRight: 20 },
   savedMatchCard: { width: 225, backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.line, borderRadius: 17, padding: 12 },
   savedMatchCardActive: { borderColor: COLORS.forest, borderWidth: 2, backgroundColor: COLORS.mintPale },
+  savedMatchSelectButton: { minHeight: 72 },
   savedMatchTop: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   savedMatchIcon: { width: 28, height: 28, borderRadius: 9, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center' },
   savedMatchIconComplete: { backgroundColor: COLORS.forest },
