@@ -2,7 +2,7 @@
 -- Run after a local migration reset with: supabase test db
 
 BEGIN;
-SELECT plan(61);
+SELECT plan(63);
 
 WITH expected(child_table, constraint_name, parent_table, child_columns, delete_action) AS (
   VALUES
@@ -402,7 +402,7 @@ SELECT lives_ok(
     SELECT public.complete_follow_up_with_case(
       '{"id":"72000000-0000-0000-0000-000000000007","status":"done","completed_at":"2026-07-29T15:00:00Z","note":""}'::jsonb,
       '{"id":"50000000-0000-0000-0000-000000000005","title":"Bundle test","status":"engaged","summary":"Ready","payment_status":"none","paid_amount":0}'::jsonb,
-      '{"id":"83000000-0000-0000-0000-000000000008","kind":"system","body":"Closed the loop"}'::jsonb
+      '{"id":"83000000-0000-0000-0000-000000000008","kind":"system","body":"Closed the loop (case → engaged)"}'::jsonb
     )
   $$,
   'case close-loop RPC commits follow-up, case state, and event together'
@@ -417,6 +417,26 @@ SELECT is(
     GROUP BY f.status, c.status),
   'done:engaged:1',
   'case close-loop RPC persisted all three workflow changes'
+);
+
+UPDATE public.cases SET status = 'placed'
+WHERE id = '50000000-0000-0000-0000-000000000005';
+
+SELECT lives_ok(
+  $$
+    SELECT public.complete_follow_up_with_case(
+      '{"id":"72000000-0000-0000-0000-000000000007","status":"done","completed_at":"2026-07-29T15:05:00Z","note":""}'::jsonb,
+      '{"id":"50000000-0000-0000-0000-000000000005","status":"engaged","apply_status":false}'::jsonb,
+      '{"id":"8c000000-0000-0000-0000-00000000000c","kind":"system","body":"Closed the loop — keep status"}'::jsonb
+    )
+  $$,
+  'closing a follow-up with keep-status intent succeeds'
+);
+
+SELECT is(
+  (SELECT status FROM public.cases WHERE id = '50000000-0000-0000-0000-000000000005'),
+  'placed',
+  'keep-status intent cannot revert a newer case status'
 );
 
 SELECT lives_ok(

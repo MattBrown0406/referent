@@ -63,6 +63,9 @@ assert.match(casesSource, /withStableCaseAccount/, 'case operations must reject 
 assert.match(casesSource, /current\.sessionId === expected\.sessionId/, 'case operations must share the stable login-session fence');
 assert.match(authSessionSource, /session_id/, 'session fence must survive token refresh but detect same-user re-login');
 assert.match(casesSource, /save_case_document_with_event/, 'documents and timeline events must be transactional');
+assert.match(casesSource, /record_case_payment/, 'additional case payments must use the atomic idempotent RPC');
+assert.match(casesSource, /update_case_details_with_event/, 'case detail edits must use a field-specific RPC');
+assert.match(casesSource, /update_case_payment_with_event/, 'payment corrections must use a locked field-specific RPC');
 assert.match(casesSource, /Crypto\.randomUUID\(\)/, 'native IDs must use cryptographically secure UUIDs');
 assert.doesNotMatch(casesSource, /Math\.random\(\)/, 'database IDs must not use Math.random');
 

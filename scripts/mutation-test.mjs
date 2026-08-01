@@ -23,7 +23,7 @@ assert.match(source, /isOutOfNetwork = networkCapabilities\.includes\('Out-of-ne
 
 for (const label of [
   'The match', 'The packet log', 'The case', 'The case status change',
-  'The payment change', 'The case summary', 'The case contact',
+  'The payment change', 'The additional payment', 'The case summary', 'The case details', 'The case contact',
   'The completed step and its next step', 'The follow-up and case status',
   'The next step', 'The contact log', 'The contact note', 'The follow-up',
   'The follow-up change', 'The outcome', 'The partner', 'The referral',
@@ -31,6 +31,21 @@ for (const label of [
 ]) {
   assert.ok(source.includes(`mutationSlotAvailable('${label}')`), `missing pre-optimistic mutation guard: ${label}`);
 }
+
+assert.match(source, /function saveCaseDetails\(\)/, 'case names and summaries must remain editable after creation');
+assert.match(source, /updateCaseDetailsWithEvent\(activeCase\.id, event\.id, detailsPatch, event\.body\)/, 'case details must use a field-specific patch RPC');
+assert.match(source, /accessibilityLabel="Edit case name and summary"/, 'case detail must expose an obvious edit action');
+assert.match(source, /function addCasePayment\(\)/, 'cases must accept additional payments');
+assert.match(source, /recordCasePayment\(activeCase\.id, event\.id, amount, note\)/, 'additional payments must use the atomic server-side increment RPC');
+assert.match(source, /id: paymentForm\.eventId/, 'additional-payment retries must reuse the same idempotency key');
+assert.match(source, /setCasePaymentForm\(paymentForm\)/, 'an unconfirmed payment must reopen with its original idempotency key');
+assert.match(source, /key=\{`\$\{record\.id\}:\$\{record\.summary\}`\}/, 'the inline summary editor must remount after a modal edit');
+assert.match(source, /Payment received: \$\{formatMoney\(amount\)\}/, 'each payment must be recorded as its own timeline event');
+assert.match(source, /Edit contact information for \$\{contact\.name\}/, 'contact information must have a full-row edit target');
+assert.match(source, /const totalRevenue = cases\.reduce/, 'Cases tab must summarize cumulative paid revenue');
+assert.match(source, /TOTAL PAID REVENUE/, 'Cases tab must display cumulative paid revenue');
+assert.match(source, /record\.paidAmount > 0 \? `\$\{formatMoney\(record\.paidAmount\)\} paid`/, 'each case row must show its paid revenue total');
+assert.match(source, /completeFollowUpWithCase\(completed, updatedCase, event, status !== 'keep'\)/, 'keep-status close-loop actions must explicitly skip the case status update');
 
 for (const operation of [
   'completeFollowUpWithNext', 'completeFollowUpWithCase',

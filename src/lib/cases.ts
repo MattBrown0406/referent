@@ -396,10 +396,136 @@ export async function createCaseBundle(
   }));
 }
 
+export type RecordedCasePayment = {
+  paidAmount: number;
+  paymentStatus: PaymentStatus;
+  occurredAt: string;
+  eventBody: string;
+};
+
+export type CasePaymentPatch = Partial<Pick<CaseRecord, 'paymentStatus' | 'quotedAmount' | 'paidAmount'>>;
+
+export type CorrectedCasePayment = RecordedCasePayment & {
+  quotedAmount: number | null;
+};
+
+export async function recordCasePayment(
+  caseId: string,
+  eventId: string,
+  amount: number,
+  note: string,
+): Promise<RecordedCasePayment> {
+  return withStableCaseAccount(async () => {
+    const { data, error } = await supabase.rpc('record_case_payment', {
+      p_case_id: caseId,
+      p_event_id: eventId,
+      p_amount: amount,
+      p_note: note,
+    });
+    if (error) throw new StoreError(error.message, false);
+    const row = (Array.isArray(data) ? data[0] : data) as {
+      paid_amount?: unknown;
+      payment_status?: unknown;
+      occurred_at?: unknown;
+      event_body?: unknown;
+    } | null;
+    if (!row || typeof row.paid_amount !== 'number' || typeof row.payment_status !== 'string'
+      || typeof row.occurred_at !== 'string' || typeof row.event_body !== 'string') {
+      throw new StoreError('The payment was saved but its confirmed total could not be read. Refresh the case before adding another payment.', false);
+    }
+    return {
+      paidAmount: row.paid_amount,
+      paymentStatus: row.payment_status as PaymentStatus,
+      occurredAt: row.occurred_at,
+      eventBody: row.event_body,
+    };
+  });
+}
+
+export async function updateCasePaymentWithEvent(
+  caseId: string,
+  eventId: string,
+  patch: CasePaymentPatch,
+): Promise<CorrectedCasePayment> {
+  return withStableCaseAccount(async () => {
+    const rpcPatch: Record<string, unknown> = {};
+    if ('paymentStatus' in patch) rpcPatch.payment_status = patch.paymentStatus;
+    if ('quotedAmount' in patch) rpcPatch.quoted_amount = patch.quotedAmount;
+    if ('paidAmount' in patch) rpcPatch.paid_amount = patch.paidAmount;
+    const { data, error } = await supabase.rpc('update_case_payment_with_event', {
+      p_case_id: caseId,
+      p_event_id: eventId,
+      p_patch: rpcPatch,
+    });
+    if (error) throw new StoreError(error.message, false);
+    const row = (Array.isArray(data) ? data[0] : data) as {
+      paid_amount?: unknown;
+      payment_status?: unknown;
+      quoted_amount?: unknown;
+      occurred_at?: unknown;
+      event_body?: unknown;
+    } | null;
+    if (!row || typeof row.paid_amount !== 'number' || typeof row.payment_status !== 'string'
+      || typeof row.occurred_at !== 'string' || typeof row.event_body !== 'string') {
+      throw new StoreError('The payment update was saved but its confirmed values could not be read. Refresh the case before editing payment details again.', false);
+    }
+    return {
+      paidAmount: row.paid_amount,
+      paymentStatus: row.payment_status as PaymentStatus,
+      quotedAmount: row.quoted_amount == null ? null : Number(row.quoted_amount),
+      occurredAt: row.occurred_at,
+      eventBody: row.event_body,
+    };
+  });
+}
+
+export type CaseDetailsPatch = Partial<Pick<CaseRecord, 'title' | 'summary'>>;
+
+export type UpdatedCaseDetails = {
+  title: string;
+  summary: string;
+  occurredAt: string;
+  eventBody: string;
+};
+
+export async function updateCaseDetailsWithEvent(
+  caseId: string,
+  eventId: string,
+  patch: CaseDetailsPatch,
+  eventBody: string,
+): Promise<UpdatedCaseDetails> {
+  return withStableCaseAccount(async () => {
+    const { data, error } = await supabase.rpc('update_case_details_with_event', {
+      p_case_id: caseId,
+      p_event_id: eventId,
+      p_patch: patch,
+      p_event_body: eventBody,
+    });
+    if (error) throw new StoreError(error.message, false);
+    const row = (Array.isArray(data) ? data[0] : data) as {
+      title?: unknown;
+      summary?: unknown;
+      occurred_at?: unknown;
+      event_body?: unknown;
+    } | null;
+    if (!row || typeof row.title !== 'string' || typeof row.summary !== 'string'
+      || typeof row.occurred_at !== 'string' || typeof row.event_body !== 'string') {
+      throw new StoreError('The case details were saved but their confirmed values could not be read. Refresh the case before editing again.', false);
+    }
+    return {
+      title: row.title,
+      summary: row.summary,
+      occurredAt: row.occurred_at,
+      eventBody: row.event_body,
+    };
+  });
+}
+
 export async function updateCase(record: CaseRecord): Promise<void> {
-  const row = caseToRow(record);
-  const { id, ...patch } = row;
-  await runOrThrow(() => supabase.from('cases').update(patch).eq('id', record.id));
+  await runOrThrow(() => supabase.from('cases').update({
+    summary: record.summary,
+    updated_at: new Date().toISOString(),
+  }).eq('id', record.id));
 }
 
 export async function updateCaseWithEvent(record: CaseRecord, event: CaseEvent): Promise<void> {
@@ -413,10 +539,11 @@ export async function completeFollowUpWithCase(
   completed: FollowUp,
   record: CaseRecord,
   event: CaseEvent,
+  applyStatus = true,
 ): Promise<void> {
   await runOrThrow(() => supabase.rpc('complete_follow_up_with_case', {
     p_completed: followUpToRpcRow(completed),
-    p_case: caseToRow(record),
+    p_case: { ...caseToRow(record), apply_status: applyStatus },
     p_event: eventToRow(event),
   }));
 }

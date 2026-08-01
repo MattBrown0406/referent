@@ -116,11 +116,14 @@ import {
   newDocumentId,
   newUuid,
   PaymentStatus,
+  recordCasePayment,
   removeCaseFile,
   restoreDocumentRow,
   saveContactAtomic,
   searchCases,
   updateCase,
+  updateCaseDetailsWithEvent,
+  updateCasePaymentWithEvent,
   updateCaseWithEvent,
   uploadCaseFile,
 } from './src/lib/cases';
@@ -203,6 +206,17 @@ type CaseContactFormState = {
 function makeEmptyCaseContactForm(): CaseContactFormState {
   return { id: null, name: '', relationship: '', phone: '', email: '', note: '', isPrimary: false };
 }
+
+type CaseEditFormState = {
+  title: string;
+  summary: string;
+};
+
+type CasePaymentFormState = {
+  eventId: string;
+  amount: string;
+  note: string;
+};
 
 function relativeActivity(iso: string): string {
   const then = new Date(iso).getTime();
@@ -653,6 +667,8 @@ export default function App() {
   const [caseSearching, setCaseSearching] = useState(false);
   const [caseForm, setCaseForm] = useState(makeEmptyCaseForm);
   const [caseContactForm, setCaseContactForm] = useState<CaseContactFormState | null>(null);
+  const [caseEditForm, setCaseEditForm] = useState<CaseEditFormState | null>(null);
+  const [casePaymentForm, setCasePaymentForm] = useState<CasePaymentFormState | null>(null);
   const [timelineDraft, setTimelineDraft] = useState('');
   const [timelineKind, setTimelineKind] = useState<CaseEventKind>('note');
   const [quickNoteContact, setQuickNoteContact] = useState<{ contact: CaseContact; kind: 'call' | 'text' | 'email' } | null>(null);
@@ -833,6 +849,8 @@ export default function App() {
     setReferralForm(emptyReferral);
     setCaseForm(makeEmptyCaseForm());
     setCaseContactForm(null);
+    setCaseEditForm(null);
+    setCasePaymentForm(null);
     setPacketTarget(null);
     setPacketText('');
     setQuickNoteContact(null);
@@ -968,6 +986,14 @@ export default function App() {
           if (refreshed) applySnapshot(refreshed);
         }
         if (!stillCurrent()) return;
+        const refreshedCaseData = await fetchCaseData();
+        if (!stillCurrent()) return;
+        setCases(refreshedCaseData.cases);
+        if (activeCaseId) {
+          setCaseContacts(refreshedCaseData.caseContacts.filter((item) => item.caseId === activeCaseId));
+          setCaseEvents(refreshedCaseData.caseEvents.filter((item) => item.caseId === activeCaseId));
+          setCaseDocuments(refreshedCaseData.caseDocuments.filter((item) => item.caseId === activeCaseId));
+        }
         await syncDerived(refreshed || undefined);
       })().catch((error) => {
         if (stillCurrent()) Alert.alert('Sync issue', (error as Error).message);
@@ -977,7 +1003,7 @@ export default function App() {
       active = false;
       subscription.remove();
     };
-  }, [session?.user?.id, applySnapshot, syncDerived]);
+  }, [session?.user?.id, activeCaseId, applySnapshot, syncDerived]);
 
   // Tapping a notification jumps to the relevant tab and, for cadence nudges,
   // opens the named partner once that account's directory has hydrated.
@@ -1485,6 +1511,7 @@ export default function App() {
     fetchCaseData()
       .then((data) => {
         if (!userId || activeUserIdRef.current !== userId || caseLoadGenerationRef.current !== generation) return;
+        setCases(data.cases);
         setCaseContacts(data.caseContacts.filter((item) => item.caseId === caseId));
         setCaseEvents(data.caseEvents.filter((item) => item.caseId === caseId));
         setCaseDocuments(data.caseDocuments.filter((item) => item.caseId === caseId));
@@ -1504,6 +1531,8 @@ export default function App() {
     setCaseEvents([]);
     setCaseDocuments([]);
     setCaseContactForm(null);
+    setCaseEditForm(null);
+    setCasePaymentForm(null);
     setQuickNoteContact(null);
     setDocView(null);
   }
@@ -1615,7 +1644,17 @@ export default function App() {
 
   function saveCasePayment(record: CaseRecord, patch: { paymentStatus?: PaymentStatus; quotedAmount?: number | null; paidAmount?: number }) {
     if (!mutationSlotAvailable('The payment change')) return;
-    const updated: CaseRecord = { ...record, ...patch, updatedAt: new Date().toISOString() };
+    const derivedStatus: PaymentStatus = patch.paymentStatus || (
+      patch.paidAmount !== undefined || patch.quotedAmount !== undefined
+        ? (() => {
+          const paid = patch.paidAmount ?? record.paidAmount;
+          const quoted = patch.quotedAmount !== undefined ? patch.quotedAmount : record.quotedAmount;
+          if (paid === 0) return quoted == null ? 'none' : 'quoted';
+          return quoted != null && paid >= quoted ? 'paid' : 'partial';
+        })()
+        : record.paymentStatus
+    );
+    const updated: CaseRecord = { ...record, ...patch, paymentStatus: derivedStatus, updatedAt: new Date().toISOString() };
     const previous = cases;
     const next = previous.map((item) => (item.id === record.id ? updated : item));
     setCases(next);
@@ -1626,9 +1665,10 @@ export default function App() {
     const body = bits.join(' · ') || 'Payment updated';
     const eventId = makeId('e');
     const event: CaseEvent = { id: eventId, caseId: record.id, kind: 'payment', body, occurredAt: updated.updatedAt };
+    let confirmedPayment: Awaited<ReturnType<typeof updateCasePaymentWithEvent>> | null = null;
     applyCaseEvent(event);
     void settleOptimisticWrite(
-      () => updateCaseWithEvent(updated, event),
+      async () => { confirmedPayment = await updateCasePaymentWithEvent(record.id, eventId, patch); },
       { partners, referrals, referralMatches, touches, followUps, scorecards },
       { partners, referrals, referralMatches, touches, followUps, scorecards },
       () => {
@@ -1636,7 +1676,22 @@ export default function App() {
         setCaseEvents((current) => current.filter((item) => item.id !== eventId));
       },
       'The payment change', next, previous,
-    );
+    ).then((saved) => {
+      if (!saved || !confirmedPayment) return;
+      const confirmed = confirmedPayment as Awaited<ReturnType<typeof updateCasePaymentWithEvent>>;
+      setCases((current) => current.map((item) => item.id === record.id ? {
+        ...item,
+        paidAmount: confirmed.paidAmount,
+        paymentStatus: confirmed.paymentStatus,
+        quotedAmount: confirmed.quotedAmount,
+        updatedAt: confirmed.occurredAt,
+      } : item));
+      setCaseEvents((current) => current.map((item) => item.id === eventId ? {
+        ...item,
+        body: confirmed.eventBody,
+        occurredAt: confirmed.occurredAt,
+      } : item));
+    });
   }
 
   function saveCaseSummary(record: CaseRecord, summary: string) {
@@ -1652,6 +1707,121 @@ export default function App() {
       () => setCases(previous),
       'The case summary', next, previous,
     );
+  }
+
+  function saveCaseDetails() {
+    if (!activeCase || !caseEditForm) return;
+    const title = caseEditForm.title.trim();
+    const summary = caseEditForm.summary.trim();
+    if (!title) {
+      Alert.alert('Name the case', 'A case name is required.');
+      return;
+    }
+    if (title === activeCase.title && summary === activeCase.summary) {
+      setCaseEditForm(null);
+      return;
+    }
+    if (!mutationSlotAvailable('The case details')) return;
+    const detailsPatch: { title?: string; summary?: string } = {};
+    if (title !== activeCase.title) detailsPatch.title = title;
+    if (summary !== activeCase.summary) detailsPatch.summary = summary;
+    const updated: CaseRecord = { ...activeCase, ...detailsPatch, updatedAt: new Date().toISOString() };
+    const previous = cases;
+    const next = previous.map((item) => (item.id === activeCase.id ? updated : item));
+    const changes: string[] = [];
+    if (detailsPatch.title !== undefined) changes.push(`Case name: ${activeCase.title} → ${title}`);
+    if (detailsPatch.summary !== undefined) changes.push('Summary updated');
+    const event: CaseEvent = {
+      id: makeId('e'),
+      caseId: activeCase.id,
+      kind: 'system',
+      body: changes.join(' · '),
+      occurredAt: updated.updatedAt,
+    };
+    let confirmedDetails: Awaited<ReturnType<typeof updateCaseDetailsWithEvent>> | null = null;
+    setCases(next);
+    setCaseEditForm(null);
+    applyCaseEvent(event);
+    void settleOptimisticWrite(
+      async () => {
+        confirmedDetails = await updateCaseDetailsWithEvent(activeCase.id, event.id, detailsPatch, event.body);
+      },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => {
+        setCases(previous);
+        setCaseEvents((current) => current.filter((item) => item.id !== event.id));
+      },
+      'The case details', next, previous,
+    ).then((saved) => {
+      if (!saved || !confirmedDetails) return;
+      const confirmed = confirmedDetails as Awaited<ReturnType<typeof updateCaseDetailsWithEvent>>;
+      setCases((current) => current.map((item) => item.id === activeCase.id ? {
+        ...item,
+        ...(detailsPatch.title !== undefined ? { title: confirmed.title } : {}),
+        ...(detailsPatch.summary !== undefined ? { summary: confirmed.summary } : {}),
+        updatedAt: confirmed.occurredAt,
+      } : item));
+      setCaseEvents((current) => current.map((item) => item.id === event.id ? {
+        ...item,
+        body: confirmed.eventBody,
+        occurredAt: confirmed.occurredAt,
+      } : item));
+    });
+  }
+
+  function addCasePayment() {
+    if (!activeCase || !casePaymentForm) return;
+    const paymentForm = casePaymentForm;
+    const rawAmount = casePaymentForm.amount.replace(/[^\d]/g, '');
+    const amount = rawAmount ? Number(rawAmount) : 0;
+    if (!Number.isSafeInteger(amount) || amount <= 0 || amount > 10000000) {
+      Alert.alert('Enter a payment', 'Add the amount received in whole dollars, up to $10,000,000.');
+      return;
+    }
+    if (!mutationSlotAvailable('The additional payment')) return;
+    const paidAmount = activeCase.paidAmount + amount;
+    const paymentStatus: PaymentStatus = activeCase.quotedAmount != null && paidAmount >= activeCase.quotedAmount ? 'paid' : 'partial';
+    const updated: CaseRecord = { ...activeCase, paidAmount, paymentStatus, updatedAt: new Date().toISOString() };
+    const note = paymentForm.note.trim();
+    const event: CaseEvent = {
+      id: paymentForm.eventId,
+      caseId: activeCase.id,
+      kind: 'payment',
+      body: `Payment received: ${formatMoney(amount)}${note ? ` · ${note}` : ''} · Total paid: ${formatMoney(paidAmount)}`,
+      occurredAt: updated.updatedAt,
+    };
+    const previous = cases;
+    const next = previous.map((item) => (item.id === activeCase.id ? updated : item));
+    let confirmedPayment: Awaited<ReturnType<typeof recordCasePayment>> | null = null;
+    setCases(next);
+    setCasePaymentForm(null);
+    applyCaseEvent(event);
+    void settleOptimisticWrite(
+      async () => { confirmedPayment = await recordCasePayment(activeCase.id, event.id, amount, note); },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => {
+        setCases(previous);
+        setCasePaymentForm(paymentForm);
+        setCaseEvents((current) => current.filter((item) => item.id !== event.id));
+      },
+      'The additional payment', next, previous,
+    ).then((saved) => {
+      if (!saved || !confirmedPayment) return;
+      const confirmed = confirmedPayment as Awaited<ReturnType<typeof recordCasePayment>>;
+      setCases((current) => current.map((item) => item.id === activeCase.id ? {
+        ...item,
+        paidAmount: confirmed.paidAmount,
+        paymentStatus: confirmed.paymentStatus,
+        updatedAt: confirmed.occurredAt,
+      } : item));
+      setCaseEvents((current) => current.map((item) => item.id === event.id ? {
+        ...item,
+        body: confirmed.eventBody,
+        occurredAt: confirmed.occurredAt,
+      } : item));
+    });
   }
 
   function saveCaseContact() {
@@ -2166,7 +2336,7 @@ export default function App() {
     setFollowUps(nextFollowUps);
     applyCaseEvent(event);
     void settleOptimisticWrite(
-      () => completeFollowUpWithCase(completed, updatedCase, event),
+      () => completeFollowUpWithCase(completed, updatedCase, event, status !== 'keep'),
       { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
       { partners, referrals, referralMatches, touches, followUps: previousFollowUps, scorecards },
       () => {
@@ -3172,7 +3342,7 @@ export default function App() {
           <Text numberOfLines={1} style={styles.caseRowTitle}>{record.title}</Text>
           <View style={styles.caseRowMetaLine}>
             <View style={[styles.caseChip, { backgroundColor: colors.bg }]}><Text style={[styles.caseChipText, { color: colors.fg }]}>{record.status}</Text></View>
-            <View style={[styles.caseChip, { backgroundColor: COLORS.mintPale }]}><Text style={[styles.caseChipText, { color: COLORS.forest }]}>{record.paymentStatus === 'none' ? 'no payment' : record.paymentStatus}</Text></View>
+            <View style={[styles.caseChip, { backgroundColor: COLORS.mintPale }]}><Text style={[styles.caseChipText, { color: COLORS.forest }]}>{record.paidAmount > 0 ? `${formatMoney(record.paidAmount)} paid` : record.paymentStatus === 'none' ? 'no payment' : record.paymentStatus}</Text></View>
           </View>
           <Text numberOfLines={1} style={styles.caseRowMeta}>
             {primary ? `${primary.name}${primary.phone ? ` · ${primary.phone}` : ''} · ` : ''}active {relativeActivity(record.updatedAt)}
@@ -3186,6 +3356,8 @@ export default function App() {
   function CasesScreen() {
     const openCases = cases.filter(isOpenCase).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     const closedCases = cases.filter((item) => !isOpenCase(item)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const totalRevenue = cases.reduce((sum, record) => sum + record.paidAmount, 0);
+    const openBalance = openCases.reduce((sum, record) => sum + Math.max((record.quotedAmount ?? record.paidAmount) - record.paidAmount, 0), 0);
     const searching = caseSearch.trim().length > 0;
     const resultCases = searching && caseSearchResults
       ? caseSearchResults.map((result) => cases.find((item) => item.id === result.caseId)).filter((item): item is CaseRecord => Boolean(item))
@@ -3196,6 +3368,17 @@ export default function App() {
         <View style={styles.directoryTitleRow}>
           <View style={styles.directoryTitleCopy}><Text style={styles.screenTitle}>Case files</Text><Text style={styles.screenSubtitle}>One family, one place — contacts, notes, documents, and the timeline.</Text></View>
           <TouchableOpacity style={styles.addButton} onPress={() => { setCaseForm(makeEmptyCaseForm()); setShowNewCase(true); }}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>New case</Text></TouchableOpacity>
+        </View>
+        <View style={styles.caseRevenueCard}>
+          <View style={styles.caseRevenueMetric}>
+            <Text style={styles.caseRevenueLabel}>TOTAL PAID REVENUE</Text>
+            <Text style={styles.caseRevenueValue}>{formatMoney(totalRevenue)}</Text>
+          </View>
+          <View style={styles.caseRevenueDivider} />
+          <View style={styles.caseRevenueMetric}>
+            <Text style={styles.caseRevenueLabel}>OPEN QUOTED BALANCE</Text>
+            <Text style={styles.caseRevenueValue}>{formatMoney(openBalance)}</Text>
+          </View>
         </View>
         <View style={styles.searchBox}>
           <AppIcon name="search" size={19} color={COLORS.gray} />
@@ -3393,7 +3576,14 @@ export default function App() {
             <View style={styles.modalHeader}>
               <TouchableOpacity accessibilityLabel="Close case file" onPress={closeCase} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
               <Text style={styles.modalHeaderTitle}>Case file</Text>
-              <View style={styles.closeButton} />
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel="Edit case name and summary"
+                style={styles.modalHeaderAction}
+                onPress={() => setCaseEditForm({ title: record.title, summary: record.summary })}
+              >
+                <Text style={styles.saveText}>Edit</Text>
+              </TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled">
 
@@ -3414,7 +3604,17 @@ export default function App() {
               </View>
 
               <View style={styles.infoCard}>
-                <Text style={styles.infoTitle}>Payment</Text>
+                <View style={styles.caseSectionHeader}>
+                  <Text style={styles.infoTitle}>Payments</Text>
+                  <TouchableOpacity
+                    accessibilityRole="button"
+                    accessibilityLabel="Add another payment"
+                    onPress={() => setCasePaymentForm({ eventId: makeId('evt'), amount: '', note: '' })}
+                    style={styles.caseSectionAction}
+                  >
+                    <AppIcon name="add" size={15} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Add payment</Text>
+                  </TouchableOpacity>
+                </View>
                 <View style={styles.casePaymentRow}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.infoLabel}>Status</Text>
@@ -3429,6 +3629,7 @@ export default function App() {
                   <View style={{ flex: 1 }}>
                     <Text style={styles.infoLabel}>Quoted</Text>
                     <TextInput
+                      key={`quoted-${record.quotedAmount ?? 'none'}`}
                       defaultValue={record.quotedAmount != null ? String(record.quotedAmount) : ''}
                       onEndEditing={(event) => {
                         const raw = event.nativeEvent.text.replace(/[^\d]/g, '');
@@ -3444,6 +3645,7 @@ export default function App() {
                   <View style={{ flex: 1 }}>
                     <Text style={styles.infoLabel}>Paid</Text>
                     <TextInput
+                      key={`paid-${record.paidAmount}`}
                       defaultValue={record.paidAmount ? String(record.paidAmount) : ''}
                       onEndEditing={(event) => {
                         const raw = event.nativeEvent.text.replace(/[^\d]/g, '');
@@ -3457,12 +3659,21 @@ export default function App() {
                     />
                   </View>
                 </View>
-                <Text style={styles.casePaymentHint}>Amounts save when you leave the field; every change lands on the timeline.</Text>
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  style={styles.caseAddPaymentButton}
+                  onPress={() => setCasePaymentForm({ eventId: makeId('evt'), amount: '', note: '' })}
+                >
+                  <AppIcon name="card" size={17} color={COLORS.white} />
+                  <Text style={styles.caseAddPaymentButtonText}>Record another payment</Text>
+                </TouchableOpacity>
+                <Text style={styles.casePaymentHint}>Use “Record another payment” for each coaching session or installment. The paid total stays editable for corrections; every change lands on the timeline.</Text>
               </View>
 
               <View style={[styles.infoCard, { marginTop: 12 }]}>
                 <Text style={styles.infoTitle}>Summary</Text>
                 <TextInput
+                  key={`${record.id}:${record.summary}`}
                   defaultValue={record.summary}
                   onEndEditing={(event) => { if (event.nativeEvent.text.trim() !== record.summary) saveCaseSummary(record, event.nativeEvent.text); }}
                   placeholder="The situation in a few lines — who, what, where things stand."
@@ -3474,7 +3685,10 @@ export default function App() {
 
               {/* Contacts */}
               <View style={styles.caseSectionHeader}>
-                <Text style={styles.infoTitleStandalone}>Contacts</Text>
+                <View>
+                  <Text style={styles.infoTitleStandalone}>Contacts</Text>
+                  <Text style={styles.caseSectionHint}>Tap a contact or Edit to change name, phone, or email.</Text>
+                </View>
                 <TouchableOpacity onPress={() => setCaseContactForm(makeEmptyCaseContactForm())} style={styles.caseSectionAction}>
                   <AppIcon name="add" size={15} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Add</Text>
                 </TouchableOpacity>
@@ -3484,11 +3698,19 @@ export default function App() {
                   {caseContacts.map((contact, index) => (
                     <View key={contact.id} style={[styles.caseContactRow, index === caseContacts.length - 1 && { borderBottomWidth: 0 }]}>
                       <View style={{ flex: 1 }}>
-                        <View style={styles.caseContactNameLine}>
-                          <Text style={styles.caseContactName}>{contact.name}</Text>
-                          {contact.isPrimary ? <View style={[styles.caseChip, { backgroundColor: COLORS.mint }]}><Text style={[styles.caseChipText, { color: COLORS.forest }]}>primary</Text></View> : null}
-                        </View>
-                        <Text style={styles.caseContactMeta}>{[contact.relationship, contact.phone, contact.email].filter(Boolean).join(' · ') || 'No details yet'}</Text>
+                        <TouchableOpacity
+                          accessibilityRole="button"
+                          accessibilityLabel={`Edit contact information for ${contact.name}`}
+                          onPress={() => setCaseContactForm({ id: contact.id, name: contact.name, relationship: contact.relationship, phone: contact.phone, email: contact.email, note: contact.note, isPrimary: contact.isPrimary })}
+                          style={styles.caseContactEditTarget}
+                        >
+                          <View style={styles.caseContactNameLine}>
+                            <Text style={styles.caseContactName}>{contact.name}</Text>
+                            {contact.isPrimary ? <View style={[styles.caseChip, { backgroundColor: COLORS.mint }]}><Text style={[styles.caseChipText, { color: COLORS.forest }]}>primary</Text></View> : null}
+                            <AppIcon name="create-outline" size={15} color={COLORS.gray} />
+                          </View>
+                          <Text style={styles.caseContactMeta}>{[contact.relationship, contact.phone, contact.email].filter(Boolean).join(' · ') || 'No details yet'}</Text>
+                        </TouchableOpacity>
                         <View style={styles.caseContactActions}>
                           <TouchableOpacity accessibilityLabel={`Call ${contact.name}`} onPress={() => contactAction(contact, 'call')} style={styles.caseContactAction}><AppIcon name="call" size={15} color={COLORS.forest} /><Text style={styles.caseContactActionText}>Call</Text></TouchableOpacity>
                           <TouchableOpacity accessibilityLabel={`Text ${contact.name}`} onPress={() => contactAction(contact, 'text')} style={styles.caseContactAction}><AppIcon name="chatbubble" size={14} color={COLORS.forest} /><Text style={styles.caseContactActionText}>Text</Text></TouchableOpacity>
@@ -3666,6 +3888,60 @@ export default function App() {
               <FormField label="PHONE" value={caseForm.contactPhone} onChangeText={(contactPhone) => setCaseForm((current) => ({ ...current, contactPhone }))} placeholder="(541) 555-0142" keyboardType="phone-pad" />
               <FormField label="EMAIL" value={caseForm.contactEmail} onChangeText={(contactEmail) => setCaseForm((current) => ({ ...current, contactEmail }))} placeholder="name@email.com" keyboardType="email-address" />
               <TouchableOpacity style={styles.primaryButton} onPress={saveNewCase}><Text style={styles.primaryButtonText}>Create case file</Text></TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function EditCaseModal() {
+    if (!caseEditForm || !activeCase) return null;
+    const close = () => setCaseEditForm(null);
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityLabel="Close edit case form" onPress={close} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Edit case</Text>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={saveCaseDetails}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>Update the case name or summary. Contact names, phones, and emails can be edited from the Contacts section.</Text>
+              <FormField label="CASE NAME *" value={caseEditForm.title} onChangeText={(title) => setCaseEditForm((current) => (current ? { ...current, title } : current))} placeholder="Henderson family — son Jake, 24" />
+              <FormField label="SUMMARY" value={caseEditForm.summary} onChangeText={(summary) => setCaseEditForm((current) => (current ? { ...current, summary } : current))} placeholder="The situation in a few lines" multiline />
+              <TouchableOpacity style={styles.primaryButton} onPress={saveCaseDetails}><Text style={styles.primaryButtonText}>Save case changes</Text></TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function AddCasePaymentModal() {
+    if (!casePaymentForm || !activeCase) return null;
+    const close = () => setCasePaymentForm(null);
+    const amount = Number(casePaymentForm.amount.replace(/[^\d]/g, '')) || 0;
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityLabel="Close payment form" onPress={close} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Add payment</Text>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={addCasePayment}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>Record each new coaching session or installment separately so the case timeline and total revenue stay current.</Text>
+              <View style={styles.paymentTotalCard}>
+                <Text style={styles.infoLabel}>CURRENTLY PAID</Text>
+                <Text style={styles.paymentTotalValue}>{formatMoney(activeCase.paidAmount)}</Text>
+                {amount > 0 ? <Text style={styles.paymentTotalPreview}>New total: {formatMoney(activeCase.paidAmount + amount)}</Text> : null}
+              </View>
+              <FormField label="PAYMENT AMOUNT *" value={casePaymentForm.amount} onChangeText={(amountText) => setCasePaymentForm((current) => (current ? { ...current, amount: amountText.replace(/[^\d]/g, '') } : current))} placeholder="$150" keyboardType="number-pad" />
+              <FormField label="WHAT WAS THIS FOR? (OPTIONAL)" value={casePaymentForm.note} onChangeText={(note) => setCasePaymentForm((current) => (current ? { ...current, note } : current))} placeholder="Coaching session 2, second installment…" />
+              <TouchableOpacity style={styles.primaryButton} onPress={addCasePayment}><Text style={styles.primaryButtonText}>Add {amount > 0 ? formatMoney(amount) : 'payment'}</Text></TouchableOpacity>
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
@@ -4583,6 +4859,8 @@ export default function App() {
       {OutcomeCaptureModal()}
       {CaseDetailModal()}
       {NewCaseModal()}
+      {EditCaseModal()}
+      {AddCasePaymentModal()}
       {CaseContactModal()}
       {QuickNoteModal()}
       {DocViewModal()}
@@ -4927,6 +5205,11 @@ const styles = StyleSheet.create({
   starRow: { flexDirection: 'row', gap: 8, marginBottom: 18 },
   starButton: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center', padding: 4 },
   // Case files
+  caseRevenueCard: { flexDirection: 'row', alignItems: 'stretch', backgroundColor: COLORS.white, borderRadius: 17, borderWidth: 1, borderColor: COLORS.line, marginBottom: 14, paddingVertical: 14, paddingHorizontal: 12 },
+  caseRevenueMetric: { flex: 1, minWidth: 0, paddingHorizontal: 6 },
+  caseRevenueLabel: { color: COLORS.gray, fontSize: 8, lineHeight: 11, fontWeight: '800', letterSpacing: 0.4 },
+  caseRevenueValue: { color: COLORS.forest, fontSize: 20, fontWeight: '900', marginTop: 4 },
+  caseRevenueDivider: { width: 1, backgroundColor: COLORS.line, marginHorizontal: 8 },
   caseRow: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   caseRowIcon: { width: 34, height: 34, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
   caseRowTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '700' },
@@ -4942,8 +5225,10 @@ const styles = StyleSheet.create({
   caseSectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   caseSectionAction: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 3, paddingVertical: 6 },
   caseSectionActionText: { color: COLORS.forest, fontSize: 12, fontWeight: '800' },
+  caseSectionHint: { color: COLORS.gray, fontSize: 9, lineHeight: 13, marginTop: 2, maxWidth: 250 },
   caseEmptyNote: { color: COLORS.gray, fontSize: 11, lineHeight: 17, backgroundColor: COLORS.white, borderRadius: 15, borderWidth: 1, borderColor: COLORS.line, padding: 13, marginTop: 9 },
   caseContactRow: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
+  caseContactEditTarget: { minHeight: 44, justifyContent: 'center' },
   caseContactNameLine: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   caseContactName: { color: COLORS.ink, fontSize: 13, fontWeight: '800' },
   caseContactMeta: { color: COLORS.gray, fontSize: 10, marginTop: 3 },
@@ -4962,7 +5247,12 @@ const styles = StyleSheet.create({
   casePaymentPicker: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 10, minHeight: 44, marginTop: 4 },
   casePaymentPickerText: { color: COLORS.ink, fontSize: 12, fontWeight: '700', textTransform: 'capitalize' },
   caseAmountInput: { backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 10, minHeight: 44, marginTop: 4, color: COLORS.ink, fontSize: 12, fontWeight: '700' },
+  caseAddPaymentButton: { minHeight: 46, borderRadius: 13, backgroundColor: COLORS.forest, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, marginTop: 12 },
+  caseAddPaymentButtonText: { color: COLORS.white, fontSize: 12, fontWeight: '800' },
   casePaymentHint: { color: COLORS.gray, fontSize: 9, lineHeight: 14, marginTop: 9 },
+  paymentTotalCard: { backgroundColor: COLORS.mintPale, borderRadius: 16, borderWidth: 1, borderColor: COLORS.line, padding: 16, marginBottom: 18 },
+  paymentTotalValue: { color: COLORS.forest, fontSize: 28, fontWeight: '900', marginTop: 4 },
+  paymentTotalPreview: { color: COLORS.inkSoft, fontSize: 12, fontWeight: '700', marginTop: 6 },
   caseDocAddRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 9 },
   caseDocGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 9, marginTop: 11 },
   caseDocTile: { width: '31%', backgroundColor: COLORS.white, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, padding: 10 },
