@@ -3560,6 +3560,14 @@ export default function App() {
   // actions, the timeline, documents, and linked business objects.
   function CaseDetailModal() {
     if (!activeCase) return null;
+    // iOS cannot reliably present a second sibling React Native <Modal> while
+    // the case pageSheet is already on screen. Keep one native modal mounted
+    // and swap its contents for every case-specific editor/sheet.
+    if (caseEditForm) return EditCaseModal();
+    if (casePaymentForm) return AddCasePaymentModal();
+    if (caseContactForm) return CaseContactModal();
+    if (quickNoteContact) return QuickNoteModal();
+    if (docView) return DocViewModal();
     const record = activeCase;
     const colors = CASE_STATUS_COLORS[record.status];
     const linkedMatch = referralMatches.find((item) => item.id === record.matchProfileId)
@@ -4859,11 +4867,6 @@ export default function App() {
       {OutcomeCaptureModal()}
       {CaseDetailModal()}
       {NewCaseModal()}
-      {EditCaseModal()}
-      {AddCasePaymentModal()}
-      {CaseContactModal()}
-      {QuickNoteModal()}
-      {DocViewModal()}
       {DoneSheet()}
       {NextStepSheet()}
       {SnoozeSheet()}

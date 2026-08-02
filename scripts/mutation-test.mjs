@@ -35,6 +35,16 @@ for (const label of [
 assert.match(source, /function saveCaseDetails\(\)/, 'case names and summaries must remain editable after creation');
 assert.match(source, /updateCaseDetailsWithEvent\(activeCase\.id, event\.id, detailsPatch, event\.body\)/, 'case details must use a field-specific patch RPC');
 assert.match(source, /accessibilityLabel="Edit case name and summary"/, 'case detail must expose an obvious edit action');
+assert.match(
+  source,
+  /function CaseDetailModal\(\) \{[\s\S]{0,700}if \(caseEditForm\) return EditCaseModal\(\);[\s\S]{0,160}if \(casePaymentForm\) return AddCasePaymentModal\(\);[\s\S]{0,160}if \(caseContactForm\) return CaseContactModal\(\);/,
+  'case editors must replace the open case sheet instead of attempting to present a second sibling iOS modal',
+);
+assert.doesNotMatch(
+  source,
+  /\{CaseDetailModal\(\)\}[\s\S]{0,400}\{EditCaseModal\(\)\}/,
+  'case editors must not be mounted as sibling native modals while the case sheet is visible',
+);
 assert.match(source, /function addCasePayment\(\)/, 'cases must accept additional payments');
 assert.match(source, /recordCasePayment\(activeCase\.id, event\.id, amount, note\)/, 'additional payments must use the atomic server-side increment RPC');
 assert.match(source, /id: paymentForm\.eventId/, 'additional-payment retries must reuse the same idempotency key');
