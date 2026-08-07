@@ -17,6 +17,9 @@ A native Expo app for managing professional referral relationships and finding c
 - Match packets that close the loop: share a de-identified placement recommendation, log the referral, set the check-in follow-up — all case-linked when the profile started from a case
 - Today Command Center: the home screen is a prioritized daily operating list (OVERDUE / TODAY / PARTNERS DUE) — one-tap call/text that auto-logs, a Done sheet that always forces a next step or a closed loop, snooze, set-next-step, and a 5-second "I need to…" quick add. New inquiry cases auto-create their first-call action
 - Daily briefing (counts the today list), cadence reminders, and consult alerts 30 minutes ahead (local, on-device)
+- Business dashboard with case funnel, lead attribution, revenue, referral outcomes, and automatic stage history
+- Square/PandaDoc case links with HMAC-verified webhook status synchronization (the providers remain authoritative)
+- Complete searchable referral history with direction filters
 
 ## Backend
 
@@ -67,16 +70,18 @@ test "$(git rev-parse HEAD)" = "$MERGED_SHA"
 test -z "$(git status --porcelain)"
 
 npx eas-cli@21.4.0 build --platform ios --profile production --freeze-credentials --non-interactive --wait
-npx eas-cli@21.4.0 build:list --platform ios --app-identifier com.mattbrown.referralfit --git-commit-hash "$MERGED_SHA" --build-profile production --distribution store --app-version 1.0.1 --app-build-version 13 --status finished --limit 10 --json --non-interactive > /tmp/referent-eas-build.json
+APP_VERSION="$(node -p "require('./app.json').expo.version")"
+APP_BUILD_NUMBER="$(node -p "require('./app.json').expo.ios.buildNumber")"
+npx eas-cli@21.4.0 build:list --platform ios --app-identifier com.mattbrown.referralfit --git-commit-hash "$MERGED_SHA" --build-profile production --distribution store --app-version "$APP_VERSION" --app-build-version "$APP_BUILD_NUMBER" --status finished --limit 10 --json --non-interactive > /tmp/referent-eas-build.json
 # Require exactly one matching record and verify commit, profile, platform,
 # distribution, app version, and build number.
-VERIFIED_EAS_BUILD_ID="$(node scripts/verify-eas-build.mjs /tmp/referent-eas-build.json "$MERGED_SHA" 1.0.1 13)"
+VERIFIED_EAS_BUILD_ID="$(node scripts/verify-eas-build.mjs /tmp/referent-eas-build.json "$MERGED_SHA" "$APP_VERSION" "$APP_BUILD_NUMBER")"
 
 # EAS build records do not expose CFBundleIdentifier. Verify the signed IPA
 # itself before submitting it to Apple.
 IPA_URL="$(node -e 'const x=require("/tmp/referent-eas-build.json"); process.stdout.write(x[0].artifacts.applicationArchiveUrl)')"
 curl --fail --location "$IPA_URL" --output "/tmp/referent-${VERIFIED_EAS_BUILD_ID}.ipa"
-python3 scripts/verify-ios-ipa.py "/tmp/referent-${VERIFIED_EAS_BUILD_ID}.ipa" com.mattbrown.referralfit 1.0.1 10
+python3 scripts/verify-ios-ipa.py "/tmp/referent-${VERIFIED_EAS_BUILD_ID}.ipa" com.mattbrown.referralfit "$APP_VERSION" "$APP_BUILD_NUMBER"
 
 npx eas-cli@21.4.0 submit --platform ios --id "$VERIFIED_EAS_BUILD_ID" --non-interactive --wait
 ```
@@ -104,3 +109,8 @@ Two data classes, deliberately different:
    tool on a single Supabase project.
 
 Insurance and Medicaid contracts change frequently and may vary by county, eligibility group, and level of care. Menu entries are discovery aids only; verify benefits, authorization requirements, and in-network status directly before presenting a placement.
+
+## Business automation
+
+See [`docs/BUSINESS_AUTOMATION.md`](docs/BUSINESS_AUTOMATION.md) for the
+Square/PandaDoc deployment runbook and the gated secure-intake automation design.

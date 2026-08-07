@@ -41,6 +41,10 @@ export type CaseRecord = {
   title: string;
   status: CaseStatus;
   summary: string;
+  leadSource: string;
+  leadSourceDetail: string;
+  lostReason: string;
+  stageChangedAt: string;
   paymentStatus: PaymentStatus;
   quotedAmount: number | null;
   paidAmount: number;
@@ -98,6 +102,10 @@ type CaseRow = {
   title: string;
   status: CaseStatus;
   summary: string | null;
+  lead_source: string | null;
+  lead_source_detail: string | null;
+  lost_reason: string | null;
+  stage_changed_at: string | null;
   payment_status: PaymentStatus;
   quoted_amount: number | null;
   paid_amount: number | null;
@@ -144,6 +152,10 @@ function mapCaseRow(row: CaseRow): CaseRecord {
     title: row.title,
     status: row.status,
     summary: row.summary || '',
+    leadSource: row.lead_source || 'Unspecified',
+    leadSourceDetail: row.lead_source_detail || '',
+    lostReason: row.lost_reason || '',
+    stageChangedAt: row.stage_changed_at || row.created_at,
     paymentStatus: row.payment_status,
     quotedAmount: row.quoted_amount,
     paidAmount: row.paid_amount ?? 0,
@@ -197,6 +209,9 @@ function caseToRow(record: CaseRecord): Record<string, unknown> {
     title: record.title,
     status: record.status,
     summary: record.summary,
+    lead_source: record.leadSource,
+    lead_source_detail: record.leadSourceDetail,
+    lost_reason: record.lostReason,
     payment_status: record.paymentStatus,
     quoted_amount: record.quotedAmount,
     paid_amount: record.paidAmount,
@@ -515,6 +530,56 @@ export async function updateCaseDetailsWithEvent(
     return {
       title: row.title,
       summary: row.summary,
+      occurredAt: row.occurred_at,
+      eventBody: row.event_body,
+    };
+  });
+}
+
+export type CaseBusinessDetailsPatch = Partial<Pick<CaseRecord, 'leadSource' | 'leadSourceDetail' | 'lostReason'>>;
+
+export type UpdatedCaseBusinessDetails = {
+  leadSource: string;
+  leadSourceDetail: string;
+  lostReason: string;
+  occurredAt: string;
+  eventBody: string;
+};
+
+export async function updateCaseBusinessDetailsWithEvent(
+  caseId: string,
+  eventId: string,
+  patch: CaseBusinessDetailsPatch,
+  eventBody: string,
+): Promise<UpdatedCaseBusinessDetails> {
+  return withStableCaseAccount(async () => {
+    const rpcPatch: Record<string, unknown> = {};
+    if ('leadSource' in patch) rpcPatch.lead_source = patch.leadSource;
+    if ('leadSourceDetail' in patch) rpcPatch.lead_source_detail = patch.leadSourceDetail;
+    if ('lostReason' in patch) rpcPatch.lost_reason = patch.lostReason;
+    const { data, error } = await supabase.rpc('update_case_business_details_with_event', {
+      p_case_id: caseId,
+      p_event_id: eventId,
+      p_patch: rpcPatch,
+      p_event_body: eventBody,
+    });
+    if (error) throw new StoreError(error.message, false);
+    const row = (Array.isArray(data) ? data[0] : data) as {
+      lead_source?: unknown;
+      lead_source_detail?: unknown;
+      lost_reason?: unknown;
+      occurred_at?: unknown;
+      event_body?: unknown;
+    } | null;
+    if (!row || typeof row.lead_source !== 'string' || typeof row.lead_source_detail !== 'string'
+      || typeof row.lost_reason !== 'string' || typeof row.occurred_at !== 'string'
+      || typeof row.event_body !== 'string') {
+      throw new StoreError('The business details were saved but their confirmed values could not be read. Refresh the case before editing again.', false);
+    }
+    return {
+      leadSource: row.lead_source,
+      leadSourceDetail: row.lead_source_detail,
+      lostReason: row.lost_reason,
       occurredAt: row.occurred_at,
       eventBody: row.event_body,
     };

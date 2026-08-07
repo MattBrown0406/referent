@@ -56,6 +56,13 @@ assert.match(source, /const totalRevenue = cases\.reduce/, 'Cases tab must summa
 assert.match(source, /TOTAL PAID REVENUE/, 'Cases tab must display cumulative paid revenue');
 assert.match(source, /record\.paidAmount > 0 \? `\$\{formatMoney\(record\.paidAmount\)\} paid`/, 'each case row must show its paid revenue total');
 assert.match(source, /completeFollowUpWithCase\(completed, updatedCase, event, status !== 'keep'\)/, 'keep-status close-loop actions must explicitly skip the case status update');
+const doneSheetSource = source.slice(source.indexOf('function DoneSheet()'), source.indexOf('function NextStepSheet()'));
+assert.equal((doneSheetSource.match(/<Modal/g) || []).length, 1, 'DoneSheet must keep one stable native modal while choosing a case status');
+assert.match(source, /const \[caseCloseLoopSaving, setCaseCloseLoopSaving\] = useState\(false\)/, 'case close-loop saves must expose a visible pending state');
+assert.match(source, /if \(!card\?\.followUp \|\| caseCloseLoopSaving\) return/, 'case close-loop saves must reject repeat taps');
+assert.match(source, /setCaseCloseLoopSaving\(true\)[\s\S]{0,700}settleOptimisticWrite\(/, 'the status sheet must stay mounted while the optimistic write settles');
+assert.match(source, /requestAnimationFrame\(\(\) => \{\s*setDoneCard\(\(current\) => current\?\.id === card\.id \? null : current\)/, 'the status sheet must dismiss after the status-pill press settles');
+assert.match(source, /withTimeout\(\s*rescheduleNotifications\(/, 'native notification refresh must not block a completed save indefinitely');
 
 for (const operation of [
   'completeFollowUpWithNext', 'completeFollowUpWithCase',

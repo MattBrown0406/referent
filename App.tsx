@@ -42,6 +42,13 @@ import {
 } from './src/data';
 import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
+import BusinessDashboard from './src/lib/BusinessDashboard';
+import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
+import {
+  type BusinessData,
+  fetchBusinessData,
+  LEAD_SOURCES,
+} from './src/lib/business';
 import {
   assignMatchReferral,
   completeFollowUpWithNext,
@@ -122,6 +129,7 @@ import {
   saveContactAtomic,
   searchCases,
   updateCase,
+  updateCaseBusinessDetailsWithEvent,
   updateCaseDetailsWithEvent,
   updateCasePaymentWithEvent,
   updateCaseWithEvent,
@@ -183,6 +191,8 @@ type CaseFormState = {
   title: string;
   status: CaseStatus;
   summary: string;
+  leadSource: string;
+  leadSourceDetail: string;
   contactName: string;
   contactRelationship: string;
   contactPhone: string;
@@ -190,7 +200,17 @@ type CaseFormState = {
 };
 
 function makeEmptyCaseForm(): CaseFormState {
-  return { title: '', status: 'inquiry', summary: '', contactName: '', contactRelationship: '', contactPhone: '', contactEmail: '' };
+  return {
+    title: '',
+    status: 'inquiry',
+    summary: '',
+    leadSource: 'Unspecified',
+    leadSourceDetail: '',
+    contactName: '',
+    contactRelationship: '',
+    contactPhone: '',
+    contactEmail: '',
+  };
 }
 
 type CaseContactFormState = {
@@ -210,6 +230,12 @@ function makeEmptyCaseContactForm(): CaseContactFormState {
 type CaseEditFormState = {
   title: string;
   summary: string;
+};
+
+type CaseBusinessFormState = {
+  leadSource: string;
+  leadSourceDetail: string;
+  lostReason: string;
 };
 
 type CasePaymentFormState = {
@@ -354,6 +380,18 @@ function addDaysStamp(days: number) {
   return `${year}-${month}-${day}`;
 }
 
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`${label} after ${timeoutMs / 1000} seconds.`)), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
 const emptyReferral = {
   direction: 'Inbound' as ReferralDirection,
   partnerId: '',
@@ -369,21 +407,24 @@ function AppIcon({ name, size = 20, color = COLORS.ink }: { name: IconName; size
 function Pill({
   label,
   active = false,
+  disabled = false,
   onPress,
   icon,
 }: {
   label: string;
   active?: boolean;
+  disabled?: boolean;
   onPress?: () => void;
   icon?: IconName;
 }) {
   return (
     <TouchableOpacity
       accessibilityRole="button"
-      accessibilityState={{ selected: active }}
+      accessibilityState={{ selected: active, disabled }}
       activeOpacity={0.75}
+      disabled={disabled}
       onPress={onPress}
-      style={[styles.pill, active && styles.pillActive]}
+      style={[styles.pill, active && styles.pillActive, disabled && { opacity: 0.5 }]}
     >
       {icon ? <AppIcon name={icon} size={14} color={active ? COLORS.white : COLORS.inkSoft} /> : null}
       <Text style={[styles.pillText, active && styles.pillTextActive]}>{label}</Text>
@@ -668,6 +709,7 @@ export default function App() {
   const [caseForm, setCaseForm] = useState(makeEmptyCaseForm);
   const [caseContactForm, setCaseContactForm] = useState<CaseContactFormState | null>(null);
   const [caseEditForm, setCaseEditForm] = useState<CaseEditFormState | null>(null);
+  const [caseBusinessForm, setCaseBusinessForm] = useState<CaseBusinessFormState | null>(null);
   const [casePaymentForm, setCasePaymentForm] = useState<CasePaymentFormState | null>(null);
   const [timelineDraft, setTimelineDraft] = useState('');
   const [timelineKind, setTimelineKind] = useState<CaseEventKind>('note');
@@ -701,6 +743,7 @@ export default function App() {
   const [doneCard, setDoneCard] = useState<TodayCard | null>(null); // "Done — what's next?" sheet
   const [nextStepCard, setNextStepCard] = useState<TodayCard | null>(null); // Set-next-step sheet
   const [doneStatusPicker, setDoneStatusPicker] = useState(false); // Close-the-loop case status picker
+  const [caseCloseLoopSaving, setCaseCloseLoopSaving] = useState(false);
   const [stepForm, setStepForm] = useState<{ kind: FollowUpKind; when: WhenChoice; customDate: string; time: string; waitingOn: string; note: string }>({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', waitingOn: '', note: '' });
   const [snoozeCard, setSnoozeCard] = useState<TodayCard | null>(null);
   const [showQuickAdd, setShowQuickAdd] = useState(false);
@@ -709,6 +752,12 @@ export default function App() {
   const [todayQuickNote, setTodayQuickNote] = useState<{ card: TodayCard; action: 'call' | 'text'; contact?: CaseContact } | null>(null);
   const [partnerForm, setPartnerForm] = useState<PartnerForm>(makeEmptyPartnerForm);
   const [referralForm, setReferralForm] = useState(emptyReferral);
+  const [referralSearch, setReferralSearch] = useState('');
+  const [referralDirectionFilter, setReferralDirectionFilter] = useState<'All' | ReferralDirection>('All');
+  const [showBusinessDashboard, setShowBusinessDashboard] = useState(false);
+  const [businessData, setBusinessData] = useState<BusinessData>({ stages: [], integrations: [] });
+  const [businessLoading, setBusinessLoading] = useState(false);
+  const [businessError, setBusinessError] = useState('');
   const [search, setSearch] = useState('');
   const [directoryType, setDirectoryType] = useState('All');
   const [selectedMatchId, setSelectedMatchId] = useState<string | null>(null);
@@ -727,6 +776,23 @@ export default function App() {
   const caseLoadGenerationRef = useRef(0);
   activeUserIdRef.current = activeUserId;
 
+  const refreshBusiness = useCallback(async () => {
+    const userId = session?.user?.id;
+    if (!userId) return;
+    setBusinessLoading(true);
+    setBusinessError('');
+    try {
+      const next = await fetchBusinessData();
+      if (activeUserIdRef.current !== userId) return;
+      setBusinessData(next);
+    } catch (error) {
+      if (activeUserIdRef.current !== userId) return;
+      setBusinessError((error as Error).message);
+    } finally {
+      if (activeUserIdRef.current === userId) setBusinessLoading(false);
+    }
+  }, [session?.user?.id]);
+
   // Push a snapshot of in-memory state to the offline cache, refresh the
   // offline indicator + queued-write count, and recompute notifications.
   // Cases are app-side state (not part of the store Snapshot) and are passed
@@ -744,7 +810,11 @@ export default function App() {
     if (!accountIsCurrent()) throw new Error('The account changed before local data could be saved.');
     setQueuedWrites(pending);
     setOffline(pending > 0);
-    await rescheduleNotifications({ ...data, cases: activeCases }, userId);
+    await withTimeout(
+      rescheduleNotifications({ ...data, cases: activeCases }, userId),
+      6000,
+      'Notification scheduling timed out',
+    );
     if (!accountIsCurrent()) throw new Error('The account changed before notification scheduling completed.');
   }, [session?.user?.id, partners, referrals, referralMatches, touches, followUps, scorecards, cases]);
 
@@ -850,9 +920,21 @@ export default function App() {
     setCaseForm(makeEmptyCaseForm());
     setCaseContactForm(null);
     setCaseEditForm(null);
+    setCaseBusinessForm(null);
     setCasePaymentForm(null);
+    setReferralSearch('');
+    setReferralDirectionFilter('All');
+    setShowBusinessDashboard(false);
+    setBusinessData({ stages: [], integrations: [] });
+    setBusinessLoading(false);
+    setBusinessError('');
     setPacketTarget(null);
     setPacketText('');
+    setDoneCard(null);
+    setDoneStatusPicker(false);
+    setCaseCloseLoopSaving(false);
+    setNextStepCard(null);
+    setSnoozeCard(null);
     setQuickNoteContact(null);
     setTodayQuickNote(null);
     setContactPick(null);
@@ -927,6 +1009,15 @@ export default function App() {
         const activeCaseList = caseData?.cases || [];
         setCases(activeCaseList);
 
+        try {
+          const nextBusinessData = await fetchBusinessData();
+          if (!active || generation !== authGenerationRef.current) return;
+          setBusinessData(nextBusinessData);
+          setBusinessError('');
+        } catch (error) {
+          if (active && generation === authGenerationRef.current) setBusinessError((error as Error).message);
+        }
+
         const pending = await pendingWriteCount(userId);
         if (!active || generation !== authGenerationRef.current) return;
         setQueuedWrites(pending);
@@ -989,6 +1080,14 @@ export default function App() {
         const refreshedCaseData = await fetchCaseData();
         if (!stillCurrent()) return;
         setCases(refreshedCaseData.cases);
+        try {
+          const nextBusinessData = await fetchBusinessData();
+          if (!stillCurrent()) return;
+          setBusinessData(nextBusinessData);
+          setBusinessError('');
+        } catch (error) {
+          if (stillCurrent()) setBusinessError((error as Error).message);
+        }
         if (activeCaseId) {
           setCaseContacts(refreshedCaseData.caseContacts.filter((item) => item.caseId === activeCaseId));
           setCaseEvents(refreshedCaseData.caseEvents.filter((item) => item.caseId === activeCaseId));
@@ -1134,10 +1233,26 @@ export default function App() {
         || monthlyCostForPartner(a.partner) - monthlyCostForPartner(b.partner));
   }, [partners, matchType, matchInsurance, matchNetworkPreferences, matchState, matchBudget, matchTherapies, scorecards]);
 
-  const recentReferrals = referrals
+  const sortedReferrals = referrals
     .slice()
-    .sort((a, b) => b.date.localeCompare(a.date))
-    .slice(0, 5);
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  const recentReferrals = sortedReferrals.slice(0, 5);
+
+  const filteredReferrals = useMemo(() => {
+    const needle = referralSearch.trim().toLowerCase();
+    return sortedReferrals.filter((referral) => {
+      if (referralDirectionFilter !== 'All' && referral.direction !== referralDirectionFilter) return false;
+      const partner = partners.find((item) => item.id === referral.partnerId);
+      return !needle || [
+        referral.clientLabel,
+        referral.outcome,
+        referral.note,
+        partner?.name,
+        partner?.organization,
+      ].filter(Boolean).join(' ').toLowerCase().includes(needle);
+    });
+  }, [sortedReferrals, referralSearch, referralDirectionFilter, partners]);
 
   const activeReferralMatches = referralMatches.filter((item) => item.status === 'Matching' || item.status === 'Referred');
 
@@ -1532,6 +1647,7 @@ export default function App() {
     setCaseDocuments([]);
     setCaseContactForm(null);
     setCaseEditForm(null);
+    setCaseBusinessForm(null);
     setCasePaymentForm(null);
     setQuickNoteContact(null);
     setDocView(null);
@@ -1562,6 +1678,10 @@ export default function App() {
       title: caseForm.title.trim(),
       status: caseForm.status,
       summary: caseForm.summary.trim(),
+      leadSource: caseForm.leadSource,
+      leadSourceDetail: caseForm.leadSourceDetail.trim(),
+      lostReason: '',
+      stageChangedAt: now,
       paymentStatus: 'none',
       quotedAmount: null,
       paidAmount: 0,
@@ -1617,7 +1737,8 @@ export default function App() {
   function changeCaseStatus(record: CaseRecord, status: CaseStatus) {
     if (status === record.status) return;
     if (!mutationSlotAvailable('The case status change')) return;
-    const updated: CaseRecord = { ...record, status, updatedAt: new Date().toISOString() };
+    const changedAt = new Date().toISOString();
+    const updated: CaseRecord = { ...record, status, stageChangedAt: changedAt, updatedAt: changedAt };
     const previous = cases;
     const next = previous.map((item) => (item.id === record.id ? updated : item));
     setCases(next);
@@ -1767,6 +1888,71 @@ export default function App() {
         body: confirmed.eventBody,
         occurredAt: confirmed.occurredAt,
       } : item));
+    });
+  }
+
+  function saveCaseBusinessDetails() {
+    if (!activeCase || !caseBusinessForm) return;
+    const leadSource = caseBusinessForm.leadSource.trim() || 'Unspecified';
+    const leadSourceDetail = caseBusinessForm.leadSourceDetail.trim();
+    const lostReason = caseBusinessForm.lostReason.trim();
+    if (leadSource === activeCase.leadSource
+      && leadSourceDetail === activeCase.leadSourceDetail
+      && lostReason === activeCase.lostReason) {
+      setCaseBusinessForm(null);
+      return;
+    }
+    if (!mutationSlotAvailable('The case business details')) return;
+    const updatedAt = new Date().toISOString();
+    const updated: CaseRecord = { ...activeCase, leadSource, leadSourceDetail, lostReason, updatedAt };
+    const previous = cases;
+    const next = previous.map((item) => item.id === activeCase.id ? updated : item);
+    const changes: string[] = [];
+    if (leadSource !== activeCase.leadSource) changes.push(`Lead source: ${activeCase.leadSource} → ${leadSource}`);
+    if (leadSourceDetail !== activeCase.leadSourceDetail) changes.push('Lead-source detail updated');
+    if (lostReason !== activeCase.lostReason) changes.push(lostReason ? 'Lost reason updated' : 'Lost reason cleared');
+    const event: CaseEvent = {
+      id: makeId('e'),
+      caseId: activeCase.id,
+      kind: 'system',
+      body: changes.join(' · ') || 'Business details updated',
+      occurredAt: updatedAt,
+    };
+    let confirmed: Awaited<ReturnType<typeof updateCaseBusinessDetailsWithEvent>> | null = null;
+    setCases(next);
+    setCaseBusinessForm(null);
+    applyCaseEvent(event);
+    void settleOptimisticWrite(
+      async () => {
+        confirmed = await updateCaseBusinessDetailsWithEvent(activeCase.id, event.id, {
+          leadSource,
+          leadSourceDetail,
+          lostReason,
+        }, event.body);
+      },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => {
+        setCases(previous);
+        setCaseEvents((current) => current.filter((item) => item.id !== event.id));
+      },
+      'The case business details', next, previous,
+    ).then((saved) => {
+      if (!saved || !confirmed) return;
+      const result = confirmed as Awaited<ReturnType<typeof updateCaseBusinessDetailsWithEvent>>;
+      setCases((current) => current.map((item) => item.id === activeCase.id ? {
+        ...item,
+        leadSource: result.leadSource,
+        leadSourceDetail: result.leadSourceDetail,
+        lostReason: result.lostReason,
+        updatedAt: result.occurredAt,
+      } : item));
+      setCaseEvents((current) => current.map((item) => item.id === event.id ? {
+        ...item,
+        body: result.eventBody,
+        occurredAt: result.occurredAt,
+      } : item));
+      void refreshBusiness();
     });
   }
 
@@ -2280,23 +2466,28 @@ export default function App() {
   // the case; partner items complete plainly.
   function confirmDoneCloseLoop() {
     const card = doneCard;
-    if (!card?.followUp) return;
+    if (!card?.followUp || caseCloseLoopSaving) return;
     const followUp = card.followUp;
-    setDoneCard(null);
     if (card.referralId && card.context.referralAwaitingAnswer) {
       // Reuse the packet outcome sheet as-is (admitted? experience stars).
-      setOutcomeFollowUp(followUp);
-      setOutcomeAnswer(null);
-      setOutcomeAdmittedOn(localDateStamp());
-      setOutcomeStars(0);
-      setOutcomeNote('');
+      setDoneCard(null);
+      requestAnimationFrame(() => {
+        setOutcomeFollowUp(followUp);
+        setOutcomeAnswer(null);
+        setOutcomeAdmittedOn(localDateStamp());
+        setOutcomeStars(0);
+        setOutcomeNote('');
+      });
       return;
     }
     if (card.caseId) {
-      setDoneStatusPicker(true); // inline status picker inside the Done sheet
-      setDoneCard(card);
+      // Keep the same native Modal mounted and change only its inner content.
+      // Unmounting and immediately remounting this sheet could leave an
+      // invisible iOS modal overlay intercepting every touch.
+      setDoneStatusPicker(true);
       return;
     }
+    setDoneCard(null);
     completePlainFollowUp(followUp);
   }
 
@@ -2304,7 +2495,7 @@ export default function App() {
   // (status 'keep' = leave it where it is).
   function closeLoopWithStatus(status: CaseStatus | 'keep') {
     const card = doneCard;
-    if (!card?.followUp) return;
+    if (!card?.followUp || caseCloseLoopSaving) return;
     if (!mutationSlotAvailable('The follow-up and case status')) return;
     const followUp = card.followUp;
     const record = cases.find((item) => item.id === followUp.caseId);
@@ -2330,8 +2521,7 @@ export default function App() {
     const previousFollowUps = followUps;
     const nextCases = cases.map((item) => item.id === record.id ? updatedCase : item);
     const nextFollowUps = followUps.map((item) => item.id === followUp.id ? completed : item);
-    setDoneCard(null);
-    setDoneStatusPicker(false);
+    setCaseCloseLoopSaving(true);
     setCases(nextCases);
     setFollowUps(nextFollowUps);
     applyCaseEvent(event);
@@ -2347,7 +2537,15 @@ export default function App() {
       'The follow-up and case status',
       nextCases,
       previousCases,
-    );
+    ).then((saved) => {
+      if (!saved) return;
+      // The original status-pill press has fully settled before dismissing the
+      // native sheet, avoiding the stale transparent-overlay race on iOS.
+      requestAnimationFrame(() => {
+        setDoneCard((current) => current?.id === card.id ? null : current);
+        setDoneStatusPicker(false);
+      });
+    }).finally(() => setCaseCloseLoopSaving(false));
   }
 
   // Set Next Step WITHOUT completing: retype/reschedule the current item
@@ -3367,7 +3565,21 @@ export default function App() {
         {renderHeader('Cases')}
         <View style={styles.directoryTitleRow}>
           <View style={styles.directoryTitleCopy}><Text style={styles.screenTitle}>Case files</Text><Text style={styles.screenSubtitle}>One family, one place — contacts, notes, documents, and the timeline.</Text></View>
-          <TouchableOpacity style={styles.addButton} onPress={() => { setCaseForm(makeEmptyCaseForm()); setShowNewCase(true); }}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>New case</Text></TouchableOpacity>
+          <View style={styles.caseHeaderActions}>
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Open business dashboard"
+              style={styles.businessButton}
+              onPress={() => {
+                setShowBusinessDashboard(true);
+                void refreshBusiness();
+              }}
+            >
+              <AppIcon name="bar-chart-outline" size={18} color={COLORS.forest} />
+              <Text style={styles.businessButtonText}>Business</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.addButton} onPress={() => { setCaseForm(makeEmptyCaseForm()); setShowNewCase(true); }}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>New case</Text></TouchableOpacity>
+          </View>
         </View>
         <View style={styles.caseRevenueCard}>
           <View style={styles.caseRevenueMetric}>
@@ -3499,12 +3711,37 @@ export default function App() {
         </View>
 
         <SectionTitle title="Referral history" />
-        {recentReferrals.length ? <View style={styles.referralList}>
-          {recentReferrals.map((referral, index) => {
+        <View style={styles.searchBox}>
+          <AppIcon name="search" size={19} color={COLORS.gray} />
+          <TextInput
+            value={referralSearch}
+            onChangeText={setReferralSearch}
+            placeholder="Client label, partner, outcome, or note"
+            placeholderTextColor="#91A09B"
+            style={styles.searchInput}
+          />
+          {referralSearch ? <TouchableOpacity accessibilityRole="button" accessibilityLabel="Clear referral search" style={styles.searchClearButton} onPress={() => setReferralSearch('')}><AppIcon name="close-circle" size={18} color={COLORS.gray} /></TouchableOpacity> : null}
+        </View>
+        <View style={styles.referralFilterRow}>
+          {(['All', 'Inbound', 'Outbound'] as const).map((direction) => (
+            <TouchableOpacity
+              key={direction}
+              accessibilityRole="button"
+              accessibilityState={{ selected: referralDirectionFilter === direction }}
+              onPress={() => setReferralDirectionFilter(direction)}
+              style={[styles.referralFilterButton, referralDirectionFilter === direction && styles.referralFilterButtonActive]}
+            >
+              <Text style={[styles.referralFilterText, referralDirectionFilter === direction && styles.referralFilterTextActive]}>{direction}</Text>
+            </TouchableOpacity>
+          ))}
+          <Text style={styles.referralFilterCount}>{filteredReferrals.length} records</Text>
+        </View>
+        {filteredReferrals.length ? <View style={styles.referralList}>
+          {filteredReferrals.map((referral, index) => {
             const partner = partners.find((item) => item.id === referral.partnerId);
             if (!partner) return null;
             return (
-              <TouchableOpacity key={referral.id} onPress={() => setSelectedPartner(partner)} style={[styles.referralRow, index === recentReferrals.length - 1 && { borderBottomWidth: 0 }]}>
+              <TouchableOpacity key={referral.id} onPress={() => setSelectedPartner(partner)} style={[styles.referralRow, index === filteredReferrals.length - 1 && { borderBottomWidth: 0 }]}>
                 <View style={[styles.referralDirectionLine, { backgroundColor: referral.direction === 'Inbound' ? COLORS.forest : COLORS.blue }]} />
                 <View style={{ flex: 1 }}>
                   <View style={styles.referralTop}><Text style={styles.referralClient}>{referral.clientLabel}</Text><Text style={styles.referralDate}>{shortDate(referral.date)}</Text></View>
@@ -3514,7 +3751,7 @@ export default function App() {
               </TouchableOpacity>
             );
           })}
-        </View> : <EmptyState icon="swap-horizontal-outline" title="No referral history" body="Add a partner, then log your first inbound or outbound referral." />}
+        </View> : <EmptyState icon="swap-horizontal-outline" title="No matching referrals" body={referrals.length ? 'Try another search or direction filter.' : 'Add a partner, then log your first inbound or outbound referral.'} />}
 
         <SectionTitle title="Relationship balance" />
         {partners.length ? partners.slice().sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound)).slice(0, 5).map((partner) => {
@@ -3564,6 +3801,7 @@ export default function App() {
     // the case pageSheet is already on screen. Keep one native modal mounted
     // and swap its contents for every case-specific editor/sheet.
     if (caseEditForm) return EditCaseModal();
+    if (caseBusinessForm) return CaseBusinessDetailsModal();
     if (casePaymentForm) return AddCasePaymentModal();
     if (caseContactForm) return CaseContactModal();
     if (quickNoteContact) return QuickNoteModal();
@@ -3609,6 +3847,34 @@ export default function App() {
                   </TouchableOpacity>
                 </View>
                 <Text style={styles.profileName}>Opened {shortDate(record.createdAt.slice(0, 10))} · active {relativeActivity(record.updatedAt)}</Text>
+              </View>
+
+              <View style={styles.infoCard}>
+                <View style={styles.caseSectionHeader}>
+                  <Text style={styles.infoTitle}>Attribution</Text>
+                  <TouchableOpacity
+                    accessibilityRole="button"
+                    onPress={() => setCaseBusinessForm({
+                      leadSource: record.leadSource,
+                      leadSourceDetail: record.leadSourceDetail,
+                      lostReason: record.lostReason,
+                    })}
+                    style={styles.caseSectionAction}
+                  >
+                    <AppIcon name="create-outline" size={14} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Edit</Text>
+                  </TouchableOpacity>
+                </View>
+                <View style={styles.businessDetailRow}>
+                  <View style={styles.businessDetailMetric}>
+                    <Text style={styles.infoLabel}>LEAD SOURCE</Text>
+                    <Text style={styles.businessDetailValue}>{record.leadSource || 'Unspecified'}</Text>
+                  </View>
+                  <View style={styles.businessDetailMetric}>
+                    <Text style={styles.infoLabel}>SOURCE DETAIL</Text>
+                    <Text style={styles.businessDetailValue}>{record.leadSourceDetail || '—'}</Text>
+                  </View>
+                </View>
+                {record.lostReason ? <Text style={styles.businessLostReason}>Lost reason: {record.lostReason}</Text> : null}
               </View>
 
               <View style={styles.infoCard}>
@@ -3677,6 +3943,8 @@ export default function App() {
                 </TouchableOpacity>
                 <Text style={styles.casePaymentHint}>Use “Record another payment” for each coaching session or installment. The paid total stays editable for corrections; every change lands on the timeline.</Text>
               </View>
+
+              <CaseIntegrationPanel record={record} integrations={businessData.integrations} onChanged={refreshBusiness} />
 
               <View style={[styles.infoCard, { marginTop: 12 }]}>
                 <Text style={styles.infoTitle}>Summary</Text>
@@ -3889,6 +4157,14 @@ export default function App() {
                 onChange={(status) => setCaseForm((current) => ({ ...current, status: status as CaseStatus }))}
                 options={CASE_STATUSES.map((status) => ({ label: status, value: status }))}
               />
+              <DropdownField
+                label="LEAD SOURCE"
+                value={caseForm.leadSource}
+                icon="trending-up-outline"
+                onChange={(leadSource) => setCaseForm((current) => ({ ...current, leadSource }))}
+                options={LEAD_SOURCES.map((source) => ({ label: source, value: source }))}
+              />
+              <FormField label="SOURCE DETAIL (OPTIONAL)" value={caseForm.leadSourceDetail} onChangeText={(leadSourceDetail) => setCaseForm((current) => ({ ...current, leadSourceDetail }))} placeholder="Person, organization, campaign, or event" />
               <FormField label="SUMMARY (OPTIONAL)" value={caseForm.summary} onChangeText={(summary) => setCaseForm((current) => ({ ...current, summary }))} placeholder="The situation in a few lines" multiline />
               <Text style={styles.fieldLabel}>PRIMARY CONTACT</Text>
               <FormField label="NAME" value={caseForm.contactName} onChangeText={(contactName) => setCaseForm((current) => ({ ...current, contactName }))} placeholder="Mom, dad, referent…" />
@@ -3920,6 +4196,37 @@ export default function App() {
               <FormField label="CASE NAME *" value={caseEditForm.title} onChangeText={(title) => setCaseEditForm((current) => (current ? { ...current, title } : current))} placeholder="Henderson family — son Jake, 24" />
               <FormField label="SUMMARY" value={caseEditForm.summary} onChangeText={(summary) => setCaseEditForm((current) => (current ? { ...current, summary } : current))} placeholder="The situation in a few lines" multiline />
               <TouchableOpacity style={styles.primaryButton} onPress={saveCaseDetails}><Text style={styles.primaryButtonText}>Save case changes</Text></TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function CaseBusinessDetailsModal() {
+    if (!caseBusinessForm || !activeCase) return null;
+    const close = () => setCaseBusinessForm(null);
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityLabel="Close business details form" onPress={close} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Business details</Text>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={saveCaseBusinessDetails}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>Attribution and loss reasons feed the Business dashboard. Keep PHI out of these reporting fields.</Text>
+              <DropdownField
+                label="LEAD SOURCE"
+                value={caseBusinessForm.leadSource}
+                icon="trending-up-outline"
+                onChange={(leadSource) => setCaseBusinessForm((current) => current ? { ...current, leadSource } : current)}
+                options={LEAD_SOURCES.map((source) => ({ label: source, value: source }))}
+              />
+              <FormField label="SOURCE DETAIL" value={caseBusinessForm.leadSourceDetail} onChangeText={(leadSourceDetail) => setCaseBusinessForm((current) => current ? { ...current, leadSourceDetail } : current)} placeholder="Specific person, organization, campaign, or event" />
+              <FormField label="LOST REASON" value={caseBusinessForm.lostReason} onChangeText={(lostReason) => setCaseBusinessForm((current) => current ? { ...current, lostReason } : current)} placeholder="No response, price, chose another provider…" multiline />
+              <TouchableOpacity style={styles.primaryButton} onPress={saveCaseBusinessDetails}><Text style={styles.primaryButtonText}>Save business details</Text></TouchableOpacity>
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
@@ -4585,36 +4892,35 @@ export default function App() {
   // (a) Next step… / (b) Close the loop. No bare done for linked items.
   function DoneSheet() {
     if (!doneCard) return null;
-    const close = () => { setDoneCard(null); setDoneStatusPicker(false); };
+    const close = () => {
+      if (caseCloseLoopSaving) return;
+      setDoneCard(null);
+      setDoneStatusPicker(false);
+    };
     const referralAwaiting = Boolean(doneCard.referralId && doneCard.context.referralAwaitingAnswer);
     const linkedCase = doneCard.caseId ? cases.find((item) => item.id === doneCard.caseId) : undefined;
-    if (doneStatusPicker && linkedCase) {
-      return (
-        <Modal visible transparent animationType="fade" onRequestClose={close}>
-          <Pressable style={styles.dropdownOverlay} onPress={close}>
-            <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
-              <View style={styles.dropdownSheetHandle} />
-              <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
-                <Text style={styles.prePromptTitle}>Close the loop — {linkedCase.title}</Text>
-                <Text style={styles.prePromptText}>Complete this item{doneCard.title ? ` (“${doneCard.title}”)` : ''} and set the case status. The change lands on the case timeline.</Text>
-                <View style={styles.cadenceRow}>
-                  {CASE_STATUSES.map((status) => (
-                    <Pill key={status} label={status} active={status === linkedCase.status} onPress={() => closeLoopWithStatus(status)} />
-                  ))}
-                </View>
-                <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => closeLoopWithStatus('keep')}><Text style={styles.saveText}>Just complete — keep “{linkedCase.status}”</Text></TouchableOpacity>
-              </ScrollView>
-            </Pressable>
-          </Pressable>
-        </Modal>
-      );
-    }
     return (
       <Modal visible transparent animationType="fade" onRequestClose={close}>
         <Pressable style={styles.dropdownOverlay} onPress={close}>
           <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
             <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
+              {doneStatusPicker && linkedCase ? (
+                <>
+                <Text style={styles.prePromptTitle}>Close the loop — {linkedCase.title}</Text>
+                <Text style={styles.prePromptText}>Complete this item{doneCard.title ? ` (“${doneCard.title}”)` : ''} and set the case status. The change lands on the case timeline.</Text>
+                <View style={[styles.cadenceRow, caseCloseLoopSaving && { opacity: 0.55 }]}>
+                  {CASE_STATUSES.map((status) => (
+                    <Pill key={status} label={status} active={status === linkedCase.status} disabled={caseCloseLoopSaving} onPress={() => closeLoopWithStatus(status)} />
+                  ))}
+                </View>
+                <TouchableOpacity accessibilityRole="button" accessibilityState={{ disabled: caseCloseLoopSaving, busy: caseCloseLoopSaving }} disabled={caseCloseLoopSaving} style={[styles.modalHeaderAction, caseCloseLoopSaving && { opacity: 0.55 }]} onPress={() => closeLoopWithStatus('keep')}>
+                  <Text style={styles.saveText}>{caseCloseLoopSaving ? 'Saving…' : `Just complete — keep “${linkedCase.status}”`}</Text>
+                </TouchableOpacity>
+                {caseCloseLoopSaving ? <Text accessibilityLiveRegion="polite" style={[styles.prePromptText, { textAlign: 'center', marginTop: 8 }]}>Saving the follow-up and case status…</Text> : null}
+                </>
+              ) : (
+                <>
               <View style={styles.prePromptIcon}><AppIcon name="checkmark-done" size={24} color={COLORS.forest} /></View>
               <Text style={styles.prePromptTitle}>Done — what's next?</Text>
               <Text style={styles.prePromptText}>{doneCard.title}{doneCard.context.caseTitle ? ` — ${doneCard.context.caseTitle}` : doneCard.context.partnerName ? ` — ${doneCard.context.partnerName}` : ''}</Text>
@@ -4625,6 +4931,8 @@ export default function App() {
                 <Text style={styles.sheetSecondaryButtonText}>{referralAwaiting ? 'Close the loop — record the outcome' : doneCard.caseId ? 'Close the loop — complete & set case status' : 'Close the loop — just complete'}</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Not yet</Text></TouchableOpacity>
+                </>
+              )}
             </ScrollView>
           </Pressable>
         </Pressable>
@@ -4867,6 +5175,20 @@ export default function App() {
       {OutcomeCaptureModal()}
       {CaseDetailModal()}
       {NewCaseModal()}
+      <BusinessDashboard
+        visible={showBusinessDashboard}
+        cases={cases}
+        referrals={referrals}
+        data={businessData}
+        loading={businessLoading}
+        error={businessError}
+        onClose={() => setShowBusinessDashboard(false)}
+        onRefresh={() => { void refreshBusiness(); }}
+        onOpenCase={(caseId) => {
+          setShowBusinessDashboard(false);
+          setTimeout(() => openCase(caseId), 350);
+        }}
+      />
       {DoneSheet()}
       {NextStepSheet()}
       {SnoozeSheet()}
@@ -5038,6 +5360,9 @@ const styles = StyleSheet.create({
   directoryTitleCopy: { flex: 1, minWidth: 0 },
   addButton: { minHeight: 44, flexShrink: 0, flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.forest, borderRadius: 15, paddingHorizontal: 12, paddingVertical: 10 },
   addButtonText: { color: COLORS.white, fontSize: 12, fontWeight: '800' },
+  caseHeaderActions: { flexShrink: 0, alignItems: 'stretch', gap: 6 },
+  businessButton: { minHeight: 38, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, backgroundColor: COLORS.white, paddingHorizontal: 10 },
+  businessButtonText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
   roundAdd: { width: 44, height: 44, borderRadius: 15, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
   searchBox: { flexDirection: 'row', alignItems: 'center', gap: 9, backgroundColor: COLORS.white, borderRadius: 16, paddingHorizontal: 14, height: 50, borderWidth: 1, borderColor: COLORS.line },
   searchInput: { flex: 1, color: COLORS.ink, fontSize: 13, outlineStyle: 'none' } as any,
@@ -5082,6 +5407,12 @@ const styles = StyleSheet.create({
   quickLogRow: { flexDirection: 'row', gap: 10, marginBottom: 26 },
   quickLogButton: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, borderRadius: 15, backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.line, paddingVertical: 12 },
   quickLogText: { color: COLORS.inkSoft, fontSize: 12, fontWeight: '700' },
+  referralFilterRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginTop: 10, marginBottom: 10 },
+  referralFilterButton: { minHeight: 38, justifyContent: 'center', borderRadius: 11, borderWidth: 1, borderColor: COLORS.line, backgroundColor: COLORS.white, paddingHorizontal: 11 },
+  referralFilterButtonActive: { backgroundColor: COLORS.forest, borderColor: COLORS.forest },
+  referralFilterText: { color: COLORS.inkSoft, fontSize: 10, fontWeight: '800' },
+  referralFilterTextActive: { color: COLORS.white },
+  referralFilterCount: { flex: 1, minWidth: 70, color: COLORS.gray, fontSize: 9, textAlign: 'right', paddingRight: 2 },
   referralList: { backgroundColor: COLORS.white, borderRadius: 22, paddingHorizontal: 15, borderWidth: 1, borderColor: COLORS.line, marginBottom: 27 },
   referralRow: { flexDirection: 'row', gap: 11, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   referralDirectionLine: { width: 3, borderRadius: 2 },
@@ -5213,6 +5544,10 @@ const styles = StyleSheet.create({
   caseRevenueLabel: { color: COLORS.gray, fontSize: 8, lineHeight: 11, fontWeight: '800', letterSpacing: 0.4 },
   caseRevenueValue: { color: COLORS.forest, fontSize: 20, fontWeight: '900', marginTop: 4 },
   caseRevenueDivider: { width: 1, backgroundColor: COLORS.line, marginHorizontal: 8 },
+  businessDetailRow: { flexDirection: 'row', gap: 12, marginTop: 6 },
+  businessDetailMetric: { flex: 1, minWidth: 0 },
+  businessDetailValue: { color: COLORS.inkSoft, fontSize: 11, lineHeight: 16, fontWeight: '700' },
+  businessLostReason: { color: COLORS.coral, fontSize: 10, lineHeight: 15, marginTop: 11 },
   caseRow: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   caseRowIcon: { width: 34, height: 34, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
   caseRowTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '700' },
