@@ -94,7 +94,10 @@ export function snoozeDate(choice: SnoozeChoice, today: Date): string {
 
 export function partnerDaysSinceContact(partner: Partner, today: Date): number {
   const basis = partner.lastContact || partner.createdAt || '';
-  const parsed = new Date(basis);
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(basis);
+  const parsed = dateOnly
+    ? new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]))
+    : new Date(basis);
   const basisDay = Number.isNaN(parsed.getTime())
     ? startOfDay(today)
     : startOfDay(parsed);
