@@ -11,7 +11,7 @@
     "expo": "57.0.8",
     "expo-crypto": "~57.0.1",
     "expo-dev-client": "~57.0.9",
-    "expo-file-system": "~57.0.2",
+    "expo-file-system": "57.0.1",
     "expo-font": "~57.0.1",
     "expo-image-picker": "~57.0.6",
     "expo-notifications": "~57.0.7",
@@ -34,7 +34,7 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "typecheck": "tsc --noEmit --pretty false",
-    "test": "node scripts/store-account-test.mjs && node scripts/notifications-test.mjs && node scripts/mutation-test.mjs && node scripts/phone-test.mjs && node scripts/packet-test.mjs && node scripts/business-test.mjs && node scripts/today-test.mjs",
+    "test": "node scripts/native-compat-test.mjs && node scripts/store-account-test.mjs && node scripts/notifications-test.mjs && node scripts/mutation-test.mjs && node scripts/phone-test.mjs && node scripts/packet-test.mjs && node scripts/business-test.mjs && node scripts/today-test.mjs",
     "quality": "npm run typecheck && npm test",
     "eas-build-pre-install": "npm install --global npm@10.9.8"
   },
@@ -44,6 +44,7 @@
       "exclude": [
         "expo",
         "expo-dev-client",
+        "expo-file-system",
         "expo-image-picker",
         "expo-notifications",
         "expo-updates",
