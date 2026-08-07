@@ -3,10 +3,11 @@ BEGIN;
 SELECT plan(23);
 
 SELECT ok(
-  has_column('public', 'cases', 'lead_source')
-  AND has_column('public', 'cases', 'lead_source_detail')
-  AND has_column('public', 'cases', 'lost_reason')
-  AND has_column('public', 'cases', 'stage_changed_at'),
+  (SELECT count(*) = 4
+     FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'cases'
+      AND column_name IN ('lead_source', 'lead_source_detail', 'lost_reason', 'stage_changed_at')),
   'cases expose the reporting fields'
 );
 
