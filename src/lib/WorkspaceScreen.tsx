@@ -21,15 +21,23 @@ import {
   renameWorkspace,
   type Workspace,
 } from './org';
+import { type Entitlement, type EntitlementState } from './entitlements';
 
 type Props = {
   visible: boolean;
   userId: string;
+  entitlements: EntitlementState;
   onClose: () => void;
   // Joining another practice re-homes this account's data, so the caller must
   // rehydrate everything from the server afterward.
   onWorkspaceChanged: () => void;
 };
+
+const PLAN_ROWS: { key: Entitlement; label: string; description: string }[] = [
+  { key: 'pro', label: 'Pro', description: 'Team workspace and full business analytics' },
+  { key: 'directory', label: 'Directory', description: 'Shared, verified placement directory' },
+  { key: 'benchmarks', label: 'Benchmarks', description: 'Cross-practice performance benchmarks' },
+];
 
 const COLORS = {
   ink: '#101828',
@@ -51,7 +59,7 @@ function inviteExpiryLabel(expiresAt: string): string {
   return days === 1 ? 'expires in 1 day' : `expires in ${days} days`;
 }
 
-export default function WorkspaceScreen({ visible, userId, onClose, onWorkspaceChanged }: Props) {
+export default function WorkspaceScreen({ visible, userId, entitlements, onClose, onWorkspaceChanged }: Props) {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
@@ -225,6 +233,26 @@ export default function WorkspaceScreen({ visible, userId, onClose, onWorkspaceC
               ))}
             </View>
 
+            <View style={styles.card}>
+              <Text style={styles.cardLabel}>Plan</Text>
+              {PLAN_ROWS.map((row) => (
+                <View key={row.key} style={styles.memberRow}>
+                  <View style={styles.memberInfo}>
+                    <Text style={styles.memberName}>{row.label}</Text>
+                    <Text style={styles.memberRole}>{row.description}</Text>
+                  </View>
+                  <View style={entitlements.entitlements[row.key] ? styles.planBadgeActive : styles.planBadge}>
+                    <Text style={entitlements.entitlements[row.key] ? styles.planBadgeActiveText : styles.planBadgeText}>
+                      {entitlements.entitlements[row.key] ? 'Active' : 'Free'}
+                    </Text>
+                  </View>
+                </View>
+              ))}
+              <Text style={styles.helpText}>
+                Subscriptions are managed through the App Store from the upgrade screen.
+              </Text>
+            </View>
+
             {isOwner ? (
               <View style={styles.card}>
                 <Text style={styles.cardLabel}>Invite a teammate</Text>
@@ -349,4 +377,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   primaryButtonText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  planBadge: { backgroundColor: COLORS.bg, borderRadius: 999, paddingVertical: 4, paddingHorizontal: 10, borderWidth: 1, borderColor: COLORS.line },
+  planBadgeText: { fontSize: 13, fontWeight: '600', color: COLORS.gray },
+  planBadgeActive: { backgroundColor: COLORS.greenSoft, borderRadius: 999, paddingVertical: 4, paddingHorizontal: 10 },
+  planBadgeActiveText: { fontSize: 13, fontWeight: '600', color: COLORS.green },
 });

@@ -44,6 +44,7 @@ import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
+import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
 import {
   type BusinessData,
@@ -757,6 +758,7 @@ export default function App() {
   const [referralDirectionFilter, setReferralDirectionFilter] = useState<'All' | ReferralDirection>('All');
   const [showBusinessDashboard, setShowBusinessDashboard] = useState(false);
   const [showWorkspace, setShowWorkspace] = useState(false);
+  const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
   // Incremented after the account joins a different practice workspace, which
   // re-homes its rows server-side; bumping it re-runs the hydration effect.
   const [workspaceEpoch, setWorkspaceEpoch] = useState(0);
@@ -912,6 +914,7 @@ export default function App() {
   const resetAccountState = useCallback(() => {
     caseLoadGenerationRef.current += 1;
     applySnapshot({ partners: [], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} });
+    setEntitlements(NO_ENTITLEMENTS);
     setCases([]);
     setCaseContacts([]);
     setCaseEvents([]);
@@ -1021,6 +1024,16 @@ export default function App() {
           setBusinessError('');
         } catch (error) {
           if (active && generation === authGenerationRef.current) setBusinessError((error as Error).message);
+        }
+
+        // Subscription state is advisory UI context; failures fall back to
+        // the free tier rather than blocking hydration.
+        try {
+          const nextEntitlements = await fetchEntitlements();
+          if (!active || generation !== authGenerationRef.current) return;
+          setEntitlements(nextEntitlements);
+        } catch {
+          if (active && generation === authGenerationRef.current) setEntitlements(NO_ENTITLEMENTS);
         }
 
         const pending = await pendingWriteCount(userId);
@@ -5205,6 +5218,7 @@ export default function App() {
       <WorkspaceScreen
         visible={showWorkspace}
         userId={activeUserId}
+        entitlements={entitlements}
         onClose={() => setShowWorkspace(false)}
         onWorkspaceChanged={() => {
           setShowWorkspace(false);
