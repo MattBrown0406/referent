@@ -5223,6 +5223,7 @@ export default function App() {
         data={businessData}
         loading={businessLoading}
         error={businessError}
+        benchmarksEntitled={entitlements.entitlements.benchmarks}
         onClose={() => setShowBusinessDashboard(false)}
         onRefresh={() => { void refreshBusiness(); }}
         onOpenCase={(caseId) => {

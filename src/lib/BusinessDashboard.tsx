@@ -11,6 +11,7 @@ import {
 } from 'react-native';
 
 import { formatMoney, type Referral } from '../data';
+import BenchmarksPanel from './BenchmarksPanel';
 import type { CaseRecord } from './cases';
 import {
   type BusinessData,
@@ -26,6 +27,7 @@ type Props = {
   data: BusinessData;
   loading: boolean;
   error?: string;
+  benchmarksEntitled: boolean;
   onClose: () => void;
   onRefresh: () => void;
   onOpenCase: (caseId: string) => void;
@@ -71,6 +73,7 @@ export default function BusinessDashboard({
   data,
   loading,
   error,
+  benchmarksEntitled,
   onClose,
   onRefresh,
   onOpenCase,
@@ -245,6 +248,9 @@ export default function BusinessDashboard({
           ) : (
             <Text style={styles.emptyFootnote}>No linked contract or invoice currently needs attention.</Text>
           )}
+
+          <Text style={styles.sectionTitle}>Network benchmarks</Text>
+          <BenchmarksPanel visible={visible} entitled={benchmarksEntitled} />
         </ScrollView>
       </SafeAreaView>
     </Modal>
