@@ -45,6 +45,7 @@ import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
+import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
 import {
   type BusinessData,
@@ -759,6 +760,7 @@ export default function App() {
   const [showBusinessDashboard, setShowBusinessDashboard] = useState(false);
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
+  const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
   // Incremented after the account joins a different practice workspace, which
   // re-homes its rows server-side; bumping it re-runs the hydration effect.
   const [workspaceEpoch, setWorkspaceEpoch] = useState(0);
@@ -3684,6 +3686,19 @@ export default function App() {
           <View style={styles.directoryTitleCopy}><Text style={styles.screenTitle}>Your network</Text><Text style={styles.screenSubtitle}>{partners.length} people and programs</Text></View>
           <TouchableOpacity style={styles.addButton} onPress={openNewPartner}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>Add</Text></TouchableOpacity>
         </View>
+        <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="Browse the ReferralFit directory"
+          style={styles.globalDirectoryBanner}
+          onPress={() => setShowGlobalDirectory(true)}
+        >
+          <AppIcon name="globe-outline" size={20} color={COLORS.blue} />
+          <View style={styles.globalDirectoryCopy}>
+            <Text style={styles.globalDirectoryTitle}>ReferralFit Directory</Text>
+            <Text style={styles.globalDirectorySubtitle}>Verified programs, ready to add to your network</Text>
+          </View>
+          <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
+        </TouchableOpacity>
         <View style={styles.searchBox}>
           <AppIcon name="search" size={19} color={COLORS.gray} />
           <TextInput value={search} onChangeText={setSearch} placeholder="Name, program, location, specialty" placeholderTextColor="#91A09B" style={styles.searchInput} />
@@ -5215,6 +5230,17 @@ export default function App() {
           setTimeout(() => openCase(caseId), 350);
         }}
       />
+      <GlobalDirectoryScreen
+        visible={showGlobalDirectory}
+        entitled={entitlements.entitlements.directory}
+        importedGlobalIds={new Set(partners.map((partner) => partner.globalPartnerId).filter((id): id is string => Boolean(id)))}
+        onClose={() => setShowGlobalDirectory(false)}
+        onImported={(partner, globalId) => {
+          setPartners((current) => current.some((item) => item.id === partner.id)
+            ? current
+            : [{ ...partner, globalPartnerId: globalId }, ...current]);
+        }}
+      />
       <WorkspaceScreen
         visible={showWorkspace}
         userId={activeUserId}
@@ -5393,6 +5419,10 @@ const styles = StyleSheet.create({
   assignReferralButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: COLORS.forest, borderRadius: 13, marginTop: 13 },
   assignReferralButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
   directoryTitleRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 18 },
+  globalDirectoryBanner: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#EFF4FF', borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14, marginBottom: 16 },
+  globalDirectoryCopy: { flex: 1 },
+  globalDirectoryTitle: { fontSize: 15, fontWeight: '700', color: '#175CD3' },
+  globalDirectorySubtitle: { fontSize: 12.5, color: '#667085', marginTop: 1 },
   directoryTitleCopy: { flex: 1, minWidth: 0 },
   addButton: { minHeight: 44, flexShrink: 0, flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.forest, borderRadius: 15, paddingHorizontal: 12, paddingVertical: 10 },
   addButtonText: { color: COLORS.white, fontSize: 12, fontWeight: '800' },

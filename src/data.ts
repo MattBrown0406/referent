@@ -37,6 +37,8 @@ export type Partner = {
   favorite?: boolean;
   touchCadenceDays?: number;
   createdAt?: string;
+  /** Set when this partner was imported from the shared ReferralFit directory. */
+  globalPartnerId?: string;
 };
 
 export type Referral = {

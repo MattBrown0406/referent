@@ -443,6 +443,7 @@ type PartnerRow = {
   touch_cadence_days: number | null;
   last_contact_at: string | null;
   created_at: string;
+  global_partner_id?: string | null;
 };
 
 type ReferralRow = {
@@ -576,6 +577,7 @@ function mapPartnerRow(row: PartnerRow, balance: BalanceRow | undefined): Partne
     favorite: Boolean(row.favorite),
     touchCadenceDays: row.touch_cadence_days ?? undefined,
     createdAt: row.created_at,
+    globalPartnerId: row.global_partner_id ?? undefined,
   };
 }
 
