@@ -36,6 +36,17 @@ function invoicePaidAmount(invoice: Json): number | null {
   return amounts.reduce<number>((sum, amount) => sum + (amount || 0), 0);
 }
 
+function invoiceCurrency(invoice: Json): string | null {
+  const currencies = new Set<string>();
+  for (const request of Array.isArray(invoice.payment_requests) ? invoice.payment_requests : []) {
+    const item = objectValue(request);
+    for (const money of [objectValue(item.computed_amount_money), objectValue(item.total_completed_amount_money)]) {
+      if (typeof money.currency === 'string') currencies.add(money.currency.toUpperCase());
+    }
+  }
+  return currencies.size === 1 ? [...currencies][0] : null;
+}
+
 function dueDate(invoice: Json): string | null {
   const dates = (Array.isArray(invoice.payment_requests) ? invoice.payment_requests : [])
     .map((request) => objectValue(request).due_date)
@@ -81,7 +92,9 @@ Deno.serve(async (request) => {
       : moneyAmount(candidate.amount_money);
     const paidAmountCents = candidateType === 'invoice' ? invoicePaidAmount(candidate) : null;
     const currencyObject = objectValue(candidate.amount_money);
-    const currency = typeof currencyObject.currency === 'string' ? currencyObject.currency : 'USD';
+    const currency = candidateType === 'invoice'
+      ? invoiceCurrency(candidate)
+      : typeof currencyObject.currency === 'string' ? currencyObject.currency.toUpperCase() : null;
     const updatedAt = typeof candidate.updated_at === 'string' ? candidate.updated_at : new Date().toISOString();
     const completedAt = ['paid', 'completed', 'refunded'].includes(status) ? updatedAt : null;
 
@@ -115,14 +128,14 @@ Deno.serve(async (request) => {
     if (externalId && candidateType) {
       const patch: Json = {
         status,
-        currency,
-        completed_at: completedAt,
         last_synced_at: new Date().toISOString(),
         metadata: {
           square_order_id: candidate.order_id || null,
           square_customer_id: candidate.customer_id || objectValue(candidate.primary_recipient).customer_id || null,
         },
       };
+      if (currency) patch.currency = currency;
+      if (completedAt) patch.completed_at = completedAt;
       if (amountCents != null) patch.amount_cents = amountCents;
       if (candidateType === 'invoice') {
         patch.due_on = dueDate(candidate);
@@ -138,10 +151,11 @@ Deno.serve(async (request) => {
       if (updateError) throw updateError;
     }
 
-    await supabase.from('integration_webhook_events').update({
+    const { error: processedError } = await supabase.from('integration_webhook_events').update({
       processed_at: new Date().toISOString(),
       processing_error: '',
     }).eq('provider', 'square').eq('external_event_id', eventId);
+    if (processedError) throw processedError;
     return jsonResponse({ ok: true });
   } catch (error) {
     console.error('Square webhook processing failed', error);

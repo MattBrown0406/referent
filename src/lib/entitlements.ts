@@ -22,9 +22,7 @@ export const NO_ENTITLEMENTS: EntitlementState = {
 };
 
 export async function fetchEntitlements(): Promise<EntitlementState> {
-  const { data, error } = await supabase
-    .from('org_entitlements')
-    .select('entitlement, active, expires_at');
+  const { data, error } = await supabase.rpc('fetch_org_entitlements');
   if (error) throw new Error(error.message || 'Could not load subscription state.');
   const now = Date.now();
   const entitlements = { ...NO_ENTITLEMENTS.entitlements };

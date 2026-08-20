@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -18,10 +18,12 @@ import type { Partner } from '../data';
 type Props = {
   visible: boolean;
   entitled: boolean;
+  entitlementKnown: boolean;
+  userId: string;
   // Global listing ids already imported into this workspace's network.
   importedGlobalIds: ReadonlySet<string>;
   onClose: () => void;
-  onImported: (partner: Partner, globalId: string) => void;
+  onImported: (partner: Partner, globalId: string, initiatingUserId: string) => void;
 };
 
 const COLORS = {
@@ -46,12 +48,13 @@ function listingSubtitle(listing: GlobalPartner): string {
   return parts.join('  ·  ');
 }
 
-export default function GlobalDirectoryScreen({ visible, entitled, importedGlobalIds, onClose, onImported }: Props) {
+export default function GlobalDirectoryScreen({ visible, entitled, entitlementKnown, userId, importedGlobalIds, onClose, onImported }: Props) {
   const [listings, setListings] = useState<GlobalPartner[] | null>(null);
   const [loadError, setLoadError] = useState('');
   const [search, setSearch] = useState('');
   const [stateFilter, setStateFilter] = useState('');
   const [importingId, setImportingId] = useState<string | null>(null);
+  const operationGenerationRef = useRef(0);
 
   useEffect(() => {
     if (!visible || !entitled) return;
@@ -61,7 +64,12 @@ export default function GlobalDirectoryScreen({ visible, entitled, importedGloba
       .then((next) => { if (active) setListings(next); })
       .catch((error) => { if (active) setLoadError((error as Error).message); });
     return () => { active = false; };
-  }, [visible, entitled]);
+  }, [visible, entitled, userId]);
+
+  useEffect(() => {
+    operationGenerationRef.current += 1;
+    setImportingId(null);
+  }, [visible, entitled, userId]);
 
   const states = useMemo(() => {
     const unique = new Set((listings || []).map((listing) => listing.state).filter(Boolean));
@@ -81,15 +89,21 @@ export default function GlobalDirectoryScreen({ visible, entitled, importedGloba
 
   function addToNetwork(listing: GlobalPartner) {
     if (importingId) return;
+    const operationGeneration = ++operationGenerationRef.current;
+    const initiatingUserId = userId;
     setImportingId(listing.id);
-    importGlobalPartner(listing)
+    importGlobalPartner(listing, initiatingUserId)
       .then((partner) => {
-        onImported(partner, listing.id);
+        if (operationGeneration !== operationGenerationRef.current) return;
+        onImported(partner, listing.id, initiatingUserId);
       })
       .catch((error) => {
+        if (operationGeneration !== operationGenerationRef.current) return;
         Alert.alert('Could not add program', (error as Error).message);
       })
-      .finally(() => setImportingId(null));
+      .finally(() => {
+        if (operationGeneration === operationGenerationRef.current) setImportingId(null);
+      });
   }
 
   return (
@@ -102,7 +116,11 @@ export default function GlobalDirectoryScreen({ visible, entitled, importedGloba
           </TouchableOpacity>
         </View>
 
-        {!entitled ? (
+        {!entitlementKnown ? (
+          <View style={styles.centered}>
+            <Text accessibilityRole="alert" style={styles.errorText}>Subscription status is unavailable. Reopen the screen when the app is online.</Text>
+          </View>
+        ) : !entitled ? (
           <View style={styles.centered}>
             <Text style={styles.teaserTitle}>A verified network, maintained for you</Text>
             <Text style={styles.teaserBody}>
@@ -116,7 +134,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, importedGloba
           </View>
         ) : loadError ? (
           <View style={styles.centered}>
-            <Text style={styles.errorText}>{loadError}</Text>
+            <Text accessibilityRole="alert" style={styles.errorText}>{loadError}</Text>
           </View>
         ) : listings === null ? (
           <View style={styles.centered}><ActivityIndicator color={COLORS.blue} /></View>
@@ -133,6 +151,8 @@ export default function GlobalDirectoryScreen({ visible, entitled, importedGloba
               />
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.stateRow}>
                 <TouchableOpacity
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: stateFilter === '' }}
                   style={stateFilter === '' ? styles.statePillActive : styles.statePill}
                   onPress={() => setStateFilter('')}
                 >
@@ -141,6 +161,8 @@ export default function GlobalDirectoryScreen({ visible, entitled, importedGloba
                 {states.map((state) => (
                   <TouchableOpacity
                     key={state}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: stateFilter === state }}
                     style={stateFilter === state ? styles.statePillActive : styles.statePill}
                     onPress={() => setStateFilter(stateFilter === state ? '' : state)}
                   >
@@ -177,6 +199,9 @@ export default function GlobalDirectoryScreen({ visible, entitled, importedGloba
                       <View style={styles.importedBadge}><Text style={styles.importedText}>In your network</Text></View>
                     ) : (
                       <TouchableOpacity
+                        accessibilityRole="button"
+                        accessibilityLabel={`Add ${listing.organization || listing.name} to my network`}
+                        accessibilityState={{ disabled: importingId !== null, busy: importingId === listing.id }}
                         disabled={importingId !== null}
                         onPress={() => addToNetwork(listing)}
                         style={styles.addButton}

@@ -11,6 +11,7 @@ const authSessionSource = await readFile(new URL('../src/lib/auth-session.ts', i
 const mustContain = [
   "const CACHE_KEY_PREFIX = 'referralfit-cache-v2:'",
   "const QUEUE_KEY_PREFIX = 'referralfit-write-queue-v2:'",
+  "const WORKSPACE_KEY_PREFIX = 'referralfit-workspace-v1:'",
   'type CacheEnvelope = { version: 2; userId: string; snapshot: Snapshot }',
   'type QueueEnvelope = { version: 2; userId: string; ops: QueueOp[] }',
   'parsed.userId?.toLowerCase() !== userId',
@@ -35,6 +36,8 @@ const expectedSignatures = [
   /export async function hydrate\(expectedUserId: string\)/,
   /export async function flushWriteQueue\(expectedUserId: string\)/,
   /export async function pendingWriteCount\(expectedUserId: string\)/,
+  /export async function prepareForWorkspaceChange\(expectedUserId: string\)/,
+  /export async function bindLocalWorkspace\(expectedUserId: string, orgId: string\)/,
   /export async function persistCache\(snapshot: Snapshot, expectedUserId: string\)/,
   /export async function refreshSnapshot\(expectedUserId: string\)/,
   /export async function createPartner\(partner: Partner, expectedUserId: string\)/,
@@ -43,9 +46,15 @@ const expectedSignatures = [
 ];
 for (const signature of expectedSignatures) assert.match(source, signature);
 
+assert.match(
+  source,
+  /prepareForWorkspaceChange[\s\S]*flushWriteQueue[\s\S]*readQueueUnlocked[\s\S]*AsyncStorage\.multiRemove/,
+  'workspace changes must flush, verify, and clear account-local state before crossing a tenant boundary',
+);
+
 // Every AsyncStorage write is in a catch block that converts failure to StoreError.
 const writes = [...source.matchAll(/await AsyncStorage\.setItem\([^;]+;/g)];
-assert.equal(writes.length, 2, 'unexpected AsyncStorage write path added without durability audit');
+assert.equal(writes.length, 3, 'unexpected AsyncStorage write path added without durability audit');
 for (const write of writes) {
   const following = source.slice(write.index, write.index + 240);
   assert.match(following, /catch \(error\) \{\s*throw persistenceError\(/);
@@ -61,6 +70,7 @@ assert.match(source, /match_profile_id: null/, 'cyclic referral links must be cl
 assert.match(source, /referral_id: null/, 'cyclic match links must be cleared for dependency-safe base inserts');
 assert.match(casesSource, /withStableCaseAccount/, 'case operations must reject account transitions');
 assert.match(casesSource, /current\.sessionId === expected\.sessionId/, 'case operations must share the stable login-session fence');
+assert.match(casesSource, /current\.orgId === expected\.orgId/, 'case operations must reject workspace transitions');
 assert.match(authSessionSource, /session_id/, 'session fence must survive token refresh but detect same-user re-login');
 assert.match(casesSource, /save_case_document_with_event/, 'documents and timeline events must be transactional');
 assert.match(casesSource, /record_case_payment/, 'additional case payments must use the atomic idempotent RPC');

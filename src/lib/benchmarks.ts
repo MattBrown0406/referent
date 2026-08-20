@@ -2,9 +2,8 @@ import { StoreError } from './errors';
 import { supabase } from './supabase';
 
 // Cross-practice benchmarks (Phase 5). fetch_benchmarks() is entitlement-gated
-// server-side and returns only aggregate medians with a 3-workspace
-// k-anonymity floor; per-metric network values are null until enough
-// practices contribute.
+// server-side and returns only aggregate medians from at least five other paid
+// workspaces; per-metric values stay null until each activity floor is met.
 
 export type BenchmarkReport = {
   network: {
@@ -40,7 +39,7 @@ export async function fetchBenchmarks(): Promise<BenchmarkReport> {
       familyExperience: num(network.family_experience),
       placementRate: num(network.placement_rate),
       medianQuote: num(network.median_quote),
-      contributorFloor: num(network.contributor_floor) ?? 3,
+      contributorFloor: num(network.contributor_floor) ?? 5,
     },
     workspace: {
       outboundReferrals: num(workspace.outbound_referrals) ?? 0,

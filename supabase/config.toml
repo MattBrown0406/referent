@@ -393,6 +393,9 @@ verify_jwt = false
 [functions.pandadoc-webhook]
 verify_jwt = false
 
+[functions.revenuecat-webhook]
+verify_jwt = false
+
 [analytics]
 enabled = true
 port = 55427

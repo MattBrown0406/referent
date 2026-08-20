@@ -284,18 +284,22 @@ export type CaseFileData = {
   caseDocuments: CaseDocument[];
 };
 
-type CaseAccountFence = AuthSessionIdentity;
+type CaseAccountFence = AuthSessionIdentity & { orgId: string };
 
 async function currentCaseAccount(): Promise<CaseAccountFence> {
   const identity = await currentAuthSessionIdentity();
   if (!identity) throw new StoreError('No authenticated account is available for this case operation.', false);
-  return identity;
+  const { data: orgId, error } = await supabase.rpc('current_org_id');
+  if (error) throw new StoreError(error.message || 'The active workspace could not be verified.', false);
+  if (typeof orgId !== 'string' || !orgId) throw new StoreError('No active workspace is available.', false);
+  return { ...identity, orgId: orgId.toLowerCase() };
 }
 
 async function assertCaseAccount(expected: CaseAccountFence): Promise<void> {
   try {
     const current = await currentCaseAccount();
-    if (current.userId === expected.userId && current.sessionId === expected.sessionId) return;
+    if (current.userId === expected.userId && current.sessionId === expected.sessionId
+        && current.orgId === expected.orgId) return;
   } catch {
     // Normalize sign-out/session replacement into the same stale-operation error.
   }

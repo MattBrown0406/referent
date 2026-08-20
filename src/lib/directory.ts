@@ -1,4 +1,5 @@
 import { newUuid } from './cases';
+import { currentAuthSessionIdentity } from './auth-session';
 import { StoreError } from './errors';
 import { supabase } from './supabase';
 import type { InsuranceNetworkPreference, Partner, PartnerType } from '../data';
@@ -88,12 +89,29 @@ export async function fetchGlobalDirectory(): Promise<GlobalPartner[]> {
 // Imports a listing into the caller's workspace network and returns the
 // resulting Partner shaped for local state. The server dedupes per workspace,
 // so the returned id may belong to a previously imported copy.
-export async function importGlobalPartner(listing: GlobalPartner): Promise<Partner> {
+export async function importGlobalPartner(listing: GlobalPartner, expectedUserId: string): Promise<Partner> {
+  const identity = await currentAuthSessionIdentity();
+  if (!identity || identity.userId !== expectedUserId.toLowerCase()) {
+    throw new StoreError('The signed-in account changed before the directory import.', false);
+  }
+  const { data: initiatingOrg, error: orgError } = await supabase.rpc('current_org_id');
+  if (orgError || typeof initiatingOrg !== 'string') {
+    throw new StoreError(orgError?.message || 'The active workspace could not be verified.', false);
+  }
   const { data, error } = await supabase.rpc('import_global_partner', {
     p_global_id: listing.id,
     p_partner_id: newUuid(),
   });
   if (error) throw new StoreError(error.message || 'Could not add the program to your network.', false);
+  const [currentIdentity, currentOrgResult] = await Promise.all([
+    currentAuthSessionIdentity(),
+    supabase.rpc('current_org_id'),
+  ]);
+  if (!currentIdentity || currentIdentity.userId !== identity.userId
+      || currentIdentity.sessionId !== identity.sessionId
+      || currentOrgResult.error || currentOrgResult.data !== initiatingOrg) {
+    throw new StoreError('The account or workspace changed while importing the program. Reload the directory.', false);
+  }
   const partnerId = typeof data === 'string' ? data : String(data);
   const today = new Date();
   const stamp = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;

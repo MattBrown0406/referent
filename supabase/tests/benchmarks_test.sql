@@ -2,7 +2,7 @@
 -- Run after a local migration reset with: supabase test db
 
 BEGIN;
-SELECT plan(7);
+SELECT plan(8);
 
 INSERT INTO auth.users (id, email)
 VALUES
@@ -73,8 +73,13 @@ SELECT ok(
 
 SELECT is(
   (SELECT (public.fetch_benchmarks() -> 'network' ->> 'contributor_floor')::integer),
-  3,
+  5,
   'the report advertises the contributor floor'
+);
+
+SELECT ok(
+  position('org_id <> v_org' in pg_get_functiondef('public.fetch_benchmarks()'::regprocedure)) > 0,
+  'the caller workspace is excluded from every network comparison cohort'
 );
 
 RESET ROLE;

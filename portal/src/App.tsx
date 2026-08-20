@@ -174,7 +174,7 @@ export default function App() {
     try {
       const monthly = form.monthlyCost.trim() === '' ? 0 : Number(form.monthlyCost);
       if (!Number.isInteger(monthly) || monthly < 0) throw new Error('Monthly cost must be a whole dollar amount.');
-      const { error: updateError } = await supabase
+      const { data: updated, error: updateError } = await supabase
         .from('global_partners')
         .update({
           name: form.name.trim(),
@@ -191,9 +191,12 @@ export default function App() {
           levels: csv(form.levels),
           description: form.description.trim(),
         })
-        .eq('id', listing.id);
+        .eq('id', listing.id)
+        .select('id')
+        .maybeSingle();
       if (updateError) throw updateError;
-      setNotice('Listing saved.');
+      if (!updated) throw new Error('The listing was not updated. Sign in again and retry.');
+      setNotice('Listing saved. Its verification date was cleared until ReferralFit reviews the updated information.');
       await loadListing();
     } catch (saveError) {
       setError((saveError as Error).message);
@@ -262,8 +265,9 @@ export default function App() {
               {importCount !== null ? <span className="stat"><b>{importCount}</b> {importCount === 1 ? 'practice has' : 'practices have'} added you to their network</span> : null}
             </div>
             <p className="footnote">
-              Edits go live immediately for the fields below. Verification status is
-              reviewed by ReferralFit and cannot be changed here.
+              Edits go live immediately for the fields below and clear the verification date
+              until ReferralFit reviews the updated information. Listing status remains
+              controlled by ReferralFit.
             </p>
           </div>
           <form className="card" onSubmit={saveListing}>

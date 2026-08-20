@@ -54,6 +54,13 @@ SELECT is(
 
 -- ─── Invite → join → shared workspace ────────────────────────────────────────
 
+-- Team invitation is a Pro capability. Grant the owner a manual test
+-- entitlement before exercising the invite flow.
+INSERT INTO public.org_entitlements (org_id, entitlement, active, source)
+SELECT org_id, 'pro', true, 'manual'
+  FROM public.org_members
+ WHERE user_id = 'a1000000-0000-0000-0000-00000000000a';
+
 SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-00000000000a', true);
 SET LOCAL ROLE authenticated;
 

@@ -34,6 +34,13 @@ function fail(error: { message?: string } | null, fallback: string): never {
   throw new StoreError(error?.message || fallback, false);
 }
 
+export async function fetchCurrentOrgId(): Promise<string> {
+  const { data, error } = await supabase.rpc('current_org_id');
+  if (error) fail(error, 'Could not resolve the active workspace.');
+  if (typeof data !== 'string' || !data) throw new StoreError('No active workspace is available.', false);
+  return data.toLowerCase();
+}
+
 export async function fetchWorkspace(userId: string): Promise<Workspace | null> {
   const [orgResult, membersResult, invitesResult] = await Promise.all([
     supabase.from('orgs').select('id, name').maybeSingle(),

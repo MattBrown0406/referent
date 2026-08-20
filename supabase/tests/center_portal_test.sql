@@ -2,7 +2,7 @@
 -- Run after a local migration reset with: supabase test db
 
 BEGIN;
-SELECT plan(12);
+SELECT plan(16);
 
 INSERT INTO auth.users (id, email)
 VALUES
@@ -70,15 +70,28 @@ SELECT lives_ok(
   'a center can edit its listing content'
 );
 
-UPDATE public.global_partners
-   SET status = 'active', verified_at = now()
- WHERE id = 'bb100000-0000-0000-0000-0000000000bb';
+SELECT throws_ok(
+  $$ UPDATE public.global_partners
+        SET status = 'active', verified_at = now()
+      WHERE id = 'bb100000-0000-0000-0000-0000000000bb' $$,
+  '42501',
+  NULL,
+  'centers have no column privilege to request verification changes'
+);
 
 SELECT is(
   (SELECT status || ':' || (verified_at IS NULL)::text
      FROM public.global_partners WHERE id = 'bb100000-0000-0000-0000-0000000000bb'),
   'pending:true',
   'centers cannot change their own verification state'
+);
+
+SELECT throws_ok(
+  $$ UPDATE public.global_partners SET created_at = now() - interval '1 year'
+      WHERE id = 'bb100000-0000-0000-0000-0000000000bb' $$,
+  '42501',
+  NULL,
+  'centers cannot rewrite listing audit provenance'
 );
 
 SELECT is(
@@ -96,9 +109,9 @@ SELECT is((SELECT public.center_listing_import_count()), 0, 'import count starts
 SELECT set_config('request.jwt.claim.sub', 'aa100000-0000-0000-0000-0000000000aa', true);
 
 SELECT lives_ok(
-  $$ UPDATE public.global_partners
-     SET status = 'active', verified_at = now()
-     WHERE id = 'bb100000-0000-0000-0000-0000000000bb' $$,
+  $$ SELECT public.set_global_partner_verification(
+       'bb100000-0000-0000-0000-0000000000bb', 'active', now()
+     ) $$,
   'an admin can verify and activate a listing'
 );
 
@@ -108,8 +121,26 @@ SELECT is(
   'admin verification persists'
 );
 
+SELECT set_config('request.jwt.claim.sub', 'aa200000-0000-0000-0000-0000000000aa', true);
+UPDATE public.global_partners
+   SET description = 'Updated after verification'
+ WHERE id = 'bb100000-0000-0000-0000-0000000000bb';
+SELECT is(
+  (SELECT status || ':' || (verified_at IS NULL)::text
+     FROM public.global_partners WHERE id = 'bb100000-0000-0000-0000-0000000000bb'),
+  'active:true',
+  'a center content edit preserves admin-controlled status but clears stale verification'
+);
+
 -- ─── Second claim code cannot rebind a claimed account ───────────────────────
 
+SELECT set_config('request.jwt.claim.sub', 'aa100000-0000-0000-0000-0000000000aa', true);
+SELECT throws_ok(
+  $$ SELECT * FROM public.create_center_claim_code('bb100000-0000-0000-0000-0000000000bb') $$,
+  '22023',
+  'Directory listing is already claimed',
+  'an admin cannot issue another bootstrap code for a claimed listing'
+);
 SELECT lives_ok(
   $$ SELECT set_config('test.claim_code_2', code, true)
      FROM public.create_center_claim_code('bb200000-0000-0000-0000-0000000000bb') $$,

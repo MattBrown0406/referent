@@ -97,7 +97,14 @@ export default function BusinessDashboard({
             <Text style={styles.headerTitle}>Business</Text>
             <Text style={styles.headerSubtitle}>Pipeline, revenue, and follow-through</Text>
           </View>
-          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Refresh business dashboard" onPress={onRefresh} style={styles.headerButton}>
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityLabel="Refresh business dashboard"
+            accessibilityState={{ disabled: loading, busy: loading }}
+            disabled={loading}
+            onPress={onRefresh}
+            style={styles.headerButton}
+          >
             <Text style={styles.headerButtonText}>{loading ? 'Syncing' : 'Refresh'}</Text>
           </TouchableOpacity>
         </View>

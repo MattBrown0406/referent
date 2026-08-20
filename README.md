@@ -24,7 +24,7 @@ to other intervention practices on recurring plans:
    consistent with EKRA/anti-brokering constraints).
 5. **Benchmarks** — entitlement-gated, aggregate-only network medians
    (admit rate, family experience, placement rate, median quote) with a
-   3-workspace k-anonymity floor.
+   minimum cohort of five other paid workspaces plus per-metric activity floors.
 
 ## First-version features
 

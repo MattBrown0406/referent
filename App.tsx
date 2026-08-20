@@ -44,6 +44,7 @@ import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
+import { fetchCurrentOrgId } from './src/lib/org';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
@@ -61,6 +62,7 @@ import {
   createPartner,
   createReferral,
   createTouch,
+  bindLocalWorkspace,
   flushWriteQueue,
   finalizeMatchPacket,
   FollowUp,
@@ -782,23 +784,28 @@ export default function App() {
   // auth changes mid-flight, store.ts rejects the stale account ID.
   const activeUserId = session?.user?.id || '';
   const activeUserIdRef = useRef(activeUserId);
+  const activeOrgIdRef = useRef('');
+  const businessLoadGenerationRef = useRef(0);
   const caseLoadGenerationRef = useRef(0);
   activeUserIdRef.current = activeUserId;
 
   const refreshBusiness = useCallback(async () => {
     const userId = session?.user?.id;
     if (!userId) return;
+    const requestGeneration = ++businessLoadGenerationRef.current;
     setBusinessLoading(true);
     setBusinessError('');
     try {
       const next = await fetchBusinessData();
-      if (activeUserIdRef.current !== userId) return;
+      if (activeUserIdRef.current !== userId || requestGeneration !== businessLoadGenerationRef.current) return;
       setBusinessData(next);
     } catch (error) {
-      if (activeUserIdRef.current !== userId) return;
+      if (activeUserIdRef.current !== userId || requestGeneration !== businessLoadGenerationRef.current) return;
       setBusinessError((error as Error).message);
     } finally {
-      if (activeUserIdRef.current === userId) setBusinessLoading(false);
+      if (activeUserIdRef.current === userId && requestGeneration === businessLoadGenerationRef.current) {
+        setBusinessLoading(false);
+      }
     }
   }, [session?.user?.id]);
 
@@ -915,6 +922,8 @@ export default function App() {
 
   const resetAccountState = useCallback(() => {
     caseLoadGenerationRef.current += 1;
+    businessLoadGenerationRef.current += 1;
+    activeOrgIdRef.current = '';
     applySnapshot({ partners: [], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} });
     setEntitlements(NO_ENTITLEMENTS);
     setCases([]);
@@ -935,6 +944,8 @@ export default function App() {
     setReferralSearch('');
     setReferralDirectionFilter('All');
     setShowBusinessDashboard(false);
+    setShowWorkspace(false);
+    setShowGlobalDirectory(false);
     setBusinessData({ stages: [], integrations: [] });
     setBusinessLoading(false);
     setBusinessError('');
@@ -1001,6 +1012,11 @@ export default function App() {
     let active = true;
     (async () => {
       try {
+        const orgId = await fetchCurrentOrgId();
+        if (!active || generation !== authGenerationRef.current) return;
+        await bindLocalWorkspace(userId, orgId);
+        if (!active || generation !== authGenerationRef.current) return;
+        activeOrgIdRef.current = orgId;
         await activateReferralFitNotificationOwner(userId);
         if (!active || generation !== authGenerationRef.current) return;
         const result = await hydrate(userId);
@@ -1076,6 +1092,35 @@ export default function App() {
     };
   }, [authResolved, session?.user?.id, workspaceEpoch, applySnapshot, resetAccountState]);
 
+  // Membership changes can happen from another owner's device. Realtime is the
+  // fast path; the foreground check below is the durable fallback.
+  useEffect(() => {
+    const userId = session?.user?.id;
+    if (!userId) return undefined;
+    let active = true;
+    const channel = supabase
+      .channel(`workspace-membership-${userId}`)
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'org_members',
+        filter: `user_id=eq.${userId}`,
+      }, () => {
+        void fetchCurrentOrgId().then(async (orgId) => {
+          if (!active || activeUserIdRef.current !== userId || orgId === activeOrgIdRef.current) return;
+          await bindLocalWorkspace(userId, orgId);
+          if (!active || activeUserIdRef.current !== userId) return;
+          activeOrgIdRef.current = orgId;
+          setWorkspaceEpoch((epoch) => epoch + 1);
+        }).catch(() => undefined);
+      })
+      .subscribe();
+    return () => {
+      active = false;
+      void supabase.removeChannel(channel);
+    };
+  }, [session?.user?.id]);
+
   // Flush queued offline writes when the app returns to the foreground.
   useEffect(() => {
     const userId = session?.user?.id;
@@ -1088,6 +1133,15 @@ export default function App() {
     const subscription = AppState.addEventListener('change', (state) => {
       if (state !== 'active' || !stillCurrent()) return;
       (async () => {
+        const currentOrgId = await fetchCurrentOrgId();
+        if (!stillCurrent()) return;
+        if (currentOrgId !== activeOrgIdRef.current) {
+          await bindLocalWorkspace(userId, currentOrgId);
+          if (!stillCurrent()) return;
+          activeOrgIdRef.current = currentOrgId;
+          setWorkspaceEpoch((epoch) => epoch + 1);
+          return;
+        }
         const flushed = await flushWriteQueue(userId);
         if (!stillCurrent()) return;
         let refreshed: Snapshot | null = null;
@@ -1107,6 +1161,14 @@ export default function App() {
           setBusinessError('');
         } catch (error) {
           if (stillCurrent()) setBusinessError((error as Error).message);
+        }
+        try {
+          const nextEntitlements = await fetchEntitlements();
+          if (!stillCurrent()) return;
+          setEntitlements(nextEntitlements);
+        } catch {
+          // Preserve the last known entitlement state during a transient
+          // foreground refresh failure; server-side gates remain authoritative.
         }
         if (activeCaseId) {
           setCaseContacts(refreshedCaseData.caseContacts.filter((item) => item.caseId === activeCaseId));
@@ -3599,6 +3661,14 @@ export default function App() {
               accessibilityLabel="Open business dashboard"
               style={styles.businessButton}
               onPress={() => {
+                if (!entitlements.loadedAt) {
+                  Alert.alert('Subscription status unavailable', 'Reconnect and try again before opening paid business analytics.');
+                  return;
+                }
+                if (!entitlements.entitlements.pro) {
+                  Alert.alert('Pro plan required', 'Full business analytics are available on the Pro plan.');
+                  return;
+                }
                 setShowBusinessDashboard(true);
                 void refreshBusiness();
               }}
@@ -5234,12 +5304,21 @@ export default function App() {
       <GlobalDirectoryScreen
         visible={showGlobalDirectory}
         entitled={entitlements.entitlements.directory}
+        entitlementKnown={Boolean(entitlements.loadedAt)}
+        userId={activeUserId}
         importedGlobalIds={new Set(partners.map((partner) => partner.globalPartnerId).filter((id): id is string => Boolean(id)))}
         onClose={() => setShowGlobalDirectory(false)}
-        onImported={(partner, globalId) => {
-          setPartners((current) => current.some((item) => item.id === partner.id)
-            ? current
-            : [{ ...partner, globalPartnerId: globalId }, ...current]);
+        onImported={(_partner, _globalId, initiatingUserId) => {
+          if (activeUserIdRef.current !== initiatingUserId) return;
+          void refreshSnapshot(initiatingUserId)
+            .then((snapshot) => {
+              if (snapshot && activeUserIdRef.current === initiatingUserId) applySnapshot(snapshot);
+            })
+            .catch((error) => {
+              if (activeUserIdRef.current === initiatingUserId) {
+                Alert.alert('Program added; refresh needed', (error as Error).message);
+              }
+            });
         }}
       />
       <WorkspaceScreen

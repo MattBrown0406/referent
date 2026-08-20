@@ -22,14 +22,15 @@ import {
   type Workspace,
 } from './org';
 import { type Entitlement, type EntitlementState } from './entitlements';
+import { prepareForWorkspaceChange } from './store';
 
 type Props = {
   visible: boolean;
   userId: string;
   entitlements: EntitlementState;
   onClose: () => void;
-  // Joining another practice re-homes this account's data, so the caller must
-  // rehydrate everything from the server afterward.
+  // Joining another practice changes the account's active workspace, so the
+  // caller must rehydrate everything from the server afterward.
   onWorkspaceChanged: () => void;
 };
 
@@ -110,6 +111,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   }
 
   function makeInvite() {
+    if (!entitlements.entitlements.pro) {
+      Alert.alert('Pro plan required', 'Team workspace invitations are available on the Pro plan.');
+      return;
+    }
     void run(async () => {
       const invite = await createWorkspaceInvite();
       await load();
@@ -124,13 +129,16 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
     if (!code) return;
     Alert.alert(
       'Join this practice?',
-      'Your partners, referrals, cases, and follow-ups move into the practice workspace you are joining. Everyone in that workspace will be able to see and work on them.',
+      soloOwner
+        ? 'Your personal-workspace partners, referrals, cases, and follow-ups move into the practice you are joining. Everyone in that workspace will be able to see and work on them.'
+        : 'Your account will leave its current practice and join the new one. Work created for your current practice stays with that practice.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Join',
           style: 'destructive',
           onPress: () => void run(async () => {
+            await prepareForWorkspaceChange(userId);
             await acceptWorkspaceInvite(code);
             setJoinCode('');
             await load();
@@ -173,8 +181,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
           <View style={styles.centered}><ActivityIndicator color={COLORS.blue} /></View>
         ) : loadError ? (
           <View style={styles.centered}>
-            <Text style={styles.errorText}>{loadError}</Text>
-            <TouchableOpacity style={styles.retryButton} onPress={() => void load()}>
+            <Text accessibilityRole="alert" style={styles.errorText}>{loadError}</Text>
+            <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: loading }} style={styles.retryButton} onPress={() => void load()}>
               <Text style={styles.retryText}>Try again</Text>
             </TouchableOpacity>
           </View>
@@ -193,7 +201,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                     onSubmitEditing={saveName}
                     returnKeyType="done"
                   />
-                  <TouchableOpacity onPress={saveName} disabled={busy} style={styles.smallButton}>
+                  <TouchableOpacity accessibilityRole="button" accessibilityState={{ disabled: busy, busy }} onPress={saveName} disabled={busy} style={styles.smallButton}>
                     <Text style={styles.smallButtonText}>Save</Text>
                   </TouchableOpacity>
                 </View>
@@ -201,7 +209,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 <View style={styles.nameRow}>
                   <Text style={styles.orgName}>{workspace.name}</Text>
                   {isOwner ? (
-                    <TouchableOpacity onPress={() => setEditingName(workspace.name)} style={styles.smallButtonGhost}>
+                    <TouchableOpacity accessibilityRole="button" onPress={() => setEditingName(workspace.name)} style={styles.smallButtonGhost}>
                       <Text style={styles.smallButtonGhostText}>Rename</Text>
                     </TouchableOpacity>
                   ) : null}
@@ -222,6 +230,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                   </View>
                   {isOwner && member.userId !== userId.toLowerCase() ? (
                     <TouchableOpacity
+                      accessibilityRole="button"
+                      accessibilityState={{ disabled: busy, busy }}
                       disabled={busy}
                       onPress={() => confirmRemove(member.userId, member.displayName)}
                       style={styles.removeButton}
@@ -243,22 +253,22 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                   </View>
                   <View style={entitlements.entitlements[row.key] ? styles.planBadgeActive : styles.planBadge}>
                     <Text style={entitlements.entitlements[row.key] ? styles.planBadgeActiveText : styles.planBadgeText}>
-                      {entitlements.entitlements[row.key] ? 'Active' : 'Free'}
+                      {entitlements.entitlements[row.key] ? 'Active' : entitlements.loadedAt ? 'Free' : 'Unknown'}
                     </Text>
                   </View>
                 </View>
               ))}
               <Text style={styles.helpText}>
-                Subscriptions are managed through the App Store from the upgrade screen.
+                Subscription purchases are not enabled in this build yet. Plan access updates here after ReferralFit activates it for the workspace.
               </Text>
             </View>
 
-            {isOwner ? (
+            {isOwner && entitlements.entitlements.pro ? (
               <View style={styles.card}>
                 <Text style={styles.cardLabel}>Invite a teammate</Text>
                 <Text style={styles.helpText}>
-                  Create a single-use code and share it. When your teammate joins, their existing
-                  partners, referrals, and cases move into this workspace.
+                  Create a single-use code and share it. A solo practitioner's personal data moves
+                  with them; work owned by another practice stays with that practice.
                 </Text>
                 {workspace.openInvites.map((invite) => (
                   <View key={invite.id} style={styles.inviteRow}>
@@ -266,9 +276,16 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                     <Text style={styles.inviteExpiry}>{inviteExpiryLabel(invite.expiresAt)}</Text>
                   </View>
                 ))}
-                <TouchableOpacity disabled={busy} onPress={makeInvite} style={styles.primaryButton}>
+                <TouchableOpacity accessibilityRole="button" accessibilityState={{ disabled: busy, busy }} disabled={busy} onPress={makeInvite} style={styles.primaryButton}>
                   {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryButtonText}>Create invite code</Text>}
                 </TouchableOpacity>
+              </View>
+            ) : isOwner ? (
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>Invite a teammate</Text>
+                <Text style={styles.helpText}>
+                  Team invitations require the Pro plan. Existing members keep access if a plan expires, but new invite codes cannot be created.
+                </Text>
               </View>
             ) : null}
 
@@ -276,8 +293,9 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
               <View style={styles.card}>
                 <Text style={styles.cardLabel}>Join a practice</Text>
                 <Text style={styles.helpText}>
-                  Have an invite code from another practice? Joining moves your data into their
-                  shared workspace.
+                  {soloOwner
+                    ? 'Have an invite code from another practice? Joining moves your personal-workspace data into their workspace and gives their members access to it.'
+                    : 'Have an invite code from another practice? Your account will move, while work created for your current practice stays there.'}
                 </Text>
                 <View style={styles.nameRow}>
                   <TextInput
@@ -289,7 +307,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                     autoCapitalize="none"
                     autoCorrect={false}
                   />
-                  <TouchableOpacity disabled={busy || !joinCode.trim()} onPress={joinWorkspace} style={styles.smallButton}>
+                  <TouchableOpacity accessibilityRole="button" accessibilityState={{ disabled: busy || !joinCode.trim(), busy }} disabled={busy || !joinCode.trim()} onPress={joinWorkspace} style={styles.smallButton}>
                     <Text style={styles.smallButtonText}>Join</Text>
                   </TouchableOpacity>
                 </View>

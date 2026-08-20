@@ -37,16 +37,28 @@ customer-info can be used for instant optimistic UI if desired.
 1. Deploy the function: `supabase functions deploy revenuecat-webhook --no-verify-jwt`
 2. Set the secrets:
    ```
-   supabase secrets set REVENUECAT_WEBHOOK_AUTH="<long random string>"
+   supabase secrets set \
+     REVENUECAT_WEBHOOK_AUTH="<long random string>" \
+     REVENUECAT_ALLOWED_APP_IDS="<RevenueCat production app id>" \
+     REVENUECAT_ALLOWED_STORES="APP_STORE,PLAY_STORE" \
+     REVENUECAT_PRODUCT_MAP_JSON='{"<store product id>":"pro"}'
    ```
    (`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` are provided automatically.)
 3. In RevenueCat → Project → Integrations → Webhooks, add
    `https://<project-ref>.functions.supabase.co/revenuecat-webhook` and set the
    Authorization header value to the same string.
 
+Production events are accepted by default. Sandbox events are recorded but do
+not grant access. For an isolated non-production project only, set
+`REVENUECAT_ALLOW_SANDBOX=true`; never enable that override on production.
+Events must also match the configured RevenueCat app ID, store, product ID, and
+entitlement mapping. Missing configuration fails closed.
+
 Deliveries are idempotent: the RevenueCat event id is recorded in
 `integration_webhook_events`, duplicates are acknowledged without reprocessing,
-and a delivery that failed mid-processing is retried safely.
+and lifecycle updates are ordered by RevenueCat's event timestamp plus event ID.
+Paid grants are stored per purchaser/product and unioned with manual grants, so
+one purchaser cannot overwrite another purchaser or a founder comp.
 
 ### Event handling
 
@@ -59,9 +71,9 @@ and a delivery that failed mid-processing is retried safely.
 
 ## Manual grants (comps, beta access, founder account)
 
-Insert rows with `source = 'manual'` and no expiry; the webhook never touches
-rows for entitlements it isn't told about, but note a later RevenueCat event
-for the same entitlement will overwrite a manual row. For the founder account:
+Insert rows with `source = 'manual'` and no expiry. Webhook processing preserves
+manual rows even if a later RevenueCat event names the same entitlement. For the
+founder account:
 
 ```sql
 INSERT INTO public.org_entitlements (org_id, entitlement, active, source)

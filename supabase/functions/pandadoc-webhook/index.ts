@@ -88,7 +88,7 @@ Deno.serve(async (request) => {
             external_id: externalId,
             status,
             external_url: sharedLink,
-            completed_at: ['document.completed', 'document.paid'].includes(status) ? new Date().toISOString() : null,
+            completed_at: ['document.completed', 'document.paid'].includes(status) ? new Date().toISOString() : undefined,
             last_synced_at: new Date().toISOString(),
             metadata: { pandadoc_name: data.name || null },
           }, { onConflict: 'owner_id,provider,record_type,external_id' });
@@ -111,10 +111,11 @@ Deno.serve(async (request) => {
       if (updateError) throw updateError;
     }
 
-    await supabase.from('integration_webhook_events').update({
+    const { error: processedError } = await supabase.from('integration_webhook_events').update({
       processed_at: new Date().toISOString(),
       processing_error: '',
     }).eq('provider', 'pandadoc').eq('external_event_id', headerEventId);
+    if (processedError) throw processedError;
     return jsonResponse({ ok: true });
   } catch (error) {
     console.error('PandaDoc webhook processing failed', error);

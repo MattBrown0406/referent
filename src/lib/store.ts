@@ -99,6 +99,7 @@ export type HydrateResult = {
 // user's cached data or queued writes into another account.
 const CACHE_KEY_PREFIX = 'referralfit-cache-v2:';
 const QUEUE_KEY_PREFIX = 'referralfit-write-queue-v2:';
+const WORKSPACE_KEY_PREFIX = 'referralfit-workspace-v1:';
 
 function accountStorageKey(prefix: string, userId: string): string {
   if (!isUuid(userId)) throw new StoreError('Cannot use offline storage without a valid account ID.', false);
@@ -146,6 +147,24 @@ async function assertSessionFence(fence: SessionFence, queued = false): Promise<
   if (current.sessionId !== fence.sessionId) {
     throw new StoreError('The signed-in session changed while saving. Retry for the current account.', queued);
   }
+}
+
+async function assertWorkspaceFence(fence: SessionFence): Promise<string> {
+  const key = accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId);
+  let storedOrg: string | null;
+  try {
+    storedOrg = await AsyncStorage.getItem(key);
+  } catch (error) {
+    throw persistenceError('cache', error);
+  }
+  const result = await supabase.rpc('current_org_id');
+  if (result.error) throw result.error;
+  if (typeof result.data !== 'string' || !storedOrg
+      || result.data.toLowerCase() !== storedOrg.toLowerCase()) {
+    throw new StoreError('The active workspace changed. Reload before saving.', false);
+  }
+  await assertSessionFence(fence);
+  return storedOrg.toLowerCase();
 }
 
 function persistenceError(area: 'cache' | 'offline queue', error: unknown): StoreError {
@@ -353,7 +372,7 @@ function isMissingParentError(error: unknown): boolean {
 export async function flushWriteQueue(expectedUserId: string): Promise<number> {
   const fence = await sessionFence(expectedUserId);
   return withQueueLock(async () => {
-    await assertSessionFence(fence);
+    await assertWorkspaceFence(fence);
     let flushed = 0;
     let ops = await readQueueUnlocked(fence.userId);
     const deferred: QueueOp[] = [];
@@ -361,6 +380,7 @@ export async function flushWriteQueue(expectedUserId: string): Promise<number> {
     while (ops.length) {
       const [head, ...rest] = ops;
       try {
+        await assertWorkspaceFence(fence);
         await applyQueueOp(head, fence.userId);
         flushed += 1;
       } catch (error) {
@@ -376,10 +396,10 @@ export async function flushWriteQueue(expectedUserId: string): Promise<number> {
           throw new StoreError(`A queued change was rejected by the server and remains pending: ${message}`, true);
         }
       }
-      await assertSessionFence(fence);
+      await assertWorkspaceFence(fence);
       ops = rest;
       await writeQueueUnlocked(fence.userId, [...ops, ...deferred]);
-      await assertSessionFence(fence);
+      await assertWorkspaceFence(fence);
     }
 
     // Retry children whose parents appeared later in the FIFO.
@@ -388,6 +408,7 @@ export async function flushWriteQueue(expectedUserId: string): Promise<number> {
     for (let index = 0; index < retry.length; index += 1) {
       const op = retry[index];
       try {
+        await assertWorkspaceFence(fence);
         await applyQueueOp(op, fence.userId);
         flushed += 1;
       } catch (error) {
@@ -399,9 +420,9 @@ export async function flushWriteQueue(expectedUserId: string): Promise<number> {
           throw new StoreError(`A queued dependent change was rejected and remains pending: ${message}`, true);
         }
       }
-      await assertSessionFence(fence);
+      await assertWorkspaceFence(fence);
       await writeQueueUnlocked(fence.userId, [...retained, ...retry.slice(index + 1)]);
-      await assertSessionFence(fence);
+      await assertWorkspaceFence(fence);
     }
     return flushed;
   });
@@ -415,6 +436,66 @@ export async function pendingWriteCount(expectedUserId: string): Promise<number>
     await assertSessionFence(fence);
     return count;
   });
+}
+
+// Joining another workspace changes the tenant behind an otherwise unchanged
+// auth user. Flush the old workspace queue, refuse to cross the boundary while
+// anything remains unsynced, then remove the account-scoped cache so hydrate()
+// cannot interpret old-workspace rows as new unsynced local records.
+export async function prepareForWorkspaceChange(expectedUserId: string): Promise<void> {
+  const fence = await sessionFence(expectedUserId);
+  await flushWriteQueue(fence.userId);
+  await assertSessionFence(fence);
+  // Match hydrate's cache-then-queue lock order to avoid lock inversion.
+  await withCacheLock(async () => {
+    await withQueueLock(async () => {
+      const pending = await readQueueUnlocked(fence.userId);
+      if (pending.length) {
+        throw new StoreError('Sync pending changes before joining another workspace.', true);
+      }
+      try {
+        await AsyncStorage.multiRemove([
+          accountStorageKey(CACHE_KEY_PREFIX, fence.userId),
+          accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
+          accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId),
+        ]);
+      } catch (error) {
+        throw persistenceError('cache', error);
+      }
+      await assertSessionFence(fence);
+    });
+  });
+}
+
+// Bind account-local cache/queue data to the authoritative server workspace.
+// A missing marker is treated as untrusted legacy state and quarantined too.
+export async function bindLocalWorkspace(expectedUserId: string, orgId: string): Promise<boolean> {
+  if (!isUuid(orgId)) throw new StoreError('A valid workspace is required before loading offline data.', false);
+  const fence = await sessionFence(expectedUserId);
+  const workspaceKey = accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId);
+  return withCacheLock(async () => withQueueLock(async () => {
+    await assertSessionFence(fence);
+    let previous: string | null;
+    try {
+      previous = await AsyncStorage.getItem(workspaceKey);
+    } catch (error) {
+      throw persistenceError('cache', error);
+    }
+    const changed = previous?.toLowerCase() !== orgId.toLowerCase();
+    if (changed) {
+      try {
+        await AsyncStorage.multiRemove([
+          accountStorageKey(CACHE_KEY_PREFIX, fence.userId),
+          accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
+        ]);
+        await AsyncStorage.setItem(workspaceKey, orgId.toLowerCase());
+      } catch (error) {
+        throw persistenceError('cache', error);
+      }
+    }
+    await assertSessionFence(fence);
+    return changed;
+  }));
 }
 
 // ─── Row ↔ app-type mapping (snake_case DB ↔ camelCase app) ─────────────────
@@ -1074,9 +1155,9 @@ export async function persistCache(snapshot: Snapshot, expectedUserId: string): 
   // commit in call order rather than getSession() completion order.
   await withCacheLock(async () => {
     const fence = await sessionFence(expectedUserId);
-    await assertSessionFence(fence);
+    await assertWorkspaceFence(fence);
     await writeCacheUnlocked(fence, snapshot);
-    await assertSessionFence(fence);
+    await assertWorkspaceFence(fence);
   });
 }
 
@@ -1095,6 +1176,7 @@ async function runOrQueue(
   const fence = await sessionFence(expectedUserId);
   let result: { error: { message: string } | null };
   try {
+    await assertWorkspaceFence(fence);
     result = await execute(fence.userId);
   } catch (error) {
     if (!isNetworkError(error)) throw error;
@@ -1102,7 +1184,7 @@ async function runOrQueue(
     await enqueueOp(fence, op);
     return;
   }
-  await assertSessionFence(fence);
+  await assertWorkspaceFence(fence);
   if (!result.error) return;
   if (isNetworkError(result.error)) {
     await enqueueOp(fence, op);
