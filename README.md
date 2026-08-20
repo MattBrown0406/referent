@@ -2,6 +2,30 @@
 
 A native Expo app for managing professional referral relationships and finding clinically appropriate placements.
 
+## Platform (multi-practice buildout)
+
+ReferralFit is now a multi-tenant platform with five layers, built to be sold
+to other intervention practices on recurring plans:
+
+1. **Org workspaces** — every account belongs to a practice workspace
+   (`orgs`/`org_members`); teammates share partners, referrals, cases, and
+   follow-ups, joined via single-use invite codes from the in-app Workspace
+   screen. Tenancy is enforced end-to-end: RLS, composite foreign keys, and
+   every transactional RPC scope by `org_id`.
+2. **Entitlements** — subscription state per workspace
+   (`pro` / `directory` / `benchmarks`), mirrored from RevenueCat IAP by the
+   `revenuecat-webhook` edge function. See `docs/ENTITLEMENTS.md`.
+3. **Shared directory** — a platform-curated, verified list of treatment
+   programs (`global_partners`) that Directory-plan workspaces browse and
+   import into their own network with provenance.
+4. **Center portal** (`portal/`) — treatment programs claim their listing with
+   an admin-issued code and keep it accurate themselves. Verification status
+   stays with ReferralFit; claiming never buys ranking (no pay-for-placement,
+   consistent with EKRA/anti-brokering constraints).
+5. **Benchmarks** — entitlement-gated, aggregate-only network medians
+   (admit rate, family experience, placement rate, median quote) with a
+   3-workspace k-anonymity floor.
+
 ## First-version features
 
 - Searchable partner directory organized by provider type
@@ -23,10 +47,12 @@ A native Expo app for managing professional referral relationships and finding c
 
 ## Backend
 
-The app is backed by Supabase (Postgres) with email/password auth. All tables
-(`partners`, `touches`, `referrals`, `match_profiles`) are protected by
-owner-only row-level security; the publishable anon key in `src/lib/supabase.ts`
-is a public client value and is safe to ship in the bundle. Relationship
+The app is backed by Supabase (Postgres) with email/password auth. All tenant
+tables (`partners`, `touches`, `referrals`, `match_profiles`, the case tables)
+are protected by workspace-scoped row-level security (`org_id`), with
+`owner_id` retained on every row for attribution; the publishable anon key in
+`src/lib/supabase.ts` is a public client value and is safe to ship in the
+bundle. Relationship
 balances come from the `partner_balances` view; `partners_going_cold` is
 mirrored client-side for notification scheduling.
 
