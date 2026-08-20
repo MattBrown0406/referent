@@ -6,23 +6,25 @@ SELECT plan(63);
 
 WITH expected(child_table, constraint_name, parent_table, child_columns, delete_action) AS (
   VALUES
-    ('touches', 'touches_partner_owner_fk', 'partners', ARRAY['partner_id','owner_id'], 'c'),
-    ('referrals', 'referrals_partner_owner_fk', 'partners', ARRAY['partner_id','owner_id'], 'c'),
-    ('follow_ups', 'follow_ups_partner_owner_fk', 'partners', ARRAY['partner_id','owner_id'], 'c'),
-    ('follow_ups', 'follow_ups_referral_owner_fk', 'referrals', ARRAY['referral_id','owner_id'], 'c'),
-    ('case_contacts', 'case_contacts_case_owner_fk', 'cases', ARRAY['case_id','owner_id'], 'c'),
-    ('case_events', 'case_events_case_owner_fk', 'cases', ARRAY['case_id','owner_id'], 'c'),
-    ('case_documents', 'case_documents_case_owner_fk', 'cases', ARRAY['case_id','owner_id'], 'c'),
-    ('match_profiles', 'match_profiles_partner_owner_fk', 'partners', ARRAY['assigned_partner_id','owner_id'], 'n'),
-    ('match_profiles', 'match_profiles_referral_owner_fk', 'referrals', ARRAY['referral_id','owner_id'], 'n'),
-    ('match_profiles', 'match_profiles_case_owner_fk', 'cases', ARRAY['case_id','owner_id'], 'n'),
-    ('referrals', 'referrals_match_profile_owner_fk', 'match_profiles', ARRAY['match_profile_id','owner_id'], 'n'),
-    ('referrals', 'referrals_case_owner_fk', 'cases', ARRAY['case_id','owner_id'], 'n'),
-    ('cases', 'cases_match_profile_owner_fk', 'match_profiles', ARRAY['match_profile_id','owner_id'], 'n'),
-    ('follow_ups', 'follow_ups_case_owner_fk', 'cases', ARRAY['case_id','owner_id'], 'n'),
-    ('case_events', 'case_events_contact_owner_fk', 'case_contacts', ARRAY['contact_id','owner_id'], 'n'),
-    ('case_events', 'case_events_referral_owner_fk', 'referrals', ARRAY['referral_id','owner_id'], 'n'),
-    ('case_events', 'case_events_document_owner_fk', 'case_documents', ARRAY['document_id','owner_id'], 'n')
+    ('touches', 'touches_partner_org_fk', 'partners', ARRAY['partner_id','org_id'], 'c'),
+    ('referrals', 'referrals_partner_org_fk', 'partners', ARRAY['partner_id','org_id'], 'c'),
+    ('follow_ups', 'follow_ups_partner_org_fk', 'partners', ARRAY['partner_id','org_id'], 'c'),
+    ('follow_ups', 'follow_ups_referral_org_fk', 'referrals', ARRAY['referral_id','org_id'], 'c'),
+    ('case_contacts', 'case_contacts_case_org_fk', 'cases', ARRAY['case_id','org_id'], 'c'),
+    ('case_events', 'case_events_case_org_fk', 'cases', ARRAY['case_id','org_id'], 'c'),
+    ('case_documents', 'case_documents_case_org_fk', 'cases', ARRAY['case_id','org_id'], 'c'),
+    ('case_stage_history', 'case_stage_history_case_org_fk', 'cases', ARRAY['case_id','org_id'], 'c'),
+    ('case_integrations', 'case_integrations_case_org_fk', 'cases', ARRAY['case_id','org_id'], 'c'),
+    ('match_profiles', 'match_profiles_partner_org_fk', 'partners', ARRAY['assigned_partner_id','org_id'], 'n'),
+    ('match_profiles', 'match_profiles_referral_org_fk', 'referrals', ARRAY['referral_id','org_id'], 'n'),
+    ('match_profiles', 'match_profiles_case_org_fk', 'cases', ARRAY['case_id','org_id'], 'n'),
+    ('referrals', 'referrals_match_profile_org_fk', 'match_profiles', ARRAY['match_profile_id','org_id'], 'n'),
+    ('referrals', 'referrals_case_org_fk', 'cases', ARRAY['case_id','org_id'], 'n'),
+    ('cases', 'cases_match_profile_org_fk', 'match_profiles', ARRAY['match_profile_id','org_id'], 'n'),
+    ('follow_ups', 'follow_ups_case_org_fk', 'cases', ARRAY['case_id','org_id'], 'n'),
+    ('case_events', 'case_events_contact_org_fk', 'case_contacts', ARRAY['contact_id','org_id'], 'n'),
+    ('case_events', 'case_events_referral_org_fk', 'referrals', ARRAY['referral_id','org_id'], 'n'),
+    ('case_events', 'case_events_document_org_fk', 'case_documents', ARRAY['document_id','org_id'], 'n')
 ), actual AS (
   SELECT
     child.relname AS child_table,
@@ -41,15 +43,15 @@ WITH expected(child_table, constraint_name, parent_table, child_columns, delete_
   JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
   JOIN pg_class parent ON parent.oid = c.confrelid
   WHERE child_ns.nspname = 'public'
-    AND c.conname LIKE '%_owner_fk'
+    AND c.conname LIKE '%_org_fk'
 )
 SELECT is(
   (SELECT count(*)::integer
      FROM expected e
      JOIN actual a USING (child_table, constraint_name, parent_table, child_columns, delete_action)
     WHERE a.convalidated),
-  17,
-  'all 17 expected same-owner foreign keys exist, preserve delete behavior, and are validated'
+  19,
+  'all 19 expected same-workspace foreign keys exist, preserve delete behavior, and are validated'
 );
 
 SELECT is(
@@ -60,9 +62,9 @@ SELECT is(
     WHERE n.nspname = 'public'
       AND c.contype = 'u'
       AND c.conname IN (
-        'partners_id_owner_key', 'referrals_id_owner_key',
-        'match_profiles_id_owner_key', 'cases_id_owner_key',
-        'case_contacts_id_owner_key', 'case_documents_id_owner_key'
+        'partners_id_org_key', 'referrals_id_org_key',
+        'match_profiles_id_org_key', 'cases_id_org_key',
+        'case_contacts_id_org_key', 'case_documents_id_org_key'
       )),
   6,
   'all referenced parents expose composite unique keys'
@@ -81,8 +83,8 @@ SELECT is(
 
 SELECT ok(
   pg_get_functiondef('public.touch_partner_last_contact()'::regprocedure)
-    LIKE '%p.owner_id = NEW.owner_id%',
-  'touch trigger update matches both partner id and owner id'
+    LIKE '%p.org_id = NEW.org_id%',
+  'touch trigger update matches both partner id and workspace id'
 );
 
 SELECT is(
@@ -128,8 +130,8 @@ SELECT throws_ok(
     )
   $$,
   '23503',
-  'insert or update on table "touches" violates foreign key constraint "touches_partner_owner_fk"',
-  'a child cannot reference another owner''s parent'
+  'insert or update on table "touches" violates foreign key constraint "touches_partner_org_fk"',
+  'a child cannot reference another workspace''s parent'
 );
 
 INSERT INTO public.touches (owner_id, partner_id, kind, occurred_at)

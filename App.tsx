@@ -43,6 +43,7 @@ import {
 import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
+import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
 import {
   type BusinessData,
@@ -755,6 +756,10 @@ export default function App() {
   const [referralSearch, setReferralSearch] = useState('');
   const [referralDirectionFilter, setReferralDirectionFilter] = useState<'All' | ReferralDirection>('All');
   const [showBusinessDashboard, setShowBusinessDashboard] = useState(false);
+  const [showWorkspace, setShowWorkspace] = useState(false);
+  // Incremented after the account joins a different practice workspace, which
+  // re-homes its rows server-side; bumping it re-runs the hydration effect.
+  const [workspaceEpoch, setWorkspaceEpoch] = useState(0);
   const [businessData, setBusinessData] = useState<BusinessData>({ stages: [], integrations: [] });
   const [businessLoading, setBusinessLoading] = useState(false);
   const [businessError, setBusinessError] = useState('');
@@ -1054,7 +1059,7 @@ export default function App() {
       active = false;
       authGenerationRef.current += 1;
     };
-  }, [authResolved, session?.user?.id, applySnapshot, resetAccountState]);
+  }, [authResolved, session?.user?.id, workspaceEpoch, applySnapshot, resetAccountState]);
 
   // Flush queued offline writes when the app returns to the foreground.
   useEffect(() => {
@@ -3137,6 +3142,14 @@ export default function App() {
           </TouchableOpacity>
         </View>
         <View style={styles.headerActions}>
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityLabel="Workspace and team"
+            style={styles.headerIconButton}
+            onPress={() => setShowWorkspace(true)}
+          >
+            <AppIcon name="people-outline" size={20} color={COLORS.gray} />
+          </TouchableOpacity>
           {notificationPermissionState === 'blocked' ? (
             <TouchableOpacity
               accessibilityRole="button"
@@ -5187,6 +5200,15 @@ export default function App() {
         onOpenCase={(caseId) => {
           setShowBusinessDashboard(false);
           setTimeout(() => openCase(caseId), 350);
+        }}
+      />
+      <WorkspaceScreen
+        visible={showWorkspace}
+        userId={activeUserId}
+        onClose={() => setShowWorkspace(false)}
+        onWorkspaceChanged={() => {
+          setShowWorkspace(false);
+          setWorkspaceEpoch((epoch) => epoch + 1);
         }}
       />
       {DoneSheet()}

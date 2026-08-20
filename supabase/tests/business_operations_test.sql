@@ -180,8 +180,8 @@ SELECT throws_ok(
     'square', 'invoice', 'other-owner-case'
   ) $$,
   '23503',
-  'insert or update on table "case_integrations" violates foreign key constraint "case_integrations_case_owner_fk"',
-  'a provider link cannot target another owner case'
+  'insert or update on table "case_integrations" violates foreign key constraint "case_integrations_case_org_fk"',
+  'a provider link cannot target another workspace''s case'
 );
 
 SELECT is(
