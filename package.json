@@ -51,5 +51,10 @@
         "react-native"
       ]
     }
+  },
+  "overrides": {
+    "postcss": {
+      "nanoid": "^3.3.18"
+    }
   }
 }
