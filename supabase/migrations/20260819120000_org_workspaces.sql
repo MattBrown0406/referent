@@ -137,6 +137,21 @@ ALTER TABLE public.case_documents     ADD COLUMN org_id uuid REFERENCES public.o
 ALTER TABLE public.case_stage_history ADD COLUMN org_id uuid REFERENCES public.orgs(id);
 ALTER TABLE public.case_integrations  ADD COLUMN org_id uuid REFERENCES public.orgs(id);
 
+-- Production tables already have owner-only RLS. The migration role is not a
+-- user JWT, so temporarily suspend those policies for the deterministic
+-- backfill, then restore RLS before any new policy or grant is exposed.
+ALTER TABLE public.partners           DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.touches            DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.referrals          DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.match_profiles     DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.follow_ups         DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.cases              DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.case_contacts      DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.case_events        DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.case_documents     DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.case_stage_history DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.case_integrations  DISABLE ROW LEVEL SECURITY;
+
 UPDATE public.partners           t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
 UPDATE public.touches            t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
 UPDATE public.referrals          t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
@@ -145,8 +160,11 @@ UPDATE public.follow_ups         t SET org_id = m.org_id FROM public.org_members
 UPDATE public.cases              t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
 -- Case-child tenancy follows the durable parent case. Historical activity may
 -- be attributed to a different/deleted collaborator, so owner membership is not
--- authoritative for these rows.
+-- authoritative for these rows. The deferred primary-contact constraint also
+-- fires on every UPDATE; suspend it while changing only tenancy metadata.
+ALTER TABLE public.case_contacts DISABLE TRIGGER USER;
 UPDATE public.case_contacts      t SET org_id = c.org_id FROM public.cases c WHERE c.id = t.case_id;
+ALTER TABLE public.case_contacts ENABLE TRIGGER USER;
 UPDATE public.case_events        t SET org_id = c.org_id FROM public.cases c WHERE c.id = t.case_id;
 UPDATE public.case_documents     t SET org_id = c.org_id FROM public.cases c WHERE c.id = t.case_id;
 UPDATE public.case_stage_history t SET org_id = c.org_id FROM public.cases c WHERE c.id = t.case_id;
@@ -163,6 +181,18 @@ ALTER TABLE public.case_events        ALTER COLUMN org_id SET NOT NULL;
 ALTER TABLE public.case_documents     ALTER COLUMN org_id SET NOT NULL;
 ALTER TABLE public.case_stage_history ALTER COLUMN org_id SET NOT NULL;
 ALTER TABLE public.case_integrations  ALTER COLUMN org_id SET NOT NULL;
+
+ALTER TABLE public.partners           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.touches            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.referrals          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.match_profiles     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.follow_ups         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.cases              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.case_contacts      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.case_events        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.case_documents     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.case_stage_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.case_integrations  ENABLE ROW LEVEL SECURITY;
 
 CREATE INDEX partners_org_idx           ON public.partners (org_id);
 CREATE INDEX touches_org_idx            ON public.touches (org_id, partner_id, occurred_at DESC);
