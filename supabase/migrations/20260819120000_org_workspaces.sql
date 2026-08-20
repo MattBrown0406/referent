@@ -143,11 +143,14 @@ UPDATE public.referrals          t SET org_id = m.org_id FROM public.org_members
 UPDATE public.match_profiles     t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
 UPDATE public.follow_ups         t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
 UPDATE public.cases              t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
-UPDATE public.case_contacts      t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
-UPDATE public.case_events        t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
-UPDATE public.case_documents     t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
-UPDATE public.case_stage_history t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
-UPDATE public.case_integrations  t SET org_id = m.org_id FROM public.org_members m WHERE m.user_id = t.owner_id;
+-- Case-child tenancy follows the durable parent case. Historical activity may
+-- be attributed to a different/deleted collaborator, so owner membership is not
+-- authoritative for these rows.
+UPDATE public.case_contacts      t SET org_id = c.org_id FROM public.cases c WHERE c.id = t.case_id;
+UPDATE public.case_events        t SET org_id = c.org_id FROM public.cases c WHERE c.id = t.case_id;
+UPDATE public.case_documents     t SET org_id = c.org_id FROM public.cases c WHERE c.id = t.case_id;
+UPDATE public.case_stage_history t SET org_id = c.org_id FROM public.cases c WHERE c.id = t.case_id;
+UPDATE public.case_integrations  t SET org_id = c.org_id FROM public.cases c WHERE c.id = t.case_id;
 
 ALTER TABLE public.partners           ALTER COLUMN org_id SET NOT NULL;
 ALTER TABLE public.touches            ALTER COLUMN org_id SET NOT NULL;
