@@ -676,6 +676,39 @@ function EmptyState({ icon, title, body }: { icon: IconName; title: string; body
   );
 }
 
+type TimePeriod = 'AM' | 'PM';
+
+function formatTwelveHourInput(value: string): string {
+  const digits = value.replace(/\D/g, '').slice(0, 4);
+  if (digits.length <= 2) return digits;
+  const hourLength = digits.length === 3 && !digits.startsWith('0') ? 1 : 2;
+  return `${digits.slice(0, hourLength)}:${digits.slice(hourLength)}`;
+}
+
+function storedTimeToTwelveHour(value?: string): { time: string; timePeriod: TimePeriod } {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value || '');
+  if (!match) return { time: '', timePeriod: 'AM' };
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) return { time: '', timePeriod: 'AM' };
+  return {
+    time: `${hour % 12 || 12}:${String(minute).padStart(2, '0')}`,
+    timePeriod: hour >= 12 ? 'PM' : 'AM',
+  };
+}
+
+function twelveHourToStoredTime(value: string, period: TimePeriod): string | null {
+  const digits = value.replace(/\D/g, '');
+  if (!digits) return null;
+  const hourDigits = digits.length <= 2 ? digits : digits.slice(0, digits.length - 2);
+  const minuteDigits = digits.length <= 2 ? '00' : digits.slice(-2);
+  const hour = Number(hourDigits);
+  const minute = Number(minuteDigits);
+  if (!Number.isInteger(hour) || hour < 1 || hour > 12 || !Number.isInteger(minute) || minute > 59) return null;
+  const hour24 = (hour % 12) + (period === 'PM' ? 12 : 0);
+  return `${String(hour24).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>('home');
   const [partners, setPartners] = useState<Partner[]>(initialPartners);
@@ -750,10 +783,10 @@ export default function App() {
   const [caseNextStepCaseId, setCaseNextStepCaseId] = useState<string | null>(null); // Case-file next-step editor
   const [doneStatusPicker, setDoneStatusPicker] = useState(false); // Close-the-loop case status picker
   const [caseCloseLoopSaving, setCaseCloseLoopSaving] = useState(false);
-  const [stepForm, setStepForm] = useState<{ kind: FollowUpKind; when: WhenChoice; customDate: string; time: string; waitingOn: string; note: string }>({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', waitingOn: '', note: '' });
+  const [stepForm, setStepForm] = useState<{ kind: FollowUpKind; when: WhenChoice; customDate: string; time: string; timePeriod: TimePeriod; waitingOn: string; note: string }>({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', timePeriod: 'AM', waitingOn: '', note: '' });
   const [snoozeCard, setSnoozeCard] = useState<TodayCard | null>(null);
   const [showQuickAdd, setShowQuickAdd] = useState(false);
-  const [quickAddForm, setQuickAddForm] = useState<{ kind: FollowUpKind; title: string; targetType: 'none' | 'case' | 'partner'; targetId: string; targetSearch: string; when: WhenChoice; customDate: string; time: string; waitingOn: string }>({ kind: 'follow_up', title: '', targetType: 'none', targetId: '', targetSearch: '', when: 'today', customDate: '', time: '', waitingOn: '' });
+  const [quickAddForm, setQuickAddForm] = useState<{ kind: FollowUpKind; title: string; targetType: 'none' | 'case' | 'partner'; targetId: string; targetSearch: string; when: WhenChoice; customDate: string; time: string; timePeriod: TimePeriod; waitingOn: string }>({ kind: 'follow_up', title: '', targetType: 'none', targetId: '', targetSearch: '', when: 'today', customDate: '', time: '', timePeriod: 'AM', waitingOn: '' });
   const [contactPick, setContactPick] = useState<{ card: TodayCard; action: 'call' | 'text'; contacts: CaseContact[] } | null>(null);
   const [todayQuickNote, setTodayQuickNote] = useState<{ card: TodayCard; action: 'call' | 'text'; contact?: CaseContact } | null>(null);
   const [partnerForm, setPartnerForm] = useState<PartnerForm>(makeEmptyPartnerForm);
@@ -2482,6 +2515,14 @@ export default function App() {
   // THE RULE: completing anything requires an outcome. Backed items always
   // open the "Done — what's next?" sheet; only virtual partner cards and
   // unlinked standalone items may complete plainly (cadence self-reschedules).
+  function validatedStepDueTime(): string | undefined | null {
+    if (stepForm.kind !== 'consult' || !stepForm.time.trim()) return undefined;
+    const dueTime = twelveHourToStoredTime(stepForm.time, stepForm.timePeriod);
+    if (dueTime) return dueTime;
+    Alert.alert('Check the time', 'Enter a time from 1:00 through 12:59, then choose AM or PM.');
+    return null;
+  }
+
   function openDoneSheet(card: TodayCard) {
     if (card.virtual || (!card.caseId && !card.referralId)) {
       if (card.virtual) openTouchLogger(partners.find((item) => item.id === card.partnerId) as Partner);
@@ -2490,7 +2531,7 @@ export default function App() {
     }
     setNextStepCard(null);
     setDoneStatusPicker(false);
-    setStepForm({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', waitingOn: '', note: '' });
+    setStepForm({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', timePeriod: 'AM', waitingOn: '', note: '' });
     setDoneCard(card);
   }
 
@@ -2506,6 +2547,7 @@ export default function App() {
       when: followUp?.kind === 'first_call' ? 'in3days' : 'tomorrow',
       customDate: '',
       time: '',
+      timePeriod: 'AM',
       waitingOn: followUp?.waitingOn || '',
       note: '',
     });
@@ -2514,11 +2556,13 @@ export default function App() {
 
   function openNextStepSheet(card: TodayCard) {
     const followUp = card.followUp;
+    const existingTime = storedTimeToTwelveHour(followUp?.dueTime);
     setStepForm({
       kind: followUp?.kind || (card.virtual ? 'touch' : 'follow_up'),
       when: 'tomorrow',
       customDate: '',
-      time: followUp?.dueTime || '',
+      time: existingTime.time,
+      timePeriod: existingTime.timePeriod,
       waitingOn: followUp?.waitingOn || '',
       note: followUp?.note || '',
     });
@@ -2552,7 +2596,8 @@ export default function App() {
     const followUp = card.followUp;
     const now = new Date().toISOString();
     const dueOn = nextStepDate(stepForm.when, new Date(), stepForm.customDate);
-    const dueTime = stepForm.kind === 'consult' && stepForm.time ? stepForm.time : undefined;
+    const dueTime = validatedStepDueTime();
+    if (dueTime === null) return;
     const completed: FollowUp = { ...followUp, status: 'done', completedAt: now, snoozedUntil: undefined };
     const next: FollowUp = {
       id: makeId('f'),
@@ -2699,7 +2744,8 @@ export default function App() {
     if (!card) return;
     if (!mutationSlotAvailable('The next step')) return;
     const dueOn = nextStepDate(stepForm.when, new Date(), stepForm.customDate);
-    const dueTime = stepForm.kind === 'consult' && stepForm.time ? stepForm.time : undefined;
+    const dueTime = validatedStepDueTime();
+    if (dueTime === null) return;
     const waitingOn = stepForm.kind === 'waiting_on' ? stepForm.waitingOn.trim() : undefined;
     setNextStepCard(null);
     if (card.virtual) {
@@ -2739,14 +2785,15 @@ export default function App() {
   }
 
   function openCaseNextStep(record: CaseRecord) {
-    setStepForm({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', waitingOn: '', note: '' });
+    setStepForm({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', timePeriod: 'AM', waitingOn: '', note: '' });
     setCaseNextStepCaseId(record.id);
   }
 
   function saveCaseNextStep(record: CaseRecord) {
     if (!mutationSlotAvailable('The case next step')) return;
     const dueOn = nextStepDate(stepForm.when, new Date(), stepForm.customDate);
-    const dueTime = stepForm.kind === 'consult' && stepForm.time ? stepForm.time : undefined;
+    const dueTime = validatedStepDueTime();
+    if (dueTime === null) return;
     const waitingOn = stepForm.kind === 'waiting_on' ? stepForm.waitingOn.trim() : undefined;
     const titleAnchor = record.title;
     const title = stepForm.kind === 'promised_call' ? `Call back — ${titleAnchor}`
@@ -2951,6 +2998,13 @@ export default function App() {
       Alert.alert('Say what it is', 'One line is enough — "I promised Sarah I\'d call Thursday".');
       return;
     }
+    const quickDueTime = quickAddForm.kind === 'consult' && quickAddForm.time.trim()
+      ? twelveHourToStoredTime(quickAddForm.time, quickAddForm.timePeriod)
+      : undefined;
+    if (quickAddForm.kind === 'consult' && quickAddForm.time.trim() && !quickDueTime) {
+      Alert.alert('Check the time', 'Enter a time from 1:00 through 12:59, then choose AM or PM.');
+      return;
+    }
     if (!mutationSlotAvailable('The follow-up')) return;
     const linkedCase = quickAddForm.targetType === 'case' ? cases.find((item) => item.id === quickAddForm.targetId) : undefined;
     const linkedPartner = quickAddForm.targetType === 'partner' ? partners.find((item) => item.id === quickAddForm.targetId) : undefined;
@@ -2961,7 +3015,7 @@ export default function App() {
       kind: quickAddForm.kind,
       title: quickAddForm.title.trim(),
       dueOn: nextStepDate(quickAddForm.when, new Date(), quickAddForm.customDate),
-      dueTime: quickAddForm.kind === 'consult' && quickAddForm.time ? quickAddForm.time : undefined,
+      dueTime: quickDueTime || undefined,
       waitingOn: quickAddForm.kind === 'waiting_on' ? quickAddForm.waitingOn.trim() : undefined,
       status: 'open',
       note: '',
@@ -2969,7 +3023,7 @@ export default function App() {
     const nextFollowUps = [followUp, ...followUps];
     setFollowUps(nextFollowUps);
     setShowQuickAdd(false);
-    setQuickAddForm({ kind: 'follow_up', title: '', targetType: 'none', targetId: '', targetSearch: '', when: 'today', customDate: '', time: '', waitingOn: '' });
+    setQuickAddForm({ kind: 'follow_up', title: '', targetType: 'none', targetId: '', targetSearch: '', when: 'today', customDate: '', time: '', timePeriod: 'AM', waitingOn: '' });
     void settleOptimisticWrite(
       () => createFollowUp(followUp, activeUserId),
       { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
@@ -5102,7 +5156,19 @@ export default function App() {
           <DropdownField label="DATE" value={stepForm.customDate || customDateOptions[0]?.value || ''} icon="calendar-outline" onChange={(customDate) => setStepForm((current) => ({ ...current, customDate }))} options={customDateOptions} />
         ) : null}
         {stepForm.kind === 'consult' ? (
-          <FormField label="TIME (OPTIONAL, 24H — e.g. 14:00)" value={stepForm.time} onChangeText={(time) => setStepForm((current) => ({ ...current, time: time.replace(/[^\d:]/g, '').slice(0, 5) }))} placeholder="14:00" keyboardType="number-pad" />
+          <View style={styles.timeEntryRow}>
+            <View style={styles.timeInputField}>
+              <FormField label="TIME (OPTIONAL)" value={stepForm.time} onChangeText={(time) => setStepForm((current) => ({ ...current, time: formatTwelveHourInput(time) }))} placeholder="9:00" keyboardType="number-pad" />
+            </View>
+            <View style={styles.timePeriodField}>
+              <Text style={styles.fieldLabel}>AM OR PM</Text>
+              <View style={styles.timePeriodRow}>
+                {(['AM', 'PM'] as TimePeriod[]).map((period) => (
+                  <Pill key={period} label={period} active={stepForm.timePeriod === period} onPress={() => setStepForm((current) => ({ ...current, timePeriod: period }))} />
+                ))}
+              </View>
+            </View>
+          </View>
         ) : null}
         <FormField label="NOTE (OPTIONAL)" value={stepForm.note} onChangeText={(note) => setStepForm((current) => ({ ...current, note }))} placeholder="Anything to remember when this comes due" multiline />
       </>
@@ -5322,7 +5388,19 @@ export default function App() {
                 <DropdownField label="DATE" value={quickAddForm.customDate || customDateOptions[0]?.value || ''} icon="calendar-outline" onChange={(customDate) => setQuickAddForm((current) => ({ ...current, customDate }))} options={customDateOptions} />
               ) : null}
               {quickAddForm.kind === 'consult' ? (
-                <FormField label="TIME (OPTIONAL, 24H)" value={quickAddForm.time} onChangeText={(time) => setQuickAddForm((current) => ({ ...current, time: time.replace(/[^\d:]/g, '').slice(0, 5) }))} placeholder="14:00" keyboardType="number-pad" />
+                <View style={styles.timeEntryRow}>
+                  <View style={styles.timeInputField}>
+                    <FormField label="TIME (OPTIONAL)" value={quickAddForm.time} onChangeText={(time) => setQuickAddForm((current) => ({ ...current, time: formatTwelveHourInput(time) }))} placeholder="9:00" keyboardType="number-pad" />
+                  </View>
+                  <View style={styles.timePeriodField}>
+                    <Text style={styles.fieldLabel}>AM OR PM</Text>
+                    <View style={styles.timePeriodRow}>
+                      {(['AM', 'PM'] as TimePeriod[]).map((period) => (
+                        <Pill key={period} label={period} active={quickAddForm.timePeriod === period} onPress={() => setQuickAddForm((current) => ({ ...current, timePeriod: period }))} />
+                      ))}
+                    </View>
+                  </View>
+                </View>
               ) : null}
               <TouchableOpacity style={styles.primaryButton} onPress={saveQuickAdd}><Text style={styles.primaryButtonText}>Add to the list</Text></TouchableOpacity>
               <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel</Text></TouchableOpacity>
@@ -5769,6 +5847,10 @@ const styles = StyleSheet.create({
   formIntro: { color: COLORS.gray, fontSize: 13, lineHeight: 19, marginBottom: 20 },
   formField: { marginBottom: 15 },
   formInput: { backgroundColor: COLORS.white, minHeight: 48, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 14, color: COLORS.ink, fontSize: 13, outlineStyle: 'none' } as any,
+  timeEntryRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
+  timeInputField: { flex: 1, minWidth: 0 },
+  timePeriodField: { width: 132 },
+  timePeriodRow: { flexDirection: 'row', gap: 6 },
   multilineInput: { minHeight: 94, paddingTop: 13, textAlignVertical: 'top' },
   formRow: { flexDirection: 'row', gap: 10 },
   networkPlanRow: { minHeight: 52, flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, borderRadius: 14, paddingHorizontal: 12, marginTop: -7, marginBottom: 15 },

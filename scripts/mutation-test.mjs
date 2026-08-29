@@ -54,6 +54,10 @@ assert.match(source, /function CaseNextStepModal\(record: CaseRecord\)/, 'case f
 assert.match(source, /accessibilityLabel=\{`Schedule a next step for \$\{record\.title\}`\}/, 'case files must expose a clear schedule-next-step action');
 assert.match(source, /function saveCaseNextStep\(record: CaseRecord\)[\s\S]{0,1200}caseId: record\.id,[\s\S]{0,500}status: 'open'/, 'case-file scheduling must create an open follow-up linked to that case');
 assert.match(source, /Scheduled here also appears on Today when it is due\./, 'case files must explain where scheduled next steps appear');
+assert.match(source, /function formatTwelveHourInput\(value: string\): string/, 'consult times must auto-format numeric input as a clock time');
+assert.match(source, /function twelveHourToStoredTime\(value: string, period: TimePeriod\): string \| null/, '12-hour input must be converted to the stored 24-hour time contract');
+assert.match(source, /<Text style=\{styles\.fieldLabel\}>AM OR PM<\/Text>/, 'consult scheduling must provide an explicit AM/PM selector');
+assert.match(source, /Enter a time from 1:00 through 12:59, then choose AM or PM\./, 'invalid consultation times must be rejected with useful guidance');
 assert.match(source, /id: paymentForm\.eventId/, 'additional-payment retries must reuse the same idempotency key');
 assert.match(source, /setCasePaymentForm\(paymentForm\)/, 'an unconfirmed payment must reopen with its original idempotency key');
 assert.match(source, /key=\{`\$\{record\.id\}:\$\{record\.summary\}`\}/, 'the inline summary editor must remount after a modal edit');
