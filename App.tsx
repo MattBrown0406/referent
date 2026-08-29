@@ -747,6 +747,7 @@ export default function App() {
   const [showHomeMore, setShowHomeMore] = useState(false);
   const [doneCard, setDoneCard] = useState<TodayCard | null>(null); // "Done — what's next?" sheet
   const [nextStepCard, setNextStepCard] = useState<TodayCard | null>(null); // Set-next-step sheet
+  const [caseNextStepCaseId, setCaseNextStepCaseId] = useState<string | null>(null); // Case-file next-step editor
   const [doneStatusPicker, setDoneStatusPicker] = useState(false); // Close-the-loop case status picker
   const [caseCloseLoopSaving, setCaseCloseLoopSaving] = useState(false);
   const [stepForm, setStepForm] = useState<{ kind: FollowUpKind; when: WhenChoice; customDate: string; time: string; waitingOn: string; note: string }>({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', waitingOn: '', note: '' });
@@ -1731,6 +1732,7 @@ export default function App() {
     setCaseEditForm(null);
     setCaseBusinessForm(null);
     setCasePaymentForm(null);
+    setCaseNextStepCaseId(null);
     setQuickNoteContact(null);
     setDocView(null);
   }
@@ -2734,6 +2736,47 @@ export default function App() {
     };
     if (followUp.caseId) logTodaySystemEvent(followUp.caseId, `Next step: ${followUp.title} → ${updated.title} (${shortDate(updated.dueOn)}${updated.dueTime ? ` ${updated.dueTime}` : ''})`);
     persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
+  }
+
+  function openCaseNextStep(record: CaseRecord) {
+    setStepForm({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', waitingOn: '', note: '' });
+    setCaseNextStepCaseId(record.id);
+  }
+
+  function saveCaseNextStep(record: CaseRecord) {
+    if (!mutationSlotAvailable('The case next step')) return;
+    const dueOn = nextStepDate(stepForm.when, new Date(), stepForm.customDate);
+    const dueTime = stepForm.kind === 'consult' && stepForm.time ? stepForm.time : undefined;
+    const waitingOn = stepForm.kind === 'waiting_on' ? stepForm.waitingOn.trim() : undefined;
+    const titleAnchor = record.title;
+    const title = stepForm.kind === 'promised_call' ? `Call back — ${titleAnchor}`
+      : stepForm.kind === 'consult' ? `Consult — ${titleAnchor}`
+        : stepForm.kind === 'waiting_on' ? `Check — ${waitingOn || titleAnchor}`
+          : stepForm.kind === 'touch' ? `Reach out — ${titleAnchor}`
+            : stepForm.kind === 'first_call' ? `First call — ${titleAnchor}`
+              : `Follow up — ${titleAnchor}`;
+    const followUp: FollowUp = {
+      id: makeId('f'),
+      caseId: record.id,
+      kind: stepForm.kind,
+      title,
+      dueOn,
+      dueTime,
+      waitingOn,
+      note: stepForm.note.trim(),
+      status: 'open',
+    };
+    const previousFollowUps = followUps;
+    const nextFollowUps = [followUp, ...previousFollowUps];
+    setFollowUps(nextFollowUps);
+    setCaseNextStepCaseId(null);
+    void settleOptimisticWrite(
+      () => createFollowUp(followUp, activeUserId),
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps: previousFollowUps, scorecards },
+      () => setFollowUps(previousFollowUps),
+      'The case next step',
+    );
   }
 
   // Snooze: backed items write snoozed_until (today_actions hides them until
@@ -3972,6 +4015,7 @@ export default function App() {
     if (caseEditForm) return EditCaseModal();
     if (caseBusinessForm) return CaseBusinessDetailsModal();
     if (casePaymentForm) return AddCasePaymentModal();
+    if (caseNextStepCaseId === activeCase.id) return CaseNextStepModal(activeCase);
     if (caseContactForm) return CaseContactModal();
     if (quickNoteContact) return QuickNoteModal();
     if (docView) return DocViewModal();
@@ -3981,7 +4025,9 @@ export default function App() {
       || referralMatches.find((item) => item.caseId === record.id)
       || null;
     const linkedReferrals = referrals.filter((item) => item.caseId === record.id || (linkedMatch ? item.matchProfileId === linkedMatch.id : false));
-    const linkedFollowUps = followUps.filter((item) => item.caseId === record.id && item.status === 'open');
+    const linkedFollowUps = followUps
+      .filter((item) => item.caseId === record.id && item.status === 'open')
+      .sort((a, b) => `${a.dueOn} ${a.dueTime || ''}`.localeCompare(`${b.dueOn} ${b.dueTime || ''}`));
     const timeline = caseEvents.slice().sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={closeCase}>
@@ -4016,6 +4062,32 @@ export default function App() {
                   </TouchableOpacity>
                 </View>
                 <Text style={styles.profileName}>Opened {shortDate(record.createdAt.slice(0, 10))} · active {relativeActivity(record.updatedAt)}</Text>
+              </View>
+
+              <View style={styles.infoCard}>
+                <View style={styles.caseSectionHeader}>
+                  <View>
+                    <Text style={styles.infoTitle}>Next steps</Text>
+                    <Text style={styles.caseSectionHint}>Scheduled here also appears on Today when it is due.</Text>
+                  </View>
+                  <TouchableOpacity
+                    accessibilityRole="button"
+                    accessibilityLabel={`Schedule a next step for ${record.title}`}
+                    onPress={() => openCaseNextStep(record)}
+                    style={styles.caseSectionAction}
+                  >
+                    <AppIcon name="calendar-outline" size={15} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Schedule</Text>
+                  </TouchableOpacity>
+                </View>
+                {linkedFollowUps.length ? linkedFollowUps.map((followUp) => (
+                  <View key={followUp.id} style={styles.caseNextStepRow}>
+                    <View style={[styles.followUpIcon, { width: 30, height: 30 }]}><AppIcon name="arrow-forward-circle-outline" size={15} color={COLORS.coral} /></View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.touchLogTitle}>{followUp.title}</Text>
+                      <Text style={styles.touchLogNote}>Due {shortDate(followUp.dueOn)}{followUp.dueTime ? ` at ${followUp.dueTime}` : ''}{followUp.waitingOn ? ` · Waiting on ${followUp.waitingOn}` : ''}</Text>
+                    </View>
+                  </View>
+                )) : <Text style={styles.caseEmptyNote}>No next step scheduled. Add one so this case does not fall through the cracks.</Text>}
               </View>
 
               <View style={styles.infoCard}>
@@ -4278,26 +4350,6 @@ export default function App() {
                     </View>
                   );
                 })}
-                {linkedFollowUps.map((followUp) => {
-                  const partner = partners.find((item) => item.id === followUp.partnerId);
-                  const card = followUpToCard(followUp, new Date(), followUpContext(followUp));
-                  return (
-                    <View key={followUp.id} style={styles.caseLinkedRow}>
-                      <View style={[styles.followUpIcon, { width: 28, height: 28 }]}><AppIcon name={todayKindIcon(card)} size={14} color={COLORS.coral} /></View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.touchLogTitle}>{followUp.title}</Text>
-                        <Text style={styles.touchLogNote}>{partner ? `${partner.organization} · ` : ''}due {shortDate(followUp.dueOn)}{followUp.dueTime ? ` ${followUp.dueTime}` : ''}</Text>
-                        <View style={styles.followUpActions}>
-                          <TouchableOpacity style={styles.followUpActionDone} onPress={() => openDoneSheet(card)}><Text style={styles.followUpActionDoneText}>Done</Text></TouchableOpacity>
-                          <TouchableOpacity style={styles.followUpAction} onPress={() => openNextStepSheet(card)}><Text style={styles.followUpActionText}>Next step</Text></TouchableOpacity>
-                          <TouchableOpacity style={styles.followUpAction} onPress={() => setSnoozeCard(card)}><Text style={styles.followUpActionText}>Snooze</Text></TouchableOpacity>
-                          <TouchableOpacity style={styles.followUpAction} onPress={() => skipFollowUp(followUp)}><Text style={styles.followUpActionText}>Skip</Text></TouchableOpacity>
-                        </View>
-                      </View>
-                    </View>
-                  );
-                })}
-                {!linkedMatch && !linkedReferrals.length && !linkedFollowUps.length ? null : null}
               </View>
             </ScrollView>
           </KeyboardAvoidingView>
@@ -5057,6 +5109,31 @@ export default function App() {
     );
   }
 
+  function CaseNextStepModal(record: CaseRecord) {
+    const close = () => setCaseNextStepCaseId(null);
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Back to case file" onPress={close} style={styles.closeButton}><AppIcon name="arrow-back" size={21} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Schedule next step</Text>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => saveCaseNextStep(record)}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>Set the next action for {record.title}. It will appear on Today when due.</Text>
+              {StepFormFields()}
+              <TouchableOpacity accessibilityRole="button" style={styles.primaryButton} onPress={() => saveCaseNextStep(record)}>
+                <Text style={styles.primaryButtonText}>Schedule next step</Text>
+              </TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
   // "Done — what's next?" — completing anything forces a decision:
   // (a) Next step… / (b) Close the loop. No bare done for linked items.
   function DoneSheet() {
@@ -5790,6 +5867,7 @@ const styles = StyleSheet.create({
   caseSectionAction: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 3, paddingVertical: 6 },
   caseSectionActionText: { color: COLORS.forest, fontSize: 12, fontWeight: '800' },
   caseSectionHint: { color: COLORS.gray, fontSize: 9, lineHeight: 13, marginTop: 2, maxWidth: 250 },
+  caseNextStepRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   caseEmptyNote: { color: COLORS.gray, fontSize: 11, lineHeight: 17, backgroundColor: COLORS.white, borderRadius: 15, borderWidth: 1, borderColor: COLORS.line, padding: 13, marginTop: 9 },
   caseContactRow: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   caseContactEditTarget: { minHeight: 44, justifyContent: 'center' },
