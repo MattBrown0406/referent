@@ -64,6 +64,9 @@ assert.equal((doneSheetSource.match(/<Modal/g) || []).length, 1, 'DoneSheet must
 assert.match(doneSheetSource, /nextStepCard\?\.id === doneCard\.id[\s\S]*StepFormFields\(\)[\s\S]*confirmDoneNextStep/, 'Done → Next step must replace content inside the existing iOS modal');
 assert.match(source, /function NextStepSheet\(\) \{\s*if \(!nextStepCard \|\| doneCard\) return null;/, 'the standalone next-step modal must never mount over the Done modal');
 assert.match(source, /setNextStepCard\(null\);\s*setDoneCard\(null\);/, 'completing and scheduling must dismiss both pieces of Done flow state');
+assert.match(doneSheetSource, /showingDoneNextStep && styles\.stepFormSheet[\s\S]*showingDoneNextStep && styles\.stepFormScroll/, 'the Done next-step form must use a bounded, scrollable iOS sheet');
+assert.match(source, /stepFormSheet: \{ height: '92%', maxHeight: '92%' \}[\s\S]*stepFormScroll: \{ flex: 1 \}/, 'the next-step sheet must reserve viewport height and scrolling space for timing and save controls');
+assert.match(source, /scroll to set when it should happen and save/, 'the long next-step form must tell users that timing and save controls continue below');
 assert.match(source, /const \[caseCloseLoopSaving, setCaseCloseLoopSaving\] = useState\(false\)/, 'case close-loop saves must expose a visible pending state');
 assert.match(source, /if \(!card\?\.followUp \|\| caseCloseLoopSaving\) return/, 'case close-loop saves must reject repeat taps');
 assert.match(source, /setCaseCloseLoopSaving\(true\)[\s\S]{0,700}settleOptimisticWrite\(/, 'the status sheet must stay mounted while the optimistic write settles');

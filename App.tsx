@@ -5069,16 +5069,23 @@ export default function App() {
     };
     const referralAwaiting = Boolean(doneCard.referralId && doneCard.context.referralAwaitingAnswer);
     const linkedCase = doneCard.caseId ? cases.find((item) => item.id === doneCard.caseId) : undefined;
+    const showingDoneNextStep = nextStepCard?.id === doneCard.id;
     return (
       <Modal visible transparent animationType="fade" onRequestClose={close}>
         <Pressable style={styles.dropdownOverlay} onPress={close}>
-          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+          <Pressable style={[styles.dropdownSheet, showingDoneNextStep && styles.stepFormSheet]} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
-            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
-              {nextStepCard?.id === doneCard.id ? (
+            <ScrollView
+              style={[styles.keyboardSheetScroll, showingDoneNextStep && styles.stepFormScroll]}
+              contentContainerStyle={[styles.prePromptBody, showingDoneNextStep && styles.stepFormContent]}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={showingDoneNextStep}
+            >
+              {showingDoneNextStep ? (
                 <>
                   <Text style={styles.prePromptTitle}>Done — set the next step</Text>
                   <Text style={styles.prePromptText}>{doneCard.title} — completing this and creating what comes after.</Text>
+                  <Text style={styles.stepFormScrollHint}>Choose the next step, then scroll to set when it should happen and save.</Text>
                   {StepFormFields()}
                   <TouchableOpacity style={styles.primaryButton} onPress={confirmDoneNextStep}>
                     <Text style={styles.primaryButtonText}>Complete & schedule next</Text>
@@ -5721,7 +5728,11 @@ const styles = StyleSheet.create({
   touchLogNote: { color: COLORS.gray, fontSize: 10, marginTop: 2 },
   touchLogDate: { color: COLORS.gray, fontSize: 10 },
   prePromptBody: { padding: 20, paddingBottom: 26 },
-  keyboardSheetScroll: { maxHeight: '82%' },
+  keyboardSheetScroll: { flexShrink: 1 },
+  stepFormSheet: { height: '92%', maxHeight: '92%' },
+  stepFormScroll: { flex: 1 },
+  stepFormContent: { paddingBottom: 44 },
+  stepFormScrollHint: { color: COLORS.forest, fontSize: 12, fontWeight: '700', lineHeight: 18, marginTop: -8, marginBottom: 12 },
   prePromptIcon: { width: 52, height: 52, borderRadius: 18, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center', marginBottom: 14 },
   prePromptTitle: { color: COLORS.ink, fontSize: 18, fontWeight: '800', letterSpacing: -0.35, marginBottom: 8 },
   prePromptText: { color: COLORS.gray, fontSize: 13, lineHeight: 19, marginBottom: 20 },
