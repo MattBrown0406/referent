@@ -14,6 +14,10 @@ assert.match(source, /setSelectedMatchId\(previousSelectedMatchId\)/);
 assert.match(source, /setPendingCaseMatchId\(previousPendingCaseMatchId\)/);
 assert.doesNotMatch(source, /<TouchableOpacity key=\{item\.id\}[\s\S]*?<TouchableOpacity style=\{styles\.savedMatchPacketButton\}/);
 assert.match(source, /accessibilityRole="radio"\s*accessibilityState=\{\{ selected \}\}/);
+assert.match(source, /function removeReferralMatch\(item: ReferralMatch\)/, 'active referral matches must be removable');
+assert.match(source, /deleteMatchProfile\(item\.id, activeUserId\)/, 'removing an active match must persist the deletion');
+assert.match(source, /Existing case and referral records will not be deleted\./, 'the removal confirmation must explain what is and is not deleted');
+assert.match(source, /accessibilityLabel=\{`Remove \$\{item\.clientLabel\} from active referral matches`\}/, 'each active match must expose a clear accessible remove action');
 assert.match(source, /const stillCurrent = \(\) => active[\s\S]*activeUserIdRef\.current === userId/);
 assert.match(source, /label="MONTHLY CASH COST"/);
 assert.doesNotMatch(source, /label="CASH MIN"|label="CASH MAX"/);
@@ -22,7 +26,7 @@ assert.match(source, /insuranceNetworks: partnerForm\.insuranceNetworks/);
 assert.match(source, /isOutOfNetwork = networkCapabilities\.includes\('Out-of-network'\)/);
 
 for (const label of [
-  'The match', 'The packet log', 'The case', 'The case status change',
+  'The match', 'The match removal', 'The packet log', 'The case', 'The case status change',
   'The payment change', 'The additional payment', 'The case summary', 'The case details', 'The case contact',
   'The completed step and its next step', 'The follow-up and case status',
   'The next step', 'The case next step', 'The contact log', 'The contact note', 'The follow-up',

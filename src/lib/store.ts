@@ -180,6 +180,7 @@ type QueueOp =
   | { kind: 'referral.insert'; row: Record<string, unknown> }
   | { kind: 'match.insert'; row: Record<string, unknown> }
   | { kind: 'match.update'; id: string; patch: Record<string, unknown> }
+  | { kind: 'match.delete'; id: string }
   | { kind: 'touch.insert'; row: Record<string, unknown> }
   | { kind: 'follow_up.insert'; row: Record<string, unknown> }
   | { kind: 'follow_up.update'; id: string; patch: Record<string, unknown> }
@@ -213,6 +214,7 @@ function isQueueOp(value: unknown): value is QueueOp {
   const updateKinds = ['partner.update', 'match.update', 'follow_up.update', 'referral.update'];
   if (typeof op.kind !== 'string') return false;
   if (insertKinds.includes(op.kind)) return Boolean(op.row && typeof op.row === 'object');
+  if (op.kind === 'match.delete') return typeof op.id === 'string';
   if (op.kind === 'follow_up.complete_next') {
     return Boolean(op.completed && typeof op.completed === 'object' && op.next && typeof op.next === 'object'
       && (op.event === null || (op.event && typeof op.event === 'object')));
@@ -311,6 +313,9 @@ async function applyQueueOp(op: QueueOp, userId: string): Promise<void> {
       break;
     case 'match.update':
       ({ error } = await supabase.from('match_profiles').update(op.patch).eq('id', op.id).eq('owner_id', userId));
+      break;
+    case 'match.delete':
+      ({ error } = await supabase.from('match_profiles').delete().eq('id', op.id).eq('owner_id', userId));
       break;
     case 'touch.insert':
       ({ error } = await supabase.from('touches').upsert({ ...op.row, owner_id: userId }, { onConflict: 'id' }));
@@ -1221,6 +1226,12 @@ export async function updateMatchProfile(match: ReferralMatch, expectedUserId: s
   const safeMatchId = safeId(match.id) as string;
   await runOrQueue(expectedUserId, { kind: 'match.update', id: safeMatchId, patch }, (userId) =>
     supabase.from('match_profiles').update(patch).eq('id', safeMatchId).eq('owner_id', userId));
+}
+
+export async function deleteMatchProfile(matchId: string, expectedUserId: string): Promise<void> {
+  const safeMatchId = safeId(matchId) as string;
+  await runOrQueue(expectedUserId, { kind: 'match.delete', id: safeMatchId }, (userId) =>
+    supabase.from('match_profiles').delete().eq('id', safeMatchId).eq('owner_id', userId));
 }
 
 export async function createTouch(touch: Touch, expectedUserId: string): Promise<void> {

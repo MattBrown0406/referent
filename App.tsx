@@ -59,6 +59,7 @@ import {
   completeFollowUpWithOutcome,
   createFollowUp,
   createMatchProfile,
+  deleteMatchProfile,
   createPartner,
   createReferral,
   createTouch,
@@ -1401,6 +1402,51 @@ export default function App() {
     setMatchBudget('');
     setMatchTherapies([]);
     requestAnimationFrame(() => matchClientLabelRef.current?.focus());
+  }
+
+  function removeReferralMatch(item: ReferralMatch) {
+    Alert.alert(
+      'Remove from active matches?',
+      `This removes ${item.clientLabel}'s saved matching criteria. Existing case and referral records will not be deleted.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Remove',
+          style: 'destructive',
+          onPress: () => {
+            if (!mutationSlotAvailable('The match removal')) return;
+            const previousMatches = referralMatches;
+            const previousCases = cases;
+            const previousReferrals = referrals;
+            const previousSelectedMatchId = selectedMatchId;
+            const nextMatches = previousMatches.filter((match) => match.id !== item.id);
+            const nextCases = previousCases.map((record) => record.matchProfileId === item.id ? { ...record, matchProfileId: undefined } : record);
+            const nextReferrals = previousReferrals.map((referral) => referral.matchProfileId === item.id ? { ...referral, matchProfileId: undefined } : referral);
+            const nextActive = nextMatches.find((match) => match.status === 'Matching' || match.status === 'Referred');
+            setReferralMatches(nextMatches);
+            setCases(nextCases);
+            setReferrals(nextReferrals);
+            if (selectedMatchId === item.id) {
+              if (nextActive) loadReferralMatch(nextActive);
+              else startNewReferralMatch();
+            }
+            void settleOptimisticWrite(
+              () => deleteMatchProfile(item.id, activeUserId),
+              { partners, referrals: nextReferrals, referralMatches: nextMatches, touches, followUps, scorecards },
+              { partners, referrals: previousReferrals, referralMatches: previousMatches, touches, followUps, scorecards },
+              () => {
+                setReferralMatches(previousMatches);
+                setCases(previousCases);
+                setReferrals(previousReferrals);
+                setSelectedMatchId(previousSelectedMatchId);
+                if (previousSelectedMatchId === item.id) loadReferralMatch(item);
+              },
+              'The match removal',
+            );
+          },
+        },
+      ],
+    );
   }
 
   async function saveCurrentReferralMatch(): Promise<ReferralMatch | null> {
@@ -3627,12 +3673,18 @@ export default function App() {
                       <Text numberOfLines={1} style={styles.savedMatchMeta}>{item.levelOfCare === 'Any type' ? 'Any level' : item.levelOfCare} · {item.state === 'ANY' ? 'Any location' : item.state}</Text>
                       <Text style={[styles.savedMatchStatus, item.status === 'Referred' && styles.savedMatchStatusComplete]}>{assignedPartner ? `Referred to ${assignedPartner.organization}` : 'Matching in progress'}</Text>
                     </TouchableOpacity>
-                    {item.status === 'Referred' && assignedPartner ? (
-                      <TouchableOpacity accessibilityLabel={`Send packet for ${item.clientLabel}`} accessibilityRole="button" style={styles.savedMatchPacketButton} onPress={() => openPacketForAssigned(item)}>
-                        <AppIcon name="paper-plane-outline" size={13} color={COLORS.forest} />
-                        <Text style={styles.savedMatchPacketButtonText}>Send packet</Text>
+                    <View style={styles.savedMatchActions}>
+                      {item.status === 'Referred' && assignedPartner ? (
+                        <TouchableOpacity accessibilityLabel={`Send packet for ${item.clientLabel}`} accessibilityRole="button" style={styles.savedMatchPacketButton} onPress={() => openPacketForAssigned(item)}>
+                          <AppIcon name="paper-plane-outline" size={13} color={COLORS.forest} />
+                          <Text style={styles.savedMatchPacketButtonText}>Send packet</Text>
+                        </TouchableOpacity>
+                      ) : null}
+                      <TouchableOpacity accessibilityLabel={`Remove ${item.clientLabel} from active referral matches`} accessibilityRole="button" style={styles.savedMatchRemoveButton} onPress={() => removeReferralMatch(item)}>
+                        <AppIcon name="close-circle-outline" size={14} color={COLORS.coral} />
+                        <Text style={styles.savedMatchRemoveButtonText}>Remove</Text>
                       </TouchableOpacity>
-                    ) : null}
+                    </View>
                   </View>
                 );
               })}
@@ -5653,6 +5705,9 @@ const styles = StyleSheet.create({
   savedMatchMeta: { color: COLORS.gray, fontSize: 10, marginTop: 9 },
   savedMatchStatus: { minHeight: 28, color: COLORS.coral, fontSize: 10, lineHeight: 14, fontWeight: '700', marginTop: 5 },
   savedMatchStatusComplete: { color: COLORS.forest },
+  savedMatchActions: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 6 },
+  savedMatchRemoveButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4, paddingHorizontal: 7 },
+  savedMatchRemoveButtonText: { color: COLORS.coral, fontSize: 10, fontWeight: '800' },
   noSavedMatches: { color: COLORS.gray, fontSize: 11, lineHeight: 16, backgroundColor: COLORS.white, borderRadius: 15, borderWidth: 1, borderColor: COLORS.line, padding: 13 },
   filterCard: { backgroundColor: COLORS.white, borderRadius: 24, padding: 18, borderWidth: 1, borderColor: '#E5E8E3', marginBottom: 26 },
   matchEditorHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 16 },

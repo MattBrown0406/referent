@@ -41,6 +41,7 @@ const expectedSignatures = [
   /export async function persistCache\(snapshot: Snapshot, expectedUserId: string\)/,
   /export async function refreshSnapshot\(expectedUserId: string\)/,
   /export async function createPartner\(partner: Partner, expectedUserId: string\)/,
+  /export async function deleteMatchProfile\(matchId: string, expectedUserId: string\)/,
   /export async function assignMatchReferral\(referral: Referral, match: ReferralMatch, expectedUserId: string\)/,
   /export async function logContactActivity\(/,
 ];
@@ -67,6 +68,7 @@ assert.match(source, /complete_follow_up_with_outcome/, 'follow-up + outcome mus
 assert.match(source, /contact\.log_activity/, 'case events and partner touches from one handoff must be one durable queue operation');
 assert.match(source, /log_contact_activity/, 'contact activity must use its transactional RPC');
 assert.match(source, /match_profile_id: null/, 'cyclic referral links must be cleared for dependency-safe base inserts');
+assert.match(source, /match\.delete/, 'match removal must remain durable while offline');
 assert.match(source, /referral_id: null/, 'cyclic match links must be cleared for dependency-safe base inserts');
 assert.match(casesSource, /withStableCaseAccount/, 'case operations must reject account transitions');
 assert.match(casesSource, /current\.sessionId === expected\.sessionId/, 'case operations must share the stable login-session fence');
