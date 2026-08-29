@@ -8,8 +8,11 @@ const [packageJson, packageLock] = await Promise.all([
 
 const expected = {
   expo: '57.0.8',
+  expoCrypto: '57.0.1',
   expoFileSystem: '57.0.1',
+  expoFont: '57.0.1',
   expoModulesCore: '57.0.7',
+  expoSecureStore: '57.0.1',
 };
 
 assert.equal(
@@ -38,6 +41,23 @@ assert.equal(
   'expo-modules-core must be upgraded intentionally with the native Expo dependency set.',
 );
 
+for (const [packageName, expectedVersion] of [
+  ['expo-crypto', expected.expoCrypto],
+  ['expo-font', expected.expoFont],
+  ['expo-secure-store', expected.expoSecureStore],
+]) {
+  assert.equal(
+    packageJson.dependencies[packageName],
+    expectedVersion,
+    `${packageName} must remain exactly pinned after the iOS launch-time symbol mismatch.`,
+  );
+  assert.equal(
+    packageLock.packages[`node_modules/${packageName}`].version,
+    expectedVersion,
+    `${packageName} lockfile version must match the known-compatible native pin.`,
+  );
+}
+
 console.log(
-  `Native Expo compatibility: PASS (expo ${expected.expo}, expo-file-system ${expected.expoFileSystem}, expo-modules-core ${expected.expoModulesCore})`,
+  `Native Expo compatibility: PASS (expo ${expected.expo}; crypto/font/file-system/secure-store 57.0.1; expo-modules-core ${expected.expoModulesCore})`,
 );
