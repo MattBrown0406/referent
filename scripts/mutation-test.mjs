@@ -61,6 +61,9 @@ assert.match(source, /record\.paidAmount > 0 \? `\$\{formatMoney\(record\.paidAm
 assert.match(source, /completeFollowUpWithCase\(completed, updatedCase, event, status !== 'keep'\)/, 'keep-status close-loop actions must explicitly skip the case status update');
 const doneSheetSource = source.slice(source.indexOf('function DoneSheet()'), source.indexOf('function NextStepSheet()'));
 assert.equal((doneSheetSource.match(/<Modal/g) || []).length, 1, 'DoneSheet must keep one stable native modal while choosing a case status');
+assert.match(doneSheetSource, /nextStepCard\?\.id === doneCard\.id[\s\S]*StepFormFields\(\)[\s\S]*confirmDoneNextStep/, 'Done → Next step must replace content inside the existing iOS modal');
+assert.match(source, /function NextStepSheet\(\) \{\s*if \(!nextStepCard \|\| doneCard\) return null;/, 'the standalone next-step modal must never mount over the Done modal');
+assert.match(source, /setNextStepCard\(null\);\s*setDoneCard\(null\);/, 'completing and scheduling must dismiss both pieces of Done flow state');
 assert.match(source, /const \[caseCloseLoopSaving, setCaseCloseLoopSaving\] = useState\(false\)/, 'case close-loop saves must expose a visible pending state');
 assert.match(source, /if \(!card\?\.followUp \|\| caseCloseLoopSaving\) return/, 'case close-loop saves must reject repeat taps');
 assert.match(source, /setCaseCloseLoopSaving\(true\)[\s\S]{0,700}settleOptimisticWrite\(/, 'the status sheet must stay mounted while the optimistic write settles');

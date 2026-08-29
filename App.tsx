@@ -2486,16 +2486,17 @@ export default function App() {
       else if (card.followUp) completePlainFollowUp(card.followUp);
       return;
     }
+    setNextStepCard(null);
     setDoneStatusPicker(false);
     setStepForm({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', waitingOn: '', note: '' });
     setDoneCard(card);
   }
 
   function openDoneNextStepFlow(card: TodayCard) {
-    // Done → Next step: keep doneCard SET (it's what switches the shared
-    // step sheet's confirm to complete-and-create) and layer the sheet on
-    // top. Preselect a sensible kind so one tap can finish: first_call →
-    // Consult (book it), waiting_on → keep waiting.
+    // Keep the existing Done native Modal mounted and switch its inner
+    // content. Presenting a second sibling Modal over it is unreliable on iOS.
+    // Preselect a sensible kind so one tap can finish: first_call → Consult
+    // (book it), waiting_on → keep waiting.
     const followUp = card.followUp;
     const suggested: FollowUpKind = followUp?.kind === 'first_call' ? 'consult' : followUp?.kind === 'waiting_on' ? 'waiting_on' : 'follow_up';
     setStepForm({
@@ -2566,6 +2567,7 @@ export default function App() {
     };
     const nextFollowUps = [next, ...followUps.map((item) => (item.id === followUp.id ? completed : item))];
     setFollowUps(nextFollowUps);
+    setNextStepCard(null);
     setDoneCard(null);
     const event: CaseEvent | null = followUp.caseId ? {
       id: makeId('e'),
@@ -5061,6 +5063,7 @@ export default function App() {
     if (!doneCard) return null;
     const close = () => {
       if (caseCloseLoopSaving) return;
+      setNextStepCard(null);
       setDoneCard(null);
       setDoneStatusPicker(false);
     };
@@ -5072,7 +5075,17 @@ export default function App() {
           <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
             <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
-              {doneStatusPicker && linkedCase ? (
+              {nextStepCard?.id === doneCard.id ? (
+                <>
+                  <Text style={styles.prePromptTitle}>Done — set the next step</Text>
+                  <Text style={styles.prePromptText}>{doneCard.title} — completing this and creating what comes after.</Text>
+                  {StepFormFields()}
+                  <TouchableOpacity style={styles.primaryButton} onPress={confirmDoneNextStep}>
+                    <Text style={styles.primaryButtonText}>Complete & schedule next</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => setNextStepCard(null)} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Back</Text></TouchableOpacity>
+                </>
+              ) : doneStatusPicker && linkedCase ? (
                 <>
                 <Text style={styles.prePromptTitle}>Close the loop — {linkedCase.title}</Text>
                 <Text style={styles.prePromptText}>Complete this item{doneCard.title ? ` (“${doneCard.title}”)` : ''} and set the case status. The change lands on the case timeline.</Text>
@@ -5108,11 +5121,11 @@ export default function App() {
   }
 
   // Set Next Step — reschedule/retype WITHOUT completing the current item.
-  // (When doneCard is set this same sheet is the Done → Next-step flow: its
-  // confirm completes the current item and creates the next one.)
+  // Done → Next step is rendered inside DoneSheet so iOS never has to present
+  // this native Modal over another native Modal.
   function NextStepSheet() {
-    if (!nextStepCard) return null;
-    const close = () => { setNextStepCard(null); setDoneCard(null); };
+    if (!nextStepCard || doneCard) return null;
+    const close = () => setNextStepCard(null);
     return (
       <Modal visible transparent animationType="fade" onRequestClose={close}>
         <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
@@ -5120,11 +5133,11 @@ export default function App() {
             <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
             <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
-              <Text style={styles.prePromptTitle}>{doneCard ? 'Done — set the next step' : 'Set next step'}</Text>
-              <Text style={styles.prePromptText}>{nextStepCard.title}{doneCard ? ' — completing this and creating what comes after.' : ' — rescheduling without completing it.'}</Text>
+              <Text style={styles.prePromptTitle}>Set next step</Text>
+              <Text style={styles.prePromptText}>{nextStepCard.title} — rescheduling without completing it.</Text>
               {StepFormFields()}
-              <TouchableOpacity style={styles.primaryButton} onPress={doneCard ? confirmDoneNextStep : confirmNextStep}>
-                <Text style={styles.primaryButtonText}>{doneCard ? 'Complete & schedule next' : 'Save next step'}</Text>
+              <TouchableOpacity style={styles.primaryButton} onPress={confirmNextStep}>
+                <Text style={styles.primaryButtonText}>Save next step</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel</Text></TouchableOpacity>
             </ScrollView>
