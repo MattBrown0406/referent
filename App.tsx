@@ -3213,7 +3213,7 @@ export default function App() {
     return (
       <View style={styles.header}>
         <View style={styles.brandRow}>
-          <Image accessibilityLabel="ReferralFit Fit Point logo" source={require('./assets/icon-fit-point.png')} style={styles.brandMark} />
+          <Image accessibilityLabel="ReferralFit partner network logo" source={require('./assets/icon-referent-symbiosis.png')} style={styles.brandMark} />
           <TouchableOpacity accessibilityLabel={title || 'ReferralFit'} activeOpacity={0.7} onLongPress={confirmSignOut} delayLongPress={1200}>
             <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
           </TouchableOpacity>

@@ -60,7 +60,9 @@ const stages = [
 ];
 const integrations = [
   { id: 'i1', caseId: 'c1', provider: 'square', recordType: 'invoice', externalId: 'inv1', status: 'partially_paid', amountCents: 100000, paidAmountCents: 50000, currency: 'USD', dueOn: '2026-08-01', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' },
-  { id: 'i2', caseId: 'c1', provider: 'pandadoc', recordType: 'document', externalId: 'doc1', status: 'document.sent', amountCents: null, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' },
+  { id: 'i2', caseId: 'c1', provider: 'pandadoc', recordType: 'document', externalId: 'doc1', status: 'document.sent', amountCents: 350000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' },
+  // Older still-open proposal for the same case must not be double-counted.
+  { id: 'i2-old', caseId: 'c1', provider: 'pandadoc', recordType: 'document', externalId: 'doc0', status: 'document.viewed', amountCents: 250000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-07-31T00:00:00Z' },
   { id: 'i3', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv2', status: 'paid', amountCents: 200000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' },
 ];
 const referrals = [
@@ -78,7 +80,14 @@ equal('case and revenue snapshot', {
 }, { cases: 3, active: 2, quoted: 3000, collected: 2500, outstanding: 500 });
 equal('funnel values', result.funnel.map((item) => item.value), [3, 2, 2, 1]);
 equal('placement and referral rates', [result.placementRate, result.referralPlacementRate], [1 / 3, 1 / 2]);
-equal('integration attention', [result.pendingContracts, result.openInvoices, result.overdueInvoices], [1, 1, 1]);
+equal('integration attention', [result.pendingContracts, result.pendingContractRevenue, result.openInvoices, result.overdueInvoices], [1, 3500, 1, 1]);
+equal('US currency parsing', [
+  business.parseOptionalPositiveUsdCents(''),
+  business.parseOptionalPositiveUsdCents('1500.00'),
+  business.parseOptionalPositiveUsdCents('$1,500.50'),
+  business.parseOptionalPositiveUsdCents('-100'),
+  business.parseOptionalPositiveUsdCents('1500,50'),
+], [null, 150000, 150050, undefined, undefined]);
 equal('source ordering', result.sources.map((item) => [item.source, item.cases, item.collected]), [
   ['Website', 2, 500],
   ['Professional referral', 1, 2000],

@@ -66,7 +66,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.scroll}>
           <View style={styles.card}>
-            <Image accessibilityLabel="ReferralFit Fit Point logo" source={require('../../assets/icon-fit-point.png')} style={styles.brandMark} />
+            <Image accessibilityLabel="ReferralFit partner network logo" source={require('../../assets/icon-referent-symbiosis.png')} style={styles.brandMark} />
             <Text style={styles.brandName}>ReferralFit</Text>
             <Text style={styles.tagline}>Sign in to sync your referral network across devices.</Text>
 

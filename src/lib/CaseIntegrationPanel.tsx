@@ -16,6 +16,7 @@ import {
   deleteCaseIntegration,
   type IntegrationProvider,
   type IntegrationRecordType,
+  parseOptionalPositiveUsdCents,
   saveCaseIntegration,
 } from './business';
 
@@ -26,6 +27,7 @@ type Props = {
 };
 
 type FormState = {
+  id?: string;
   provider: IntegrationProvider;
   recordType: IntegrationRecordType;
   externalId: string;
@@ -71,20 +73,21 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
       Alert.alert('Invalid record URL', 'Use the full HTTPS link from Square or PandaDoc, or leave it blank.');
       return;
     }
-    const dollars = Number(form.amount.replace(/[^\d.]/g, ''));
-    if (form.amount.trim() && (!Number.isFinite(dollars) || dollars < 0)) {
-      Alert.alert('Invalid amount', 'Enter a positive dollar amount or leave it blank.');
+    const amountCents = parseOptionalPositiveUsdCents(form.amount);
+    if (amountCents === undefined) {
+      Alert.alert('Invalid amount', 'Enter a positive US dollar amount, such as 1500.00 or $1,500.00, or leave it blank.');
       return;
     }
     setSaving(true);
     try {
       await saveCaseIntegration({
+        id: form.id,
         caseId: record.id,
         provider: form.provider,
         recordType: form.recordType,
         externalId: form.externalId,
         status: form.status,
-        amountCents: form.amount.trim() ? Math.round(dollars * 100) : null,
+        amountCents,
         currency: 'USD',
         dueOn: form.dueOn.trim() || undefined,
         completedAt: undefined,
@@ -97,6 +100,19 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
     } finally {
       setSaving(false);
     }
+  }
+
+  function beginEdit(item: CaseIntegration) {
+    setForm({
+      id: item.id,
+      provider: item.provider,
+      recordType: item.recordType,
+      externalId: item.externalId,
+      status: item.status,
+      amount: item.amountCents == null ? '' : (item.amountCents / 100).toFixed(2),
+      dueOn: item.dueOn || '',
+      externalUrl: item.externalUrl,
+    });
   }
 
   function removeLink(item: CaseIntegration) {
@@ -150,7 +166,10 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
                 </View>
                 {item.externalUrl ? <Text style={styles.openText}>Open</Text> : null}
               </TouchableOpacity>
-              <TouchableOpacity accessibilityLabel={`Unlink ${integrationTitle(item)}`} onPress={() => removeLink(item)} style={styles.removeButton}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Edit ${integrationTitle(item)}`} onPress={() => beginEdit(item)} style={styles.editButton}>
+                <Text style={styles.editText}>Edit</Text>
+              </TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Unlink ${integrationTitle(item)}`} onPress={() => removeLink(item)} style={styles.removeButton}>
                 <Text style={styles.removeText}>×</Text>
               </TouchableOpacity>
             </View>
@@ -163,7 +182,7 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
       {form ? (
         <View style={styles.formCard}>
           <View style={styles.formHeader}>
-            <Text style={styles.formTitle}>Link external record</Text>
+            <Text style={styles.formTitle}>{form.id ? 'Edit linked record' : 'Link external record'}</Text>
             <TouchableOpacity accessibilityRole="button" onPress={() => setForm(null)} style={styles.cancelButton}>
               <Text style={styles.cancelButtonText}>Cancel</Text>
             </TouchableOpacity>
@@ -175,12 +194,14 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
                 {(['pandadoc', 'square'] as IntegrationProvider[]).map((provider) => (
                   <TouchableOpacity
                     key={provider}
+                    disabled={Boolean(form.id)}
+                    accessibilityState={{ disabled: Boolean(form.id), selected: form.provider === provider }}
                     onPress={() => setForm((current) => current ? {
                       ...current,
                       provider,
                       recordType: provider === 'pandadoc' ? 'document' : 'invoice',
                     } : current)}
-                    style={[styles.segment, form.provider === provider && styles.segmentActive]}
+                    style={[styles.segment, form.provider === provider && styles.segmentActive, form.id && styles.segmentDisabled]}
                   >
                     <Text style={[styles.segmentText, form.provider === provider && styles.segmentTextActive]}>{provider === 'pandadoc' ? 'PandaDoc' : 'Square'}</Text>
                   </TouchableOpacity>
@@ -191,28 +212,47 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
                 {(form.provider === 'pandadoc' ? ['document'] : ['invoice', 'payment', 'refund', 'customer']).map((recordType) => (
                   <TouchableOpacity
                     key={recordType}
+                    disabled={Boolean(form.id)}
+                    accessibilityState={{ disabled: Boolean(form.id), selected: form.recordType === recordType }}
                     onPress={() => setForm((current) => current ? { ...current, recordType: recordType as IntegrationRecordType } : current)}
-                    style={[styles.segment, form.recordType === recordType && styles.segmentActive]}
+                    style={[styles.segment, form.recordType === recordType && styles.segmentActive, form.id && styles.segmentDisabled]}
                   >
                     <Text style={[styles.segmentText, form.recordType === recordType && styles.segmentTextActive]}>{recordType}</Text>
                   </TouchableOpacity>
                 ))}
               </View>
               <Text style={styles.label}>EXTERNAL ID *</Text>
-              <TextInput value={form.externalId} onChangeText={(externalId) => setForm((current) => current ? { ...current, externalId } : current)} placeholder="Document or invoice ID" placeholderTextColor="#91A09B" autoCapitalize="none" style={styles.input} />
+              <TextInput
+                value={form.externalId}
+                editable={!form.id}
+                accessibilityState={{ disabled: Boolean(form.id) }}
+                onChangeText={(externalId) => setForm((current) => current ? { ...current, externalId } : current)}
+                placeholder="Document or invoice ID"
+                placeholderTextColor="#91A09B"
+                autoCapitalize="none"
+                style={[styles.input, form.id && styles.inputDisabled]}
+              />
               <Text style={styles.label}>CURRENT STATUS</Text>
               <TextInput value={form.status} onChangeText={(status) => setForm((current) => current ? { ...current, status } : current)} placeholder="sent, completed, unpaid…" placeholderTextColor="#91A09B" autoCapitalize="none" style={styles.input} />
+              <Text style={styles.label}>{form.provider === 'pandadoc' ? 'PROPOSED CONTRACT AMOUNT (OPTIONAL)' : 'AMOUNT (OPTIONAL)'}</Text>
+              <TextInput
+                accessibilityLabel={form.provider === 'pandadoc' ? 'Proposed contract amount' : 'Amount'}
+                value={form.amount}
+                onChangeText={(amount) => setForm((current) => current ? { ...current, amount } : current)}
+                placeholder="1500.00"
+                placeholderTextColor="#91A09B"
+                keyboardType="decimal-pad"
+                style={styles.input}
+              />
               {form.provider === 'square' ? (
                 <>
-                  <Text style={styles.label}>AMOUNT (OPTIONAL)</Text>
-                  <TextInput value={form.amount} onChangeText={(amount) => setForm((current) => current ? { ...current, amount } : current)} placeholder="1500.00" placeholderTextColor="#91A09B" keyboardType="decimal-pad" style={styles.input} />
                   <Text style={styles.label}>DUE DATE (OPTIONAL)</Text>
                   <TextInput value={form.dueOn} onChangeText={(dueOn) => setForm((current) => current ? { ...current, dueOn } : current)} placeholder="YYYY-MM-DD" placeholderTextColor="#91A09B" autoCapitalize="none" style={styles.input} />
                 </>
               ) : null}
               <Text style={styles.label}>RECORD URL (OPTIONAL)</Text>
               <TextInput value={form.externalUrl} onChangeText={(externalUrl) => setForm((current) => current ? { ...current, externalUrl } : current)} placeholder="https://…" placeholderTextColor="#91A09B" keyboardType="url" autoCapitalize="none" style={styles.input} />
-              <TouchableOpacity onPress={saveLink} disabled={saving} style={styles.primaryButton}><Text style={styles.primaryButtonText}>{saving ? 'Linking…' : 'Link record'}</Text></TouchableOpacity>
+              <TouchableOpacity onPress={saveLink} disabled={saving} style={styles.primaryButton}><Text style={styles.primaryButtonText}>{saving ? 'Saving…' : form.id ? 'Save changes' : 'Link record'}</Text></TouchableOpacity>
           </View>
         </View>
       ) : null}
@@ -240,7 +280,9 @@ const styles = StyleSheet.create({
   rowMeta: { color: '#73827D', fontSize: 9, marginTop: 3 },
   externalId: { color: '#91A09B', fontSize: 8, marginTop: 3 },
   openText: { color: '#507C86', fontSize: 9, fontWeight: '800' },
-  removeButton: { width: 36, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
+  editButton: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
+  editText: { color: '#1F5A49', fontSize: 9, fontWeight: '800' },
+  removeButton: { width: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
   removeText: { color: '#D9795F', fontSize: 21 },
   empty: { color: '#73827D', fontSize: 9, lineHeight: 14, fontStyle: 'italic', marginBottom: 4 },
   formCard: { marginTop: 12, backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: '#DDE4DF', borderRadius: 15, overflow: 'hidden' },
@@ -252,9 +294,11 @@ const styles = StyleSheet.create({
   formIntro: { color: '#73827D', fontSize: 10, lineHeight: 16, marginBottom: 18 },
   label: { color: '#73827D', fontSize: 8, fontWeight: '900', letterSpacing: 0.5, marginBottom: 6, marginTop: 10 },
   input: { minHeight: 46, backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: '#DDE4DF', borderRadius: 12, color: '#16352E', paddingHorizontal: 12, fontSize: 12 },
+  inputDisabled: { backgroundColor: '#EEF1EE', color: '#73827D' },
   segmentRow: { flexDirection: 'row', gap: 7, flexWrap: 'wrap' },
   segment: { minHeight: 40, minWidth: 88, paddingHorizontal: 12, alignItems: 'center', justifyContent: 'center', borderRadius: 11, borderWidth: 1, borderColor: '#DDE4DF', backgroundColor: '#FFFFFF' },
   segmentActive: { backgroundColor: '#1F5A49', borderColor: '#1F5A49' },
+  segmentDisabled: { opacity: 0.72 },
   segmentText: { color: '#38564F', fontSize: 10, fontWeight: '800', textTransform: 'capitalize' },
   segmentTextActive: { color: '#FFFFFF' },
   primaryButton: { minHeight: 50, marginTop: 22, borderRadius: 13, backgroundColor: '#1F5A49', alignItems: 'center', justifyContent: 'center' },

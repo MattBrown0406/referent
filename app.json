@@ -4,7 +4,7 @@
     "slug": "referralfit",
     "version": "1.0.1",
     "orientation": "portrait",
-    "icon": "./assets/icon-fit-point.png",
+    "icon": "./assets/icon-referent-symbiosis.png",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
@@ -27,7 +27,7 @@
       ]
     },
     "web": {
-      "favicon": "./assets/icon-fit-point.png",
+      "favicon": "./assets/icon-referent-symbiosis.png",
       "bundler": "metro"
     },
     "scheme": "referralfit",

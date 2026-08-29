@@ -82,9 +82,21 @@ export type BusinessDashboardMetrics = {
   funnel: FunnelMetric[];
   sources: LeadSourceMetric[];
   pendingContracts: number;
+  pendingContractRevenue: number;
   openInvoices: number;
   overdueInvoices: number;
 };
+
+export function parseOptionalPositiveUsdCents(input: string): number | null | undefined {
+  const value = input.trim();
+  if (!value) return null;
+  // Accept plain US currency or correctly grouped thousands. Reject ambiguous
+  // decimal commas instead of silently turning "1500,50" into "150050".
+  if (!/^\$?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$/.test(value)) return undefined;
+  const dollars = Number(value.replace(/[$,]/g, ''));
+  if (!Number.isFinite(dollars) || dollars <= 0) return undefined;
+  return Math.round(dollars * 100);
+}
 
 type StageRow = {
   id: string;
@@ -312,6 +324,17 @@ export function computeBusinessDashboard(
   const today = localDateStamp(now);
   const squareInvoices = scopedIntegrations.filter((item) => item.provider === 'square' && item.recordType === 'invoice');
   const openInvoices = squareInvoices.filter((item) => !terminalInvoiceStatuses.has(item.status.toLowerCase()));
+  const pendingContractsByCase = new Map<string, CaseIntegration>();
+  scopedIntegrations
+    .filter((item) => item.provider === 'pandadoc'
+      && item.recordType === 'document' && !terminalDocumentStatuses.has(item.status.toLowerCase()))
+    .forEach((item) => {
+      const current = pendingContractsByCase.get(item.caseId);
+      if (!current || item.updatedAt.localeCompare(current.updatedAt) > 0) pendingContractsByCase.set(item.caseId, item);
+    });
+  // A reissued proposal replaces an older still-open PandaDoc document for the
+  // same case, so pending revenue reflects one current proposal per case.
+  const pendingContractRecords = [...pendingContractsByCase.values()];
 
   return {
     casesCreated: scopedCases.length,
@@ -335,8 +358,11 @@ export function computeBusinessDashboard(
       { key: 'placed', label: 'Placed', value: placed, rate: placed / base },
     ],
     sources: [...sourceMap.values()].sort((a, b) => b.cases - a.cases || b.collected - a.collected),
-    pendingContracts: scopedIntegrations.filter((item) => item.provider === 'pandadoc'
-      && item.recordType === 'document' && !terminalDocumentStatuses.has(item.status.toLowerCase())).length,
+    pendingContracts: pendingContractRecords.length,
+    pendingContractRevenue: pendingContractRecords.reduce(
+      (sum, contract) => sum + (contract.amountCents == null ? 0 : contract.amountCents / 100),
+      0,
+    ),
     openInvoices: openInvoices.length,
     overdueInvoices: openInvoices.filter((item) => Boolean(item.dueOn && item.dueOn < today)).length,
   };

@@ -41,8 +41,8 @@ to other intervention practices on recurring plans:
 - Match packets that close the loop: share a de-identified placement recommendation, log the referral, set the check-in follow-up — all case-linked when the profile started from a case
 - Today Command Center: the home screen is a prioritized daily operating list (OVERDUE / TODAY / PARTNERS DUE) — one-tap call/text that auto-logs, a Done sheet that always forces a next step or a closed loop, snooze, set-next-step, and a 5-second "I need to…" quick add. New inquiry cases auto-create their first-call action
 - Daily briefing (counts the today list), cadence reminders, and consult alerts 30 minutes ahead (local, on-device)
-- Business dashboard with case funnel, lead attribution, revenue, referral outcomes, and automatic stage history
-- Square/PandaDoc case links with HMAC-verified webhook status synchronization (the providers remain authoritative)
+- Business dashboard with case funnel, lead attribution, collected/outstanding revenue, proposed-contract pending revenue, referral outcomes, and automatic stage history
+- Square/PandaDoc case links with editable proposed contract amounts and HMAC-verified webhook status synchronization (the providers remain authoritative)
 - Complete searchable referral history with direction filters
 
 ## Backend

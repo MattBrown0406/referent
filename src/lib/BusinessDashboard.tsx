@@ -215,6 +215,13 @@ export default function BusinessDashboard({
           </View>
 
           <Text style={styles.sectionTitle}>Square + PandaDoc</Text>
+          <View style={styles.pendingRevenueCard}>
+            <Text style={styles.metricLabel}>PENDING CONTRACT REVENUE</Text>
+            <Text style={styles.pendingRevenueValue}>{formatMoney(metrics.pendingContractRevenue)}</Text>
+            <Text style={styles.metricDetail}>
+              {metrics.pendingContracts} open {metrics.pendingContracts === 1 ? 'contract' : 'contracts'} · based on proposed amounts entered
+            </Text>
+          </View>
           <View style={styles.summaryCard}>
             <View style={styles.summaryMetric}>
               <Text style={styles.summaryValue}>{metrics.pendingContracts}</Text>
@@ -245,7 +252,11 @@ export default function BusinessDashboard({
                     <View style={styles.attentionBadge}><Text style={styles.attentionBadgeText}>{record.provider === 'square' ? 'S' : 'P'}</Text></View>
                     <View style={styles.funnelCopy}>
                       <Text style={styles.rowTitle}>{linkedCase?.title || 'Linked case'}</Text>
-                      <Text style={styles.rowDetail}>{record.recordType} · {statusLabel(record.status)}{record.dueOn ? ` · due ${record.dueOn}` : ''}</Text>
+                      <Text style={styles.rowDetail}>
+                        {record.recordType} · {statusLabel(record.status)}
+                        {record.amountCents != null ? ` · ${formatMoney(record.amountCents / 100)}` : ''}
+                        {record.dueOn ? ` · due ${record.dueOn}` : ''}
+                      </Text>
                     </View>
                     <Text style={styles.openText}>{record.externalUrl ? 'Open' : 'Case'}</Text>
                   </TouchableOpacity>
@@ -304,6 +315,8 @@ const styles = StyleSheet.create({
   sourceQuoted: { color: '#73827D', fontSize: 8, marginTop: 2 },
   lastRow: { borderBottomWidth: 0 },
   emptyText: { color: '#73827D', fontSize: 10, lineHeight: 15, paddingVertical: 15 },
+  pendingRevenueCard: { backgroundColor: '#E9EFE6', borderWidth: 1, borderColor: '#CAD8CE', borderRadius: 15, padding: 15, marginBottom: 10 },
+  pendingRevenueValue: { color: '#1F5A49', fontSize: 25, fontWeight: '900', marginTop: 5 },
   summaryCard: { flexDirection: 'row', backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: '#DDE4DF', borderRadius: 15, paddingVertical: 14, marginBottom: 12 },
   summaryMetric: { flex: 1, alignItems: 'center' },
   summaryValue: { color: '#1F5A49', fontSize: 19, fontWeight: '900' },
