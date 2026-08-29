@@ -1897,6 +1897,62 @@ export default function App() {
     });
   }
 
+  function selectCasePaymentStatus(record: CaseRecord, status: PaymentStatus) {
+    if (status === record.paymentStatus) return;
+
+    if (status === 'quoted' && record.paidAmount === 0 && record.quotedAmount == null) {
+      if (Platform.OS !== 'ios') {
+        Alert.alert('Enter the quote first', 'Add the quoted amount. The payment status will change to quoted automatically.');
+        return;
+      }
+      Alert.prompt(
+        'Enter quoted amount',
+        'A case can only be marked quoted when it has a quote. Enter the whole-dollar amount and both will be saved together.',
+        (value) => {
+          if (value == null || value.trim() === '') return;
+          const normalized = value.trim();
+          if (!/^\$?(?:\d+|\d{1,3}(?:,\d{3})+)$/.test(normalized)) {
+            Alert.alert('Enter a valid quote', 'Use a positive whole-dollar amount, such as 7500 or $7,500.');
+            return;
+          }
+          const quotedAmount = Number(normalized.replace(/[$,]/g, ''));
+          if (!Number.isSafeInteger(quotedAmount) || quotedAmount <= 0 || quotedAmount > 10000000) {
+            Alert.alert('Enter a valid quote', 'The quote must be between $1 and $10,000,000.');
+            return;
+          }
+          saveCasePayment(record, { paymentStatus: 'quoted', quotedAmount });
+        },
+        'plain-text',
+        '',
+        'number-pad',
+      );
+      return;
+    }
+
+    if (status === 'quoted' && record.paidAmount > 0) {
+      Alert.alert('Payment already recorded', 'Quoted status requires a zero paid total. Correct the paid amount first, or keep the current payment status.');
+      return;
+    }
+    if (status === 'none' && (record.paidAmount > 0 || record.quotedAmount != null)) {
+      Alert.alert('Clear payment amounts first', 'None requires both the quoted amount and paid total to be empty or zero.');
+      return;
+    }
+    if ((status === 'deposit' || status === 'partial') && record.paidAmount <= 0) {
+      Alert.alert('Record a payment first', 'Deposit and partial statuses require a paid amount greater than zero.');
+      return;
+    }
+    if (status === 'partial' && record.quotedAmount != null && record.paidAmount >= record.quotedAmount) {
+      Alert.alert('Already fully paid', 'The paid total meets or exceeds the quote, so this case cannot be marked partial.');
+      return;
+    }
+    if (status === 'paid' && (record.paidAmount <= 0 || (record.quotedAmount != null && record.paidAmount < record.quotedAmount))) {
+      Alert.alert('Paid total is too low', 'Paid status requires a positive paid total that meets or exceeds the quote.');
+      return;
+    }
+
+    saveCasePayment(record, { paymentStatus: status });
+  }
+
   function saveCaseSummary(record: CaseRecord, summary: string) {
     if (!mutationSlotAvailable('The case summary')) return;
     const updated: CaseRecord = { ...record, summary: summary.trim(), updatedAt: new Date().toISOString() };
@@ -4004,7 +4060,7 @@ export default function App() {
                   <View style={{ flex: 1 }}>
                     <Text style={styles.infoLabel}>Status</Text>
                     <TouchableOpacity
-                      onPress={() => Alert.alert('Payment status', undefined, [...PAYMENT_STATUSES.map((status): { text: string; onPress: () => void } => ({ text: status, onPress: () => saveCasePayment(record, { paymentStatus: status }) })), { text: 'Cancel', style: 'cancel' }])}
+                      onPress={() => Alert.alert('Payment status', undefined, [...PAYMENT_STATUSES.map((status): { text: string; onPress: () => void } => ({ text: status, onPress: () => selectCasePaymentStatus(record, status) })), { text: 'Cancel', style: 'cancel' }])}
                       style={styles.casePaymentPicker}
                     >
                       <Text style={styles.casePaymentPickerText}>{record.paymentStatus}</Text>
@@ -4052,7 +4108,7 @@ export default function App() {
                   <AppIcon name="card" size={17} color={COLORS.white} />
                   <Text style={styles.caseAddPaymentButtonText}>Record another payment</Text>
                 </TouchableOpacity>
-                <Text style={styles.casePaymentHint}>Use “Record another payment” for each coaching session or installment. The paid total stays editable for corrections; every change lands on the timeline.</Text>
+                <Text style={styles.casePaymentHint}>Enter a quote to mark the case quoted automatically. Use “Record another payment” for each coaching session or installment. Every change lands on the timeline.</Text>
               </View>
 
               <CaseIntegrationPanel record={record} integrations={businessData.integrations} onChanged={refreshBusiness} />

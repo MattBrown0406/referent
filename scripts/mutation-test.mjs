@@ -47,6 +47,9 @@ assert.doesNotMatch(
 );
 assert.match(source, /function addCasePayment\(\)/, 'cases must accept additional payments');
 assert.match(source, /recordCasePayment\(activeCase\.id, event\.id, amount, note\)/, 'additional payments must use the atomic server-side increment RPC');
+assert.match(source, /function selectCasePaymentStatus\(record: CaseRecord, status: PaymentStatus\)/, 'payment status selection must validate server invariants before writing');
+assert.match(source, /saveCasePayment\(record, \{ paymentStatus: 'quoted', quotedAmount \}\)/, 'choosing quoted without an amount must save the entered quote and status atomically');
+assert.match(source, /Enter a quote to mark the case quoted automatically\./, 'the payment UI must explain that entering a quote derives quoted status');
 assert.match(source, /id: paymentForm\.eventId/, 'additional-payment retries must reuse the same idempotency key');
 assert.match(source, /setCasePaymentForm\(paymentForm\)/, 'an unconfirmed payment must reopen with its original idempotency key');
 assert.match(source, /key=\{`\$\{record\.id\}:\$\{record\.summary\}`\}/, 'the inline summary editor must remount after a modal edit');
