@@ -72,9 +72,9 @@ IMPORTANT: `expo-notifications` requires a development build (EAS Build or
 `npx expo run:ios` / `npx expo run:android`). Local notifications do NOT work in
 Expo Go, and an OTA-only (EAS Update) release cannot add them — they need
 native code compiled into the binary. The same is true of `expo-image-picker`
-(case-file document attach): it is a config-plugin native module, so attaching
-documents needs the same development build. The rest of the app (auth, sync,
-offline cache, case files minus document attach) runs fine in Expo Go via
+(case-file document attach) and `expo-speech-recognition` (approval-first voice
+drafts): both are config-plugin native modules, so those capabilities require
+the same development build. The rest of the app runs in Expo Go via
 `npm run ios` if you only need a quick look.
 
 Use `npm run web` for the browser preview (notifications are a no-op on web).

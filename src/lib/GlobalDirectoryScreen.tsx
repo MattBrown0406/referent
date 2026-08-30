@@ -48,6 +48,20 @@ function listingSubtitle(listing: GlobalPartner): string {
   return parts.join('  ·  ');
 }
 
+function availabilityLabel(listing: GlobalPartner): string {
+  if (!listing.availability.fresh || listing.availability.state === 'unknown') return 'Availability unknown';
+  if (listing.availability.state === 'accepting') return 'Accepting inquiries';
+  if (listing.availability.state === 'limited') return 'Limited availability';
+  return 'Not accepting right now';
+}
+
+function availabilityStyle(listing: GlobalPartner) {
+  if (listing.availability.state === 'accepting' && listing.availability.fresh) return styles.availabilityAccepting;
+  if (listing.availability.state === 'limited' && listing.availability.fresh) return styles.availabilityLimited;
+  if (listing.availability.state === 'not_accepting' && listing.availability.fresh) return styles.availabilityClosed;
+  return styles.availabilityUnknown;
+}
+
 export default function GlobalDirectoryScreen({ visible, entitled, entitlementKnown, userId, importedGlobalIds, onClose, onImported }: Props) {
   const [listings, setListings] = useState<GlobalPartner[] | null>(null);
   const [loadError, setLoadError] = useState('');
@@ -191,6 +205,14 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                       {listing.description ? (
                         <Text style={styles.cardDescription} numberOfLines={3}>{listing.description}</Text>
                       ) : null}
+                      <View style={[styles.availabilityBadge, availabilityStyle(listing)]}>
+                        <Text style={styles.availabilityText}>{availabilityLabel(listing)}</Text>
+                      </View>
+                      {listing.availability.fresh && (listing.availability.responseTime || listing.availability.levels.length) ? (
+                        <Text style={styles.availabilityDetail} numberOfLines={2}>
+                          {[listing.availability.responseTime, listing.availability.levels.slice(0, 3).join(' · ')].filter(Boolean).join(' · ')}
+                        </Text>
+                      ) : null}
                       {listing.verifiedAt ? (
                         <Text style={styles.verified}>Verified {listing.verifiedAt.slice(0, 10)}</Text>
                       ) : null}
@@ -273,6 +295,13 @@ const styles = StyleSheet.create({
   cardContact: { fontSize: 14, color: COLORS.ink },
   cardSubtitle: { fontSize: 13, color: COLORS.gray },
   cardDescription: { fontSize: 13, color: COLORS.gray, lineHeight: 18, marginTop: 4 },
+  availabilityBadge: { alignSelf: 'flex-start', borderRadius: 999, paddingVertical: 5, paddingHorizontal: 10, marginTop: 8 },
+  availabilityAccepting: { backgroundColor: COLORS.greenSoft },
+  availabilityLimited: { backgroundColor: '#FFF7E6' },
+  availabilityClosed: { backgroundColor: '#FEF3F2' },
+  availabilityUnknown: { backgroundColor: COLORS.line },
+  availabilityText: { color: COLORS.ink, fontSize: 12, fontWeight: '700' },
+  availabilityDetail: { color: COLORS.gray, fontSize: 12, lineHeight: 17, marginTop: 4 },
   verified: { fontSize: 12, fontWeight: '600', color: COLORS.green, marginTop: 4 },
   importedBadge: { alignSelf: 'flex-start', backgroundColor: COLORS.greenSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 },
   importedText: { color: COLORS.green, fontWeight: '600', fontSize: 14 },

@@ -29,6 +29,19 @@ export type GlobalPartner = {
   levels: string[];
   description: string;
   verifiedAt?: string;
+  availability: ProgramAvailability;
+};
+
+export type AvailabilityState = 'accepting' | 'limited' | 'not_accepting' | 'unknown';
+
+export type ProgramAvailability = {
+  state: AvailabilityState;
+  levels: string[];
+  responseTime: string;
+  publicNote: string;
+  confirmedAt?: string;
+  expiresAt?: string;
+  fresh: boolean;
 };
 
 type GlobalPartnerRow = {
@@ -52,7 +65,22 @@ type GlobalPartnerRow = {
   verified_at: string | null;
 };
 
-function mapListing(row: GlobalPartnerRow): GlobalPartner {
+type AvailabilityRow = {
+  global_partner_id: string;
+  accepting_state: AvailabilityState;
+  levels: string[] | null;
+  response_time: string | null;
+  public_note: string | null;
+  confirmed_at: string | null;
+  expires_at: string | null;
+};
+
+const UNKNOWN_AVAILABILITY: ProgramAvailability = {
+  state: 'unknown', levels: [], responseTime: '', publicNote: '', fresh: false,
+};
+
+function mapListing(row: GlobalPartnerRow, availability?: AvailabilityRow): GlobalPartner {
+  const fresh = Boolean(availability?.expires_at && new Date(availability.expires_at).getTime() > Date.now());
   return {
     id: row.id,
     name: row.name,
@@ -72,6 +100,15 @@ function mapListing(row: GlobalPartnerRow): GlobalPartner {
     levels: row.levels || [],
     description: row.description || '',
     verifiedAt: row.verified_at || undefined,
+    availability: availability && fresh ? {
+      state: availability.accepting_state,
+      levels: availability.levels || [],
+      responseTime: availability.response_time || '',
+      publicNote: availability.public_note || '',
+      confirmedAt: availability.confirmed_at || undefined,
+      expiresAt: availability.expires_at || undefined,
+      fresh: true,
+    } : { ...UNKNOWN_AVAILABILITY, confirmedAt: availability?.confirmed_at || undefined, expiresAt: availability?.expires_at || undefined },
   };
 }
 
@@ -83,7 +120,15 @@ export async function fetchGlobalDirectory(): Promise<GlobalPartner[]> {
     .order('state')
     .order('organization');
   if (error) throw new StoreError(error.message || 'Could not load the directory.', false);
-  return ((data || []) as GlobalPartnerRow[]).map(mapListing);
+  const rows = (data || []) as GlobalPartnerRow[];
+  if (!rows.length) return [];
+  const { data: availabilityData, error: availabilityError } = await supabase
+    .from('center_availability')
+    .select('global_partner_id, accepting_state, levels, response_time, public_note, confirmed_at, expires_at')
+    .in('global_partner_id', rows.map((row) => row.id));
+  if (availabilityError) throw new StoreError(availabilityError.message || 'Could not load current program availability.', false);
+  const byProgram = new Map(((availabilityData || []) as AvailabilityRow[]).map((item) => [item.global_partner_id, item]));
+  return rows.map((row) => mapListing(row, byProgram.get(row.id)));
 }
 
 // Imports a listing into the caller's workspace network and returns the

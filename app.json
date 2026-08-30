@@ -45,6 +45,13 @@
         {
           "photosPermission": "ReferralFit attaches photos you choose (insurance cards, signed agreements) to private case files."
         }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Allow ReferralFit to use the microphone only while you dictate a draft.",
+          "speechRecognitionPermission": "Allow ReferralFit to turn your spoken draft into editable text. Nothing is saved until you approve it."
+        }
       ]
     ],
     "extra": {

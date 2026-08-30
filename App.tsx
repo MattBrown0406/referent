@@ -45,6 +45,8 @@ import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import { fetchCurrentOrgId } from './src/lib/org';
+import VoiceCaptureSheet, { type ApprovedVoiceDraft } from './src/lib/VoiceCaptureSheet';
+import ReferralGrowthScreen from './src/lib/ReferralGrowthScreen';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
@@ -75,6 +77,7 @@ import {
   persistCache,
   refreshSnapshot,
   saveMatchWithCase,
+  saveVoiceActivity,
   Snapshot,
   Touch,
   TouchKind,
@@ -293,6 +296,7 @@ function todayKindIcon(card: TodayCard): IconName {
     case 'consult': return 'calendar';
     case 'waiting_on': return 'hourglass-outline';
     case 'touch': return 'hand-left-outline';
+    case 'referral_handshake': return 'git-compare-outline';
     case 'cadence': return 'repeat';
     default: return 'return-up-back';
   }
@@ -796,6 +800,8 @@ export default function App() {
   const [referralDirectionFilter, setReferralDirectionFilter] = useState<'All' | ReferralDirection>('All');
   const [showBusinessDashboard, setShowBusinessDashboard] = useState(false);
   const [showWorkspace, setShowWorkspace] = useState(false);
+  const [showVoiceCapture, setShowVoiceCapture] = useState(false);
+  const [showReferralGrowth, setShowReferralGrowth] = useState(false);
   const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
   // Incremented after the account joins a different practice workspace, which
@@ -3490,6 +3496,49 @@ export default function App() {
     );
   }
 
+  async function saveApprovedVoiceDraft(draft: ApprovedVoiceDraft): Promise<void> {
+    if (!activeUserId) throw new Error('Sign in again before saving this draft.');
+    const occurredAt = new Date().toISOString();
+    const touch: Touch = {
+      id: makeId('t'),
+      partnerId: draft.partnerId,
+      kind: draft.touchKind,
+      note: draft.note,
+      occurredAt,
+    };
+    const followUp: FollowUp | undefined = draft.followUp ? {
+      id: makeId('f'),
+      partnerId: draft.partnerId,
+      kind: 'touch',
+      title: draft.followUp.title,
+      dueOn: draft.followUp.dueOn,
+      dueTime: draft.followUp.dueTime,
+      status: 'open',
+      note: '',
+    } : undefined;
+
+    await saveVoiceActivity(touch, followUp, activeUserId);
+    const nextTouches = [touch, ...touches];
+    const nextFollowUps = followUp ? [followUp, ...followUps] : followUps;
+    const today = localDateStamp();
+    const nextPartners = partners.map((partner) => partner.id === draft.partnerId
+      ? { ...partner, lastContact: today }
+      : partner);
+    setTouches(nextTouches);
+    setFollowUps(nextFollowUps);
+    setPartners(nextPartners);
+    void syncDerived({
+      partners: nextPartners,
+      referrals,
+      referralMatches,
+      touches: nextTouches,
+      followUps: nextFollowUps,
+      scorecards,
+    }).catch(() => {
+      // The server transaction is authoritative; hydration repairs cache later.
+    });
+  }
+
   // Today Command Center — the prioritized daily operating list. The old
   // home told you what happened; this one tells you WHAT TO DO NEXT.
   function HomeScreen() {
@@ -3509,6 +3558,33 @@ export default function App() {
             <Text style={styles.eyebrow}>{currentDateLabel()}</Text>
             <Text style={styles.heroTitle}>Today</Text>
             <Text style={styles.heroSubtitle}>{loadLine}</Text>
+          </View>
+
+          <View style={styles.growthActionRow}>
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Open Referral Growth Hub"
+              style={styles.growthAction}
+              onPress={() => setShowReferralGrowth(true)}
+            >
+              <View style={styles.growthActionIcon}><AppIcon name="git-network-outline" size={20} color={COLORS.forest} /></View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.growthActionTitle}>Referral Hub</Text>
+                <Text style={styles.growthActionBody}>Links, handoffs & daily plan</Text>
+              </View>
+            </TouchableOpacity>
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Dictate a partner touch"
+              style={styles.growthAction}
+              onPress={() => setShowVoiceCapture(true)}
+            >
+              <View style={styles.growthActionIcon}><AppIcon name="mic-outline" size={20} color={COLORS.forest} /></View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.growthActionTitle}>Voice capture</Text>
+                <Text style={styles.growthActionBody}>Review before saving</Text>
+              </View>
+            </TouchableOpacity>
           </View>
 
           {todaySections.overdue.length ? (
@@ -5614,6 +5690,23 @@ export default function App() {
           setWorkspaceEpoch((epoch) => epoch + 1);
         }}
       />
+      <VoiceCaptureSheet
+        visible={showVoiceCapture}
+        partners={partners}
+        onClose={() => setShowVoiceCapture(false)}
+        onApprove={saveApprovedVoiceDraft}
+      />
+      <ReferralGrowthScreen
+        visible={showReferralGrowth}
+        onClose={() => setShowReferralGrowth(false)}
+        partners={partners}
+        referrals={referrals}
+        touches={touches}
+        followUps={followUps}
+        scorecards={scorecards}
+        cases={cases}
+        offline={offline}
+      />
       {DoneSheet()}
       {NextStepSheet()}
       {SnoozeSheet()}
@@ -5654,7 +5747,12 @@ const styles = StyleSheet.create({
   brandRow: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 10 },
   brandMark: { width: 36, height: 36, borderRadius: 12 },
   brandName: { fontSize: 19, fontWeight: '800', color: COLORS.ink, letterSpacing: -0.4 },
-  welcomeRow: { marginBottom: 22 },
+  welcomeRow: { marginBottom: 16 },
+  growthActionRow: { flexDirection: 'row', gap: 10, marginBottom: 20 },
+  growthAction: { flex: 1, minHeight: 78, flexDirection: 'row', alignItems: 'center', gap: 9, backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.line, borderRadius: 16, padding: 12 },
+  growthActionIcon: { width: 36, height: 36, borderRadius: 12, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center' },
+  growthActionTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '800' },
+  growthActionBody: { color: COLORS.gray, fontSize: 10, lineHeight: 14, marginTop: 2 },
   eyebrow: { color: COLORS.gray, fontSize: 11, fontWeight: '800', letterSpacing: 1.25, marginBottom: 7 },
   heroTitle: { fontSize: 29, lineHeight: 35, color: COLORS.ink, fontWeight: '800', letterSpacing: -0.9 },
   heroSubtitle: { fontSize: 15, color: COLORS.gray, marginTop: 5 },

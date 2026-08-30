@@ -209,11 +209,12 @@ export function partnerDueToCard(due: PartnerDue): TodayCard {
 
 const TODAY_KIND_ORDER: Record<string, number> = {
   first_call: 0,
-  promised_call: 1,
-  waiting_on: 2,
-  consult: 3,
-  touch: 4,
-  follow_up: 5,
+  referral_handshake: 1,
+  promised_call: 2,
+  waiting_on: 3,
+  consult: 4,
+  touch: 5,
+  follow_up: 6,
 };
 
 export function buildTodaySections(

@@ -396,6 +396,11 @@ verify_jwt = false
 [functions.revenuecat-webhook]
 verify_jwt = false
 
+# Public capability endpoint. The function validates CORS/input and calls only
+# narrowly granted service-role RPCs; browser requests never receive a key.
+[functions.public-referrals]
+verify_jwt = false
+
 [analytics]
 enabled = true
 port = 55427

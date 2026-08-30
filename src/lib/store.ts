@@ -28,7 +28,7 @@ export type FollowUpStatus = 'open' | 'done' | 'skipped';
 
 // v4 Today Command Center kinds (migration 20260724190000). 'touch' is a
 // partner-relationship touch (Done → Log touch); the rest are self-evident.
-export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch';
+export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch' | 'referral_handshake';
 
 export type FollowUp = {
   id: string;
@@ -1237,6 +1237,22 @@ export async function deleteMatchProfile(matchId: string, expectedUserId: string
 export async function createTouch(touch: Touch, expectedUserId: string): Promise<void> {
   const row = touchToRow(touch);
   await runOrQueue(expectedUserId, { kind: 'touch.insert', row }, (userId) => supabase.from('touches').upsert({ ...row, owner_id: userId }, { onConflict: 'id' }));
+}
+
+export async function saveVoiceActivity(
+  touch: Touch,
+  followUp: FollowUp | undefined,
+  expectedUserId: string,
+): Promise<void> {
+  const fence = await sessionFence(expectedUserId);
+  await assertSessionFence(fence);
+  const { error } = await supabase.rpc('save_voice_activity', {
+    p_expected_owner_id: fence.userId,
+    p_touch: touchToRow(touch),
+    p_follow_up: followUp ? followUpToRow(followUp) : null,
+  });
+  await assertSessionFence(fence);
+  if (error) throw new Error(error.message);
 }
 
 export async function saveMatchWithCase(match: ReferralMatch, caseId: string, expectedUserId: string): Promise<void> {
