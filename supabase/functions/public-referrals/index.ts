@@ -85,8 +85,12 @@ async function readLimitedJson(request: Request): Promise<Json> {
 }
 
 function clientIp(request: Request): string {
-  const forwarded = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim();
-  return request.headers.get('cf-connecting-ip')?.trim() || forwarded || 'unavailable';
+  // Supabase/Kong appends the immediate peer to X-Forwarded-For. Use the final
+  // hop rather than the caller-controlled first value; the database also
+  // enforces a source-wide ceiling independent of this address bucket.
+  const forwarded = request.headers.get('x-forwarded-for')
+    ?.split(',').map((value) => value.trim()).filter(Boolean).at(-1);
+  return forwarded || request.headers.get('cf-connecting-ip')?.trim() || 'unavailable';
 }
 
 async function ipHash(ip: string, sourceId: string): Promise<string> {

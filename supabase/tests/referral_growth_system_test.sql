@@ -1,12 +1,18 @@
 -- Attack and state-machine coverage for referral growth system.
 BEGIN;
-SELECT plan(41);
+SELECT plan(52);
 
 INSERT INTO auth.users(id,email) VALUES
  ('91000000-0000-0000-0000-000000000001','owner@referral.test'),
  ('91000000-0000-0000-0000-000000000002','outsider@referral.test'),
  ('91000000-0000-0000-0000-000000000003','center@referral.test'),
- ('91000000-0000-0000-0000-000000000004','other-center@referral.test');
+ ('91000000-0000-0000-0000-000000000004','other-center@referral.test'),
+ ('91000000-0000-0000-0000-000000000005','coworker@referral.test');
+
+UPDATE public.org_members
+   SET org_id=(SELECT org_id FROM public.org_members WHERE user_id='91000000-0000-0000-0000-000000000001'),
+       role='member'
+ WHERE user_id='91000000-0000-0000-0000-000000000005';
 
 INSERT INTO public.partners(id,owner_id,name,organization) VALUES
  ('92000000-0000-0000-0000-000000000001','91000000-0000-0000-0000-000000000001','Referral partner','Partner practice');
@@ -61,6 +67,44 @@ SELECT lives_ok($$SELECT public.public_referral_intake_submit(
  'idempotent retry succeeds without duplicate writes');
 RESET ROLE;
 SELECT is((SELECT submission_count::integer FROM public.referral_sources WHERE id='93000000-0000-0000-0000-000000000001'),1,'idempotent retry increments source only once');
+
+SELECT set_config('request.jwt.claim.sub','91000000-0000-0000-0000-000000000005',true);
+SET LOCAL ROLE authenticated;
+SELECT throws_ok($$SELECT * FROM public.rotate_referral_source('93000000-0000-0000-0000-000000000001')$$,
+  '42501','Only the source owner can rotate this referral link',
+  'workspace coworker cannot take ownership by rotating a personal source');
+SELECT set_config('request.jwt.claim.sub','91000000-0000-0000-0000-000000000001',true);
+SELECT lives_ok($$SELECT set_config('test.rotated_source',id::text,true)
+  FROM public.rotate_referral_source('93000000-0000-0000-0000-000000000001')$$,
+  'source owner rotates a referral link atomically');
+SELECT ok(NOT (SELECT active FROM public.referral_sources WHERE id='93000000-0000-0000-0000-000000000001'),
+  'rotation revokes the old public link');
+SELECT ok((SELECT active AND partner_id='92000000-0000-0000-0000-000000000001'
+  FROM public.referral_sources WHERE id=current_setting('test.rotated_source')::uuid),
+  'rotation creates an active replacement with the same attribution');
+SELECT is((SELECT owner_id FROM public.referral_sources
+  WHERE id=current_setting('test.rotated_source')::uuid),
+  '91000000-0000-0000-0000-000000000001'::uuid,
+  'coworker rotation preserves the personal source owner');
+SELECT is((SELECT id FROM public.rotate_referral_source('93000000-0000-0000-0000-000000000001')),
+  current_setting('test.rotated_source')::uuid,
+  'rotation retry returns the existing replacement');
+SELECT is((SELECT count(*)::integer FROM public.referral_sources
+  WHERE active AND id=current_setting('test.rotated_source')::uuid),1,
+  'rotation retry creates no additional active replacement');
+SELECT throws_ok($$UPDATE public.referral_sources SET active=true
+  WHERE id='93000000-0000-0000-0000-000000000001'$$,
+  '42501','A rotated referral source cannot be reactivated',
+  'rotated source is permanently revoked');
+RESET ROLE;
+INSERT INTO public.referral_intake_rate_limits(source_id,ip_hash,window_start,attempts)
+VALUES(current_setting('test.rotated_source')::uuid,repeat('0',64),clock_timestamp(),40);
+SET LOCAL ROLE service_role;
+SELECT throws_ok($$SELECT public.public_referral_intake_submit(
+ current_setting('test.rotated_source')::uuid,'94000000-0000-0000-0000-000000000003',
+ 'Katherine','Johnson','','kj@example.test',true,true,repeat('c',64))$$,
+ 'P0001','Rate limit exceeded','source-wide ceiling blocks proxy-header rotation abuse');
+RESET ROLE;
 
 SELECT set_config('request.jwt.claim.sub','91000000-0000-0000-0000-000000000001',true);
 SET LOCAL ROLE authenticated;
@@ -135,6 +179,8 @@ SELECT set_config('request.jwt.claim.sub','91000000-0000-0000-0000-000000000003'
 SET LOCAL ROLE authenticated;
 SELECT lives_ok($$SELECT * FROM public.confirm_center_availability('limited',ARRAY['residential'],'Usually within one day','Call for fit',NULL)$$,'claimed center confirms its own availability');
 SELECT is((SELECT expires_at-confirmed_at FROM public.get_center_availability()),interval '7 days','freshness expires exactly seven days after confirmation');
+SELECT lives_ok($$SELECT * FROM public.confirm_center_availability('accepting',ARRAY['residential'],'Same day','Open now',1)$$,'claimed center reconfirms using its current version');
+SELECT is((SELECT version FROM public.get_center_availability()),2,'reconfirmation advances the availability version');
 SELECT set_config('request.jwt.claim.sub','91000000-0000-0000-0000-000000000004',true);
 SELECT is((SELECT count(*)::integer FROM public.get_center_availability()),0,'other center cannot read first center through narrow RPC');
 SELECT set_config('request.jwt.claim.sub','91000000-0000-0000-0000-000000000001',true);

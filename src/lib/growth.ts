@@ -12,6 +12,8 @@ export type ReferralSource = {
   publicPracticeDisplay: string;
   publicSourceDisplay: string;
   active: boolean;
+  canRotate: boolean;
+  rotatedToSourceId?: string;
   submissionCount: number;
   createdAt: string;
   updatedAt: string;
@@ -78,11 +80,13 @@ export class GrowthError extends Error {
 
 type ReferralSourceRow = {
   id: string;
+  owner_id: string;
   partner_id: string | null;
   label: string;
   public_practice_display: string;
   public_source_display: string;
   active: boolean;
+  rotated_to_source_id: string | null;
   submission_count: number | string;
   created_at: string;
   updated_at: string;
@@ -179,7 +183,7 @@ function publicLabel(value: string, label: string): string {
   return cleaned;
 }
 
-function mapSource(row: ReferralSourceRow): ReferralSource {
+function mapSource(row: ReferralSourceRow, currentUserId: string): ReferralSource {
   return {
     id: row.id,
     partnerId: row.partner_id || undefined,
@@ -187,6 +191,8 @@ function mapSource(row: ReferralSourceRow): ReferralSource {
     publicPracticeDisplay: row.public_practice_display,
     publicSourceDisplay: row.public_source_display,
     active: row.active,
+    canRotate: row.owner_id === currentUserId,
+    rotatedToSourceId: row.rotated_to_source_id || undefined,
     submissionCount: Math.max(0, Number(row.submission_count) || 0),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -240,7 +246,7 @@ export function nextHandoffStatus(status: HandoffStatus): HandoffStatus | null {
 }
 
 export async function fetchReferralGrowth(): Promise<{ sources: ReferralSource[]; handoffs: ReferralHandoff[] }> {
-  return withStableAccount(async () => {
+  return withStableAccount(async (identity) => {
     const [sourcesResult, handoffsResult, remindersResult] = await Promise.all([
       supabase.from('referral_sources').select('*').order('created_at', { ascending: false }),
       supabase.from('referral_handoffs').select('*').order('updated_at', { ascending: false }),
@@ -258,7 +264,7 @@ export async function fetchReferralGrowth(): Promise<{ sources: ReferralSource[]
       }
     }
     return {
-      sources: ((sourcesResult.data || []) as ReferralSourceRow[]).map(mapSource),
+      sources: ((sourcesResult.data || []) as ReferralSourceRow[]).map((row) => mapSource(row, identity.userId)),
       handoffs: ((handoffsResult.data || []) as ReferralHandoffRow[])
         .map((row) => mapHandoff(row, dueByHandoff.get(row.id))),
     };
@@ -277,19 +283,29 @@ export async function createReferralSource(input: CreateReferralSourceInput): Pr
     };
     const { data, error } = await supabase.from('referral_sources').insert(row).select('*').single();
     if (error) throw error;
-    return mapSource(data as ReferralSourceRow);
+    return mapSource(data as ReferralSourceRow, identity.userId);
   });
 }
 
 export async function setReferralSourceActive(sourceId: string, active: boolean): Promise<ReferralSource> {
-  return withStableAccount(async () => {
+  return withStableAccount(async (identity) => {
     const { data, error } = await supabase.from('referral_sources')
       .update({ active })
       .eq('id', sourceId)
       .select('*')
       .single();
     if (error) throw error;
-    return mapSource(data as ReferralSourceRow);
+    return mapSource(data as ReferralSourceRow, identity.userId);
+  });
+}
+
+export async function rotateReferralSource(sourceId: string): Promise<ReferralSource> {
+  return withStableAccount(async (identity) => {
+    const { data, error } = await supabase.rpc('rotate_referral_source', { p_source_id: sourceId });
+    if (error) throw error;
+    const row = (Array.isArray(data) ? data[0] : data) as ReferralSourceRow | null;
+    if (!row?.id) throw new GrowthError('The link was rotated, but the replacement could not be loaded. Refresh before sharing.');
+    return mapSource(row, identity.userId);
   });
 }
 

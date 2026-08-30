@@ -15,6 +15,7 @@ CREATE TABLE public.referral_sources (
   public_source_display    text NOT NULL CHECK (length(btrim(public_source_display)) BETWEEN 1 AND 120),
   active                   boolean NOT NULL DEFAULT true,
   revoked_at               timestamptz,
+  rotated_to_source_id     uuid UNIQUE REFERENCES public.referral_sources(id) ON DELETE RESTRICT,
   submission_count         bigint NOT NULL DEFAULT 0 CHECK (submission_count >= 0),
   created_at               timestamptz NOT NULL DEFAULT now(),
   updated_at               timestamptz NOT NULL DEFAULT now(),
@@ -43,6 +44,9 @@ BEGIN
     RAISE EXCEPTION 'Referral source identity and counters are server-managed' USING ERRCODE = '42501';
   END IF;
   IF auth.uid() IS NOT NULL AND NEW.active IS DISTINCT FROM OLD.active THEN
+    IF NEW.active AND OLD.rotated_to_source_id IS NOT NULL THEN
+      RAISE EXCEPTION 'A rotated referral source cannot be reactivated' USING ERRCODE = '42501';
+    END IF;
     NEW.revoked_at := CASE WHEN NEW.active THEN NULL ELSE pg_catalog.clock_timestamp() END;
   ELSIF NEW.revoked_at IS DISTINCT FROM OLD.revoked_at THEN
     RAISE EXCEPTION 'Set active to revoke or reactivate a referral source' USING ERRCODE = '42501';
@@ -66,6 +70,51 @@ GRANT INSERT (id, owner_id, partner_id, label, public_practice_display, public_s
   ON public.referral_sources TO authenticated;
 GRANT UPDATE (partner_id, label, public_practice_display, public_source_display, active)
   ON public.referral_sources TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.rotate_referral_source(p_source_id uuid)
+RETURNS SETOF public.referral_sources
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_user uuid := auth.uid();
+  v_org uuid := public.current_org_id();
+  v_source public.referral_sources%ROWTYPE;
+  v_new_id uuid := gen_random_uuid();
+BEGIN
+  IF v_user IS NULL OR v_org IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
+  END IF;
+  SELECT * INTO v_source FROM public.referral_sources
+   WHERE id = p_source_id AND org_id = v_org FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Referral source not found' USING ERRCODE = 'P0002'; END IF;
+  IF v_source.owner_id <> v_user THEN
+    RAISE EXCEPTION 'Only the source owner can rotate this referral link' USING ERRCODE = '42501';
+  END IF;
+
+  -- Return the same successor after a lost response. The row lock serializes
+  -- concurrent calls, so one source can produce only one replacement.
+  IF v_source.rotated_to_source_id IS NOT NULL THEN
+    RETURN QUERY SELECT * FROM public.referral_sources WHERE id = v_source.rotated_to_source_id;
+    RETURN;
+  END IF;
+  IF NOT v_source.active OR v_source.revoked_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Only an active referral source can be rotated' USING ERRCODE = '22023';
+  END IF;
+
+  INSERT INTO public.referral_sources(
+    id, org_id, owner_id, partner_id, label,
+    public_practice_display, public_source_display, active
+  ) VALUES (
+    v_new_id, v_org, v_user, v_source.partner_id,
+    pg_catalog.left(v_source.label, 110) || ' (rotated)', v_source.public_practice_display,
+    v_source.public_source_display, true
+  );
+  UPDATE public.referral_sources
+     SET active = false, rotated_to_source_id = v_new_id
+   WHERE id = v_source.id;
+  RETURN QUERY SELECT * FROM public.referral_sources WHERE id = v_new_id;
+END
+$$;
 
 -- Service-only anti-abuse and idempotency ledgers. They remain in public for
 -- PostgREST RPC transaction access, but expose no table privileges or policies.
@@ -130,6 +179,7 @@ DECLARE
   v_phone text := pg_catalog.btrim(coalesce(p_phone, ''));
   v_email text := pg_catalog.lower(pg_catalog.btrim(coalesce(p_email, '')));
   v_attempts integer;
+  v_source_attempts integer;
   v_old_sub text := current_setting('request.jwt.claim.sub', true);
 BEGIN
   IF p_source_id IS NULL OR p_idempotency_key IS NULL THEN
@@ -158,6 +208,23 @@ BEGIN
    WHERE source_id = p_source_id AND idempotency_key = p_idempotency_key;
   IF FOUND THEN
     RETURN jsonb_build_object('accepted', true);
+  END IF;
+
+  -- Bound total source traffic as well as each network address. This prevents a
+  -- caller from bypassing the per-address bucket by rotating proxy headers.
+  INSERT INTO public.referral_intake_rate_limits(source_id, ip_hash, window_start, attempts, updated_at)
+  VALUES (p_source_id, repeat('0', 64), v_now, 1, v_now)
+  ON CONFLICT (source_id, ip_hash) DO UPDATE SET
+    window_start = CASE
+      WHEN public.referral_intake_rate_limits.window_start <= v_now - interval '15 minutes' THEN v_now
+      ELSE public.referral_intake_rate_limits.window_start END,
+    attempts = CASE
+      WHEN public.referral_intake_rate_limits.window_start <= v_now - interval '15 minutes' THEN 1
+      ELSE public.referral_intake_rate_limits.attempts + 1 END,
+    updated_at = v_now
+  RETURNING attempts INTO v_source_attempts;
+  IF v_source_attempts > 40 THEN
+    RAISE EXCEPTION 'Rate limit exceeded' USING ERRCODE = 'P0001';
   END IF;
 
   INSERT INTO public.referral_intake_rate_limits(source_id, ip_hash, window_start, attempts, updated_at)
@@ -593,6 +660,7 @@ REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
   ON public.case_stage_history, public.org_entitlements FROM authenticated;
 
 REVOKE ALL ON FUNCTION public.guard_referral_source_update() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.rotate_referral_source(uuid) FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.public_referral_source_resolve(uuid) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.public_referral_intake_submit(uuid,uuid,text,text,text,text,boolean,boolean,text) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.reject_handoff_event_mutation() FROM PUBLIC, anon, authenticated;
@@ -608,7 +676,8 @@ REVOKE ALL ON FUNCTION public.get_center_availability() FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.confirm_center_availability(text,text[],text,text,integer) FROM PUBLIC, anon;
 
 GRANT EXECUTE ON FUNCTION public.referral_handoff_next_status(text) TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION public.create_referral_handoff(uuid,uuid,uuid,text,text,text),
+GRANT EXECUTE ON FUNCTION public.rotate_referral_source(uuid),
+  public.create_referral_handoff(uuid,uuid,uuid,text,text,text),
   public.transition_referral_handoff(uuid,integer,text), public.revoke_referral_handoff(uuid),
   public.save_voice_activity(uuid,jsonb,jsonb),
   public.get_center_availability(), public.confirm_center_availability(text,text[],text,text,integer)

@@ -140,17 +140,15 @@ function CenterPortal() {
 
   const loadAvailability = useCallback(async () => {
     setAvailabilityError('');
-    const { data, error: loadError } = await supabase
-      .from('center_availability')
-      .select('accepting_state, levels, response_time, public_note, confirmed_at, expires_at, version')
-      .maybeSingle();
+    const { data, error: loadError } = await supabase.rpc('get_center_availability');
     if (loadError) { setAvailabilityError(loadError.message); return; }
-    if (!data) {
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) {
       setAvailability(null);
       setAvailabilityForm(DEFAULT_AVAILABILITY);
       return;
     }
-    const next = data as Availability;
+    const next = row as Availability;
     setAvailability(next);
     setAvailabilityForm({
       acceptingState: next.accepting_state,
@@ -258,6 +256,7 @@ function CenterPortal() {
         p_levels: levels,
         p_response_time: availabilityForm.responseTime,
         p_public_note: availabilityForm.publicNote.trim(),
+        p_expected_version: availability?.version ?? null,
       });
       if (saveError) throw saveError;
       await loadAvailability();

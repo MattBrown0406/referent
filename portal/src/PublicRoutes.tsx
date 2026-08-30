@@ -4,38 +4,34 @@ type PublicRoute =
   | { kind: 'intake'; value: string }
   | { kind: 'handoff'; value: string };
 
-type IntakeLabels = { practiceName: string; sourceName: string };
+type IntakeLabels = { sourceId: string; practiceDisplay: string; sourceDisplay: string };
 type HandoffStatus = 'sent' | 'received' | 'contact_attempted' | 'family_reached' | 'consult_scheduled' | 'closed';
 type HandoffRecord = {
-  alias: string;
-  practiceName: string;
-  recipientName: string;
+  clientAlias: string;
+  senderPracticeDisplay: string;
+  recipientDisplay: string;
   status: HandoffStatus;
   version: number;
   allowedNextStatus: HandoffStatus | null;
 };
 
 type IntakeForm = {
-  name: string;
-  relationship: string;
+  firstName: string;
+  lastName: string;
   phone: string;
   email: string;
-  preferredContact: 'phone' | 'email';
-  bestTime: string;
-  note: string;
-  consent: boolean;
+  callbackConsent: boolean;
+  privacyConsent: boolean;
   website: string;
 };
 
 const EMPTY_INTAKE: IntakeForm = {
-  name: '',
-  relationship: '',
+  firstName: '',
+  lastName: '',
   phone: '',
   email: '',
-  preferredContact: 'phone',
-  bestTime: '',
-  note: '',
-  consent: false,
+  callbackConsent: false,
+  privacyConsent: false,
   website: '',
 };
 
@@ -72,7 +68,10 @@ export function getPublicRoute(pathname: string): PublicRoute | null {
   const intake = pathname.match(/^\/r\/([0-9a-fA-F-]{36})\/?$/);
   if (intake) return { kind: 'intake', value: intake[1] };
   const handoff = pathname.match(/^\/h\/([^/]+)\/?$/);
-  if (handoff) return { kind: 'handoff', value: decodeURIComponent(handoff[1]) };
+  if (handoff) {
+    try { return { kind: 'handoff', value: decodeURIComponent(handoff[1]) }; }
+    catch { return { kind: 'handoff', value: '' }; }
+  }
   return null;
 }
 
@@ -121,31 +120,28 @@ export function PublicIntake({ sourceId }: { sourceId: string }) {
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     const nextErrors: string[] = [];
-    if (!form.name.trim()) nextErrors.push('Enter your name.');
+    if (!form.firstName.trim()) nextErrors.push('Enter your first name.');
+    if (!form.lastName.trim()) nextErrors.push('Enter your last name.');
     if (!form.phone.trim() && !form.email.trim()) nextErrors.push('Enter a phone number or email address.');
-    if (form.preferredContact === 'phone' && !form.phone.trim()) nextErrors.push('Enter a phone number or choose email as your preferred contact.');
-    if (form.preferredContact === 'email' && !form.email.trim()) nextErrors.push('Enter an email address or choose phone as your preferred contact.');
     if (form.email.trim() && !/^\S+@\S+\.\S+$/.test(form.email.trim())) nextErrors.push('Enter a valid email address.');
-    if (!form.consent) nextErrors.push('Confirm that you agree to be contacted about this request.');
+    if (!form.callbackConsent) nextErrors.push('Confirm that you agree to be contacted about this request.');
+    if (!form.privacyConsent) nextErrors.push('Confirm that you understand how this request will be used.');
     if (nextErrors.length) { setErrors(nextErrors); return; }
 
     setErrors([]);
     setState('submitting');
     try {
-      await publicAction<{ ok: true }>({
+      await publicAction<{ accepted: true; message: string }>({
         action: 'intake.submit',
         sourceId,
         idempotencyKey,
-        consent: true,
-        honeypot: form.website,
-        contact: {
-          name: form.name.trim(),
-          relationship: form.relationship.trim(),
-          phone: form.phone.trim(),
-          email: form.email.trim(),
-          preferredContact: form.preferredContact,
-        },
-        request: { bestTime: form.bestTime.trim(), note: form.note.trim() },
+        firstName: form.firstName.trim(),
+        lastName: form.lastName.trim(),
+        phone: form.phone.trim(),
+        email: form.email.trim(),
+        callbackConsent: form.callbackConsent,
+        privacyConsent: form.privacyConsent,
+        website: form.website,
       });
       setIdempotencyKey(crypto.randomUUID());
       setState('success');
@@ -170,7 +166,7 @@ export function PublicIntake({ sourceId }: { sourceId: string }) {
           <span className="success-icon" aria-hidden="true">✓</span>
           <p className="eyebrow">Request received</p>
           <h1 id="intake-success-title">Thank you for reaching out.</h1>
-          <p>{labels?.practiceName} has your callback request. You can close this page now.</p>
+          <p>{labels?.practiceDisplay} has your callback request. You can close this page now.</p>
         </section>
         <PublicFooter emergency />
       </main>
@@ -184,7 +180,7 @@ export function PublicIntake({ sourceId }: { sourceId: string }) {
         <p className="eyebrow">A private callback request</p>
         <h1 id="intake-title">Let’s make the first step simple.</h1>
         <p className="lede">
-          Share the best way for <strong>{labels?.practiceName}</strong> to reach you. This link was provided by {labels?.sourceName}.
+          Share the best way for <strong>{labels?.practiceDisplay}</strong> to reach you. This link was provided by {labels?.sourceDisplay}.
         </p>
         <div className="privacy-note">You do not need to share diagnosis, treatment, or medical details here.</div>
 
@@ -198,15 +194,12 @@ export function PublicIntake({ sourceId }: { sourceId: string }) {
         <form onSubmit={submit} noValidate>
           <div className="field-grid two-column">
             <div className="field">
-              <label htmlFor="intake-name">Your name <span aria-hidden="true">*</span></label>
-              <input id="intake-name" value={form.name} onChange={(e) => update('name', e.target.value)} autoComplete="name" required />
+              <label htmlFor="intake-first-name">First name <span aria-hidden="true">*</span></label>
+              <input id="intake-first-name" value={form.firstName} onChange={(e) => update('firstName', e.target.value)} autoComplete="given-name" required />
             </div>
             <div className="field">
-              <label htmlFor="intake-relationship">Your relationship to the person seeking help</label>
-              <select id="intake-relationship" value={form.relationship} onChange={(e) => update('relationship', e.target.value)}>
-                <option value="">Choose one (optional)</option>
-                <option>Self</option><option>Parent or guardian</option><option>Partner or spouse</option><option>Family member</option><option>Friend</option><option>Professional</option><option>Other</option>
-              </select>
+              <label htmlFor="intake-last-name">Last name <span aria-hidden="true">*</span></label>
+              <input id="intake-last-name" value={form.lastName} onChange={(e) => update('lastName', e.target.value)} autoComplete="family-name" required />
             </div>
           </div>
 
@@ -222,22 +215,7 @@ export function PublicIntake({ sourceId }: { sourceId: string }) {
                 <input id="intake-email" type="email" value={form.email} onChange={(e) => update('email', e.target.value)} autoComplete="email" inputMode="email" />
               </div>
             </div>
-            <div className="choice-row" aria-label="Preferred contact method">
-              <span className="choice-label">I prefer</span>
-              <label className="choice"><input type="radio" name="preferred" checked={form.preferredContact === 'phone'} onChange={() => update('preferredContact', 'phone')} /> Phone</label>
-              <label className="choice"><input type="radio" name="preferred" checked={form.preferredContact === 'email'} onChange={() => update('preferredContact', 'email')} /> Email</label>
-            </div>
           </fieldset>
-
-          <div className="field">
-            <label htmlFor="intake-time">A good time to reach you</label>
-            <input id="intake-time" value={form.bestTime} onChange={(e) => update('bestTime', e.target.value)} placeholder="For example, weekday mornings" />
-          </div>
-          <div className="field">
-            <label htmlFor="intake-note">Anything else about reaching you?</label>
-            <textarea id="intake-note" value={form.note} onChange={(e) => update('note', e.target.value)} maxLength={500} placeholder="Optional scheduling or accessibility details only" />
-            <span className="field-hint">Please do not include medical or treatment details. {form.note.length}/500</span>
-          </div>
 
           <div className="hp-field" aria-hidden="true">
             <label htmlFor="website">Website</label>
@@ -245,8 +223,12 @@ export function PublicIntake({ sourceId }: { sourceId: string }) {
           </div>
 
           <label className="consent-row">
-            <input type="checkbox" checked={form.consent} onChange={(e) => update('consent', e.target.checked)} />
-            <span>I agree that {labels?.practiceName} may contact me about this request. <span aria-hidden="true">*</span></span>
+            <input type="checkbox" checked={form.callbackConsent} onChange={(e) => update('callbackConsent', e.target.checked)} />
+            <span>I agree that {labels?.practiceDisplay} may contact me about this request. <span aria-hidden="true">*</span></span>
+          </label>
+          <label className="consent-row">
+            <input type="checkbox" checked={form.privacyConsent} onChange={(e) => update('privacyConsent', e.target.checked)} />
+            <span>I understand this information is used only to respond to my request and should not include medical or treatment details. <span aria-hidden="true">*</span></span>
           </label>
           <button className="primary-action" type="submit" disabled={state === 'submitting'}>
             {state === 'submitting' ? 'Sending request…' : 'Request a callback'}
@@ -297,10 +279,11 @@ export function PublicHandoff({ token }: { token: string }) {
     setState('saving');
     setMessage('');
     try {
-      const next = await publicAction<HandoffRecord>({
-        action: 'handoff.transition', token, expectedVersion: record.version, targetStatus: record.allowedNextStatus,
+      const next = await publicAction<{ status: HandoffStatus; version: number }>({
+        action: 'handoff.transition', token, expectedVersion: record.version, nextStatus: record.allowedNextStatus,
       });
-      setRecord(next);
+      const allowedNextStatus = STATUS_STEPS[STATUS_STEPS.findIndex((step) => step.value === next.status) + 1]?.value ?? null;
+      setRecord({ ...record, ...next, allowedNextStatus });
       setState('ready');
       setMessage(`Status updated to ${statusLabel(next.status)}.`);
     } catch (error) {
@@ -321,8 +304,8 @@ export function PublicHandoff({ token }: { token: string }) {
       <PublicBrand />
       <section className="public-card" aria-labelledby="handoff-title">
         <p className="eyebrow">Secure handoff status</p>
-        <h1 id="handoff-title">Referral {record.alias}</h1>
-        <p className="lede">A privacy-safe progress update from <strong>{record.practiceName}</strong> to <strong>{record.recipientName}</strong>.</p>
+        <h1 id="handoff-title">Referral {record.clientAlias}</h1>
+        <p className="lede">A privacy-safe progress update from <strong>{record.senderPracticeDisplay}</strong> to <strong>{record.recipientDisplay}</strong>.</p>
         <div className="current-status">
           <span>Current status</span>
           <strong>{statusLabel(record.status)}</strong>

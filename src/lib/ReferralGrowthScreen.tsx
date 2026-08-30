@@ -27,6 +27,7 @@ import {
   referralPortalBase,
   referralSourceUrl,
   revokeReferralHandoff,
+  rotateReferralSource,
   setReferralSourceActive,
   transitionReferralHandoff,
   type HandoffStatus,
@@ -235,6 +236,33 @@ export default function ReferralGrowthScreen({
     }
   }
 
+  function confirmRotateSource(source: ReferralSource) {
+    Alert.alert(
+      'Rotate this referral link?',
+      'The current URL will stop working immediately. ReferralFit will create a replacement with the same public labels and Partner attribution.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Rotate link',
+          style: 'destructive',
+          onPress: () => {
+            if (busyId) return;
+            setBusyId(source.id);
+            void rotateReferralSource(source.id)
+              .then((replacement) => {
+                setSources((current) => [replacement, ...current.map((item) => item.id === source.id
+                  ? { ...item, active: false, rotatedToSourceId: replacement.id }
+                  : item)]);
+                Alert.alert('Link rotated', 'The old URL is inactive. Copy or share the new URL from the replacement card.');
+              })
+              .catch((error) => Alert.alert('Could not rotate link', errorMessage(error)))
+              .finally(() => setBusyId(null));
+          },
+        },
+      ],
+    );
+  }
+
   function chooseReferral(referral: Referral) {
     const partner = partnerById.get(referral.partnerId);
     setSelectedReferralId(referral.id);
@@ -391,9 +419,18 @@ export default function ReferralGrowthScreen({
                   </View>
                 </View>
               ) : null}
-              <TouchableOpacity disabled={busyId === source.id} onPress={() => void toggleSource(source)} style={styles.textButton} accessibilityRole="button">
-                <Text style={source.active ? styles.dangerText : styles.textButtonText}>{source.active ? 'Deactivate link' : 'Reactivate link'}</Text>
-              </TouchableOpacity>
+              <View style={styles.actionRow}>
+                {source.active && source.canRotate ? (
+                  <TouchableOpacity disabled={busyId === source.id} onPress={() => confirmRotateSource(source)} style={styles.textButton} accessibilityRole="button" accessibilityLabel={`Rotate link ${source.label}`}>
+                    <Text style={styles.dangerText}>Rotate link</Text>
+                  </TouchableOpacity>
+                ) : null}
+                {!source.rotatedToSourceId ? (
+                  <TouchableOpacity disabled={busyId === source.id} onPress={() => void toggleSource(source)} style={styles.textButton} accessibilityRole="button">
+                    <Text style={source.active ? styles.dangerText : styles.textButtonText}>{source.active ? 'Deactivate link' : 'Reactivate link'}</Text>
+                  </TouchableOpacity>
+                ) : <Text style={styles.helperText}>Permanently replaced</Text>}
+              </View>
             </View>
           );
         })}
