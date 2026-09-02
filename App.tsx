@@ -41,6 +41,7 @@ import {
   therapyOptions,
 } from './src/data';
 import { supabase } from './src/lib/supabase';
+import { CommittedUploadError, CommittedWriteError, StoreError } from './src/lib/errors';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
@@ -124,6 +125,7 @@ import {
   createCaseBundle,
   createCaseFileSignedUrl,
   saveDocumentWithEvent,
+  deleteCase,
   deleteContact,
   deleteDocumentRow,
   fetchCaseData,
@@ -175,6 +177,27 @@ const partnerSnoozeKey = (userId: string) => `referralfit-partner-snooze-v2:${us
 // call sites read the same, but it is intentionally unused.
 function makeId(_prefix?: string) {
   return newUuid();
+}
+
+const VOICE_RECORDING_MARKER = '\n\n[voice-recording:';
+
+function voiceRecordingPath(note: string): string | null {
+  const start = note.lastIndexOf(VOICE_RECORDING_MARKER);
+  if (start < 0 || !note.endsWith(']')) return null;
+  return note.slice(start + VOICE_RECORDING_MARKER.length, -1);
+}
+
+function visibleVoiceNote(note: string): string {
+  const start = note.lastIndexOf(VOICE_RECORDING_MARKER);
+  return start < 0 ? note : note.slice(0, start);
+}
+
+function recordingFileDetails(uri: string): { fileName: string; mimeType: string } {
+  const clean = uri.split('?')[0];
+  const ext = clean.split('.').pop()?.toLowerCase();
+  if (ext === 'caf') return { fileName: `voice-recording-${Date.now()}.caf`, mimeType: 'audio/x-caf' };
+  if (ext === 'm4a') return { fileName: `voice-recording-${Date.now()}.m4a`, mimeType: 'audio/m4a' };
+  return { fileName: `voice-recording-${Date.now()}.wav`, mimeType: 'audio/wav' };
 }
 
 // ─── Case files (v3) ────────────────────────────────────────────────────────
@@ -867,12 +890,17 @@ export default function App() {
     if (!accountIsCurrent()) throw new Error('The account changed before local data could be saved.');
     setQueuedWrites(pending);
     setOffline(pending > 0);
-    await withTimeout(
+    // Notification scheduling is derived work, not part of the data save. Do not
+    // hold the global mutation slot for up to six seconds while iOS rebuilds
+    // reminders; that made unrelated case saves appear permanently locked.
+    void withTimeout(
       rescheduleNotifications({ ...data, cases: activeCases }, userId),
       6000,
       'Notification scheduling timed out',
-    );
-    if (!accountIsCurrent()) throw new Error('The account changed before notification scheduling completed.');
+    ).catch(() => {
+      // The authoritative data and offline cache are already saved. The next
+      // foreground refresh will retry notification scheduling.
+    });
   }, [session?.user?.id, partners, referrals, referralMatches, touches, followUps, scorecards, cases]);
 
   async function settleOptimisticWrite(
@@ -3497,46 +3525,197 @@ export default function App() {
   }
 
   async function saveApprovedVoiceDraft(draft: ApprovedVoiceDraft): Promise<void> {
-    if (!activeUserId) throw new Error('Sign in again before saving this draft.');
-    const occurredAt = new Date().toISOString();
-    const touch: Touch = {
-      id: makeId('t'),
-      partnerId: draft.partnerId,
-      kind: draft.touchKind,
-      note: draft.note,
-      occurredAt,
-    };
-    const followUp: FollowUp | undefined = draft.followUp ? {
-      id: makeId('f'),
-      partnerId: draft.partnerId,
-      kind: 'touch',
-      title: draft.followUp.title,
-      dueOn: draft.followUp.dueOn,
-      dueTime: draft.followUp.dueTime,
-      status: 'open',
-      note: '',
-    } : undefined;
+    if (!activeUserId) throw new Error('Sign in again before saving this recording.');
+    const ownerId = activeUserId;
+    const { fileName, mimeType } = recordingFileDetails(draft.audioUri);
+    const documentId = newDocumentId();
 
-    await saveVoiceActivity(touch, followUp, activeUserId);
-    const nextTouches = [touch, ...touches];
-    const nextFollowUps = followUp ? [followUp, ...followUps] : followUps;
-    const today = localDateStamp();
-    const nextPartners = partners.map((partner) => partner.id === draft.partnerId
-      ? { ...partner, lastContact: today }
-      : partner);
-    setTouches(nextTouches);
-    setFollowUps(nextFollowUps);
-    setPartners(nextPartners);
-    void syncDerived({
-      partners: nextPartners,
-      referrals,
-      referralMatches,
-      touches: nextTouches,
-      followUps: nextFollowUps,
-      scorecards,
-    }).catch(() => {
-      // The server transaction is authoritative; hydration repairs cache later.
-    });
+    if (draft.destination.type === 'partner') {
+      const partnerId = draft.destination.partnerId;
+      let uploadedPath: string | null = null;
+      try {
+        const uploaded = await uploadCaseFile({
+          ownerId,
+          caseId: `partner-${partnerId}`,
+          documentId,
+          localUri: draft.audioUri,
+          fileName,
+          mimeType,
+          sizeBytes: null,
+        });
+        uploadedPath = uploaded.storagePath;
+        const occurredAt = new Date().toISOString();
+        const touch: Touch = {
+          id: makeId('t'),
+          partnerId: partnerId,
+          kind: draft.touchKind,
+          note: `${draft.note}${VOICE_RECORDING_MARKER}${uploadedPath}]`,
+          occurredAt,
+        };
+        const followUp: FollowUp | undefined = draft.followUp ? {
+          id: makeId('f'),
+          partnerId: partnerId,
+          kind: 'touch',
+          title: draft.followUp.title,
+          dueOn: draft.followUp.dueOn,
+          dueTime: draft.followUp.dueTime,
+          status: 'open',
+          note: '',
+        } : undefined;
+        await saveVoiceActivity(touch, followUp, ownerId);
+        const nextTouches = [touch, ...touches];
+        const nextFollowUps = followUp ? [followUp, ...followUps] : followUps;
+        const nextPartners = partners.map((partner) => partner.id === partnerId
+          ? { ...partner, lastContact: localDateStamp() }
+          : partner);
+        setTouches(nextTouches);
+        setFollowUps(nextFollowUps);
+        setPartners(nextPartners);
+        void syncDerived({ partners: nextPartners, referrals, referralMatches, touches: nextTouches, followUps: nextFollowUps, scorecards }).catch(() => undefined);
+        return;
+      } catch (error) {
+        if (error instanceof CommittedWriteError) return;
+        if (error instanceof CommittedUploadError) {
+          throw new Error('The recording uploaded, but the active account changed before it could be attached. Sign back into the original workspace before retrying.');
+        }
+        if (!(error instanceof StoreError)) {
+          throw new Error('The save status could not be confirmed. The private recording was kept; refresh the professional activity before retrying.');
+        }
+        if (uploadedPath) await removeCaseFile(uploadedPath).catch(() => undefined);
+        throw error;
+      }
+    }
+
+    const caseId = draft.destination.type === 'existing_case' ? draft.destination.caseId : makeId('c');
+    let uploadedPath: string | null = null;
+    let createdCase = false;
+    try {
+      let newRecord: CaseRecord | null = null;
+      let firstCall: FollowUp | null = null;
+      if (draft.destination.type === 'new_case') {
+        const now = new Date().toISOString();
+        newRecord = {
+          id: caseId,
+          title: draft.destination.title,
+          status: 'inquiry',
+          summary: draft.transcript,
+          leadSource: 'Voice recording',
+          leadSourceDetail: '',
+          lostReason: '',
+          stageChangedAt: now,
+          paymentStatus: 'none',
+          quotedAmount: null,
+          paidAmount: 0,
+          createdAt: now,
+          updatedAt: now,
+        };
+        firstCall = {
+          id: makeId('f'),
+          caseId,
+          kind: 'first_call',
+          title: `First call — ${newRecord.title}`,
+          dueOn: localDateStamp(),
+          status: 'open',
+          note: '',
+        };
+        // Keep the provisional case rollback-safe. The first-call task is
+        // created only after the recording metadata commits; follow_ups use
+        // ON DELETE SET NULL and would otherwise survive a failed upload.
+        await createCaseBundle(newRecord, null, null, ownerId);
+        createdCase = true;
+      }
+
+      // Storage RLS validates case folders, so a new case must exist before
+      // its recording is uploaded. Any later failure removes both artifacts.
+      const uploaded = await uploadCaseFile({
+        ownerId,
+        caseId,
+        documentId,
+        localUri: draft.audioUri,
+        fileName,
+        mimeType,
+        sizeBytes: null,
+      });
+      uploadedPath = uploaded.storagePath;
+
+      const createdAt = new Date().toISOString();
+      const document: CaseDocument = {
+        id: documentId,
+        caseId,
+        label: `Voice recording — ${new Date().toLocaleString()}`,
+        storagePath: uploadedPath,
+        mimeType,
+        sizeBytes: null,
+        createdAt,
+      };
+      const event: CaseEvent = {
+        id: makeId('e'),
+        caseId,
+        kind: 'voice_note',
+        body: draft.note || draft.transcript,
+        documentId,
+        occurredAt: createdAt,
+      };
+      await saveDocumentWithEvent(document, event);
+
+      let savedFirstCall = firstCall;
+      if (firstCall) {
+        try {
+          await createFollowUp(firstCall, ownerId);
+        } catch {
+          savedFirstCall = null;
+          Alert.alert('Recording saved', 'The new case and recording were saved, but the first-call task could not be created. Add the next step from the case file.');
+        }
+      }
+
+      if (newRecord) {
+        const nextCases = [newRecord, ...cases];
+        const nextFollowUps = savedFirstCall ? [savedFirstCall, ...followUps] : followUps;
+        setCases(nextCases);
+        setFollowUps(nextFollowUps);
+        void syncDerived(
+          { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+          nextCases,
+        ).catch(() => undefined);
+      } else {
+        const nextCases = cases.map((record) => record.id === caseId ? { ...record, updatedAt: createdAt } : record);
+        setCases(nextCases);
+        void syncDerived(undefined, nextCases).catch(() => undefined);
+      }
+      if (activeCaseId === caseId) {
+        setCaseDocuments((current) => [...current, document]);
+        applyCaseEvent(event);
+      }
+      return;
+    } catch (error) {
+      if (error instanceof CommittedWriteError) return;
+      if (error instanceof CommittedUploadError) {
+        throw new Error('The recording uploaded, but the active account changed before it could be attached. The new case was kept; sign back into the original workspace before retrying.');
+      }
+      if (!(error instanceof StoreError)) {
+        throw new Error('The save status could not be confirmed. The case and private recording were kept; refresh Cases before retrying.');
+      }
+      let storageRemoved = !uploadedPath;
+      if (uploadedPath) {
+        try {
+          await removeCaseFile(uploadedPath);
+          storageRemoved = true;
+        } catch {
+          storageRemoved = false;
+        }
+      }
+      if (createdCase && storageRemoved) {
+        try {
+          await deleteCase(caseId);
+        } catch {
+          throw new Error('The recording was not attached, and the newly created case could not be rolled back. Open Cases and review the new case before retrying.');
+        }
+      }
+      if (createdCase && !storageRemoved) {
+        throw new Error('The recording was not attached. The new case was kept so its private audio can still be recovered; open that case before retrying.');
+      }
+      throw error;
+    }
   }
 
   // Today Command Center — the prioritized daily operating list. The old
@@ -4548,7 +4727,7 @@ export default function App() {
             <View style={styles.modalHeader}>
               <TouchableOpacity accessibilityLabel="Close new case form" onPress={() => setShowNewCase(false)} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
               <Text style={styles.modalHeaderTitle}>New case</Text>
-              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={saveNewCase}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+              <View style={styles.modalHeaderAction} />
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               <Text style={styles.formIntro}>One family, one file. Everything else — more contacts, notes, documents, payments — gets added from the case file itself.</Text>
@@ -4810,19 +4989,31 @@ export default function App() {
               );
             })()}
             {(() => {
-              const partnerTouches = touches.filter((touch) => touch.partnerId === selectedPartner.id).slice(0, 5);
+              const allPartnerTouches = touches.filter((touch) => touch.partnerId === selectedPartner.id);
+              const recentPartnerTouches = allPartnerTouches.slice(0, 5);
+              const olderRecordings = allPartnerTouches.slice(5).filter((touch) => Boolean(voiceRecordingPath(touch.note)));
+              const partnerTouches = [...recentPartnerTouches, ...olderRecordings];
               return partnerTouches.length ? (
                 <View style={styles.touchLogList}>
-                  {partnerTouches.map((touch) => (
-                    <View key={touch.id} style={styles.touchLogRow}>
-                      <View style={styles.touchLogIcon}><AppIcon name={touch.kind === 'call' ? 'call' : touch.kind === 'text' ? 'chatbubble' : touch.kind === 'email' ? 'mail' : touch.kind === 'meeting' ? 'people' : 'ellipsis-horizontal'} size={14} color={COLORS.forest} /></View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.touchLogTitle}>{touch.kind.charAt(0).toUpperCase() + touch.kind.slice(1)}</Text>
-                        {touch.note ? <Text numberOfLines={1} style={styles.touchLogNote}>{touch.note}</Text> : null}
+                  {partnerTouches.map((touch) => {
+                    const recordingPath = voiceRecordingPath(touch.note);
+                    const note = visibleVoiceNote(touch.note);
+                    return (
+                      <View key={touch.id} style={styles.touchLogRow}>
+                        <View style={styles.touchLogIcon}><AppIcon name={touch.kind === 'call' ? 'call' : touch.kind === 'text' ? 'chatbubble' : touch.kind === 'email' ? 'mail' : touch.kind === 'meeting' ? 'people' : 'ellipsis-horizontal'} size={14} color={COLORS.forest} /></View>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.touchLogTitle}>{touch.kind.charAt(0).toUpperCase() + touch.kind.slice(1)}</Text>
+                          {note ? <Text numberOfLines={1} style={styles.touchLogNote}>{note}</Text> : null}
+                          {recordingPath ? (
+                            <TouchableOpacity onPress={() => void createCaseFileSignedUrl(recordingPath).then((url) => Linking.openURL(url)).catch((error) => Alert.alert('Could not open recording', (error as Error).message))}>
+                              <Text style={styles.voiceRecordingLink}>▶ Play recording</Text>
+                            </TouchableOpacity>
+                          ) : null}
+                        </View>
+                        <Text style={styles.touchLogDate}>{shortDate(touch.occurredAt.slice(0, 10))}</Text>
                       </View>
-                      <Text style={styles.touchLogDate}>{shortDate(touch.occurredAt.slice(0, 10))}</Text>
-                    </View>
-                  ))}
+                    );
+                  })}
                 </View>
               ) : null;
             })()}
@@ -5693,6 +5884,7 @@ export default function App() {
       <VoiceCaptureSheet
         visible={showVoiceCapture}
         partners={partners}
+        cases={cases}
         onClose={() => setShowVoiceCapture(false)}
         onApprove={saveApprovedVoiceDraft}
       />
@@ -6038,6 +6230,7 @@ const styles = StyleSheet.create({
   touchLogIcon: { width: 28, height: 28, borderRadius: 9, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center' },
   touchLogTitle: { color: COLORS.ink, fontSize: 12, fontWeight: '700' },
   touchLogNote: { color: COLORS.gray, fontSize: 10, marginTop: 2 },
+  voiceRecordingLink: { color: COLORS.forest, fontSize: 11, fontWeight: '800', marginTop: 5 },
   touchLogDate: { color: COLORS.gray, fontSize: 10 },
   prePromptBody: { padding: 20, paddingBottom: 26 },
   keyboardSheetScroll: { flexShrink: 1 },

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
 const source = await readFile(new URL('../App.tsx', import.meta.url), 'utf8');
+const voiceSource = await readFile(new URL('../src/lib/VoiceCaptureSheet.tsx', import.meta.url), 'utf8');
 
 assert.match(source, /function mutationSlotAvailable\(label: string\): boolean/);
 assert.match(source, /async function saveCurrentReferralMatch\(\): Promise<ReferralMatch \| null>/);
@@ -84,6 +85,14 @@ assert.match(source, /if \(!card\?\.followUp \|\| caseCloseLoopSaving\) return/,
 assert.match(source, /setCaseCloseLoopSaving\(true\)[\s\S]{0,700}settleOptimisticWrite\(/, 'the status sheet must stay mounted while the optimistic write settles');
 assert.match(source, /requestAnimationFrame\(\(\) => \{\s*setDoneCard\(\(current\) => current\?\.id === card\.id \? null : current\)/, 'the status sheet must dismiss after the status-pill press settles');
 assert.match(source, /withTimeout\(\s*rescheduleNotifications\(/, 'native notification refresh must not block a completed save indefinitely');
+assert.equal((source.match(/onPress=\{saveNewCase\}/g) || []).length, 1, 'the new-case form must expose exactly one save action');
+assert.match(source, /void withTimeout\(\s*rescheduleNotifications\(/, 'derived notification scheduling must not hold the mutation slot');
+assert.match(voiceSource, /recordingOptions: \{ persist: true \}/, 'voice capture must retain the approved audio file long enough to attach it');
+for (const destination of ['new_case', 'existing_case', 'partner']) {
+  assert.ok(voiceSource.includes(`['${destination}'`), `voice review must offer the ${destination} destination`);
+}
+assert.match(source, /if \(draft\.destination\.type === 'partner'\)[\s\S]*uploadCaseFile\(/, 'professional recordings must be uploaded before the touch is saved');
+assert.match(source, /draft\.destination\.type === 'existing_case'[\s\S]*saveDocumentWithEvent\(document, event\)/, 'case recordings must create private document metadata and a timeline event');
 
 for (const operation of [
   'completeFollowUpWithNext', 'completeFollowUpWithCase',

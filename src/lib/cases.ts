@@ -2,7 +2,7 @@ import { decode } from 'base64-arraybuffer';
 import * as Crypto from 'expo-crypto';
 import * as FileSystem from 'expo-file-system/legacy';
 
-import { StoreError } from './errors';
+import { CommittedUploadError, CommittedWriteError, StoreError } from './errors';
 import { currentAuthSessionIdentity, type AuthSessionIdentity } from './auth-session';
 import { phoneSearchSuffix } from './phone';
 import { supabase } from './supabase';
@@ -397,6 +397,14 @@ export async function createCase(record: CaseRecord, expectedUserId: string): Pr
   await runOrThrow(() => supabase.from('cases').insert(row));
 }
 
+export async function deleteCase(id: string): Promise<void> {
+  await withStableCaseAccount(async () => {
+    const { data, error } = await supabase.from('cases').delete().eq('id', id).select('id');
+    if (error) throw new StoreError(error.message, false);
+    if (!data?.length) throw new StoreError('The case could not be removed from the active workspace.', false);
+  });
+}
+
 // The case and its initial children are one user action. The matching RPC is a
 // single Postgres transaction, so a failed contact or first-call insert cannot
 // leave a ghost case behind on the server.
@@ -669,10 +677,17 @@ export async function createDocumentRow(document: CaseDocument): Promise<void> {
 }
 
 export async function saveDocumentWithEvent(document: CaseDocument, event: CaseEvent): Promise<void> {
-  await runOrThrow(() => supabase.rpc('save_case_document_with_event', {
+  const fence = await currentCaseAccount();
+  const { error } = await supabase.rpc('save_case_document_with_event', {
     p_document: documentToRow(document),
     p_event: eventToRow(event),
-  }));
+  });
+  if (error) throw new StoreError(error.message, false);
+  try {
+    await assertCaseAccount(fence);
+  } catch {
+    throw new CommittedWriteError();
+  }
 }
 
 export async function deleteDocumentRow(id: string): Promise<void> {
@@ -738,16 +753,21 @@ async function readAsBase64(localUri: string): Promise<string> {
 }
 
 export async function uploadCaseFile(input: UploadCaseFileInput): Promise<{ storagePath: string }> {
-  return withStableCaseAccount(async (userId) => {
-  if (input.ownerId !== userId) throw new StoreError('The document owner does not match the active account.', false);
+  const fence = await currentCaseAccount();
+  if (input.ownerId !== fence.userId) throw new StoreError('The document owner does not match the active account.', false);
   const storagePath = `${input.ownerId}/${input.caseId}/${input.documentId}.${sanitizeExt(input.fileName, input.mimeType)}`;
   const base64 = await readAsBase64(input.localUri);
+  await assertCaseAccount(fence);
   const { error } = await supabase.storage
     .from(BUCKET)
     .upload(storagePath, decode(base64), { contentType: input.mimeType, upsert: false });
   if (error) throw new StoreError(error.message, false);
+  try {
+    await assertCaseAccount(fence);
+  } catch {
+    throw new CommittedUploadError(storagePath);
+  }
   return { storagePath };
-  });
 }
 
 // 60-second signed URL for viewing. The URL expires; the row never stores it.

@@ -17,8 +17,10 @@ import {
   useSpeechRecognitionEvent,
   type ExpoSpeechRecognitionErrorCode,
 } from 'expo-speech-recognition';
+import * as FileSystem from 'expo-file-system/legacy';
 
 import type { Partner } from '../data';
+import type { CaseRecord } from './cases';
 import {
   parseVoiceTranscript,
   type VoiceFollowUpDraft,
@@ -27,20 +29,27 @@ import {
 } from './voice';
 
 export type ApprovedVoiceDraft = {
-  partnerId: string;
+  destination:
+    | { type: 'new_case'; title: string }
+    | { type: 'existing_case'; caseId: string }
+    | { type: 'partner'; partnerId: string };
   touchKind: VoiceTouchKind;
   note: string;
+  transcript: string;
+  audioUri: string;
   followUp?: VoiceFollowUpDraft;
 };
 
 type Props = {
   visible: boolean;
   partners: Partner[];
+  cases: CaseRecord[];
   onClose: () => void;
   onApprove: (draft: ApprovedVoiceDraft) => Promise<void> | void;
 };
 
 type Screen = 'capture' | 'review';
+type DestinationType = ApprovedVoiceDraft['destination']['type'];
 
 const COLORS = {
   cream: '#F6F4EE',
@@ -101,7 +110,7 @@ function emptyFollowUp(): VoiceFollowUpDraft {
   return { title: '', dueOn: '' };
 }
 
-export default function VoiceCaptureSheet({ visible, partners, onClose, onApprove }: Props) {
+export default function VoiceCaptureSheet({ visible, partners, cases, onClose, onApprove }: Props) {
   const [screen, setScreen] = useState<Screen>('capture');
   const [transcript, setTranscript] = useState('');
   const [parseRequested, setParseRequested] = useState(false);
@@ -113,11 +122,22 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
   const [saveError, setSaveError] = useState('');
   const [saving, setSaving] = useState(false);
   const [partnerSearch, setPartnerSearch] = useState('');
+  const [caseSearch, setCaseSearch] = useState('');
+  const [destinationType, setDestinationType] = useState<DestinationType>('partner');
+  const [selectedCaseId, setSelectedCaseId] = useState('');
+  const [newCaseTitle, setNewCaseTitle] = useState('');
+  const [audioUri, setAudioUri] = useState('');
   const activeRecognition = useRef(false);
+  const awaitingAudio = useRef(false);
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
 
   const reset = useCallback(() => {
+    awaitingAudio.current = false;
+    if (audioUri) {
+      if (audioUri.startsWith('blob:') && typeof URL !== 'undefined') URL.revokeObjectURL(audioUri);
+      else void FileSystem.deleteAsync(audioUri, { idempotent: true }).catch(() => undefined);
+    }
     setScreen('capture');
     setTranscript('');
     setParseRequested(false);
@@ -129,9 +149,15 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
     setSaveError('');
     setSaving(false);
     setPartnerSearch('');
-  }, []);
+    setCaseSearch('');
+    setDestinationType('partner');
+    setSelectedCaseId('');
+    setNewCaseTitle('');
+    setAudioUri('');
+  }, [audioUri]);
 
   const abortRecognition = useCallback(() => {
+    awaitingAudio.current = false;
     if (!activeRecognition.current) return;
     activeRecognition.current = false;
     try {
@@ -177,6 +203,12 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
     if (event.isFinal) setParseRequested(true);
   });
 
+  useSpeechRecognitionEvent('audioend', (event) => {
+    if (!visibleRef.current || !awaitingAudio.current) return;
+    awaitingAudio.current = false;
+    setAudioUri(event.uri || '');
+  });
+
   useSpeechRecognitionEvent('end', () => {
     if (!activeRecognition.current || !visibleRef.current) return;
     activeRecognition.current = false;
@@ -188,6 +220,7 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
 
   useSpeechRecognitionEvent('error', (event) => {
     if (!activeRecognition.current || !visibleRef.current) return;
+    awaitingAudio.current = false;
     activeRecognition.current = false;
     setListening(false);
     setStarting(false);
@@ -213,6 +246,11 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
   async function startDictation() {
     if (starting || listening || finishing) return;
     setCaptureError('');
+    if (audioUri) {
+      if (audioUri.startsWith('blob:') && typeof URL !== 'undefined') URL.revokeObjectURL(audioUri);
+      else void FileSystem.deleteAsync(audioUri, { idempotent: true }).catch(() => undefined);
+    }
+    setAudioUri('');
     setTranscript('');
     setDraft(null);
     setStarting(true);
@@ -238,15 +276,17 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
       }
 
       activeRecognition.current = true;
+      awaitingAudio.current = true;
       ExpoSpeechRecognitionModule.start({
         lang: 'en-US',
         interimResults: true,
         continuous: false,
         maxAlternatives: 1,
         contextualStrings: partners.slice(0, 100).flatMap((partner) => [partner.name, partner.organization]),
-        recordingOptions: { persist: false },
+        recordingOptions: { persist: true },
       });
     } catch (error) {
+      awaitingAudio.current = false;
       activeRecognition.current = false;
       setStarting(false);
       setCaptureError(error instanceof Error && error.message
@@ -261,6 +301,7 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
     try {
       ExpoSpeechRecognitionModule.stop();
     } catch (error) {
+      awaitingAudio.current = false;
       activeRecognition.current = false;
       setListening(false);
       setFinishing(false);
@@ -280,13 +321,25 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
 
   async function approve() {
     if (!draft || saving) return;
-    if (!draft.partnerId) {
-      setSaveError('Select a partner before saving this touch.');
+    if (!audioUri) {
+      setSaveError('The recording file is still finishing. Wait a moment, then try again.');
+      return;
+    }
+    if (destinationType === 'partner' && !draft.partnerId) {
+      setSaveError('Select a professional referent before saving.');
+      return;
+    }
+    if (destinationType === 'existing_case' && !selectedCaseId) {
+      setSaveError('Select an existing case before saving.');
+      return;
+    }
+    if (destinationType === 'new_case' && !newCaseTitle.trim()) {
+      setSaveError('Name the new case before saving.');
       return;
     }
     const note = draft.note.trim();
     let followUp: VoiceFollowUpDraft | undefined;
-    if (draft.followUp) {
+    if (destinationType === 'partner' && draft.followUp) {
       const title = draft.followUp.title.trim();
       const dueOn = draft.followUp.dueOn.trim();
       const dueTime = draft.followUp.dueTime?.trim();
@@ -309,9 +362,15 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
     setSaveError('');
     try {
       await onApprove({
-        partnerId: draft.partnerId,
+        destination: destinationType === 'partner'
+          ? { type: 'partner', partnerId: draft.partnerId! }
+          : destinationType === 'existing_case'
+            ? { type: 'existing_case', caseId: selectedCaseId }
+            : { type: 'new_case', title: newCaseTitle.trim() },
         touchKind: draft.touchKind,
         note,
+        transcript: transcript.trim(),
+        audioUri,
         ...(followUp ? { followUp } : {}),
       });
       reset();
@@ -331,6 +390,12 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
       `${partner.name} ${partner.organization}`.toLocaleLowerCase().includes(query),
     );
   }, [partnerSearch, partners]);
+
+  const filteredCases = useMemo(() => {
+    const query = caseSearch.trim().toLocaleLowerCase();
+    if (!query) return cases;
+    return cases.filter((record) => `${record.title} ${record.summary}`.toLocaleLowerCase().includes(query));
+  }, [caseSearch, cases]);
 
   const selectedPartner = draft?.partnerId
     ? partners.find((partner) => partner.id === draft.partnerId)
@@ -371,7 +436,7 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
               </View>
               <Text style={styles.heroTitle}>Speak naturally. Approve deliberately.</Text>
               <Text style={styles.heroBody}>
-                Say who you contacted, how you connected, a brief ledger-safe note, and an optional follow-up.
+                Record the update, review the transcript, then choose where it belongs.
               </Text>
 
               <View style={styles.privacyCard}>
@@ -380,7 +445,7 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
                   ReferralFit requests microphone and speech recognition access only after you tap Start dictation. Your device’s recognition service may send audio to its provider for transcription.
                 </Text>
                 <View style={styles.rule} />
-                <Text style={styles.privacyPoint}>• ReferralFit does not persist the audio.</Text>
+                <Text style={styles.privacyPoint}>• Audio is saved only after you approve a destination.</Text>
                 <Text style={styles.privacyPoint}>• The latest transcript stays temporary until you approve.</Text>
                 <Text style={styles.privacyPoint}>• Avoid client names, diagnoses, and family details.</Text>
               </View>
@@ -461,66 +526,104 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
               ))}
 
               <View style={styles.section}>
-                <Text style={styles.sectionTitle}>Partner <Text style={styles.required}>Required</Text></Text>
-                {selectedPartner ? (
-                  <View style={styles.selectedPartner}>
-                    <Text style={styles.selectedPartnerName}>{selectedPartner.name}</Text>
-                    <Text style={styles.selectedPartnerOrg}>{selectedPartner.organization}</Text>
-                  </View>
-                ) : (
-                  <Text style={styles.fieldHint}>The transcript did not identify one partner. Choose one below.</Text>
-                )}
-                <TextInput
-                  accessibilityLabel="Search partners"
-                  placeholder="Search name or organization"
-                  placeholderTextColor={COLORS.muted}
-                  value={partnerSearch}
-                  onChangeText={setPartnerSearch}
-                  style={styles.input}
-                />
-                <View style={styles.partnerList}>
-                  {filteredPartners.map((partner) => {
-                    const selected = partner.id === draft.partnerId;
+                <Text style={styles.sectionTitle}>Save recording to</Text>
+                <View style={styles.chipRow} accessibilityRole="radiogroup">
+                  {([
+                    ['new_case', 'New case'],
+                    ['existing_case', 'Existing case'],
+                    ['partner', 'Professional referent'],
+                  ] as const).map(([value, label]) => {
+                    const selected = destinationType === value;
                     return (
                       <TouchableOpacity
-                        key={partner.id}
+                        key={value}
                         accessibilityRole="radio"
-                        accessibilityLabel={`${partner.name}, ${partner.organization}`}
                         accessibilityState={{ checked: selected }}
-                        onPress={() => updateDraft({ partnerId: partner.id, partnerName: partner.name })}
-                        style={[styles.partnerOption, selected && styles.partnerOptionSelected]}
+                        onPress={() => { setDestinationType(value); setSaveError(''); }}
+                        style={[styles.destinationChip, selected && styles.chipSelected]}
                       >
-                        <View style={styles.partnerCopy}>
-                          <Text style={[styles.partnerName, selected && styles.partnerNameSelected]}>{partner.name}</Text>
-                          <Text style={[styles.partnerOrg, selected && styles.partnerOrgSelected]}>{partner.organization}</Text>
-                        </View>
-                        <Text style={[styles.checkmark, selected && styles.checkmarkSelected]}>{selected ? '✓' : '○'}</Text>
+                        <Text style={[styles.chipText, selected && styles.chipTextSelected]}>{label}</Text>
                       </TouchableOpacity>
                     );
                   })}
-                  {filteredPartners.length === 0 ? <Text style={styles.emptyText}>No matching partners.</Text> : null}
                 </View>
               </View>
 
-              <View style={styles.section}>
-                <Text style={styles.sectionTitle}>Touch type</Text>
-                <View style={styles.chipRow} accessibilityRole="radiogroup">
-                  {TOUCH_KINDS.map((kind) => {
-                    const selected = draft.touchKind === kind.value;
-                    return (
-                      <TouchableOpacity
-                        key={kind.value}
-                        accessibilityRole="radio"
-                        accessibilityState={{ checked: selected }}
-                        onPress={() => updateDraft({ touchKind: kind.value })}
-                        style={[styles.chip, selected && styles.chipSelected]}
-                      >
-                        <Text style={[styles.chipText, selected && styles.chipTextSelected]}>{kind.label}</Text>
-                      </TouchableOpacity>
-                    );
-                  })}
+              {destinationType === 'new_case' ? (
+                <View style={styles.section}>
+                  <Text style={styles.sectionTitle}>New case name <Text style={styles.required}>Required</Text></Text>
+                  <Text style={styles.fieldHint}>The transcript and recording will be added to the new case file.</Text>
+                  <TextInput accessibilityLabel="New case name" placeholder="Family name — who the case is about" placeholderTextColor={COLORS.muted} value={newCaseTitle} onChangeText={setNewCaseTitle} style={styles.input} />
                 </View>
-              </View>
+              ) : destinationType === 'existing_case' ? (
+                <View style={styles.section}>
+                  <Text style={styles.sectionTitle}>Existing case <Text style={styles.required}>Required</Text></Text>
+                  <TextInput accessibilityLabel="Search cases" placeholder="Search case name or summary" placeholderTextColor={COLORS.muted} value={caseSearch} onChangeText={setCaseSearch} style={styles.input} />
+                  <View style={styles.partnerList}>
+                    {filteredCases.map((record) => {
+                      const selected = record.id === selectedCaseId;
+                      return (
+                        <TouchableOpacity key={record.id} accessibilityRole="radio" accessibilityState={{ checked: selected }} onPress={() => setSelectedCaseId(record.id)} style={[styles.partnerOption, selected && styles.partnerOptionSelected]}>
+                          <View style={styles.partnerCopy}>
+                            <Text style={[styles.partnerName, selected && styles.partnerNameSelected]}>{record.title}</Text>
+                            <Text style={[styles.partnerOrg, selected && styles.partnerOrgSelected]}>{record.status}</Text>
+                          </View>
+                          <Text style={[styles.checkmark, selected && styles.checkmarkSelected]}>{selected ? '✓' : '○'}</Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                    {filteredCases.length === 0 ? <Text style={styles.emptyText}>No matching cases.</Text> : null}
+                  </View>
+                </View>
+              ) : (
+                <View style={styles.section}>
+                  <Text style={styles.sectionTitle}>Professional referent <Text style={styles.required}>Required</Text></Text>
+                  {selectedPartner ? (
+                    <View style={styles.selectedPartner}>
+                      <Text style={styles.selectedPartnerName}>{selectedPartner.name}</Text>
+                      <Text style={styles.selectedPartnerOrg}>{selectedPartner.organization}</Text>
+                    </View>
+                  ) : <Text style={styles.fieldHint}>Choose the professional this recording belongs to.</Text>}
+                  <TextInput accessibilityLabel="Search professional referents" placeholder="Search name or organization" placeholderTextColor={COLORS.muted} value={partnerSearch} onChangeText={setPartnerSearch} style={styles.input} />
+                  <View style={styles.partnerList}>
+                    {filteredPartners.map((partner) => {
+                      const selected = partner.id === draft.partnerId;
+                      return (
+                        <TouchableOpacity key={partner.id} accessibilityRole="radio" accessibilityState={{ checked: selected }} onPress={() => updateDraft({ partnerId: partner.id, partnerName: partner.name })} style={[styles.partnerOption, selected && styles.partnerOptionSelected]}>
+                          <View style={styles.partnerCopy}>
+                            <Text style={[styles.partnerName, selected && styles.partnerNameSelected]}>{partner.name}</Text>
+                            <Text style={[styles.partnerOrg, selected && styles.partnerOrgSelected]}>{partner.organization}</Text>
+                          </View>
+                          <Text style={[styles.checkmark, selected && styles.checkmarkSelected]}>{selected ? '✓' : '○'}</Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                    {filteredPartners.length === 0 ? <Text style={styles.emptyText}>No matching professional referents.</Text> : null}
+                  </View>
+                </View>
+              )}
+
+              {destinationType === 'partner' ? (
+                <View style={styles.section}>
+                  <Text style={styles.sectionTitle}>Touch type</Text>
+                  <View style={styles.chipRow} accessibilityRole="radiogroup">
+                    {TOUCH_KINDS.map((kind) => {
+                      const selected = draft.touchKind === kind.value;
+                      return (
+                        <TouchableOpacity
+                          key={kind.value}
+                          accessibilityRole="radio"
+                          accessibilityState={{ checked: selected }}
+                          onPress={() => updateDraft({ touchKind: kind.value })}
+                          style={[styles.chip, selected && styles.chipSelected]}
+                        >
+                          <Text style={[styles.chipText, selected && styles.chipTextSelected]}>{kind.label}</Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                </View>
+              ) : null}
 
               <View style={styles.section}>
                 <Text style={styles.sectionTitle}>Ledger note</Text>
@@ -537,9 +640,10 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
                 />
               </View>
 
-              <View style={styles.section}>
-                <View style={styles.sectionHeaderRow}>
-                  <Text style={styles.sectionTitle}>Follow-up</Text>
+              {destinationType === 'partner' ? (
+                <View style={styles.section}>
+                  <View style={styles.sectionHeaderRow}>
+                    <Text style={styles.sectionTitle}>Follow-up</Text>
                   <TouchableOpacity
                     accessibilityRole="button"
                     accessibilityLabel={draft.followUp ? 'Remove follow-up' : 'Add follow-up'}
@@ -589,15 +693,18 @@ export default function VoiceCaptureSheet({ visible, partners, onClose, onApprov
                       </View>
                     </View>
                   </View>
-                ) : (
-                  <Text style={styles.fieldHint}>No follow-up will be created.</Text>
-                )}
-              </View>
+                  ) : (
+                    <Text style={styles.fieldHint}>No follow-up will be created.</Text>
+                  )}
+                </View>
+              ) : null}
 
               <View style={styles.ledgerReminder}>
                 <Text style={styles.ledgerReminderTitle}>Ledger privacy check</Text>
                 <Text style={styles.ledgerReminderText}>
-                  Save only professional relationship activity. Remove client names, health information, and sensitive family details.
+                  {destinationType === 'partner'
+                    ? 'Save only professional relationship activity. Remove client names, health information, and sensitive family details.'
+                    : 'Confirm that this recording belongs in the selected case file before saving.'}
                 </Text>
               </View>
 
@@ -734,6 +841,7 @@ const styles = StyleSheet.create({
   emptyText: { color: COLORS.muted, fontSize: 13, paddingVertical: 16, textAlign: 'center' },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', marginHorizontal: -4 },
   chip: { minHeight: 44, minWidth: 68, borderWidth: 1, borderColor: COLORS.line, borderRadius: 12, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12, margin: 4 },
+  destinationChip: { minHeight: 48, minWidth: '46%', flexGrow: 1, borderWidth: 1, borderColor: COLORS.line, borderRadius: 12, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 10, margin: 4 },
   chipSelected: { backgroundColor: COLORS.forest, borderColor: COLORS.forest },
   chipText: { color: COLORS.forestDark, fontSize: 13, fontWeight: '800' },
   chipTextSelected: { color: COLORS.card },

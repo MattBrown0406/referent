@@ -2,7 +2,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { newUuid } from './cases';
 import { currentAuthSessionIdentity } from './auth-session';
-import { StoreError } from './errors';
+import { CommittedWriteError, StoreError } from './errors';
 import { supabase } from './supabase';
 import type {
   InsuranceNetworkPreference,
@@ -1251,8 +1251,12 @@ export async function saveVoiceActivity(
     p_touch: touchToRow(touch),
     p_follow_up: followUp ? followUpToRow(followUp) : null,
   });
-  await assertSessionFence(fence);
-  if (error) throw new Error(error.message);
+  if (error) throw new StoreError(error.message, false);
+  try {
+    await assertSessionFence(fence);
+  } catch {
+    throw new CommittedWriteError();
+  }
 }
 
 export async function saveMatchWithCase(match: ReferralMatch, caseId: string, expectedUserId: string): Promise<void> {
