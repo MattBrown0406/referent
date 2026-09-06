@@ -1198,6 +1198,27 @@ async function runOrQueue(
   throw new StoreError(result.error.message, false);
 }
 
+export async function fetchDirectoryPartner(id: string, expectedUserId: string): Promise<Partner> {
+  const fence = await sessionFence(expectedUserId);
+  const org = await assertWorkspaceFence(fence);
+  const [row, balance] = await Promise.all([
+    supabase.from('partners').select('*').eq('id', id).eq('org_id', org).single(),
+    supabase.from('partner_balances').select('partner_id, inbound, outbound').eq('partner_id', id).maybeSingle(),
+  ]);
+  if (row.error || balance.error) throw row.error || balance.error;
+  if (await assertWorkspaceFence(fence) !== org) throw new StoreError('Workspace changed. Reload your directory.', false);
+  const partner = mapPartnerRow(row.data as PartnerRow, (balance.data || undefined) as BalanceRow | undefined);
+  // Keep a newly imported/linked program available on the next offline launch.
+  // Merge under the existing account cache lock without replacing other records.
+  await withCacheLock(async () => {
+    if (await assertWorkspaceFence(fence) !== org) throw new StoreError('Workspace changed. Reload your directory.', false);
+    const cached = await readCacheUnlocked(fence);
+    if (cached) await writeCacheUnlocked(fence, { ...cached, partners: [partner, ...cached.partners.filter((item) => item.id !== partner.id)] });
+    await assertWorkspaceFence(fence);
+  });
+  return partner;
+}
+
 export async function createPartner(partner: Partner, expectedUserId: string): Promise<void> {
   const row = partnerToRow(partner);
   await runOrQueue(expectedUserId, { kind: 'partner.insert', row }, (userId) => supabase.from('partners').insert({ ...row, owner_id: userId }));

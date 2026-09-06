@@ -47,6 +47,8 @@ import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import { fetchCurrentOrgId } from './src/lib/org';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
+import ShareProgramPanel from './src/lib/ShareProgramPanel';
+import { fetchGlobalDirectory, importGlobalPartner, globalProgramPartner, type GlobalPartner } from './src/lib/directory';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
 import {
   type BusinessData,
@@ -798,6 +800,14 @@ export default function App() {
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
+  const [sharingProgram, setSharingProgram] = useState(false);
+  const [matchDirectorySource, setMatchDirectorySource] = useState<'local' | 'global'>('local');
+  const [matchProgramSearch, setMatchProgramSearch] = useState('');
+  const [globalPrograms, setGlobalPrograms] = useState<GlobalPartner[] | null>(null);
+  const [globalProgramsError, setGlobalProgramsError] = useState('');
+  const [globalReload, setGlobalReload] = useState(0);
+  const [importingProgramId, setImportingProgramId] = useState<string | null>(null);
+  const directoryOperationRef = useRef(0);
   // Incremented after the account joins a different practice workspace, which
   // re-homes its rows server-side; bumping it re-runs the hydration effect.
   const [workspaceEpoch, setWorkspaceEpoch] = useState(0);
@@ -981,6 +991,13 @@ export default function App() {
     setShowBusinessDashboard(false);
     setShowWorkspace(false);
     setShowGlobalDirectory(false);
+    directoryOperationRef.current += 1;
+    setSharingProgram(false);
+    setMatchDirectorySource('local');
+    setMatchProgramSearch('');
+    setGlobalPrograms(null);
+    setGlobalProgramsError('');
+    setImportingProgramId(null);
     setBusinessData({ stages: [], integrations: [] });
     setBusinessLoading(false);
     setBusinessError('');
@@ -1298,16 +1315,59 @@ export default function App() {
     return Array.from(new Set([...plansForState, ...partnerForm.insurance.filter((plan) => plan !== 'Cash pay')]));
   }, [partnerForm.state, partnerForm.insurance]);
 
+  useEffect(() => { setSharingProgram(false); }, [selectedPartner?.id]);
+
+  useEffect(() => {
+    let active = true;
+    setGlobalPrograms(null); setGlobalProgramsError('');
+    if (matchDirectorySource !== 'global' || !loaded || !activeUserId || !activeOrgIdRef.current) return;
+    fetchGlobalDirectory().then((rows) => { if (active) setGlobalPrograms(rows); })
+      .catch((e) => { if (active) setGlobalProgramsError(e.message); });
+    return () => { active = false; };
+  }, [matchDirectorySource, loaded, activeUserId, workspaceEpoch, globalReload]);
+
+  function receiveDirectoryPartner(partner: Partner, _globalId: string, userId: string, orgId: string) {
+    if (activeUserIdRef.current !== userId || activeOrgIdRef.current !== orgId) return;
+    setPartners((current) => [partner, ...current.filter((item) => item.id !== partner.id)]);
+    setSelectedPartner((current) => current?.id === partner.id ? partner : current);
+  }
+
+  async function addMatchingProgram(partner: Partner) {
+    if (importingProgramId || !mutationSlotAvailable('The directory import')) return;
+    const listing = globalPrograms?.find((item) => item.id === partner.globalPartnerId);
+    if (!listing) return;
+    const generation = ++directoryOperationRef.current;
+    const userId = activeUserId;
+    const orgId = activeOrgIdRef.current;
+    setImportingProgramId(listing.id);
+    try {
+      const localPartner = await importGlobalPartner(listing, userId, orgId);
+      if (generation !== directoryOperationRef.current) return;
+      receiveDirectoryPartner(localPartner, listing.id, userId, orgId);
+    } catch (e) {
+      if (generation === directoryOperationRef.current) Alert.alert('Could not add program', (e as Error).message);
+    } finally {
+      if (generation === directoryOperationRef.current) setImportingProgramId(null);
+    }
+  }
+
+  const matchCandidates = useMemo(() => {
+    const candidates = matchDirectorySource === 'local' ? partners : (globalPrograms || []).map((listing) =>
+      partners.find((partner) => partner.globalPartnerId === listing.id) || globalProgramPartner(listing));
+    const query = matchProgramSearch.trim().toLowerCase();
+    return candidates.filter((p) => !query || [p.organization,p.name,p.city,p.state,...p.therapies,...p.insurance].join(' ').toLowerCase().includes(query));
+  }, [matchDirectorySource, partners, globalPrograms, matchProgramSearch]);
+
   const matches = useMemo(() => {
     const budget = Number(matchBudget) || Infinity;
-    return partners
+    return matchCandidates
       .map((partner) => {
         const typeFit = matchType === 'Any type' || typesForPartner(partner).includes(matchType as Partner['type']);
         const networkCapabilities = matchInsurance === 'Cash pay' ? [] : networkCapabilitiesForPartner(partner, matchInsurance);
         const isInNetwork = networkCapabilities.includes('In-network');
         const isOutOfNetwork = networkCapabilities.includes('Out-of-network');
         const paymentFit = matchInsurance === 'Cash pay'
-          ? monthlyCostForPartner(partner) <= budget
+          ? (budget === Infinity || (monthlyCostForPartner(partner) > 0 && monthlyCostForPartner(partner) <= budget))
           : (matchNetworkPreferences.includes('In-network') && isInNetwork)
             || (matchNetworkPreferences.includes('Out-of-network') && isOutOfNetwork);
         const matchNetworkStatus: InsuranceNetworkPreference | null = matchInsurance === 'Cash pay'
@@ -1348,7 +1408,7 @@ export default function App() {
         || (b.admitRate ?? -1) - (a.admitRate ?? -1)
         || b.reciprocity - a.reciprocity
         || monthlyCostForPartner(a.partner) - monthlyCostForPartner(b.partner));
-  }, [partners, matchType, matchInsurance, matchNetworkPreferences, matchState, matchBudget, matchTherapies, scorecards]);
+  }, [matchCandidates, matchType, matchInsurance, matchNetworkPreferences, matchState, matchBudget, matchTherapies, scorecards]);
 
   const sortedReferrals = referrals
     .slice()
@@ -3239,6 +3299,7 @@ export default function App() {
       favorite: existing?.favorite,
       touchCadenceDays: cadence && cadence > 0 ? cadence : undefined,
       createdAt: existing?.createdAt || new Date().toISOString(),
+      globalPartnerId: existing?.globalPartnerId,
     };
     const nextPartners = existing
       ? partners.map((item) => item.id === partner.id ? partner : item)
@@ -3639,6 +3700,11 @@ export default function App() {
         <View style={styles.screenIntro}>
           <Text style={styles.screenTitle}>Who fits this client?</Text>
           <Text style={styles.screenSubtitle}>Clinical and financial fit come first. Relationship history is used only when fit is equal.</Text>
+          <View style={styles.referralFilterRow}>
+            {(['local', 'global'] as const).map((source) => <TouchableOpacity key={source} accessibilityRole="radio" accessibilityState={{ selected: matchDirectorySource === source }} onPress={() => setMatchDirectorySource(source)} style={[styles.referralFilterButton, matchDirectorySource === source && styles.referralFilterButtonActive]}><Text style={[styles.referralFilterText, matchDirectorySource === source && styles.referralFilterTextActive]}>{source === 'local' ? 'My directory' : 'Global directory'}</Text></TouchableOpacity>)}
+          </View>
+          <Text style={styles.screenSubtitle}>{matchDirectorySource === 'local' ? 'Your practice workspace only. Private details stay within your practice.' : 'Public program information from the shared directory. Client labels, case details, and your search criteria are never published.'}</Text>
+          <View style={styles.searchBox}><AppIcon name="search" size={18} color={COLORS.gray} /><TextInput accessibilityLabel="Search matching programs" value={matchProgramSearch} onChangeText={setMatchProgramSearch} placeholder="Program name, city, specialty" style={styles.searchInput} /></View>
         </View>
 
         <View style={styles.savedMatchesSection}>
@@ -3781,9 +3847,11 @@ export default function App() {
           <View style={styles.rankBadge}><AppIcon name="shield-checkmark" size={14} color={COLORS.forest} /><Text style={styles.rankBadgeText}>Fit ranked</Text></View>
         </View>
 
-        {matches.length ? matches.slice(0, 8).map((match, index) => (
+        {matchDirectorySource === 'global' && globalProgramsError ? <View style={styles.noteCard}><Text accessibilityRole="alert" style={styles.noteText}>{globalProgramsError}</Text><TouchableOpacity accessibilityRole="button" onPress={() => setGlobalReload((n) => n + 1)}><Text style={styles.saveText}>Retry global directory</Text></TouchableOpacity></View>
+        : matchDirectorySource === 'global' && globalPrograms === null ? <Text style={styles.screenSubtitle}>Loading global programs…</Text>
+        : matches.length ? matches.slice(0, 8).map((match, index) => (
           <View key={match.partner.id} style={[styles.matchCard, index === 0 && styles.bestMatchCard]}>
-            <TouchableOpacity onPress={() => setSelectedPartner(match.partner)} activeOpacity={0.85} style={styles.matchCardContent}>
+            <TouchableOpacity onPress={() => { if (partners.some((p) => p.id === match.partner.id)) setSelectedPartner(match.partner); }} activeOpacity={0.85} style={styles.matchCardContent}>
               <View style={styles.matchRank}><Text style={[styles.matchRankText, index === 0 && { color: COLORS.white }]}>{index + 1}</Text></View>
               <View style={styles.matchMain}>
                 <View style={styles.matchTopLine}>
@@ -3801,7 +3869,7 @@ export default function App() {
                   <Text numberOfLines={1} style={[styles.matchDetailText, styles.matchInsuranceText]}>{matchInsurance === 'Cash pay'
                     ? match.partner.insurance.slice(0, 2).join(' · ') || 'Cash pay'
                     : `${match.networkStatus} · ${matchInsurance}`}</Text>
-                  <Text numberOfLines={1} style={styles.matchPriceText}>{formatMoney(monthlyCostForPartner(match.partner))}/month</Text>
+                  <Text numberOfLines={1} style={styles.matchPriceText}>{monthlyCostForPartner(match.partner) > 0 ? `${formatMoney(monthlyCostForPartner(match.partner))}/month` : 'Confirm pricing'}</Text>
                 </View>
                 {match.reciprocity > 0 ? (
                   <View style={styles.reciprocityNote}><AppIcon name="heart" size={13} color={COLORS.coral} /><Text style={styles.reciprocityNoteText}>Tie-breaker: sent you {match.reciprocity} more than received</Text></View>
@@ -3809,6 +3877,10 @@ export default function App() {
               </View>
             </TouchableOpacity>
             <View style={styles.matchActionRow}>
+              {!partners.some((p) => p.id === match.partner.id) ? <View style={{ flex: 1, gap: 8 }}>
+                <Text style={styles.screenSubtitle}>{globalPrograms?.find((p) => p.id === match.partner.globalPartnerId)?.verifiedAt ? 'Verified listing' : 'Community listing · Verify details with the program'}</Text>
+                <TouchableOpacity accessibilityRole="button" accessibilityState={{ disabled: importingProgramId !== null, busy: importingProgramId === match.partner.globalPartnerId }} disabled={importingProgramId !== null} onPress={() => { void addMatchingProgram(match.partner); }} style={styles.assignReferralButton}><Text style={styles.assignReferralButtonText}>{importingProgramId === match.partner.globalPartnerId ? 'Adding…' : 'Add to my directory to refer'}</Text></TouchableOpacity>
+              </View> : <>
               <TouchableOpacity style={styles.packetButton} onPress={() => openPacketComposer(match.partner, match.fitInput)}>
                 <AppIcon name="document-text" size={16} color={COLORS.forest} />
                 <Text style={styles.packetButtonText}>Send packet</Text>
@@ -3817,9 +3889,10 @@ export default function App() {
                 <AppIcon name="paper-plane" size={16} color={COLORS.white} />
                 <Text style={styles.assignReferralButtonText}>Assign & refer {matchClientLabel.trim() || 'this client'}</Text>
               </TouchableOpacity>
+              </>}
             </View>
           </View>
-        )) : <EmptyState icon="search-outline" title="No eligible matches yet" body="Broaden one of the filters or add another partner to the directory." />}
+        )) : <EmptyState icon="search-outline" title="No eligible matches yet" body={matchDirectorySource === 'global' ? 'No public programs meet these filters. Programs without published prices are excluded when a cash budget is set.' : 'Broaden a filter, add a partner, or try the Global directory.'} />}
       </ScrollView>
     );
   }
@@ -3960,7 +4033,7 @@ export default function App() {
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
         {renderHeader('Directory')}
         <View style={styles.directoryTitleRow}>
-          <View style={styles.directoryTitleCopy}><Text style={styles.screenTitle}>Your network</Text><Text style={styles.screenSubtitle}>{partners.length} people and programs</Text></View>
+          <View style={styles.directoryTitleCopy}><Text style={styles.screenTitle}>My directory</Text><Text style={styles.screenSubtitle}>{partners.length} people and programs</Text></View>
           <TouchableOpacity style={styles.addButton} onPress={openNewPartner}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>Add</Text></TouchableOpacity>
         </View>
         <TouchableOpacity
@@ -3971,8 +4044,8 @@ export default function App() {
         >
           <AppIcon name="globe-outline" size={20} color={COLORS.blue} />
           <View style={styles.globalDirectoryCopy}>
-            <Text style={styles.globalDirectoryTitle}>ReferralFit Directory</Text>
-            <Text style={styles.globalDirectorySubtitle}>Verified programs, ready to add to your network</Text>
+            <Text style={styles.globalDirectoryTitle}>Search global directory</Text>
+            <Text style={styles.globalDirectorySubtitle}>Find shared programs and add them to your directory</Text>
           </View>
           <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
         </TouchableOpacity>
@@ -4677,6 +4750,17 @@ export default function App() {
 
   function PartnerDetailModal() {
     if (!selectedPartner) return null;
+    if (sharingProgram) return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setSharingProgram(false)}>
+        <SafeAreaView style={styles.modalPage}>
+          <ShareProgramPanel key={`${activeUserId}:${activeOrgIdRef.current}:${selectedPartner.id}`} partner={selectedPartner} userId={activeUserId} orgId={activeOrgIdRef.current} onCancel={() => setSharingProgram(false)} onPublished={(partner, created) => {
+            receiveDirectoryPartner(partner, partner.globalPartnerId || '', activeUserId, activeOrgIdRef.current);
+            setSelectedPartner(partner); setSharingProgram(false); setGlobalReload((n) => n + 1);
+            Alert.alert(created ? 'Public program shared' : 'Existing program linked', 'Only public program details are in the global directory. Your private practice data stays in your workspace.');
+          }} />
+        </SafeAreaView>
+      </Modal>
+    );
     const balance = selectedPartner.inbound - selectedPartner.outbound;
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setSelectedPartner(null)}>
@@ -4702,6 +4786,12 @@ export default function App() {
               <TouchableOpacity style={styles.profileAction} onPress={() => openTouchLogger(selectedPartner)}><AppIcon name="chatbox-ellipses" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Log touch</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => sharePartner(selectedPartner)}><AppIcon name="share-social" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Share</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openEditPartner(selectedPartner)}><AppIcon name="create" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Edit</Text></TouchableOpacity>
+            </View>
+
+            <View style={styles.infoCard}>
+              <Text style={styles.infoTitle}>{selectedPartner.globalPartnerId ? 'Linked to a global program' : 'Private to your practice'}</Text>
+              <Text style={styles.screenSubtitle}>Your contacts, rates, notes, referral history, revenue, and case details stay in this workspace. Public program details are shared only after review.</Text>
+              {!selectedPartner.globalPartnerId ? <TouchableOpacity accessibilityRole="button" onPress={() => setSharingProgram(true)} style={styles.packetButton}><AppIcon name="globe-outline" size={18} color={COLORS.forest} /><Text style={styles.packetButtonText}>Share public program details</Text></TouchableOpacity> : <Text style={styles.privacyHint}>Private edits do not update the global directory.</Text>}
             </View>
 
             <View style={styles.profileBalanceCard}>
@@ -5586,23 +5676,12 @@ export default function App() {
       />
       <GlobalDirectoryScreen
         visible={showGlobalDirectory}
-        entitled={entitlements.entitlements.directory}
-        entitlementKnown={Boolean(entitlements.loadedAt)}
+        key={`${activeUserId}:${workspaceEpoch}`}
+        orgId={activeOrgIdRef.current}
         userId={activeUserId}
         importedGlobalIds={new Set(partners.map((partner) => partner.globalPartnerId).filter((id): id is string => Boolean(id)))}
         onClose={() => setShowGlobalDirectory(false)}
-        onImported={(_partner, _globalId, initiatingUserId) => {
-          if (activeUserIdRef.current !== initiatingUserId) return;
-          void refreshSnapshot(initiatingUserId)
-            .then((snapshot) => {
-              if (snapshot && activeUserIdRef.current === initiatingUserId) applySnapshot(snapshot);
-            })
-            .catch((error) => {
-              if (activeUserIdRef.current === initiatingUserId) {
-                Alert.alert('Program added; refresh needed', (error as Error).message);
-              }
-            });
-        }}
+        onImported={receiveDirectoryPartner}
       />
       <WorkspaceScreen
         visible={showWorkspace}

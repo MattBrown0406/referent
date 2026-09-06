@@ -15,9 +15,10 @@ to other intervention practices on recurring plans:
 2. **Entitlements** — subscription state per workspace
    (`pro` / `directory` / `benchmarks`), mirrored from RevenueCat IAP by the
    `revenuecat-webhook` edge function. See `docs/ENTITLEMENTS.md`.
-3. **Shared directory** — a platform-curated, verified list of treatment
-   programs (`global_partners`) that Directory-plan workspaces browse and
-   import into their own network with provenance.
+3. **Shared directory** — public treatment programs (`global_partners`) that
+   all signed-in practices can discover and import into their private directory.
+   Reviewed community contributions are deduplicated and marked unverified;
+   curator verification remains separate. See `docs/SHARED_DIRECTORY.md`.
 4. **Center portal** (`portal/`) — treatment programs claim their listing with
    an admin-issued code and keep it accurate themselves. Verification status
    stays with ReferralFit; claiming never buys ranking (no pay-for-placement,

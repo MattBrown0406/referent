@@ -115,4 +115,10 @@ nativeState.responseListener({ notification: { request: { identifier: 'tap-1', c
 assert.deepEqual(targets, [['directory', 'b']], 'notification partner deep-link is delivered once');
 unsubscribe();
 
-console.log('notification permission/scheduling/deep-link regression checks: ok');
+require(path.join(tmpDir, 'react-native.js')).Platform.OS = 'web';
+const previousCancelCount = nativeState.cancelCount;
+await notifications.activateReferralFitNotificationOwner('web-user');
+await notifications.cancelReferralFitNotifications();
+assert.equal(nativeState.cancelCount, previousCancelCount, 'web account hydration must not call unavailable native notification cleanup');
+
+console.log('notification permission/scheduling/deep-link/web hydration regression checks: ok');
