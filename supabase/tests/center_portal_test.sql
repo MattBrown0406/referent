@@ -57,8 +57,8 @@ SELECT throws_ok(
 
 SELECT is(
   (SELECT count(*)::integer FROM public.global_partners),
-  1,
-  'a center reads its own listing (even while pending) and nothing else'
+  2,
+  'a center reads its own pending listing and active public listings'
 );
 
 -- ─── Center edits ────────────────────────────────────────────────────────────

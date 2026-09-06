@@ -17,13 +17,12 @@ import type { Partner } from '../data';
 
 type Props = {
   visible: boolean;
-  entitled: boolean;
-  entitlementKnown: boolean;
+  orgId: string;
   userId: string;
   // Global listing ids already imported into this workspace's network.
   importedGlobalIds: ReadonlySet<string>;
   onClose: () => void;
-  onImported: (partner: Partner, globalId: string, initiatingUserId: string) => void;
+  onImported: (partner: Partner, globalId: string, initiatingUserId: string, initiatingOrgId: string) => void;
 };
 
 const COLORS = {
@@ -48,28 +47,30 @@ function listingSubtitle(listing: GlobalPartner): string {
   return parts.join('  ·  ');
 }
 
-export default function GlobalDirectoryScreen({ visible, entitled, entitlementKnown, userId, importedGlobalIds, onClose, onImported }: Props) {
+export default function GlobalDirectoryScreen({ visible, orgId, userId, importedGlobalIds, onClose, onImported }: Props) {
   const [listings, setListings] = useState<GlobalPartner[] | null>(null);
   const [loadError, setLoadError] = useState('');
+  const [reload, setReload] = useState(0);
   const [search, setSearch] = useState('');
   const [stateFilter, setStateFilter] = useState('');
   const [importingId, setImportingId] = useState<string | null>(null);
   const operationGenerationRef = useRef(0);
 
   useEffect(() => {
-    if (!visible || !entitled) return;
+    setListings(null);
+    if (!visible || !userId || !orgId) return;
     let active = true;
     setLoadError('');
     fetchGlobalDirectory()
       .then((next) => { if (active) setListings(next); })
       .catch((error) => { if (active) setLoadError((error as Error).message); });
     return () => { active = false; };
-  }, [visible, entitled, userId]);
+  }, [visible, orgId, userId, reload]);
 
   useEffect(() => {
     operationGenerationRef.current += 1;
     setImportingId(null);
-  }, [visible, entitled, userId]);
+  }, [visible, orgId, userId]);
 
   const states = useMemo(() => {
     const unique = new Set((listings || []).map((listing) => listing.state).filter(Boolean));
@@ -82,7 +83,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
       if (stateFilter && listing.state !== stateFilter) return false;
       if (!query) return true;
       return [listing.name, listing.organization, listing.city, listing.state,
-        ...listing.levels, ...listing.populations, ...listing.therapies]
+        ...listing.types, ...listing.insurance, ...listing.levels, ...listing.populations, ...listing.therapies]
         .join(' ').toLowerCase().includes(query);
     });
   }, [listings, search, stateFilter]);
@@ -92,10 +93,10 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     const operationGeneration = ++operationGenerationRef.current;
     const initiatingUserId = userId;
     setImportingId(listing.id);
-    importGlobalPartner(listing, initiatingUserId)
+    importGlobalPartner(listing, initiatingUserId, orgId)
       .then((partner) => {
         if (operationGeneration !== operationGenerationRef.current) return;
-        onImported(partner, listing.id, initiatingUserId);
+        onImported(partner, listing.id, initiatingUserId, orgId);
       })
       .catch((error) => {
         if (operationGeneration !== operationGenerationRef.current) return;
@@ -110,31 +111,18 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
       <SafeAreaView style={styles.safe}>
         <View style={styles.header}>
-          <Text style={styles.headerTitle}>ReferralFit Directory</Text>
+          <Text style={styles.headerTitle}>Global directory</Text>
           <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close directory" onPress={onClose} style={styles.closeButton}>
             <Text style={styles.closeText}>Done</Text>
           </TouchableOpacity>
         </View>
 
-        {!entitlementKnown ? (
-          <View style={styles.centered}>
-            <Text accessibilityRole="alert" style={styles.errorText}>Subscription status is unavailable. Reopen the screen when the app is online.</Text>
-          </View>
-        ) : !entitled ? (
-          <View style={styles.centered}>
-            <Text style={styles.teaserTitle}>A verified network, maintained for you</Text>
-            <Text style={styles.teaserBody}>
-              The ReferralFit Directory is a continuously verified list of treatment programs —
-              levels of care, insurance panels, and admissions contacts — ready to add to your
-              network in one tap. It's part of the Directory plan.
-            </Text>
-            <Text style={styles.teaserFootnote}>
-              Upgrade from the Workspace screen once subscriptions launch.
-            </Text>
-          </View>
+        {!orgId ? (
+          <View style={styles.centered}><Text style={styles.errorText}>Load your practice workspace before opening the directory.</Text></View>
         ) : loadError ? (
           <View style={styles.centered}>
             <Text accessibilityRole="alert" style={styles.errorText}>{loadError}</Text>
+            <TouchableOpacity accessibilityRole="button" onPress={() => setReload((n) => n + 1)}><Text style={styles.closeText}>Retry</Text></TouchableOpacity>
           </View>
         ) : listings === null ? (
           <View style={styles.centered}><ActivityIndicator color={COLORS.blue} /></View>
@@ -145,7 +133,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                 style={styles.searchInput}
                 value={search}
                 onChangeText={setSearch}
-                placeholder="Search programs, levels, populations"
+                placeholder="Search programs, insurance, specialties"
                 placeholderTextColor={COLORS.gray}
                 autoCorrect={false}
               />
@@ -175,7 +163,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
               {filtered.length === 0 ? (
                 <Text style={styles.emptyText}>
                   {listings.length === 0
-                    ? 'The directory is filling up — verified programs appear here as they are added.'
+                    ? 'No programs yet. Open a partner in My directory to share its public program details.'
                     : 'No programs match this search.'}
                 </Text>
               ) : filtered.map((listing) => {
@@ -193,14 +181,17 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                       ) : null}
                       {listing.verifiedAt ? (
                         <Text style={styles.verified}>Verified {listing.verifiedAt.slice(0, 10)}</Text>
-                      ) : null}
+                      ) : <Text style={styles.cardSubtitle}>Community listing · Not yet verified</Text>}
+                      <Text style={styles.cardDescription}>Insurance: {listing.insurance.join(' · ') || 'Confirm with program'}</Text>
+                      <Text style={styles.cardDescription}>Specialties: {listing.therapies.join(' · ') || 'Confirm with program'}</Text>
+                      <Text style={styles.cardDescription}>Public phone: {listing.phone || 'Not listed'}</Text>
                     </View>
                     {imported ? (
-                      <View style={styles.importedBadge}><Text style={styles.importedText}>In your network</Text></View>
+                      <View style={styles.importedBadge}><Text style={styles.importedText}>In my directory</Text></View>
                     ) : (
                       <TouchableOpacity
                         accessibilityRole="button"
-                        accessibilityLabel={`Add ${listing.organization || listing.name} to my network`}
+                        accessibilityLabel={`Add ${listing.organization || listing.name} to my directory`}
                         accessibilityState={{ disabled: importingId !== null, busy: importingId === listing.id }}
                         disabled={importingId !== null}
                         onPress={() => addToNetwork(listing)}
@@ -208,7 +199,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                       >
                         {importingId === listing.id
                           ? <ActivityIndicator color="#fff" />
-                          : <Text style={styles.addButtonText}>Add to my network</Text>}
+                          : <Text style={styles.addButtonText}>Add to my directory</Text>}
                       </TouchableOpacity>
                     )}
                   </View>

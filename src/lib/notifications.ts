@@ -317,6 +317,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
 export function activateReferralFitNotificationOwner(ownerId: string): Promise<void> {
   scheduleOwnerId = ownerId;
   ++scheduleGeneration;
+  if (Platform.OS === 'web') return Promise.resolve();
   return queueScheduleWork(async () => {
     await Notifications.cancelAllScheduledNotificationsAsync();
     await Notifications.dismissAllNotificationsAsync();
@@ -333,6 +334,7 @@ export function rescheduleNotifications(input: NotificationInput, ownerId: strin
 export function cancelReferralFitNotifications(): Promise<void> {
   scheduleOwnerId = null;
   ++scheduleGeneration;
+  if (Platform.OS === 'web') return Promise.resolve();
   return queueScheduleWork(async () => {
     await Notifications.cancelAllScheduledNotificationsAsync();
     await Notifications.dismissAllNotificationsAsync();

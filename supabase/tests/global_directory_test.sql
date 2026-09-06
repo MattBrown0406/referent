@@ -97,18 +97,16 @@ SELECT set_config('request.jwt.claim.sub', 'f3000000-0000-0000-0000-00000000000f
 
 SELECT is(
   (SELECT count(*)::integer FROM public.global_partners),
-  0,
-  'without the directory entitlement no listings are visible'
+  1,
+  'free practices can discover active public listings'
 );
 
-SELECT throws_ok(
+SELECT lives_ok(
   $$ SELECT public.import_global_partner(
        '11110000-0000-0000-0000-000000000001'::uuid,
        '22220000-0000-0000-0000-000000000003'::uuid
      ) $$,
-  'P0002',
-  'Directory listing not found',
-  'without the entitlement the import RPC finds nothing'
+  'free practices can import active public listings'
 );
 
 RESET ROLE;
