@@ -16,9 +16,17 @@ BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
 
--- Columns referenced across sections (declared up front).
+-- Columns referenced across sections (declared up front so the search RPC
+-- in §3 and the identity helpers in §5 can be created in any order).
 ALTER TABLE public.global_partners
-  ADD COLUMN suggested_by_org_id uuid REFERENCES public.orgs(id) ON DELETE SET NULL;
+  ADD COLUMN suggested_by_org_id uuid REFERENCES public.orgs(id) ON DELETE SET NULL,
+  ADD COLUMN phone_digits text GENERATED ALWAYS AS (regexp_replace(coalesce(phone, ''), '\D', '', 'g')) STORED,
+  ADD COLUMN website_domain text GENERATED ALWAYS AS (
+    lower(regexp_replace(regexp_replace(coalesce(website, ''), '^\s*https?://', ''), '^(www\.)?([^/?#]+).*$', '\2'))
+  ) STORED,
+  ADD COLUMN npi text CHECK (npi IS NULL OR npi ~ '^[0-9]{10}$'),
+  ADD COLUMN merged_into uuid REFERENCES public.global_partners(id) ON DELETE SET NULL,
+  ADD COLUMN verification_expires_at timestamptz GENERATED ALWAYS AS (verified_at + INTERVAL '12 months') STORED;
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 1. Per-user favorites
@@ -545,15 +553,7 @@ $do$;
 -- 5. Listing identity, duplicates, merge, suggestions, verification expiry
 -- ═══════════════════════════════════════════════════════════════════════════
 
-ALTER TABLE public.global_partners
-  ADD COLUMN phone_digits text GENERATED ALWAYS AS (regexp_replace(coalesce(phone, ''), '\D', '', 'g')) STORED,
-  ADD COLUMN website_domain text GENERATED ALWAYS AS (
-    lower(regexp_replace(regexp_replace(coalesce(website, ''), '^\s*https?://', ''), '^(www\.)?([^/?#]+).*$', '\2'))
-  ) STORED,
-  ADD COLUMN npi text CHECK (npi IS NULL OR npi ~ '^[0-9]{10}$'),
-  ADD COLUMN merged_into uuid REFERENCES public.global_partners(id) ON DELETE SET NULL,
-  ADD COLUMN verification_expires_at timestamptz GENERATED ALWAYS AS (verified_at + INTERVAL '12 months') STORED;
-
+-- (identity columns were added at the top of this migration)
 CREATE INDEX global_partners_phone_digits_idx ON public.global_partners (phone_digits) WHERE phone_digits <> '';
 CREATE INDEX global_partners_website_domain_idx ON public.global_partners (website_domain) WHERE website_domain <> '';
 CREATE INDEX global_partners_npi_idx ON public.global_partners (npi) WHERE npi IS NOT NULL;
