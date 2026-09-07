@@ -25,8 +25,10 @@ ALTER TABLE public.global_partners
     lower(regexp_replace(regexp_replace(coalesce(website, ''), '^\s*https?://', ''), '^(www\.)?([^/?#]+).*$', '\2'))
   ) STORED,
   ADD COLUMN npi text CHECK (npi IS NULL OR npi ~ '^[0-9]{10}$'),
-  ADD COLUMN merged_into uuid REFERENCES public.global_partners(id) ON DELETE SET NULL,
-  ADD COLUMN verification_expires_at timestamptz GENERATED ALWAYS AS (verified_at + INTERVAL '12 months') STORED;
+  ADD COLUMN merged_into uuid REFERENCES public.global_partners(id) ON DELETE SET NULL;
+-- Note: verification expiry (verified_at + 12 months) is computed in
+-- search_global_partners rather than stored — timestamptz + interval is
+-- STABLE, not IMMUTABLE, so it cannot be a generated column.
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 1. Per-user favorites
@@ -389,8 +391,9 @@ AS $$
   SELECT g.id, g.name, g.organization, g.types, g.city, g.state, g.regions,
          g.phone, g.email, g.website, g.monthly_cost, g.insurance,
          g.insurance_networks, g.therapies, g.populations, g.levels,
-         g.description, g.verified_at, g.verification_expires_at,
-         (g.verified_at IS NOT NULL AND g.verification_expires_at > now()) AS verified_current,
+         g.description, g.verified_at,
+         (g.verified_at + INTERVAL '12 months') AS verification_expires_at,
+         (g.verified_at IS NOT NULL AND g.verified_at + INTERVAL '12 months' > now()) AS verified_current,
          g.updated_at,
          CASE WHEN q.text IS NULL THEN 0::real
               ELSE greatest(similarity(g.organization, q.text), similarity(g.name, q.text),
