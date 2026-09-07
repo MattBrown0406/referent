@@ -20,15 +20,38 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
 -- in §3 and the identity helpers in §5 can be created in any order).
 ALTER TABLE public.global_partners
   ADD COLUMN suggested_by_org_id uuid REFERENCES public.orgs(id) ON DELETE SET NULL,
-  ADD COLUMN phone_digits text GENERATED ALWAYS AS (regexp_replace(coalesce(phone, ''), '\D', '', 'g')) STORED,
-  ADD COLUMN website_domain text GENERATED ALWAYS AS (
-    lower(regexp_replace(regexp_replace(coalesce(website, ''), '^\s*https?://', ''), '^(www\.)?([^/?#]+).*$', '\2'))
-  ) STORED,
+  ADD COLUMN phone_digits text NOT NULL DEFAULT '',
+  ADD COLUMN website_domain text NOT NULL DEFAULT '',
+  ADD COLUMN search_tsv tsvector,
   ADD COLUMN npi text CHECK (npi IS NULL OR npi ~ '^[0-9]{10}$'),
   ADD COLUMN merged_into uuid REFERENCES public.global_partners(id) ON DELETE SET NULL;
--- Note: verification expiry (verified_at + 12 months) is computed in
--- search_global_partners rather than stored — timestamptz + interval is
--- STABLE, not IMMUTABLE, so it cannot be a generated column.
+
+-- Derived columns (normalized phone, website domain, search vector) are
+-- maintained by trigger rather than as generated columns, so no expression
+-- has to satisfy Postgres' IMMUTABLE requirement. Verification expiry
+-- (verified_at + 12 months) is computed in search_global_partners.
+CREATE OR REPLACE FUNCTION public.global_partners_derive_columns()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+  NEW.phone_digits := regexp_replace(coalesce(NEW.phone, ''), '\D', '', 'g');
+  NEW.website_domain := lower(regexp_replace(regexp_replace(coalesce(NEW.website, ''), '^\s*https?://', ''), '^(www\.)?([^/?#]+).*$', '\2'));
+  NEW.search_tsv := to_tsvector('simple',
+    coalesce(NEW.name, '') || ' ' || coalesce(NEW.organization, '') || ' ' ||
+    coalesce(NEW.city, '') || ' ' || coalesce(NEW.state, '') || ' ' || coalesce(NEW.description, ''));
+  RETURN NEW;
+END
+$$;
+REVOKE ALL ON FUNCTION public.global_partners_derive_columns() FROM PUBLIC, anon, authenticated;
+
+CREATE TRIGGER global_partners_derive_columns
+BEFORE INSERT OR UPDATE ON public.global_partners
+FOR EACH ROW EXECUTE FUNCTION public.global_partners_derive_columns();
+
+-- Backfill existing listings through the trigger.
+UPDATE public.global_partners SET phone = phone;
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 1. Per-user favorites
@@ -335,13 +358,7 @@ GRANT EXECUTE ON FUNCTION public.clear_partner_override(uuid, text) TO authentic
 -- 3. Server-side search, indexes, incremental sync, InitPlan policy
 -- ═══════════════════════════════════════════════════════════════════════════
 
-ALTER TABLE public.global_partners
-  ADD COLUMN search_tsv tsvector GENERATED ALWAYS AS (
-    to_tsvector('simple',
-      coalesce(name, '') || ' ' || coalesce(organization, '') || ' ' ||
-      coalesce(city, '') || ' ' || coalesce(state, '') || ' ' || coalesce(description, ''))
-  ) STORED;
-
+-- (search_tsv is added and maintained by trigger at the top of this migration)
 CREATE INDEX global_partners_search_tsv_idx ON public.global_partners USING gin (search_tsv);
 CREATE INDEX global_partners_name_trgm_idx ON public.global_partners USING gin (name extensions.gin_trgm_ops);
 CREATE INDEX global_partners_org_trgm_idx ON public.global_partners USING gin (organization extensions.gin_trgm_ops);
