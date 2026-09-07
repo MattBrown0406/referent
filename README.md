@@ -17,7 +17,19 @@ to other intervention practices on recurring plans:
    `revenuecat-webhook` edge function. See `docs/ENTITLEMENTS.md`.
 3. **Shared directory** — a platform-curated, verified list of treatment
    programs (`global_partners`) that Directory-plan workspaces browse and
-   import into their own network with provenance.
+   import into their own network with provenance. Imports stay **live-linked**:
+   listing edits (admin or center portal) propagate to every linked tenant
+   partner except fields the workspace overrode by hand (`partners.local_overrides`,
+   reset per field via `clear_partner_override`). Search is server-side and
+   paged (`search_global_partners`: trigram + full-text + array filters), with
+   `fetch_global_partner_changes` for incremental offline sync. Listings carry
+   normalized `phone_digits` / `website_domain` / `npi` for identity, an admin
+   duplicate report and `merge_global_partners`, member-suggested listings
+   (`suggest_global_listing` → pending, visible to the suggesting workspace),
+   and verification that expires after 12 months. Network-wide usage per
+   listing (`global_partner_stats`, hourly refresh) is exposed through
+   `fetch_global_partner_stats` as aggregates only, behind the same
+   five-workspace k-anonymity floor as benchmarks.
 4. **Center portal** (`portal/`) — treatment programs claim their listing with
    an admin-issued code and keep it accurate themselves. Verification status
    stays with ReferralFit; claiming never buys ranking (no pay-for-placement,
@@ -36,7 +48,7 @@ to other intervention practices on recurring plans:
 - Reusable client-match profiles with payment-aware budget fields
 - Referent assignment from a recommended match that automatically creates an outbound referral record
 - Inbound and outbound referral ledger with relationship-balance summaries
-- Add partners, favorite relationships, log referrals and touches, with per-partner stay-in-touch cadences
+- Add partners, favorite relationships, log referrals and touches, with per-partner stay-in-touch cadences. Favorites are two-tier: `partners.favorite` is the workspace-wide team pin; `user_favorites` are personal to each signed-in user, work on directory listings before import, and carry over to the imported partner
 - Case files: one family, one place — contacts with one-tap call/text/email (auto-logged to the timeline), payment tracking, documents in a private bucket, and phone-number search across cases
 - Match packets that close the loop: share a de-identified placement recommendation, log the referral, set the check-in follow-up — all case-linked when the profile started from a case
 - Today Command Center: the home screen is a prioritized daily operating list (OVERDUE / TODAY / PARTNERS DUE) — one-tap call/text that auto-logs, a Done sheet that always forces a next step or a closed loop, snooze, set-next-step, and a 5-second "I need to…" quick add. New inquiry cases auto-create their first-call action

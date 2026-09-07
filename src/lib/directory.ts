@@ -29,6 +29,30 @@ export type GlobalPartner = {
   levels: string[];
   description: string;
   verifiedAt?: string;
+  // Verification decays after 12 months; only current verifications earn the badge.
+  verifiedCurrent?: boolean;
+};
+
+// Network-wide, aggregate-only usage for a listing. Fields are null when
+// fewer than five workspaces contributed (k-anonymity floor).
+export type GlobalPartnerStats = {
+  globalPartnerId: string;
+  importingOrgs: number | null;
+  referrals12m: number | null;
+  admitRate: number | null;
+  familyExperience: number | null;
+  lastReferralOn: string | null;
+  disclosed: boolean;
+};
+
+export type DirectorySearchParams = {
+  query?: string;
+  state?: string;
+  levels?: string[];
+  insurance?: string[];
+  populations?: string[];
+  limit?: number;
+  offset?: number;
 };
 
 type GlobalPartnerRow = {
@@ -50,6 +74,7 @@ type GlobalPartnerRow = {
   levels: string[] | null;
   description: string | null;
   verified_at: string | null;
+  verified_current?: boolean | null;
 };
 
 function mapListing(row: GlobalPartnerRow): GlobalPartner {
@@ -72,7 +97,111 @@ function mapListing(row: GlobalPartnerRow): GlobalPartner {
     levels: row.levels || [],
     description: row.description || '',
     verifiedAt: row.verified_at || undefined,
+    verifiedCurrent: typeof row.verified_current === 'boolean'
+      ? row.verified_current
+      : (row.verified_at ? Date.now() - Date.parse(row.verified_at) < 365 * 24 * 60 * 60 * 1000 : false),
   };
+}
+
+// Server-side, paged directory search (trigram + full-text + array filters).
+// RLS still governs visibility, so an unentitled workspace gets an empty page.
+export async function searchGlobalDirectory(params: DirectorySearchParams = {}): Promise<GlobalPartner[]> {
+  const { data, error } = await supabase.rpc('search_global_partners', {
+    p_query: params.query?.trim() || null,
+    p_state: params.state || null,
+    p_levels: params.levels && params.levels.length ? params.levels : null,
+    p_insurance: params.insurance && params.insurance.length ? params.insurance : null,
+    p_populations: params.populations && params.populations.length ? params.populations : null,
+    p_limit: params.limit ?? 50,
+    p_offset: params.offset ?? 0,
+  });
+  if (error) throw new StoreError(error.message || 'Could not search the directory.', false);
+  return ((data || []) as GlobalPartnerRow[]).map(mapListing);
+}
+
+// Distinct states with active listings, for filter pills. Cheap even at
+// thousands of listings because only one column crosses the wire.
+export async function fetchGlobalDirectoryStates(): Promise<string[]> {
+  const { data, error } = await supabase
+    .from('global_partners')
+    .select('state')
+    .eq('status', 'active');
+  if (error) throw new StoreError(error.message || 'Could not load directory states.', false);
+  const unique = new Set(((data || []) as { state: string | null }[]).map((row) => row.state || '').filter(Boolean));
+  return [...unique].sort();
+}
+
+type GlobalPartnerStatsRow = {
+  global_partner_id: string;
+  importing_orgs: number | null;
+  referrals_12m: number | null;
+  admit_rate: number | string | null;
+  family_experience: number | string | null;
+  last_referral_on: string | null;
+  disclosed: boolean;
+};
+
+function toNumber(value: number | string | null): number | null {
+  if (value === null || value === undefined) return null;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export async function fetchGlobalPartnerStats(ids: string[]): Promise<Map<string, GlobalPartnerStats>> {
+  const result = new Map<string, GlobalPartnerStats>();
+  if (ids.length === 0) return result;
+  const { data, error } = await supabase.rpc('fetch_global_partner_stats', { p_ids: ids });
+  if (error) throw new StoreError(error.message || 'Could not load directory stats.', false);
+  for (const row of (data || []) as GlobalPartnerStatsRow[]) {
+    result.set(row.global_partner_id, {
+      globalPartnerId: row.global_partner_id,
+      importingOrgs: row.importing_orgs ?? null,
+      referrals12m: row.referrals_12m ?? null,
+      admitRate: toNumber(row.admit_rate),
+      familyExperience: toNumber(row.family_experience),
+      lastReferralOn: row.last_referral_on ?? null,
+      disclosed: Boolean(row.disclosed),
+    });
+  }
+  return result;
+}
+
+// ─── Per-user favorites ──────────────────────────────────────────────────────
+// Personal to the signed-in user (unlike partners.favorite, which is the
+// workspace-wide team pin). Global listings can be favorited before import;
+// the favorite carries over to the tenant partner on import.
+
+export type FavoriteTarget = 'partner' | 'global_partner';
+
+export async function fetchFavoriteIds(target: FavoriteTarget): Promise<Set<string>> {
+  const { data, error } = await supabase
+    .from('user_favorites')
+    .select('target_id')
+    .eq('target_type', target)
+    .order('position');
+  if (error) throw new StoreError(error.message || 'Could not load favorites.', false);
+  return new Set(((data || []) as { target_id: string }[]).map((row) => row.target_id));
+}
+
+// Returns the new favorite state.
+export async function toggleFavorite(target: FavoriteTarget, id: string): Promise<boolean> {
+  const { data, error } = await supabase.rpc('toggle_user_favorite', { p_target_type: target, p_target_id: id });
+  if (error) throw new StoreError(error.message || 'Could not update the favorite.', false);
+  return Boolean(data);
+}
+
+// Propose one of the workspace's private partners for the shared directory.
+// Returns the global listing id (existing, if the program was already listed).
+export async function suggestGlobalListing(partnerId: string): Promise<string> {
+  const { data, error } = await supabase.rpc('suggest_global_listing', { p_partner_id: partnerId });
+  if (error) throw new StoreError(error.message || 'Could not suggest this program.', false);
+  return typeof data === 'string' ? data : String(data);
+}
+
+// Re-adopt the directory's value for a field the workspace had overridden.
+export async function clearPartnerOverride(partnerId: string, field: string): Promise<void> {
+  const { error } = await supabase.rpc('clear_partner_override', { p_partner_id: partnerId, p_field: field });
+  if (error) throw new StoreError(error.message || 'Could not reset this field.', false);
 }
 
 export async function fetchGlobalDirectory(): Promise<GlobalPartner[]> {
