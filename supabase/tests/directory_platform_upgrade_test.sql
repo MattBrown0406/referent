@@ -131,11 +131,17 @@ SELECT lives_ok(
   'the curator updates the listing'
 );
 
+-- Tenant partners are invisible to the curator (no platform-admin read on
+-- public.partners), so assert propagation as the workspace that owns the row.
+SELECT set_config('request.jwt.claim.sub', 'a2000000-0000-0000-0000-00000000000a', true);
+
 SELECT is(
   (SELECT organization || '|' || phone FROM public.partners WHERE id = 'c2000000-0000-0000-0000-000000000001'),
   'Cascade Recovery Center (Bend Campus)|(541) 555-0199',
   'the organization change propagates while the overridden phone is preserved'
 );
+
+SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-00000000000a', true);
 
 SELECT lives_ok(
   $$ SELECT public.merge_global_partners(
@@ -145,11 +151,15 @@ SELECT lives_ok(
   'the curator merges the duplicate into the primary listing'
 );
 
+SELECT set_config('request.jwt.claim.sub', 'a3000000-0000-0000-0000-00000000000a', true);
+
 SELECT is(
   (SELECT global_partner_id FROM public.partners WHERE id = 'c3000000-0000-0000-0000-000000000003'),
   'b1000000-0000-0000-0000-000000000001'::uuid,
   'tenant links are repointed to the surviving listing'
 );
+
+SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-00000000000a', true);
 
 SELECT is(
   (SELECT status || '|' || merged_into::text FROM public.global_partners WHERE id = 'b1000000-0000-0000-0000-000000000003'),

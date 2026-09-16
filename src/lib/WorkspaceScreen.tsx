@@ -253,13 +253,13 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                   </View>
                   <View style={entitlements.entitlements[row.key] ? styles.planBadgeActive : styles.planBadge}>
                     <Text style={entitlements.entitlements[row.key] ? styles.planBadgeActiveText : styles.planBadgeText}>
-                      {entitlements.entitlements[row.key] ? 'Active' : entitlements.loadedAt ? 'Free' : 'Unknown'}
+                      {entitlements.entitlements[row.key] ? 'Active' : entitlements.loadedAt ? 'Not active' : 'Unknown'}
                     </Text>
                   </View>
                 </View>
               ))}
               <Text style={styles.helpText}>
-                Subscription purchases are not enabled in this build yet. Plan access updates here after ReferralFit activates it for the workspace.
+                Plans are licensed to your practice by ReferralFit and activated for the whole workspace. Nothing is sold inside this app; plan status updates here once a plan is active.
               </Text>
             </View>
 
