@@ -219,7 +219,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
               network in one tap. It's part of the Directory plan.
             </Text>
             <Text style={styles.teaserFootnote}>
-              Upgrade from the Workspace screen once subscriptions launch.
+              Available once the Directory plan is active for your practice workspace.
             </Text>
           </View>
         ) : loadError ? (

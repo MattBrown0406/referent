@@ -74,7 +74,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
             <TextInput
               value={email}
               onChangeText={setEmail}
-              placeholder="matt@freedominterventions.com"
+              placeholder="you@yourpractice.com"
               placeholderTextColor="#99A6A1"
               keyboardType="email-address"
               autoCapitalize="none"
@@ -105,7 +105,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
               {busy ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.buttonText}>Sign in</Text>}
             </TouchableOpacity>
 
-            <Text style={styles.footnote}>Single-user workspace. Session stays on this device in secure storage.</Text>
+            <Text style={styles.footnote}>Accounts are set up for your practice by ReferralFit. Your session stays on this device in secure storage.</Text>
           </View>
         </ScrollView>
       </KeyboardAvoidingView>

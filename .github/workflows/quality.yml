@@ -55,3 +55,15 @@ jobs:
           supabase db reset
       - name: Run database pgTAP suite
         run: supabase test db
+      - name: Verify the App Review demo-account seed against the real schema
+        run: |
+          docker exec -i supabase_db_referent psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "INSERT INTO auth.users (id, email) VALUES (gen_random_uuid(), 'appreview@freedominterventions.com');"
+          docker exec -i supabase_db_referent psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            < supabase/preflight/app_review_demo_account.sql
+          # Re-run to prove the script is idempotent (wipe + reseed of the reviewer workspace only).
+          docker exec -i supabase_db_referent psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            < supabase/preflight/app_review_demo_account.sql
+          docker exec -i supabase_db_referent psql -U postgres -d postgres -v ON_ERROR_STOP=1 -tA \
+            -c "SELECT count(*) FROM public.partners p JOIN public.org_members m ON m.org_id = p.org_id JOIN auth.users u ON u.id = m.user_id WHERE u.email = 'appreview@freedominterventions.com';" \
+            | grep -qx 6
