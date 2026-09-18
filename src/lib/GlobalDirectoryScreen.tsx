@@ -216,10 +216,10 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
             <Text style={styles.teaserBody}>
               The ReferralFit Directory is a continuously verified list of treatment programs —
               levels of care, insurance panels, and admissions contacts — ready to add to your
-              network in one tap. It's part of the Directory plan.
+              network in one tap.
             </Text>
             <Text style={styles.teaserFootnote}>
-              Available once the Directory plan is active for your practice workspace.
+              The Directory is not enabled for this workspace yet. Contact ReferralFit if you expected it.
             </Text>
           </View>
         ) : loadError ? (

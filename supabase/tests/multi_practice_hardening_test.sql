@@ -1,5 +1,9 @@
 -- Regression coverage for 20260820033721_harden_multi_practice_boundaries.sql.
 BEGIN;
+-- Exercise the plan gates as they behave once the free launch period ends.
+-- Rolled back with the rest of the transaction.
+CREATE OR REPLACE FUNCTION public.free_launch_period()
+RETURNS boolean LANGUAGE sql IMMUTABLE SET search_path = public AS $$ SELECT false $$;
 SELECT plan(15);
 
 INSERT INTO auth.users (id, email)

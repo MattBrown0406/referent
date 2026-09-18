@@ -105,7 +105,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
               {busy ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.buttonText}>Sign in</Text>}
             </TouchableOpacity>
 
-            <Text style={styles.footnote}>Accounts are set up for your practice by ReferralFit. Your session stays on this device in secure storage.</Text>
+            <Text style={styles.footnote}>Accounts are set up for your practice by ReferralFit at no charge. Your practice's data is private to your workspace — other practices can never see it. Your session stays on this device in secure storage.</Text>
           </View>
         </ScrollView>
       </KeyboardAvoidingView>

@@ -165,6 +165,7 @@ const COLORS = {
 const notificationPromptKey = (userId: string) => `referralfit-notification-prompt-v2:${userId.toLowerCase()}`;
 const notificationScheduleKey = (userId: string) => `referralfit-notification-scheduling-v2:${userId.toLowerCase()}`;
 const partnerSnoozeKey = (userId: string) => `referralfit-partner-snooze-v2:${userId.toLowerCase()}`;
+const welcomeKey = (userId: string) => `referralfit-welcome-v1:${userId.toLowerCase()}`;
 
 // Every table's PK is a Postgres `uuid` column, so client-generated ids MUST be
 // valid UUIDs — a prefixed string like `p-1785096121092-t1etoz4` is rejected with
@@ -772,6 +773,10 @@ export default function App() {
   const [outcomeStars, setOutcomeStars] = useState(0);
   const [outcomeNote, setOutcomeNote] = useState('');
   const [notifPrePromptVisible, setNotifPrePromptVisible] = useState(false);
+  const [welcomeVisible, setWelcomeVisible] = useState(false);
+  // The first-run welcome goes before the notification pre-prompt; when both
+  // are due, the notification prompt waits until the welcome is dismissed.
+  const notifPromptDeferredRef = useRef(false);
   const [notificationPermissionState, setNotificationPermissionState] = useState<'authorized' | 'askable' | 'blocked' | 'unsupported'>('unsupported');
   const [pendingNotificationPartnerId, setPendingNotificationPartnerId] = useState<string | null>(null);
   const authGenerationRef = useRef(0);
@@ -1094,6 +1099,12 @@ export default function App() {
         setQueuedWrites(pending);
         setOffline(result.source === 'cache' || pending > 0);
 
+        const welcomeSeen = await AsyncStorage.getItem(welcomeKey(userId));
+        if (!active || generation !== authGenerationRef.current) return;
+        const showWelcome = welcomeSeen !== 'seen';
+        notifPromptDeferredRef.current = false;
+        if (showWelcome) setWelcomeVisible(true);
+
         const permission = await getNotificationPermissionState();
         if (!active || generation !== authGenerationRef.current) return;
         setNotificationPermissionState(permission);
@@ -1109,7 +1120,8 @@ export default function App() {
         } else if (permission === 'askable') {
           const decision = await AsyncStorage.getItem(notificationPromptKey(userId));
           if (active && generation === authGenerationRef.current && decision !== 'dismissed') {
-            setNotifPrePromptVisible(true);
+            if (showWelcome) notifPromptDeferredRef.current = true;
+            else setNotifPrePromptVisible(true);
           }
         }
       } catch (error) {
@@ -4950,6 +4962,49 @@ export default function App() {
     );
   }
 
+  function WelcomeModal() {
+    if (!welcomeVisible || !session) return null;
+    const userId = session.user.id;
+    const generation = authGenerationRef.current;
+    const accountIsCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
+    const dismiss = async () => {
+      setWelcomeVisible(false);
+      if (!accountIsCurrent()) return;
+      if (notifPromptDeferredRef.current) {
+        notifPromptDeferredRef.current = false;
+        setNotifPrePromptVisible(true);
+      }
+      try {
+        await AsyncStorage.setItem(welcomeKey(userId), 'seen');
+      } catch {
+        // Best effort: the welcome simply shows again next launch.
+      }
+    };
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={dismiss}>
+        <Pressable style={styles.dropdownOverlay} onPress={dismiss}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
+              <View style={styles.prePromptIcon}><AppIcon name="lock-closed-outline" size={24} color={COLORS.forest} /></View>
+              <Text style={styles.prePromptTitle}>Welcome to your private workspace</Text>
+              <Text style={styles.prePromptText}>
+                Everything you add here — partners, cases, referrals, notes, and documents — belongs to your practice alone. Other practices using ReferralFit cannot see it, and it is never shared or sold.
+              </Text>
+              <Text style={styles.prePromptText}>
+                The only shared space is the Directory of treatment programs, and a program appears there only if you choose to suggest it. Benchmarks use anonymized totals that never identify a practice.
+              </Text>
+              <Text style={styles.prePromptText}>
+                ReferralFit is free to use. There is nothing to buy in this app and no charge to your practice.
+              </Text>
+              <TouchableOpacity style={styles.primaryButton} onPress={dismiss}><Text style={styles.primaryButtonText}>Got it</Text></TouchableOpacity>
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
   function NotifPrePromptModal() {
     if (!notifPrePromptVisible || !session) return null;
     const userId = session.user.id;
@@ -5563,6 +5618,7 @@ export default function App() {
       {AddPartnerModal()}
       {AddReferralModal()}
       {LogTouchModal()}
+      {WelcomeModal()}
       {NotifPrePromptModal()}
       {PacketComposeModal()}
       {PacketSendConfirmModal()}

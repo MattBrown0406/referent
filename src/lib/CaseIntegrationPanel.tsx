@@ -116,7 +116,7 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
   }
 
   function removeLink(item: CaseIntegration) {
-    Alert.alert('Unlink external record?', `${integrationTitle(item)} will remain in ${item.provider === 'square' ? 'Square' : 'PandaDoc'}, but Referent will stop tracking it.`, [
+    Alert.alert('Unlink external record?', `${integrationTitle(item)} will remain in ${item.provider === 'square' ? 'Square' : 'PandaDoc'}, but ReferralFit will stop tracking it.`, [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Unlink',
@@ -135,7 +135,7 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
       <View style={styles.header}>
         <View style={styles.headerCopy}>
           <Text style={styles.title}>Contracts & payments</Text>
-          <Text style={styles.hint}>PandaDoc and Square stay authoritative; Referent tracks status and next action.</Text>
+          <Text style={styles.hint}>Optional. PandaDoc and Square stay authoritative; ReferralFit only tracks status and next action.</Text>
         </View>
         <TouchableOpacity accessibilityRole="button" onPress={() => setForm(emptyForm)} style={styles.addButton}>
           <Text style={styles.addButtonText}>+ Link</Text>
@@ -176,7 +176,7 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
           ))}
         </View>
       ) : (
-        <Text style={styles.empty}>Link the existing PandaDoc document or Square invoice once. Signed and payment status can then update automatically through webhooks.</Text>
+        <Text style={styles.empty}>If your practice uses PandaDoc or Square, link the existing document or invoice here to track it alongside the case. Status is updated by hand unless your accounts are connected to ReferralFit.</Text>
       )}
 
       {form ? (

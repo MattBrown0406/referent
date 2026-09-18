@@ -11,6 +11,13 @@ ReferralFit uses a three-system boundary:
 ReferralFit never collects card data and does not reproduce PandaDoc's signing
 workflow. `case_integrations` is a status and reporting mirror linked to a case.
 
+**Scope today: single practice.** Linking a record from the case screen is
+optional and works for any practice — it stores only an ID and a link, never
+credentials. Automatic status updates, however, come from webhooks that are
+bound to one Supabase user (`REFERENT_OWNER_ID`) and only ever touch rows that
+user owns. Other practices' links are never modified by those webhooks and stay
+manual. Per-practice webhook keys would be a new feature.
+
 ## What this release adds
 
 - Lead source, source detail, and lost reason on every case

@@ -2,6 +2,10 @@
 -- Run after a local migration reset with: supabase test db
 
 BEGIN;
+-- Exercise the plan gates as they behave once the free launch period ends.
+-- Rolled back with the rest of the transaction.
+CREATE OR REPLACE FUNCTION public.free_launch_period()
+RETURNS boolean LANGUAGE sql IMMUTABLE SET search_path = public AS $$ SELECT false $$;
 SELECT plan(20);
 
 -- ─── Personal org bootstrap ──────────────────────────────────────────────────
