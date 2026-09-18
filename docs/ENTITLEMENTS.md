@@ -1,5 +1,14 @@
 # Entitlements & RevenueCat integration
 
+> **Free launch period (since 2026-09-18).** ReferralFit is currently free:
+> `public.free_launch_period()` returns `true`, which makes
+> `org_has_entitlement()` answer yes for every workspace, so every gate below
+> is open and no RevenueCat products are configured. Nothing in the app sells
+> or links to a purchase. To end the free period, ship a migration that
+> redefines `free_launch_period()` as `SELECT false`; everything else in this
+> document then applies unchanged. The pgTAP suites already test the gates
+> with the free period switched off.
+
 Billing runs through RevenueCat (App Store / Play in-app purchases). The
 backend never talks to the stores directly: RevenueCat sends webhook events to
 the `revenuecat-webhook` edge function, which mirrors subscription state into

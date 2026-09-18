@@ -34,10 +34,10 @@ type Props = {
   onWorkspaceChanged: () => void;
 };
 
-const PLAN_ROWS: { key: Entitlement; label: string; description: string }[] = [
-  { key: 'pro', label: 'Pro', description: 'Team workspace and full business analytics' },
+const FEATURE_ROWS: { key: Entitlement; label: string; description: string }[] = [
+  { key: 'pro', label: 'Team workspace', description: 'Invite colleagues and share one practice file' },
   { key: 'directory', label: 'Directory', description: 'Shared, verified placement directory' },
-  { key: 'benchmarks', label: 'Benchmarks', description: 'Cross-practice performance benchmarks' },
+  { key: 'benchmarks', label: 'Benchmarks', description: 'Anonymized cross-practice benchmarks' },
 ];
 
 const COLORS = {
@@ -112,7 +112,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
 
   function makeInvite() {
     if (!entitlements.entitlements.pro) {
-      Alert.alert('Pro plan required', 'Team workspace invitations are available on the Pro plan.');
+      Alert.alert('Team invitations unavailable', 'Team workspace invitations are not enabled for this workspace. Contact ReferralFit if you expected them.');
       return;
     }
     void run(async () => {
@@ -244,8 +244,18 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
             </View>
 
             <View style={styles.card}>
-              <Text style={styles.cardLabel}>Plan</Text>
-              {PLAN_ROWS.map((row) => (
+              <Text style={styles.cardLabel}>Your data is private</Text>
+              <Text style={styles.helpText}>
+                Everything in this workspace — partners, cases, referrals, notes, and documents — belongs to your practice alone. Other practices using ReferralFit cannot see it, and ReferralFit staff do not have access to it. Only people you invite with a code can join this workspace.
+              </Text>
+              <Text style={[styles.helpText, styles.helpTextSpaced]}>
+                The only shared space is the Directory, and a program appears there only when you choose to suggest it. Benchmarks use anonymized totals and never identify a practice.
+              </Text>
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.cardLabel}>Included</Text>
+              {FEATURE_ROWS.map((row) => (
                 <View key={row.key} style={styles.memberRow}>
                   <View style={styles.memberInfo}>
                     <Text style={styles.memberName}>{row.label}</Text>
@@ -253,13 +263,13 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                   </View>
                   <View style={entitlements.entitlements[row.key] ? styles.planBadgeActive : styles.planBadge}>
                     <Text style={entitlements.entitlements[row.key] ? styles.planBadgeActiveText : styles.planBadgeText}>
-                      {entitlements.entitlements[row.key] ? 'Active' : entitlements.loadedAt ? 'Not active' : 'Unknown'}
+                      {entitlements.entitlements[row.key] ? 'Included' : entitlements.loadedAt ? 'Not enabled' : 'Checking'}
                     </Text>
                   </View>
                 </View>
               ))}
               <Text style={styles.helpText}>
-                Plans are licensed to your practice by ReferralFit and activated for the whole workspace. Nothing is sold inside this app; plan status updates here once a plan is active.
+                ReferralFit is free to use. There is nothing to buy in this app and no charge to your practice.
               </Text>
             </View>
 
@@ -284,7 +294,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
               <View style={styles.card}>
                 <Text style={styles.cardLabel}>Invite a teammate</Text>
                 <Text style={styles.helpText}>
-                  Team invitations require the Pro plan. Existing members keep access if a plan expires, but new invite codes cannot be created.
+                  Team invitations are not enabled for this workspace. Existing members keep their access; contact ReferralFit if you expected to invite colleagues.
                 </Text>
               </View>
             ) : null}
@@ -377,6 +387,7 @@ const styles = StyleSheet.create({
   removeButton: { backgroundColor: COLORS.coralSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 },
   removeText: { color: COLORS.coral, fontWeight: '600' },
   helpText: { fontSize: 14, color: COLORS.gray, lineHeight: 20 },
+  helpTextSpaced: { marginTop: 10 },
   inviteRow: {
     flexDirection: 'row',
     alignItems: 'center',

@@ -58,8 +58,8 @@ export default function BenchmarksPanel({ visible, entitled }: Props) {
         <Text style={styles.teaserTitle}>How do you compare?</Text>
         <Text style={styles.teaserBody}>
           Benchmarks put your admit rate, family experience, placement rate, and pricing next
-          to anonymized medians from practices across the ReferralFit network. Part of the
-          Benchmarks plan.
+          to anonymized medians from practices across the ReferralFit network. Benchmarks are
+          not enabled for this workspace yet.
         </Text>
       </View>
     );

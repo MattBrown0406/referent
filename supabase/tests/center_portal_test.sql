@@ -2,6 +2,12 @@
 -- Run after a local migration reset with: supabase test db
 
 BEGIN;
+-- Center-portal visibility is asserted with the plan gates as they behave once
+-- the free launch period ends (a center account with a practice workspace
+-- would otherwise also see every active listing, which is fine but not what
+-- this suite measures). Rolled back with the rest of the transaction.
+CREATE OR REPLACE FUNCTION public.free_launch_period()
+RETURNS boolean LANGUAGE sql IMMUTABLE SET search_path = public AS $$ SELECT false $$;
 SELECT plan(16);
 
 INSERT INTO auth.users (id, email)
