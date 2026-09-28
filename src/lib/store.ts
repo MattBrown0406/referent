@@ -3,6 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { newUuid } from './cases';
 import { currentAuthSessionIdentity } from './auth-session';
 import { StoreError } from './errors';
+import { fetchAllPages } from './paging';
 import { supabase } from './supabase';
 import type {
   InsuranceNetworkPreference,
@@ -1038,10 +1039,36 @@ function repairSnapshotIds(snapshot: Snapshot): { snapshot: Snapshot; repaired: 
   };
 }
 
+// Follow-up ids the local cache has but the open-follow-up load did not return
+// are checked against the server before anything is queued. Only ids the
+// server does not know at all are unsynced local rows.
+const FOLLOW_UP_PROBE_CHUNK = 200;
+
+async function fetchFollowUpsById(ids: string[]): Promise<FollowUpRow[]> {
+  const rows: FollowUpRow[] = [];
+  for (let start = 0; start < ids.length; start += FOLLOW_UP_PROBE_CHUNK) {
+    const chunk = ids.slice(start, start + FOLLOW_UP_PROBE_CHUNK);
+    rows.push(...await fetchAllPages<FollowUpRow>((from, to) => supabase.from('follow_ups').select('*').in('id', chunk).order('id').range(from, to)));
+  }
+  return rows;
+}
+
 // Merge rows that exist only in this account's local cache into a freshly
 // fetched server snapshot. The caller durably queues all missing inserts before
 // publishing the merged cache, so there is no fire-and-forget data-loss window.
-function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null): { snapshot: Snapshot; ops: QueueOp[] } {
+//
+// "Missing from remote" only means "never reached the server" when the remote
+// list is complete. Partners, referrals, match profiles and touches are loaded
+// in full (paged), so that holds for them. Follow-ups are NOT loaded in full —
+// only open ones are — so a cached follow-up can be missing because a teammate
+// (or this device, earlier) completed it. Re-inserting it would resurrect it as
+// open and overwrite the completion. So for follow-ups:
+//   - cached rows that are not open are never merge candidates (a completion is
+//     an update; it is either on the server or already in the write queue);
+//   - cached open rows the remote load lacks are looked up by id on the server.
+//     A row the server has is never re-queued: the server copy wins (kept if
+//     still open, dropped if completed). Only unknown ids are queued as inserts.
+async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null): Promise<{ snapshot: Snapshot; ops: QueueOp[] }> {
   if (!local) return { snapshot: remote, ops: [] };
   const merge = <T extends { id: string }>(r: T[], l: T[]): { rows: T[]; missing: T[] } => {
     const have = new Set(r.map((x) => x.id));
@@ -1052,7 +1079,19 @@ function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null): { snapsho
   const referrals = merge(remote.referrals, local.referrals);
   const matches = merge(remote.referralMatches, local.referralMatches);
   const touches = merge(remote.touches, local.touches);
-  const followUps = merge(remote.followUps, local.followUps);
+
+  const remoteFollowUpIds = new Set(remote.followUps.map((row) => row.id));
+  const openCandidates = local.followUps.filter((row) => row.id && row.status === 'open' && !remoteFollowUpIds.has(row.id));
+  const serverCopies = openCandidates.length ? await fetchFollowUpsById(openCandidates.map((row) => row.id)) : [];
+  const serverById = new Map(serverCopies.map((row) => [row.id, row]));
+  const followUps = {
+    rows: [
+      ...remote.followUps,
+      ...serverCopies.filter((row) => row.status === 'open').map(mapFollowUpRow),
+      ...openCandidates.filter((row) => !serverById.has(row.id)),
+    ],
+    missing: openCandidates.filter((row) => !serverById.has(row.id)),
+  };
   const referralRows = referrals.missing.map((row) => referralToRow(row));
   const matchRows = matches.missing.map((row) => matchToRow(row));
   const ops: QueueOp[] = [
@@ -1086,33 +1125,40 @@ function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null): { snapsho
 
 // ─── Read path ──────────────────────────────────────────────────────────────
 
+// Every list is paged (see paging.ts) and ordered on an immutable key plus the
+// primary key, so a teammate's edit landing mid-fetch cannot move a row across
+// a page boundary. Lists the UI reads in a mutable order (match profiles by
+// updated_at, follow-ups by due_on) are re-sorted here after the full load.
+//
+// Follow-ups: Today, the case file and local reminders only ever read OPEN
+// follow-ups, so those load in full and are never count-limited. Completed
+// rows (done/skipped) are not loaded at all — nothing renders them, and the old
+// due_on-ordered read was what dropped the newest open items past 1,000 rows.
 async function fetchSnapshot(): Promise<Snapshot> {
-  const [partnersRes, referralsRes, matchesRes, touchesRes, balancesRes, followUpsRes, scorecardsRes] = await Promise.all([
-    supabase.from('partners').select('*').order('created_at', { ascending: false }),
-    supabase.from('referrals').select('*').order('referred_on', { ascending: false }),
-    supabase.from('match_profiles').select('*').order('updated_at', { ascending: false }),
-    supabase.from('touches').select('*').order('occurred_at', { ascending: false }),
-    supabase.from('partner_balances').select('partner_id, inbound, outbound'),
-    supabase.from('follow_ups').select('*').order('due_on', { ascending: true }),
-    supabase.from('partner_scorecard').select('partner_id, referrals_sent, admits, non_admits, avg_family_experience, last_referral_on'),
+  const [partnerRows, referralRows, matchRows, touchRows, balanceRows, followUpRows, scorecardRows] = await Promise.all([
+    fetchAllPages<PartnerRow>((from, to) => supabase.from('partners').select('*').order('created_at', { ascending: false }).order('id').range(from, to)),
+    fetchAllPages<ReferralRow>((from, to) => supabase.from('referrals').select('*').order('referred_on', { ascending: false }).order('id').range(from, to)),
+    fetchAllPages<MatchRow>((from, to) => supabase.from('match_profiles').select('*').order('created_at', { ascending: false }).order('id').range(from, to)),
+    fetchAllPages<TouchRow>((from, to) => supabase.from('touches').select('*').order('occurred_at', { ascending: false }).order('id').range(from, to)),
+    fetchAllPages<BalanceRow>((from, to) => supabase.from('partner_balances').select('partner_id, inbound, outbound').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
+    fetchAllPages<FollowUpRow>((from, to) => supabase.from('follow_ups').select('*').eq('status', 'open').order('created_at', { ascending: false }).order('id').range(from, to)),
+    fetchAllPages<ScorecardRow>((from, to) => supabase.from('partner_scorecard').select('partner_id, referrals_sent, admits, non_admits, avg_family_experience, last_referral_on').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
   ]);
-  const firstError = partnersRes.error || referralsRes.error || matchesRes.error || touchesRes.error || balancesRes.error || followUpsRes.error || scorecardsRes.error;
-  if (firstError) throw firstError;
 
   const balanceByPartner = new Map<string, BalanceRow>();
-  for (const row of (balancesRes.data || []) as BalanceRow[]) balanceByPartner.set(row.partner_id, row);
+  for (const row of balanceRows) balanceByPartner.set(row.partner_id, row);
 
   const scorecards: Record<string, PartnerScorecard> = {};
-  for (const row of (scorecardsRes.data || []) as ScorecardRow[]) {
+  for (const row of scorecardRows) {
     scorecards[row.partner_id] = mapScorecardRow(row);
   }
 
   return {
-    partners: ((partnersRes.data || []) as PartnerRow[]).map((row) => mapPartnerRow(row, balanceByPartner.get(row.id))),
-    referrals: ((referralsRes.data || []) as ReferralRow[]).map(mapReferralRow),
-    referralMatches: ((matchesRes.data || []) as MatchRow[]).map(mapMatchRow),
-    touches: ((touchesRes.data || []) as TouchRow[]).map(mapTouchRow),
-    followUps: ((followUpsRes.data || []) as FollowUpRow[]).map(mapFollowUpRow),
+    partners: partnerRows.map((row) => mapPartnerRow(row, balanceByPartner.get(row.id))),
+    referrals: referralRows.map(mapReferralRow),
+    referralMatches: matchRows.sort((a, b) => b.updated_at.localeCompare(a.updated_at)).map(mapMatchRow),
+    touches: touchRows.map(mapTouchRow),
+    followUps: followUpRows.sort((a, b) => a.due_on.localeCompare(b.due_on)).map(mapFollowUpRow),
     scorecards,
   };
 }
@@ -1137,7 +1183,8 @@ export async function hydrate(expectedUserId: string): Promise<HydrateResult> {
     const merged = await withCacheLock(async () => {
       await assertSessionFence(fence);
       const latestLocal = await readCacheUnlocked(fence);
-      const result = mergeUnsyncedLocal(remote, latestLocal);
+      const result = await mergeUnsyncedLocal(remote, latestLocal);
+      await assertSessionFence(fence);
       // Queue persistence happens first: the cache must never claim an unsynced
       // local row is safe until its retry operation is durable.
       await enqueueOps(fence, result.ops);
@@ -1385,7 +1432,8 @@ export async function refreshSnapshot(expectedUserId: string): Promise<Snapshot 
     return await withCacheLock(async () => {
       await assertSessionFence(fence);
       const latestLocal = await readCacheUnlocked(fence);
-      const merged = mergeUnsyncedLocal(remote, latestLocal);
+      const merged = await mergeUnsyncedLocal(remote, latestLocal);
+      await assertSessionFence(fence);
       await enqueueOps(fence, merged.ops);
       await writeCacheUnlocked(fence, merged.snapshot);
       await assertSessionFence(fence);

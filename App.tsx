@@ -123,7 +123,9 @@ import {
   saveDocumentWithEvent,
   deleteContact,
   deleteDocumentRow,
-  fetchCaseData,
+  fetchCaseContacts,
+  fetchCaseFile,
+  fetchCases,
   isOpenCase,
   logCaseEvent,
   newDocumentId,
@@ -1063,16 +1065,17 @@ export default function App() {
         if (!active || generation !== authGenerationRef.current) return;
         applySnapshot(result.snapshot);
 
-        let caseData: Awaited<ReturnType<typeof fetchCaseData>> | null = null;
+        // Only the case list loads here; contacts, timeline and documents are
+        // fetched per case when a file is opened.
+        let activeCaseList: CaseRecord[] = [];
         try {
-          caseData = await fetchCaseData();
+          activeCaseList = await fetchCases();
         } catch (error) {
           if (active && generation === authGenerationRef.current) {
             Alert.alert('Case files unavailable', `Case files could not be loaded: ${(error as Error).message}`);
           }
         }
         if (!active || generation !== authGenerationRef.current) return;
-        const activeCaseList = caseData?.cases || [];
         setCases(activeCaseList);
 
         try {
@@ -1198,9 +1201,11 @@ export default function App() {
           if (refreshed) applySnapshot(refreshed);
         }
         if (!stillCurrent()) return;
-        const refreshedCaseData = await fetchCaseData();
+        // Foreground refresh reloads the case list only; the timeline is
+        // re-read for the one open case file (below), never for every case.
+        const refreshedCases = await fetchCases();
         if (!stillCurrent()) return;
-        setCases(refreshedCaseData.cases);
+        setCases(refreshedCases);
         try {
           const nextBusinessData = await fetchBusinessData();
           if (!stillCurrent()) return;
@@ -1218,9 +1223,11 @@ export default function App() {
           // foreground refresh failure; server-side gates remain authoritative.
         }
         if (activeCaseId) {
-          setCaseContacts(refreshedCaseData.caseContacts.filter((item) => item.caseId === activeCaseId));
-          setCaseEvents(refreshedCaseData.caseEvents.filter((item) => item.caseId === activeCaseId));
-          setCaseDocuments(refreshedCaseData.caseDocuments.filter((item) => item.caseId === activeCaseId));
+          const refreshedFile = await fetchCaseFile(activeCaseId);
+          if (!stillCurrent()) return;
+          setCaseContacts(refreshedFile.contacts);
+          setCaseEvents(refreshedFile.events);
+          setCaseDocuments(refreshedFile.documents);
         }
         await syncDerived(refreshed || undefined);
       })().catch((error) => {
@@ -1797,13 +1804,13 @@ export default function App() {
     setTimelineDraft('');
     setTimelineKind('note');
     setDocLabel('');
-    fetchCaseData()
-      .then((data) => {
+    Promise.all([fetchCases(), fetchCaseFile(caseId)])
+      .then(([caseList, file]) => {
         if (!userId || activeUserIdRef.current !== userId || caseLoadGenerationRef.current !== generation) return;
-        setCases(data.cases);
-        setCaseContacts(data.caseContacts.filter((item) => item.caseId === caseId));
-        setCaseEvents(data.caseEvents.filter((item) => item.caseId === caseId));
-        setCaseDocuments(data.caseDocuments.filter((item) => item.caseId === caseId));
+        setCases(caseList);
+        setCaseContacts(file.contacts);
+        setCaseEvents(file.events);
+        setCaseDocuments(file.documents);
       })
       .catch(() => {
         if (!userId || activeUserIdRef.current !== userId || caseLoadGenerationRef.current !== generation) return;
@@ -2937,9 +2944,9 @@ export default function App() {
     const clean = (phone: string) => phone.replace(/[^\d+]/g, '');
     if (card.caseId) {
       const record = cases.find((item) => item.id === card.caseId);
-      fetchCaseData()
-        .then((data) => {
-          const contacts = data.caseContacts.filter((item) => item.caseId === card.caseId && item.phone.trim());
+      fetchCaseContacts(card.caseId)
+        .then((caseContactList) => {
+          const contacts = caseContactList.filter((item) => item.phone.trim());
           if (!contacts.length) {
             Alert.alert('No phone on file', `This case has no contact with a phone number.${record ? ' Add one in the case file.' : ''}`);
             return;

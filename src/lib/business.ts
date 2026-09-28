@@ -2,6 +2,7 @@ import type { Referral } from '../data';
 import type { CaseRecord, CaseStatus } from './cases';
 import { StoreError } from './errors';
 import { currentAuthSessionIdentity } from './auth-session';
+import { fetchAllPages } from './paging';
 import { supabase } from './supabase';
 
 export const LEAD_SOURCES = [
@@ -167,17 +168,26 @@ async function currentAccount(): Promise<BusinessAccount> {
   return { userId: identity.userId, orgId: orgId.toLowerCase() };
 }
 
+// Stage history is one row per status change per case and feeds the funnel
+// and revenue dashboards, so it loads in full — paged, never truncated.
+// Integrations page on the immutable created_at (webhooks bump updated_at
+// mid-fetch) and are re-sorted to the updated_at order the panel shows.
 export async function fetchBusinessData(): Promise<BusinessData> {
   const { orgId } = await currentAccount();
-  const [stagesResult, integrationsResult] = await Promise.all([
-    supabase.from('case_stage_history').select('*').eq('org_id', orgId).order('entered_at', { ascending: true }),
-    supabase.from('case_integrations').select('*').eq('org_id', orgId).order('updated_at', { ascending: false }),
-  ]);
-  const firstError = stagesResult.error || integrationsResult.error;
-  if (firstError) throw new StoreError(firstError.message, false);
+  let stageRows: StageRow[];
+  let integrationRows: IntegrationRow[];
+  try {
+    [stageRows, integrationRows] = await Promise.all([
+      fetchAllPages<StageRow>((from, to) => supabase.from('case_stage_history').select('*').eq('org_id', orgId).order('entered_at', { ascending: true }).order('id').range(from, to)),
+      fetchAllPages<IntegrationRow>((from, to) => supabase.from('case_integrations').select('*').eq('org_id', orgId).order('created_at', { ascending: false }).order('id').range(from, to)),
+    ]);
+  } catch (error) {
+    if (error instanceof StoreError) throw error;
+    throw new StoreError((error as { message?: string })?.message || 'Business data could not be loaded.', false);
+  }
   return {
-    stages: ((stagesResult.data || []) as StageRow[]).map(mapStage),
-    integrations: ((integrationsResult.data || []) as IntegrationRow[]).map(mapIntegration),
+    stages: stageRows.map(mapStage),
+    integrations: integrationRows.sort((a, b) => b.updated_at.localeCompare(a.updated_at)).map(mapIntegration),
   };
 }
 

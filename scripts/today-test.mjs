@@ -172,5 +172,24 @@ console.log('\n── todayLoad (briefing count) ──');
 const load = notifications.todayLoad(followUps, partners, NOW);
 eq('actions = snooze-aware due follow-ups + cadence due', load, { actions: 11, overdueCount: 3 });
 
+// ─── 5. Today never depends on completed follow-ups being loaded ────────────
+// store.ts loads OPEN follow-ups only (in full, paged) and leaves done/skipped
+// rows on the server. Every Today surface must produce the same result from
+// the open subset as from a list that also carries completed rows.
+console.log('\n── Open-only follow-up load (store snapshot shape) ──');
+const openOnly = followUps.filter((item) => item.status === 'open');
+check('fixture includes a completed row to drop', openOnly.length < followUps.length);
+const openSections = today.buildTodaySections(openOnly, due, NOW, contextFor);
+eq('OVERDUE identical without completed rows', openSections.overdue.map((c) => c.id), sections.overdue.map((c) => c.id));
+eq('TODAY identical without completed rows', openSections.today.map((c) => c.id), sections.today.map((c) => c.id));
+eq('PARTNERS DUE identical without completed rows', openSections.partnersDue.map((c) => c.id), sections.partnersDue.map((c) => c.id));
+eq('todayLoad identical without completed rows', notifications.todayLoad(openOnly, partners, NOW), load);
+eq('followUpsDue identical without completed rows',
+  notifications.followUpsDue(openOnly, NOW).map((f) => f.id), notifications.followUpsDue(followUps, NOW).map((f) => f.id));
+const storeSource = readFileSync(path.join(repoRoot, 'src/lib/store.ts'), 'utf8');
+check('store loads open follow-ups filtered by status, never by count',
+  /from\('follow_ups'\)\.select\('\*'\)\.eq\('status', 'open'\)[^\n]*\.range\(from, to\)\)/.test(storeSource)
+  && !/from\('follow_ups'\)\.select\('\*'\)\.eq\('status', 'open'\)[^\n]*\.limit\(/.test(storeSource));
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

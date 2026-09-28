@@ -4,6 +4,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 
 import { StoreError } from './errors';
 import { currentAuthSessionIdentity, type AuthSessionIdentity } from './auth-session';
+import { fetchAllPages } from './paging';
 import { phoneSearchSuffix } from './phone';
 import { supabase } from './supabase';
 import type { FollowUp } from './store';
@@ -277,11 +278,12 @@ function documentToRow(document: CaseDocument): Record<string, unknown> {
 
 // ─── Read path ──────────────────────────────────────────────────────────────
 
-export type CaseFileData = {
-  cases: CaseRecord[];
-  caseContacts: CaseContact[];
-  caseEvents: CaseEvent[];
-  caseDocuments: CaseDocument[];
+// One case file's overlays, loaded when the file is opened (or refreshed while
+// it is open). The case list itself is loaded separately by fetchCases.
+export type CaseFile = {
+  contacts: CaseContact[];
+  events: CaseEvent[];
+  documents: CaseDocument[];
 };
 
 type CaseAccountFence = AuthSessionIdentity & { orgId: string };
@@ -323,21 +325,44 @@ async function withStableCaseAccount<T>(operation: (userId: string, orgId: strin
 
 // Case files belong to the workspace, not the row creator: every teammate sees
 // (and works) every case in the org. RLS enforces the same boundary server-side.
-export async function fetchCaseData(): Promise<CaseFileData> {
+//
+// Only the case list loads up front. Contacts, the timeline and documents are
+// per-case overlays fetched when a file is opened: case_events grows with
+// every call, text and status change, and loading the whole workspace's
+// timeline on launch and on every foreground is what does not scale.
+//
+// The list pages on the immutable created_at (plus id) and is re-sorted to
+// the updated_at order the Cases tab shows, so a teammate's edit landing
+// mid-fetch cannot shift a case across a page boundary.
+export async function fetchCases(): Promise<CaseRecord[]> {
   return withStableCaseAccount(async (_userId, orgId) => {
-    const [casesRes, contactsRes, eventsRes, documentsRes] = await Promise.all([
-      supabase.from('cases').select('*').eq('org_id', orgId).order('updated_at', { ascending: false }),
-      supabase.from('case_contacts').select('*').eq('org_id', orgId).order('created_at', { ascending: true }),
-      supabase.from('case_events').select('*').eq('org_id', orgId).order('occurred_at', { ascending: false }),
-      supabase.from('case_documents').select('*').eq('org_id', orgId).order('created_at', { ascending: true }),
+    const rows = await fetchAllPages<CaseRow>((from, to) => supabase.from('cases').select('*').eq('org_id', orgId).order('created_at', { ascending: false }).order('id').range(from, to));
+    return rows.sort((a, b) => b.updated_at.localeCompare(a.updated_at)).map(mapCaseRow);
+  });
+}
+
+async function fetchContactsForCase(orgId: string, caseId: string): Promise<CaseContact[]> {
+  const rows = await fetchAllPages<CaseContactRow>((from, to) => supabase.from('case_contacts').select('*').eq('org_id', orgId).eq('case_id', caseId).order('created_at', { ascending: true }).order('id').range(from, to));
+  return rows.map(mapContactRow);
+}
+
+export async function fetchCaseContacts(caseId: string): Promise<CaseContact[]> {
+  return withStableCaseAccount((_userId, orgId) => fetchContactsForCase(orgId, caseId));
+}
+
+// Everything the open case file renders, for one case only. The timeline is
+// ordered newest-first by the server; the UI sorts again defensively.
+export async function fetchCaseFile(caseId: string): Promise<CaseFile> {
+  return withStableCaseAccount(async (_userId, orgId) => {
+    const [contacts, eventRows, documentRows] = await Promise.all([
+      fetchContactsForCase(orgId, caseId),
+      fetchAllPages<CaseEventRow>((from, to) => supabase.from('case_events').select('*').eq('org_id', orgId).eq('case_id', caseId).order('occurred_at', { ascending: false }).order('id').range(from, to)),
+      fetchAllPages<CaseDocumentRow>((from, to) => supabase.from('case_documents').select('*').eq('org_id', orgId).eq('case_id', caseId).order('created_at', { ascending: true }).order('id').range(from, to)),
     ]);
-    const firstError = casesRes.error || contactsRes.error || eventsRes.error || documentsRes.error;
-    if (firstError) throw firstError;
     return {
-      cases: ((casesRes.data || []) as CaseRow[]).map(mapCaseRow),
-      caseContacts: ((contactsRes.data || []) as CaseContactRow[]).map(mapContactRow),
-      caseEvents: ((eventsRes.data || []) as CaseEventRow[]).map(mapEventRow),
-      caseDocuments: ((documentsRes.data || []) as CaseDocumentRow[]).map(mapDocumentRow),
+      contacts,
+      events: eventRows.map(mapEventRow),
+      documents: documentRows.map(mapDocumentRow),
     };
   });
 }
@@ -357,27 +382,37 @@ export async function searchCases(query: string): Promise<CaseSearchResult[]> {
   const text = query.trim();
   const suffix = phoneSearchSuffix(text);
   const textPattern = `%${escapeIlike(text)}%`;
-  const requests: PromiseLike<{ data: unknown[] | null; error: { message: string } | null }>[] = [];
+  // Contact hits carry their own row id for paging; matches are keyed by case.
+  const noHits: Promise<{ id: string; case_id: string }[]> = Promise.resolve([]);
+  let titleHits: Promise<{ id: string }[]> = noHits;
+  let nameHits = noHits;
+  let phoneHits = noHits;
   if (text) {
-    requests.push(supabase.from('cases').select('id').eq('org_id', orgId).or(`title.ilike.${textPattern}`));
-    requests.push(supabase.from('case_contacts').select('case_id').eq('org_id', orgId).or(`name.ilike.${textPattern}`));
+    titleHits = fetchAllPages<{ id: string }>((from, to) => supabase.from('cases').select('id').eq('org_id', orgId).or(`title.ilike.${textPattern}`).order('id').range(from, to));
+    nameHits = fetchAllPages<{ id: string; case_id: string }>((from, to) => supabase.from('case_contacts').select('id, case_id').eq('org_id', orgId).or(`name.ilike.${textPattern}`).order('id').range(from, to));
   }
   if (suffix) {
-    requests.push(supabase.from('case_contacts').select('case_id').eq('org_id', orgId).or(`phone_e164.ilike.${suffix}`));
+    phoneHits = fetchAllPages<{ id: string; case_id: string }>((from, to) => supabase.from('case_contacts').select('id, case_id').eq('org_id', orgId).or(`phone_e164.ilike.${suffix}`).order('id').range(from, to));
   }
-  if (!requests.length) return [];
-  const [titleRes, nameRes, phoneRes] = await Promise.all(requests);
-  const firstError = titleRes?.error || nameRes?.error || phoneRes?.error;
-  if (firstError) throw new StoreError(firstError.message, false);
+  if (!text && !suffix) return [];
+  let titleRows: { id: string }[];
+  let nameRows: { case_id: string }[];
+  let phoneRows: { case_id: string }[];
+  try {
+    [titleRows, nameRows, phoneRows] = await Promise.all([titleHits, nameHits, phoneHits]);
+  } catch (error) {
+    if (error instanceof StoreError) throw error;
+    throw new StoreError((error as { message?: string })?.message || 'Case search failed.', false);
+  }
 
   const results = new Map<string, CaseSearchResult>();
-  for (const row of ((titleRes?.data || []) as { id: string }[])) {
+  for (const row of titleRows) {
     results.set(row.id, { caseId: row.id, matchedBy: 'title' });
   }
-  for (const row of ((nameRes?.data || []) as { case_id: string }[])) {
+  for (const row of nameRows) {
     if (!results.has(row.case_id)) results.set(row.case_id, { caseId: row.case_id, matchedBy: 'contact' });
   }
-  for (const row of ((phoneRes?.data || []) as { case_id: string }[])) {
+  for (const row of phoneRows) {
     if (!results.has(row.case_id)) results.set(row.case_id, { caseId: row.case_id, matchedBy: 'phone' });
   }
   await assertCaseAccount(fence);
