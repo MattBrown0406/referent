@@ -154,17 +154,24 @@ function mapIntegration(row: IntegrationRow): CaseIntegration {
   };
 }
 
-async function currentAccountId(): Promise<string> {
+type BusinessAccount = { userId: string; orgId: string };
+
+// Business data (stage history, external record links) is workspace-wide:
+// reads and deletes scope by org_id; owner_id is only stamped on new rows.
+async function currentAccount(): Promise<BusinessAccount> {
   const identity = await currentAuthSessionIdentity();
   if (!identity) throw new StoreError('Sign in before loading business data.', false);
-  return identity.userId;
+  const { data: orgId, error } = await supabase.rpc('current_org_id');
+  if (error) throw new StoreError(error.message || 'The active workspace could not be verified.', false);
+  if (typeof orgId !== 'string' || !orgId) throw new StoreError('No active workspace is available.', false);
+  return { userId: identity.userId, orgId: orgId.toLowerCase() };
 }
 
 export async function fetchBusinessData(): Promise<BusinessData> {
-  const userId = await currentAccountId();
+  const { orgId } = await currentAccount();
   const [stagesResult, integrationsResult] = await Promise.all([
-    supabase.from('case_stage_history').select('*').eq('owner_id', userId).order('entered_at', { ascending: true }),
-    supabase.from('case_integrations').select('*').eq('owner_id', userId).order('updated_at', { ascending: false }),
+    supabase.from('case_stage_history').select('*').eq('org_id', orgId).order('entered_at', { ascending: true }),
+    supabase.from('case_integrations').select('*').eq('org_id', orgId).order('updated_at', { ascending: false }),
   ]);
   const firstError = stagesResult.error || integrationsResult.error;
   if (firstError) throw new StoreError(firstError.message, false);
@@ -181,10 +188,8 @@ export type IntegrationInput = Omit<CaseIntegration, 'id' | 'updatedAt' | 'metad
 };
 
 export async function saveCaseIntegration(input: IntegrationInput): Promise<CaseIntegration> {
-  const userId = await currentAccountId();
-  const row = {
-    ...(input.id ? { id: input.id } : {}),
-    owner_id: userId,
+  const { userId, orgId } = await currentAccount();
+  const patch = {
     case_id: input.caseId,
     provider: input.provider,
     record_type: input.recordType,
@@ -198,18 +203,29 @@ export async function saveCaseIntegration(input: IntegrationInput): Promise<Case
     ...(input.completedAt !== undefined ? { completed_at: input.completedAt || null } : {}),
     ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
   };
-  const { data, error } = await supabase
-    .from('case_integrations')
-    .upsert(row, { onConflict: 'owner_id,provider,record_type,external_id' })
-    .select('*')
-    .single();
+  // Editing an existing link updates it in place for any teammate. Only a new
+  // link goes through the (owner, provider, record_type, external_id) upsert
+  // the webhook edge functions share; attribution cannot change on update.
+  const { data, error } = input.id
+    ? await supabase
+      .from('case_integrations')
+      .update(patch)
+      .eq('id', input.id)
+      .eq('org_id', orgId)
+      .select('*')
+      .single()
+    : await supabase
+      .from('case_integrations')
+      .upsert({ ...patch, owner_id: userId }, { onConflict: 'owner_id,provider,record_type,external_id' })
+      .select('*')
+      .single();
   if (error || !data) throw new StoreError(error?.message || 'The external record could not be linked.', false);
   return mapIntegration(data as IntegrationRow);
 }
 
 export async function deleteCaseIntegration(id: string): Promise<void> {
-  const userId = await currentAccountId();
-  const { error } = await supabase.from('case_integrations').delete().eq('id', id).eq('owner_id', userId);
+  const { orgId } = await currentAccount();
+  const { error } = await supabase.from('case_integrations').delete().eq('id', id).eq('org_id', orgId);
   if (error) throw new StoreError(error.message, false);
 }
 

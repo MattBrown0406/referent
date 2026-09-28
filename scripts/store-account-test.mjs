@@ -6,6 +6,7 @@ const source = await readFile(new URL('../src/lib/store.ts', import.meta.url), '
 assert.match(source, /function sanitizeInsuranceNetworks\(value: unknown, insurance: string\[\]\)/);
 assert.match(source, /insuranceNetworkStatuses\.has/);
 const casesSource = await readFile(new URL('../src/lib/cases.ts', import.meta.url), 'utf8');
+const businessSource = await readFile(new URL('../src/lib/business.ts', import.meta.url), 'utf8');
 const authSessionSource = await readFile(new URL('../src/lib/auth-session.ts', import.meta.url), 'utf8');
 
 const mustContain = [
@@ -21,11 +22,28 @@ const mustContain = [
   "throw persistenceError('offline queue', error)",
   "throw persistenceError('cache', error)",
   "owner_id: userId",
-  ".eq('owner_id', userId)",
+  ".eq('org_id', orgId)",
+  'execute: (userId: string, orgId: string)',
+  'const orgId = await assertWorkspaceFence(fence)',
   'currentAuthSessionIdentity',
   'current.sessionId !== fence.sessionId',
 ];
 for (const text of mustContain) assert.ok(source.includes(text), `missing store invariant: ${text}`);
+
+// Workspace scoping: rows are shared by every org member, so reads, updates,
+// and deletes filter on the bound workspace (org_id) — never on the row
+// creator. owner_id survives only as insert-time attribution.
+for (const [name, text] of [['store', source], ['cases', casesSource], ['business', businessSource]]) {
+  assert.doesNotMatch(text, /\.eq\('owner_id'/, `${name}.ts must not scope reads or writes by owner_id`);
+  assert.doesNotMatch(text, /\.or\([^)]*owner_id/, `${name}.ts must not scope searches by owner_id`);
+}
+assert.match(source, /\.update\(op\.patch\)\.eq\('id', op\.id\)\.eq\('org_id', orgId\)/, 'queued updates must target the bound workspace');
+assert.match(source, /\.delete\(\)\.eq\('id', op\.id\)\.eq\('org_id', orgId\)/, 'queued deletes must target the bound workspace');
+assert.match(casesSource, /from\('cases'\)\.select\('\*'\)\.eq\('org_id', orgId\)/, 'case files must load for the whole workspace');
+assert.match(casesSource, /from\('case_contacts'\)\.select\('case_id'\)\.eq\('org_id', orgId\)/, 'case search must cover the whole workspace');
+assert.match(businessSource, /from\('case_stage_history'\)\.select\('\*'\)\.eq\('org_id', orgId\)/, 'stage history must load for the whole workspace');
+assert.match(businessSource, /from\('case_integrations'\)\.delete\(\)\.eq\('id', id\)\.eq\('org_id', orgId\)/, 'unlinking an external record must target the bound workspace');
+assert.match(businessSource, /rpc\('current_org_id'\)/, 'business data must resolve the active workspace, not just the user');
 
 // Global v1/legacy storage is documented but must never be read or merged.
 assert.doesNotMatch(source, /AsyncStorage\.(?:getItem|setItem)\((?:CACHE_KEY|QUEUE_KEY|LEGACY_STORAGE_KEY)/);
