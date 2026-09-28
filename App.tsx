@@ -11,6 +11,7 @@ import {
   Modal,
   Platform,
   Pressable,
+  RefreshControl,
   SafeAreaView,
   ScrollView,
   Share,
@@ -69,10 +70,16 @@ import {
   FollowUp,
   FollowUpKind,
   hydrate,
+  isNetworkError,
+  loadCaseFile,
+  loadCaseList,
   logContactActivity,
   PartnerScorecard,
   pendingWriteCount,
   persistCache,
+  persistCaseFile,
+  persistCaseList,
+  readBoundWorkspace,
   refreshSnapshot,
   saveMatchWithCase,
   Snapshot,
@@ -109,6 +116,7 @@ import {
   PacketFitInput,
 } from './src/lib/packet';
 import * as ImagePicker from 'expo-image-picker';
+import { MAX_CACHED_EVENTS_PER_FILE } from './src/lib/case-cache';
 import {
   CaseContact,
   CaseDocument,
@@ -123,8 +131,6 @@ import {
   saveDocumentWithEvent,
   deleteContact,
   deleteDocumentRow,
-  fetchCaseFile,
-  fetchCaseList,
   isOpenCase,
   logCaseEvent,
   newDocumentId,
@@ -175,6 +181,16 @@ const welcomeKey = (userId: string) => `referralfit-welcome-v1:${userId.toLowerC
 function makeId(_prefix?: string) {
   return newUuid();
 }
+
+// A foreground return within this window of the last refresh that reached the
+// server is skipped; pull-to-refresh always runs.
+const FOREGROUND_REFRESH_MIN_INTERVAL_MS = 30_000;
+
+// Where the case list / open case file on screen came from. 'cache' is the
+// saved offline copy (read-only until the server is reached again);
+// 'unavailable' means no connection and no saved copy. userId pins the copy
+// to the account it belongs to so it is never persisted under another one.
+type CachedCopyState = { userId: string; source: 'remote' | 'cache' | 'unavailable'; savedAt: string; truncated: boolean };
 
 // ─── Case files (v3) ────────────────────────────────────────────────────────
 
@@ -751,6 +767,13 @@ export default function App() {
   }, []);
   const [caseEvents, setCaseEvents] = useState<CaseEvent[]>([]);
   const [caseDocuments, setCaseDocuments] = useState<CaseDocument[]>([]);
+  const [caseListSource, setCaseListSource] = useState<CachedCopyState | null>(null);
+  const [caseFileSource, setCaseFileSource] = useState<CachedCopyState | null>(null);
+  // Pull-to-refresh on the Today, Cases, Directory and Referrals lists.
+  const [pullRefreshing, setPullRefreshing] = useState(false);
+  const [refreshNotice, setRefreshNotice] = useState('');
+  const lastServerRefreshAtRef = useRef(0);
+  const refreshInFlightRef = useRef<Promise<'ok' | 'offline'> | null>(null);
   const [showNewCase, setShowNewCase] = useState(false);
   const [showClosedCases, setShowClosedCases] = useState(false);
   const [caseSearch, setCaseSearch] = useState('');
@@ -981,6 +1004,12 @@ export default function App() {
     setAllCaseContacts([]);
     setCaseEvents([]);
     setCaseDocuments([]);
+    setCaseListSource(null);
+    setCaseFileSource(null);
+    setPullRefreshing(false);
+    setRefreshNotice('');
+    lastServerRefreshAtRef.current = 0;
+    refreshInFlightRef.current = null;
     setActiveCaseId(null);
     setSelectedPartner(null);
     setTouchPartner(null);
@@ -1063,7 +1092,18 @@ export default function App() {
     let active = true;
     (async () => {
       try {
-        const orgId = await fetchCurrentOrgId();
+        // With no signal the server cannot name the workspace; the caches are
+        // read under the binding last verified on this device (never bound →
+        // nothing cached → the original error surfaces).
+        let orgId: string;
+        try {
+          orgId = await fetchCurrentOrgId();
+        } catch (error) {
+          if (!isNetworkError(error)) throw error;
+          const bound = await readBoundWorkspace(userId);
+          if (!bound) throw error;
+          orgId = bound;
+        }
         if (!active || generation !== authGenerationRef.current) return;
         await bindLocalWorkspace(userId, orgId);
         if (!active || generation !== authGenerationRef.current) return;
@@ -1074,13 +1114,18 @@ export default function App() {
         if (!active || generation !== authGenerationRef.current) return;
         applySnapshot(result.snapshot);
 
-        // The case list and its contacts load here; each file's timeline and
+        // The case list and its contacts load here (from the server, or the
+        // saved copy when there is no signal); each file's timeline and
         // documents are fetched per case when it is opened.
         let activeCaseList: CaseRecord[] = [];
         let activeContacts: CaseContact[] = [];
+        let caseListLoad: CachedCopyState | null = null;
         try {
-          ({ cases: activeCaseList, contacts: activeContacts } = await fetchCaseList());
+          const load = await loadCaseList(userId);
+          ({ cases: activeCaseList, contacts: activeContacts } = load.list);
+          caseListLoad = { userId, source: load.source, savedAt: load.savedAt, truncated: false };
         } catch (error) {
+          // Only when there is no saved copy at all (or a real server error).
           if (active && generation === authGenerationRef.current) {
             Alert.alert('Case files unavailable', `Case files could not be loaded: ${(error as Error).message}`);
           }
@@ -1088,6 +1133,7 @@ export default function App() {
         if (!active || generation !== authGenerationRef.current) return;
         setCases(activeCaseList);
         setAllCaseContacts(activeContacts);
+        setCaseListSource(caseListLoad);
 
         try {
           const nextBusinessData = await fetchBusinessData();
@@ -1111,7 +1157,8 @@ export default function App() {
         const pending = await pendingWriteCount(userId);
         if (!active || generation !== authGenerationRef.current) return;
         setQueuedWrites(pending);
-        setOffline(result.source === 'cache' || pending > 0);
+        setOffline(result.source === 'cache' || caseListLoad?.source === 'cache' || pending > 0);
+        if (result.source === 'remote') lastServerRefreshAtRef.current = Date.now();
 
         const welcomeSeen = await AsyncStorage.getItem(welcomeKey(userId));
         if (!active || generation !== authGenerationRef.current) return;
@@ -1182,7 +1229,95 @@ export default function App() {
     };
   }, [session?.user?.id]);
 
-  // Flush queued offline writes when the app returns to the foreground.
+  // One refresh path for the foreground return and pull-to-refresh: flush
+  // queued writes first, then re-read the snapshot, the case list and
+  // contacts, business data, entitlements and the one open case file. Every
+  // read is paged, so this is cheap enough to run unconditionally. Concurrent
+  // calls share one run; a foreground return inside the debounce window is
+  // skipped. Resolves 'offline' (nothing reached the server) instead of
+  // throwing so callers can show a quiet notice rather than an alert.
+  const refreshFromServer = useCallback(async (trigger: 'foreground' | 'pull'): Promise<'ok' | 'offline'> => {
+    const userId = session?.user?.id;
+    if (!userId) return 'ok';
+    if (trigger === 'foreground' && Date.now() - lastServerRefreshAtRef.current < FOREGROUND_REFRESH_MIN_INTERVAL_MS) return 'ok';
+    if (refreshInFlightRef.current) return refreshInFlightRef.current;
+    const generation = authGenerationRef.current;
+    const stillCurrent = () => generation === authGenerationRef.current && activeUserIdRef.current === userId;
+    const run = (async (): Promise<'ok' | 'offline'> => {
+      try {
+        // Keep the flush → refresh ordering: queued writes land before the
+        // snapshot that would otherwise re-queue them is read back.
+        await flushWriteQueue(userId);
+      } catch (error) {
+        if (isNetworkError(error)) return 'offline';
+        throw error;
+      }
+      if (!stillCurrent()) return 'ok';
+      const refreshed = await refreshSnapshot(userId);
+      if (!stillCurrent()) return 'ok';
+      if (!refreshed) return 'offline';
+      lastServerRefreshAtRef.current = Date.now();
+      applySnapshot(refreshed);
+      // The case list and contacts reload; the timeline is re-read for the one
+      // open case file (below), never for every case.
+      const caseLoad = await loadCaseList(userId);
+      if (!stillCurrent()) return 'ok';
+      setCases(caseLoad.list.cases);
+      setAllCaseContacts(caseLoad.list.contacts);
+      setCaseListSource({ userId, source: caseLoad.source, savedAt: caseLoad.savedAt, truncated: false });
+      try {
+        const nextBusinessData = await fetchBusinessData();
+        if (!stillCurrent()) return 'ok';
+        setBusinessData(nextBusinessData);
+        setBusinessError('');
+      } catch (error) {
+        if (stillCurrent()) setBusinessError((error as Error).message);
+      }
+      try {
+        const nextEntitlements = await fetchEntitlements();
+        if (!stillCurrent()) return 'ok';
+        setEntitlements(nextEntitlements);
+      } catch {
+        // Preserve the last known entitlement state during a transient
+        // foreground refresh failure; server-side gates remain authoritative.
+      }
+      if (activeCaseId) {
+        const fileLoad = await loadCaseFile(userId, activeCaseId);
+        if (!stillCurrent()) return 'ok';
+        setCaseEvents(fileLoad.file.events);
+        setCaseDocuments(fileLoad.file.documents);
+        setCaseFileSource({ userId, source: fileLoad.source, savedAt: fileLoad.savedAt, truncated: fileLoad.truncated });
+      }
+      await syncDerived(refreshed, caseLoad.list.cases);
+      if (stillCurrent()) setRefreshNotice('');
+      return 'ok';
+    })();
+    refreshInFlightRef.current = run;
+    try {
+      return await run;
+    } finally {
+      if (refreshInFlightRef.current === run) refreshInFlightRef.current = null;
+    }
+  }, [session?.user?.id, activeCaseId, applySnapshot, syncDerived]);
+
+  // Pull-to-refresh: always runs, stops the spinner on failure, and reports
+  // a lost connection inline instead of with an alert.
+  async function pullToRefresh() {
+    if (pullRefreshing) return;
+    setPullRefreshing(true);
+    try {
+      const outcome = await refreshFromServer('pull');
+      if (outcome === 'offline') setRefreshNotice('No connection — showing saved data.');
+    } catch (error) {
+      setRefreshNotice(isNetworkError(error) ? 'No connection — showing saved data.' : `Refresh failed: ${(error as Error).message}`);
+    } finally {
+      setPullRefreshing(false);
+    }
+  }
+
+  // Flush queued offline writes and refresh when the app returns to the
+  // foreground. The workspace check stays unconditional (it is the durable
+  // fallback for a membership change made on another device).
   useEffect(() => {
     const userId = session?.user?.id;
     if (!userId) return undefined;
@@ -1203,53 +1338,31 @@ export default function App() {
           setWorkspaceEpoch((epoch) => epoch + 1);
           return;
         }
-        const flushed = await flushWriteQueue(userId);
-        if (!stillCurrent()) return;
-        let refreshed: Snapshot | null = null;
-        if (flushed > 0) {
-          refreshed = await refreshSnapshot(userId);
-          if (!stillCurrent()) return;
-          if (refreshed) applySnapshot(refreshed);
-        }
-        if (!stillCurrent()) return;
-        // Foreground refresh reloads the case list and contacts; the timeline
-        // is re-read for the one open case file (below), never for every case.
-        const refreshedList = await fetchCaseList();
-        if (!stillCurrent()) return;
-        setCases(refreshedList.cases);
-        setAllCaseContacts(refreshedList.contacts);
-        try {
-          const nextBusinessData = await fetchBusinessData();
-          if (!stillCurrent()) return;
-          setBusinessData(nextBusinessData);
-          setBusinessError('');
-        } catch (error) {
-          if (stillCurrent()) setBusinessError((error as Error).message);
-        }
-        try {
-          const nextEntitlements = await fetchEntitlements();
-          if (!stillCurrent()) return;
-          setEntitlements(nextEntitlements);
-        } catch {
-          // Preserve the last known entitlement state during a transient
-          // foreground refresh failure; server-side gates remain authoritative.
-        }
-        if (activeCaseId) {
-          const refreshedFile = await fetchCaseFile(activeCaseId);
-          if (!stillCurrent()) return;
-          setCaseEvents(refreshedFile.events);
-          setCaseDocuments(refreshedFile.documents);
-        }
-        await syncDerived(refreshed || undefined);
+        await refreshFromServer('foreground');
       })().catch((error) => {
-        if (stillCurrent()) Alert.alert('Sync issue', (error as Error).message);
+        // Offline: the header badge already says so and the saved copies stay
+        // on screen; alerting on every foreground return would be noise.
+        if (stillCurrent() && !isNetworkError(error)) Alert.alert('Sync issue', (error as Error).message);
       });
     });
     return () => {
       active = false;
       subscription.remove();
     };
-  }, [session?.user?.id, activeCaseId, applySnapshot, syncDerived]);
+  }, [session?.user?.id, refreshFromServer]);
+
+  // Keep the saved offline copies in step with what is on screen. Case writes
+  // are online-only, so an in-memory case list or open file that came from the
+  // server (and any edit that then landed) is live data worth keeping; a copy
+  // that itself came from the cache is never written back.
+  useEffect(() => {
+    if (!caseListSource || caseListSource.source !== 'remote') return;
+    void persistCaseList({ cases, contacts: allCaseContacts }, caseListSource.userId).catch(() => undefined);
+  }, [cases, allCaseContacts, caseListSource]);
+  useEffect(() => {
+    if (!activeCaseId || !caseFileSource || caseFileSource.source !== 'remote') return;
+    void persistCaseFile(activeCaseId, { events: caseEvents, documents: caseDocuments }, caseFileSource.userId).catch(() => undefined);
+  }, [activeCaseId, caseEvents, caseDocuments, caseFileSource]);
 
   // Tapping a notification jumps to the relevant tab and, for cadence nudges,
   // opens the named partner once that account's directory has hydrated.
@@ -1808,25 +1921,37 @@ export default function App() {
 
   // Open a case file: refresh the list + contacts and fetch the timeline and
   // documents for just this case (those stay server-side until a file opens).
+  // With no signal both fall back to their saved copies; the two loads are
+  // independent so a list that cannot refresh never hides a saved timeline.
   function openCase(caseId: string) {
     const userId = activeUserId;
     const generation = ++caseLoadGenerationRef.current;
+    const stillCurrent = () => Boolean(userId) && activeUserIdRef.current === userId && caseLoadGenerationRef.current === generation;
     setActiveCaseId(caseId);
+    setCaseFileSource(null);
     setTimelineDraft('');
     setTimelineKind('note');
     setDocLabel('');
-    Promise.all([fetchCaseList(), fetchCaseFile(caseId)])
-      .then(([list, file]) => {
-        if (!userId || activeUserIdRef.current !== userId || caseLoadGenerationRef.current !== generation) return;
-        setCases(list.cases);
-        setAllCaseContacts(list.contacts);
-        setCaseEvents(file.events);
-        setCaseDocuments(file.documents);
+    loadCaseList(userId)
+      .then((load) => {
+        if (!stillCurrent()) return;
+        setCases(load.list.cases);
+        setAllCaseContacts(load.list.contacts);
+        setCaseListSource({ userId, source: load.source, savedAt: load.savedAt, truncated: false });
+      })
+      .catch(() => undefined); // no server and no saved copy: keep the list already on screen
+    loadCaseFile(userId, caseId)
+      .then((load) => {
+        if (!stillCurrent()) return;
+        setCaseEvents(load.file.events);
+        setCaseDocuments(load.file.documents);
+        setCaseFileSource({ userId, source: load.source, savedAt: load.savedAt, truncated: load.truncated });
       })
       .catch(() => {
-        if (!userId || activeUserIdRef.current !== userId || caseLoadGenerationRef.current !== generation) return;
+        if (!stillCurrent()) return;
         setCaseEvents([]);
         setCaseDocuments([]);
+        setCaseFileSource({ userId, source: 'unavailable', savedAt: '', truncated: false });
       });
   }
 
@@ -1835,6 +1960,7 @@ export default function App() {
     setActiveCaseId(null);
     setCaseEvents([]);
     setCaseDocuments([]);
+    setCaseFileSource(null);
     setCaseContactForm(null);
     setCaseEditForm(null);
     setCaseBusinessForm(null);
@@ -2474,6 +2600,12 @@ export default function App() {
         Linking.openURL(url).catch(() => Alert.alert('Unable to open', 'This device could not open that document.'));
       }
     } catch (error) {
+      // Documents open through a 60-second signed link, so unlike the saved
+      // timeline they cannot be shown from the offline copy.
+      if (isNetworkError(error)) {
+        Alert.alert('Connection needed', 'Documents open through a short-lived signed link, so this one needs a connection. The saved copy lists it but cannot open it.');
+        return;
+      }
       Alert.alert('Could not open', (error as Error).message);
     }
   }
@@ -3475,6 +3607,38 @@ export default function App() {
     );
   }
 
+  // Pull-to-refresh control shared by the four list screens, plus the inline
+  // notice a failed pull leaves behind (cleared by the next refresh that
+  // reaches the server).
+  function renderRefreshControl() {
+    return <RefreshControl refreshing={pullRefreshing} onRefresh={() => { void pullToRefresh(); }} tintColor={COLORS.forest} colors={[COLORS.forest]} />;
+  }
+
+  function renderRefreshNotice() {
+    if (!refreshNotice) return null;
+    return (
+      <View style={styles.refreshNotice}>
+        <AppIcon name="cloud-offline-outline" size={14} color={COLORS.gray} />
+        <Text style={styles.refreshNoticeText}>{refreshNotice}</Text>
+      </View>
+    );
+  }
+
+  // "Showing saved copy" line for a case list or case file that came from
+  // the offline cache (or could not be loaded at all).
+  function renderSavedCopyNotice(copy: CachedCopyState | null, what: 'case list' | 'case file') {
+    if (!copy || copy.source === 'remote') return null;
+    const body = copy.source === 'unavailable'
+      ? `No connection and no saved copy of this ${what} yet. Reconnect and pull down to refresh.`
+      : `Showing saved copy from ${relativeActivity(copy.savedAt) || 'earlier'}.${copy.truncated ? ` Latest ${MAX_CACHED_EVENTS_PER_FILE} timeline entries only.` : ''}${what === 'case file' ? ' Opening a document needs a connection.' : ''}`;
+    return (
+      <View style={styles.refreshNotice}>
+        <AppIcon name="cloud-offline-outline" size={14} color={COLORS.gray} />
+        <Text style={styles.refreshNoticeText}>{body}</Text>
+      </View>
+    );
+  }
+
   // Compact action row for the Today list. Primary row: Call / Text / Done;
   // the ⋯ overflow opens one sheet with Snooze + Set Next Step — all five
   // actions reachable in one tap + one sheet.
@@ -3529,8 +3693,9 @@ export default function App() {
     const openCases = cases.filter(isOpenCase).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return (
       <View style={{ flex: 1 }}>
-        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
+        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} refreshControl={renderRefreshControl()}>
           {renderHeader()}
+          {renderRefreshNotice()}
           <View style={styles.welcomeRow}>
             <Text style={styles.eyebrow}>{currentDateLabel()}</Text>
             <Text style={styles.heroTitle}>Today</Text>
@@ -3884,8 +4049,10 @@ export default function App() {
       ? caseSearchResults.map((result) => cases.find((item) => item.id === result.caseId)).filter((item): item is CaseRecord => Boolean(item))
       : [];
     return (
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled" refreshControl={renderRefreshControl()}>
         {renderHeader('Cases')}
+        {renderRefreshNotice()}
+        {renderSavedCopyNotice(caseListSource, 'case list')}
         <View style={styles.directoryTitleRow}>
           <View style={styles.directoryTitleCopy}><Text style={styles.screenTitle}>Case files</Text><Text style={styles.screenSubtitle}>One family, one place — contacts, notes, documents, and the timeline.</Text></View>
           <View style={styles.caseHeaderActions}>
@@ -3983,8 +4150,9 @@ export default function App() {
 
   function DirectoryScreen() {
     return (
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled" refreshControl={renderRefreshControl()}>
         {renderHeader('Directory')}
+        {renderRefreshNotice()}
         <View style={styles.directoryTitleRow}>
           <View style={styles.directoryTitleCopy}><Text style={styles.screenTitle}>Your network</Text><Text style={styles.screenSubtitle}>{partners.length} people and programs</Text></View>
           <TouchableOpacity style={styles.addButton} onPress={openNewPartner}><AppIcon name="add" size={22} color={COLORS.white} /><Text style={styles.addButtonText}>Add</Text></TouchableOpacity>
@@ -4025,8 +4193,9 @@ export default function App() {
 
   function ReferralsScreen() {
     return (
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} refreshControl={renderRefreshControl()}>
         {renderHeader('Referral ledger')}
+        {renderRefreshNotice()}
         <View style={styles.directoryTitleRow}>
           <View><Text style={styles.screenTitle}>Give & receive</Text><Text style={styles.screenSubtitle}>Relationship history at a glance</Text></View>
           <TouchableOpacity accessibilityRole="button" accessibilityLabel="Add inbound referral" style={styles.roundAdd} onPress={() => openReferral('Inbound')}><AppIcon name="add" size={24} color={COLORS.white} /></TouchableOpacity>
@@ -4195,6 +4364,7 @@ export default function App() {
                 </View>
                 <Text style={styles.profileName}>Opened {shortDate(record.createdAt.slice(0, 10))} · active {relativeActivity(record.updatedAt)}</Text>
               </View>
+              {renderSavedCopyNotice(caseFileSource, 'case file')}
 
               <View style={styles.infoCard}>
                 <View style={styles.caseSectionHeader}>
@@ -6004,6 +6174,8 @@ const styles = StyleSheet.create({
   privacyHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: -6, marginBottom: 18 },
   offlineBadge: { maxWidth: '58%', flexShrink: 1, flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 5, borderWidth: 1, borderColor: COLORS.line },
   offlineBadgeText: { flexShrink: 1, color: COLORS.gray, fontSize: 9, lineHeight: 12, fontWeight: '700' },
+  refreshNotice: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 12, paddingVertical: 9, marginBottom: 12 },
+  refreshNoticeText: { flex: 1, color: COLORS.gray, fontSize: 12, lineHeight: 16, fontWeight: '600' },
   cadenceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 },
   touchLogList: { marginTop: 12, backgroundColor: COLORS.white, borderRadius: 17, paddingHorizontal: 14, borderWidth: 1, borderColor: COLORS.line },
   touchLogRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: '#EEF0EE' },
