@@ -8,6 +8,14 @@ import { supabase } from './supabase';
 // then keeps the listing accurate itself. Verification status stays with
 // ReferralFit; claiming buys accuracy control, never ranking.
 
+// Mirrors public.is_valid_insurance_networks: each carrier maps to one or
+// both of these labels. The app's partner form and referral matching use the
+// same two values.
+type NetworkStatus = 'In-network' | 'Out-of-network';
+type InsuranceNetworks = Record<string, NetworkStatus[]>;
+
+const NETWORK_STATUSES: NetworkStatus[] = ['In-network', 'Out-of-network'];
+
 type Listing = {
   id: string;
   name: string;
@@ -19,6 +27,7 @@ type Listing = {
   website: string;
   monthly_cost: number;
   insurance: string[];
+  insurance_networks: InsuranceNetworks;
   therapies: string[];
   populations: string[];
   levels: string[];
@@ -37,6 +46,7 @@ type ListingForm = {
   website: string;
   monthlyCost: string;
   insurance: string;
+  insuranceNetworks: InsuranceNetworks;
   therapies: string;
   populations: string;
   levels: string;
@@ -54,6 +64,7 @@ function toForm(listing: Listing): ListingForm {
     website: listing.website || '',
     monthlyCost: listing.monthly_cost ? String(listing.monthly_cost) : '',
     insurance: listing.insurance.join(', '),
+    insuranceNetworks: listing.insurance_networks,
     therapies: listing.therapies.join(', '),
     populations: listing.populations.join(', '),
     levels: listing.levels.join(', '),
@@ -63,6 +74,27 @@ function toForm(listing: Listing): ListingForm {
 
 function csv(value: string): string[] {
   return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+// Carriers as typed, trimmed and deduplicated, so each gets exactly one
+// network-status row and exactly one key in the saved payload.
+function carriersOf(value: string): string[] {
+  return Array.from(new Set(csv(value)));
+}
+
+// A carrier the program has not classified yet defaults to In-network,
+// matching the app's Add/Edit Partner form and the partners-table trigger.
+function statusesFor(networks: InsuranceNetworks, carrier: string): NetworkStatus[] {
+  const explicit = networks[carrier];
+  return explicit === undefined ? ['In-network'] : explicit;
+}
+
+// The payload the database accepts: only carriers still listed, each with the
+// statuses chosen for it. Choices for carriers that were removed are dropped.
+function buildInsuranceNetworks(form: ListingForm): InsuranceNetworks {
+  return Object.fromEntries(
+    carriersOf(form.insurance).map((carrier) => [carrier, statusesFor(form.insuranceNetworks, carrier)]),
+  );
 }
 
 export default function App() {
@@ -101,7 +133,7 @@ export default function App() {
     if (!membership) { setListing('none'); return; }
     const { data, error: listingError } = await supabase
       .from('global_partners')
-      .select('id, name, organization, city, state, phone, email, website, monthly_cost, insurance, therapies, populations, levels, description, status, verified_at')
+      .select('id, name, organization, city, state, phone, email, website, monthly_cost, insurance, insurance_networks, therapies, populations, levels, description, status, verified_at')
       .eq('id', membership.global_partner_id)
       .maybeSingle();
     if (listingError) { setError(listingError.message); return; }
@@ -111,6 +143,7 @@ export default function App() {
       organization: data.organization || '',
       website: data.website || '',
       insurance: data.insurance || [],
+      insurance_networks: (data.insurance_networks as InsuranceNetworks | null) || {},
       therapies: data.therapies || [],
       populations: data.populations || [],
       levels: data.levels || [],
@@ -174,6 +207,11 @@ export default function App() {
     try {
       const monthly = form.monthlyCost.trim() === '' ? 0 : Number(form.monthlyCost);
       if (!Number.isInteger(monthly) || monthly < 0) throw new Error('Monthly cost must be a whole dollar amount.');
+      const insuranceNetworks = buildInsuranceNetworks(form);
+      const unclassified = Object.keys(insuranceNetworks).find((carrier) => insuranceNetworks[carrier].length === 0);
+      if (unclassified) {
+        throw new Error(`Choose In-network, Out-of-network, or both for ${unclassified} before saving.`);
+      }
       const { data: updated, error: updateError } = await supabase
         .from('global_partners')
         .update({
@@ -185,7 +223,8 @@ export default function App() {
           email: form.email.trim(),
           website: form.website.trim() || null,
           monthly_cost: monthly,
-          insurance: csv(form.insurance),
+          insurance: carriersOf(form.insurance),
+          insurance_networks: insuranceNetworks,
           therapies: csv(form.therapies),
           populations: csv(form.populations),
           levels: csv(form.levels),
@@ -204,6 +243,38 @@ export default function App() {
       setBusy(false);
     }
   }
+
+  function toggleNetworkStatus(carrier: string, status: NetworkStatus) {
+    if (!form) return;
+    const current = statusesFor(form.insuranceNetworks, carrier);
+    const next = current.includes(status)
+      ? current.filter((item) => item !== status)
+      : NETWORK_STATUSES.filter((item) => item === status || current.includes(item));
+    setForm({ ...form, insuranceNetworks: { ...form.insuranceNetworks, [carrier]: next } });
+  }
+
+  // "We bill out-of-network for all carriers listed": checking adds
+  // Out-of-network to every carrier and leaves In-network as it is. Unchecking
+  // removes Out-of-network again; a carrier that would be left with nothing
+  // falls back to In-network so the listing never saves an empty status.
+  function setOutOfNetworkForAll(enabled: boolean) {
+    if (!form) return;
+    const next: InsuranceNetworks = { ...form.insuranceNetworks };
+    for (const carrier of carriersOf(form.insurance)) {
+      const current = statusesFor(form.insuranceNetworks, carrier);
+      if (enabled) {
+        next[carrier] = NETWORK_STATUSES.filter((item) => item === 'Out-of-network' || current.includes(item));
+      } else {
+        const without = current.filter((item) => item !== 'Out-of-network');
+        next[carrier] = without.length ? without : ['In-network'];
+      }
+    }
+    setForm({ ...form, insuranceNetworks: next });
+  }
+
+  const carriers = form ? carriersOf(form.insurance) : [];
+  const allOutOfNetwork = carriers.length > 0
+    && carriers.every((carrier) => statusesFor(form!.insuranceNetworks, carrier).includes('Out-of-network'));
 
   if (!authReady) return null;
 
@@ -290,6 +361,35 @@ export default function App() {
             <input inputMode="numeric" value={form.monthlyCost} onChange={(e) => setForm({ ...form, monthlyCost: e.target.value })} />
             <label>Insurance carriers (comma-separated)</label>
             <input value={form.insurance} onChange={(e) => setForm({ ...form, insurance: e.target.value })} />
+            {carriers.length ? (
+              <div className="networks">
+                <label>Network status for each carrier</label>
+                <p className="help">
+                  Families and referring practices filter placements by network status, so if
+                  your program bills a carrier out-of-network, say so here. Choose one or both
+                  for every carrier.
+                </p>
+                <label className="check all">
+                  <input type="checkbox" checked={allOutOfNetwork} onChange={(e) => setOutOfNetworkForAll(e.target.checked)} />
+                  We bill out-of-network for all carriers listed
+                </label>
+                {carriers.map((carrier) => {
+                  const statuses = statusesFor(form.insuranceNetworks, carrier);
+                  return (
+                    <div key={carrier} className={`network-row${statuses.length ? '' : ' missing'}`}>
+                      <span className="carrier">{carrier}</span>
+                      {NETWORK_STATUSES.map((status) => (
+                        <label key={status} className="check">
+                          <input type="checkbox" checked={statuses.includes(status)} onChange={() => toggleNetworkStatus(carrier, status)} />
+                          {status}
+                        </label>
+                      ))}
+                      {statuses.length ? null : <span className="warn">Choose at least one</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
             <label>Levels of care (comma-separated)</label>
             <input value={form.levels} onChange={(e) => setForm({ ...form, levels: e.target.value })} />
             <label>Populations served (comma-separated)</label>

@@ -62,6 +62,20 @@ function statsLine(stats: GlobalPartnerStats | undefined): string {
   return parts.join('  ·  ');
 }
 
+// "Aetna (OON) · Cigna (IN + OON) · Blue Cross" — an unmarked carrier is
+// in-network only, the default the portal and partner form both use.
+function insuranceLine(listing: GlobalPartner): string {
+  return listing.insurance
+    .filter((carrier) => carrier !== 'Cash pay')
+    .map((carrier) => {
+      const statuses = listing.insuranceNetworks[carrier] ?? ['In-network'];
+      const outOfNetwork = statuses.includes('Out-of-network');
+      const inNetwork = statuses.includes('In-network');
+      return outOfNetwork ? `${carrier} (${inNetwork ? 'IN + OON' : 'OON'})` : carrier;
+    })
+    .join(' · ');
+}
+
 function listingSubtitle(listing: GlobalPartner): string {
   const parts = [
     [listing.city, listing.state].filter(Boolean).join(', '),
@@ -272,6 +286,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                 const imported = importedGlobalIds.has(listing.id);
                 const isFavorite = favoriteIds.has(listing.id);
                 const usage = statsLine(stats.get(listing.id));
+                const insurance = insuranceLine(listing);
                 return (
                   <View key={listing.id} style={styles.card}>
                     <View style={styles.cardHeaderRow}>
@@ -281,6 +296,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                           <Text style={styles.cardContact}>{listing.name}</Text>
                         ) : null}
                         <Text style={styles.cardSubtitle}>{listingSubtitle(listing)}</Text>
+                        {insurance ? <Text style={styles.cardInsurance}>Insurance: {insurance}</Text> : null}
                         {listing.description ? (
                           <Text style={styles.cardDescription} numberOfLines={3}>{listing.description}</Text>
                         ) : null}
@@ -398,6 +414,7 @@ const styles = StyleSheet.create({
   cardTitle: { fontSize: 16, fontWeight: '700', color: COLORS.ink },
   cardContact: { fontSize: 14, color: COLORS.ink },
   cardSubtitle: { fontSize: 13, color: COLORS.gray },
+  cardInsurance: { fontSize: 13, color: COLORS.gray, marginTop: 2 },
   cardDescription: { fontSize: 13, color: COLORS.gray, lineHeight: 18, marginTop: 4 },
   verified: { fontSize: 12, fontWeight: '600', color: COLORS.green, marginTop: 4 },
   importedBadge: { alignSelf: 'flex-start', backgroundColor: COLORS.greenSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 },
