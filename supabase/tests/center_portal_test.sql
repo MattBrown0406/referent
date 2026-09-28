@@ -8,16 +8,23 @@ BEGIN;
 -- this suite measures). Rolled back with the rest of the transaction.
 CREATE OR REPLACE FUNCTION public.free_launch_period()
 RETURNS boolean LANGUAGE sql IMMUTABLE SET search_path = public AS $$ SELECT false $$;
-SELECT plan(16);
+SELECT plan(28);
 
 INSERT INTO auth.users (id, email)
 VALUES
   ('aa100000-0000-0000-0000-0000000000aa', 'admin@example.test'),
   ('aa200000-0000-0000-0000-0000000000aa', 'center@example.test'),
-  ('aa300000-0000-0000-0000-0000000000aa', 'other-center@example.test');
+  ('aa300000-0000-0000-0000-0000000000aa', 'other-center@example.test'),
+  ('aa400000-0000-0000-0000-0000000000aa', 'practice@example.test');
 
 INSERT INTO public.platform_admins (user_id)
 VALUES ('aa100000-0000-0000-0000-0000000000aa');
+
+-- The practice workspace needs directory access to import a listing.
+INSERT INTO public.org_entitlements (org_id, entitlement, active, source)
+SELECT org_id, 'directory', true, 'manual'
+  FROM public.org_members
+ WHERE user_id = 'aa400000-0000-0000-0000-0000000000aa';
 
 INSERT INTO public.global_partners (id, name, organization, status)
 VALUES
@@ -110,6 +117,55 @@ SELECT is(
 
 SELECT is((SELECT public.center_listing_import_count()), 0, 'import count starts at zero');
 
+-- ─── Insurance network status (portal "bill out-of-network") ─────────────────
+
+SELECT lives_ok(
+  $$ UPDATE public.global_partners
+        SET insurance = ARRAY['Aetna', 'Cigna'],
+            insurance_networks = '{"Aetna": ["In-network", "Out-of-network"], "Cigna": ["Out-of-network"]}'::jsonb
+      WHERE id = 'bb100000-0000-0000-0000-0000000000bb' $$,
+  'a center can record in-network and out-of-network billing per carrier'
+);
+
+SELECT is(
+  (SELECT insurance_networks FROM public.global_partners WHERE id = 'bb100000-0000-0000-0000-0000000000bb'),
+  '{"Aetna": ["In-network", "Out-of-network"], "Cigna": ["Out-of-network"]}'::jsonb,
+  'the per-carrier network statuses persist as written'
+);
+
+SELECT throws_ok(
+  $$ UPDATE public.global_partners
+        SET insurance_networks = '{"Aetna": [], "Cigna": ["Out-of-network"]}'::jsonb
+      WHERE id = 'bb100000-0000-0000-0000-0000000000bb' $$,
+  '23514',
+  NULL,
+  'a carrier with no network status is rejected by the check constraint'
+);
+
+SELECT throws_ok(
+  $$ UPDATE public.global_partners
+        SET insurance_networks = '{"Aetna": ["Self-pay"], "Cigna": ["Out-of-network"]}'::jsonb
+      WHERE id = 'bb100000-0000-0000-0000-0000000000bb' $$,
+  '23514',
+  NULL,
+  'an unknown network status is rejected by the check constraint'
+);
+
+SELECT throws_ok(
+  $$ UPDATE public.global_partners
+        SET insurance_networks = '{"Aetna": ["Out-of-network", "Out-of-network"], "Cigna": ["Out-of-network"]}'::jsonb
+      WHERE id = 'bb100000-0000-0000-0000-0000000000bb' $$,
+  '23514',
+  NULL,
+  'a duplicated network status is rejected by the check constraint'
+);
+
+SELECT is(
+  (SELECT insurance_networks FROM public.global_partners WHERE id = 'bb100000-0000-0000-0000-0000000000bb'),
+  '{"Aetna": ["In-network", "Out-of-network"], "Cigna": ["Out-of-network"]}'::jsonb,
+  'rejected payloads leave the saved network statuses untouched'
+);
+
 -- ─── Admin verification still works ──────────────────────────────────────────
 
 SELECT set_config('request.jwt.claim.sub', 'aa100000-0000-0000-0000-0000000000aa', true);
@@ -136,6 +192,66 @@ SELECT is(
      FROM public.global_partners WHERE id = 'bb100000-0000-0000-0000-0000000000bb'),
   'active:true',
   'a center content edit preserves admin-controlled status but clears stale verification'
+);
+
+-- ─── Network status propagates to linked tenant partners ─────────────────────
+
+SELECT set_config('request.jwt.claim.sub', 'aa400000-0000-0000-0000-0000000000aa', true);
+
+SELECT lives_ok(
+  $$ SELECT public.import_global_partner(
+       'bb100000-0000-0000-0000-0000000000bb'::uuid,
+       'cc100000-0000-0000-0000-0000000000cc'::uuid
+     ) $$,
+  'a practice imports the active listing into its workspace'
+);
+
+SELECT is(
+  (SELECT insurance_networks FROM public.partners WHERE id = 'cc100000-0000-0000-0000-0000000000cc'),
+  '{"Aetna": ["In-network", "Out-of-network"], "Cigna": ["Out-of-network"]}'::jsonb,
+  'the import copies the listing network statuses into the tenant partner'
+);
+
+SELECT set_config('request.jwt.claim.sub', 'aa200000-0000-0000-0000-0000000000aa', true);
+
+SELECT lives_ok(
+  $$ UPDATE public.global_partners
+        SET insurance_networks = '{"Aetna": ["Out-of-network"], "Cigna": ["Out-of-network"]}'::jsonb
+      WHERE id = 'bb100000-0000-0000-0000-0000000000bb' $$,
+  'the center switches every carrier to out-of-network only'
+);
+
+-- Tenant partners are only visible from inside their own workspace.
+SELECT set_config('request.jwt.claim.sub', 'aa400000-0000-0000-0000-0000000000aa', true);
+
+SELECT is(
+  (SELECT insurance_networks FROM public.partners WHERE id = 'cc100000-0000-0000-0000-0000000000cc'),
+  '{"Aetna": ["Out-of-network"], "Cigna": ["Out-of-network"]}'::jsonb,
+  'the center edit propagates network statuses to a linked partner with no local override'
+);
+
+SELECT ok(
+  NOT ('insurance_networks' = ANY (
+    (SELECT coalesce(local_overrides, '{}') FROM public.partners WHERE id = 'cc100000-0000-0000-0000-0000000000cc')
+  )),
+  'propagation does not mark the synced field as a local override'
+);
+
+-- A practice that hand-edited its copy keeps its own network statuses.
+UPDATE public.partners
+   SET insurance_networks = '{"Aetna": ["In-network"], "Cigna": ["Out-of-network"]}'::jsonb
+ WHERE id = 'cc100000-0000-0000-0000-0000000000cc';
+
+SELECT set_config('request.jwt.claim.sub', 'aa200000-0000-0000-0000-0000000000aa', true);
+UPDATE public.global_partners
+   SET insurance_networks = '{"Aetna": ["In-network", "Out-of-network"], "Cigna": ["In-network", "Out-of-network"]}'::jsonb
+ WHERE id = 'bb100000-0000-0000-0000-0000000000bb';
+
+SELECT set_config('request.jwt.claim.sub', 'aa400000-0000-0000-0000-0000000000aa', true);
+SELECT is(
+  (SELECT insurance_networks FROM public.partners WHERE id = 'cc100000-0000-0000-0000-0000000000cc'),
+  '{"Aetna": ["In-network"], "Cigna": ["Out-of-network"]}'::jsonb,
+  'a locally overridden network status is not clobbered by a later center edit'
 );
 
 -- ─── Second claim code cannot rebind a claimed account ───────────────────────
