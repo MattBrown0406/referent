@@ -306,10 +306,13 @@ async function assertCaseAccount(expected: CaseAccountFence): Promise<void> {
   throw new StoreError('Account changed before the case operation completed.', false);
 }
 
-async function withStableCaseAccount<T>(operation: (userId: string) => Promise<T>): Promise<T> {
+// `operation` receives the acting user (attribution on inserts, storage folder)
+// and the active workspace (org_id scope for reads); both are re-verified after
+// the operation so an account or workspace switch mid-flight is rejected.
+async function withStableCaseAccount<T>(operation: (userId: string, orgId: string) => Promise<T>): Promise<T> {
   const fence = await currentCaseAccount();
   try {
-    const result = await operation(fence.userId);
+    const result = await operation(fence.userId, fence.orgId);
     await assertCaseAccount(fence);
     return result;
   } catch (error) {
@@ -318,13 +321,15 @@ async function withStableCaseAccount<T>(operation: (userId: string) => Promise<T
   }
 }
 
+// Case files belong to the workspace, not the row creator: every teammate sees
+// (and works) every case in the org. RLS enforces the same boundary server-side.
 export async function fetchCaseData(): Promise<CaseFileData> {
-  return withStableCaseAccount(async (userId) => {
+  return withStableCaseAccount(async (_userId, orgId) => {
     const [casesRes, contactsRes, eventsRes, documentsRes] = await Promise.all([
-      supabase.from('cases').select('*').eq('owner_id', userId).order('updated_at', { ascending: false }),
-      supabase.from('case_contacts').select('*').eq('owner_id', userId).order('created_at', { ascending: true }),
-      supabase.from('case_events').select('*').eq('owner_id', userId).order('occurred_at', { ascending: false }),
-      supabase.from('case_documents').select('*').eq('owner_id', userId).order('created_at', { ascending: true }),
+      supabase.from('cases').select('*').eq('org_id', orgId).order('updated_at', { ascending: false }),
+      supabase.from('case_contacts').select('*').eq('org_id', orgId).order('created_at', { ascending: true }),
+      supabase.from('case_events').select('*').eq('org_id', orgId).order('occurred_at', { ascending: false }),
+      supabase.from('case_documents').select('*').eq('org_id', orgId).order('created_at', { ascending: true }),
     ]);
     const firstError = casesRes.error || contactsRes.error || eventsRes.error || documentsRes.error;
     if (firstError) throw firstError;
@@ -348,17 +353,17 @@ function escapeIlike(value: string): string {
 
 export async function searchCases(query: string): Promise<CaseSearchResult[]> {
   const fence = await currentCaseAccount();
-  const userId = fence.userId;
+  const orgId = fence.orgId;
   const text = query.trim();
   const suffix = phoneSearchSuffix(text);
   const textPattern = `%${escapeIlike(text)}%`;
   const requests: PromiseLike<{ data: unknown[] | null; error: { message: string } | null }>[] = [];
   if (text) {
-    requests.push(supabase.from('cases').select('id').eq('owner_id', userId).or(`title.ilike.${textPattern}`));
-    requests.push(supabase.from('case_contacts').select('case_id').eq('owner_id', userId).or(`name.ilike.${textPattern}`));
+    requests.push(supabase.from('cases').select('id').eq('org_id', orgId).or(`title.ilike.${textPattern}`));
+    requests.push(supabase.from('case_contacts').select('case_id').eq('org_id', orgId).or(`name.ilike.${textPattern}`));
   }
   if (suffix) {
-    requests.push(supabase.from('case_contacts').select('case_id').eq('owner_id', userId).or(`phone_e164.ilike.${suffix}`));
+    requests.push(supabase.from('case_contacts').select('case_id').eq('org_id', orgId).or(`phone_e164.ilike.${suffix}`));
   }
   if (!requests.length) return [];
   const [titleRes, nameRes, phoneRes] = await Promise.all(requests);

@@ -296,14 +296,18 @@ function bindQueueOp(op: QueueOp, userId: string): QueueOp {
   return op;
 }
 
-async function applyQueueOp(op: QueueOp, userId: string): Promise<void> {
+// Inserts carry owner_id (attribution: who created the row). Updates and
+// deletes target rows by workspace (org_id), never by owner: teammates share
+// every workspace row, and an owner-scoped update against a colleague's row
+// would match nothing and report success while the change silently vanished.
+async function applyQueueOp(op: QueueOp, userId: string, orgId: string): Promise<void> {
   let error: { message: string } | null = null;
   switch (op.kind) {
     case 'partner.insert':
       ({ error } = await supabase.from('partners').upsert({ ...op.row, owner_id: userId }));
       break;
     case 'partner.update':
-      ({ error } = await supabase.from('partners').update(op.patch).eq('id', op.id).eq('owner_id', userId));
+      ({ error } = await supabase.from('partners').update(op.patch).eq('id', op.id).eq('org_id', orgId));
       break;
     case 'referral.insert':
       ({ error } = await supabase.from('referrals').upsert({ ...op.row, owner_id: userId }));
@@ -312,10 +316,10 @@ async function applyQueueOp(op: QueueOp, userId: string): Promise<void> {
       ({ error } = await supabase.from('match_profiles').upsert({ ...op.row, owner_id: userId }));
       break;
     case 'match.update':
-      ({ error } = await supabase.from('match_profiles').update(op.patch).eq('id', op.id).eq('owner_id', userId));
+      ({ error } = await supabase.from('match_profiles').update(op.patch).eq('id', op.id).eq('org_id', orgId));
       break;
     case 'match.delete':
-      ({ error } = await supabase.from('match_profiles').delete().eq('id', op.id).eq('owner_id', userId));
+      ({ error } = await supabase.from('match_profiles').delete().eq('id', op.id).eq('org_id', orgId));
       break;
     case 'touch.insert':
       ({ error } = await supabase.from('touches').upsert({ ...op.row, owner_id: userId }, { onConflict: 'id' }));
@@ -324,7 +328,7 @@ async function applyQueueOp(op: QueueOp, userId: string): Promise<void> {
       ({ error } = await supabase.from('follow_ups').upsert({ ...op.row, owner_id: userId }));
       break;
     case 'follow_up.update':
-      ({ error } = await supabase.from('follow_ups').update(op.patch).eq('id', op.id).eq('owner_id', userId));
+      ({ error } = await supabase.from('follow_ups').update(op.patch).eq('id', op.id).eq('org_id', orgId));
       break;
     case 'follow_up.complete_next':
       ({ error } = await supabase.rpc('complete_follow_up_with_next', { p_completed: op.completed, p_next: op.next, p_event: op.event }));
@@ -354,7 +358,7 @@ async function applyQueueOp(op: QueueOp, userId: string): Promise<void> {
       }));
       break;
     case 'referral.update':
-      ({ error } = await supabase.from('referrals').update(op.patch).eq('id', op.id).eq('owner_id', userId));
+      ({ error } = await supabase.from('referrals').update(op.patch).eq('id', op.id).eq('org_id', orgId));
       break;
   }
   if (error) throw error;
@@ -385,8 +389,8 @@ export async function flushWriteQueue(expectedUserId: string): Promise<number> {
     while (ops.length) {
       const [head, ...rest] = ops;
       try {
-        await assertWorkspaceFence(fence);
-        await applyQueueOp(head, fence.userId);
+        const orgId = await assertWorkspaceFence(fence);
+        await applyQueueOp(head, fence.userId, orgId);
         flushed += 1;
       } catch (error) {
         if (isNetworkError(error)) return flushed; // queue on disk is unchanged
@@ -413,8 +417,8 @@ export async function flushWriteQueue(expectedUserId: string): Promise<number> {
     for (let index = 0; index < retry.length; index += 1) {
       const op = retry[index];
       try {
-        await assertWorkspaceFence(fence);
-        await applyQueueOp(op, fence.userId);
+        const orgId = await assertWorkspaceFence(fence);
+        await applyQueueOp(op, fence.userId, orgId);
         flushed += 1;
       } catch (error) {
         if (isNetworkError(error) || isMissingParentError(error)) {
@@ -1173,16 +1177,18 @@ export async function persistCache(snapshot: Snapshot, expectedUserId: string): 
 // can surface a message.
 
 // supabase-js query builders are thenables (PromiseLike), not real Promises.
+// `execute` receives the acting user (owner_id on inserts) and the bound
+// workspace (org_id filter on updates/deletes) verified by the workspace fence.
 async function runOrQueue(
   expectedUserId: string,
   op: QueueOp,
-  execute: (userId: string) => PromiseLike<{ error: { message: string } | null }>,
+  execute: (userId: string, orgId: string) => PromiseLike<{ error: { message: string } | null }>,
 ): Promise<void> {
   const fence = await sessionFence(expectedUserId);
   let result: { error: { message: string } | null };
   try {
-    await assertWorkspaceFence(fence);
-    result = await execute(fence.userId);
+    const orgId = await assertWorkspaceFence(fence);
+    result = await execute(fence.userId, orgId);
   } catch (error) {
     if (!isNetworkError(error)) throw error;
     await assertSessionFence(fence);
@@ -1206,8 +1212,8 @@ export async function createPartner(partner: Partner, expectedUserId: string): P
 export async function updatePartner(partner: Partner, expectedUserId: string): Promise<void> {
   const row = partnerToRow(partner);
   const { id, ...patch } = row;
-  await runOrQueue(expectedUserId, { kind: 'partner.update', id: safeId(partner.id) as string, patch }, (userId) =>
-    supabase.from('partners').update(patch).eq('id', safeId(partner.id)).eq('owner_id', userId));
+  await runOrQueue(expectedUserId, { kind: 'partner.update', id: safeId(partner.id) as string, patch }, (_userId, orgId) =>
+    supabase.from('partners').update(patch).eq('id', safeId(partner.id)).eq('org_id', orgId));
 }
 
 export async function createReferral(referral: Referral, expectedUserId: string): Promise<void> {
@@ -1224,14 +1230,14 @@ export async function updateMatchProfile(match: ReferralMatch, expectedUserId: s
   const row = matchToRow(match);
   const { id, ...patch } = row;
   const safeMatchId = safeId(match.id) as string;
-  await runOrQueue(expectedUserId, { kind: 'match.update', id: safeMatchId, patch }, (userId) =>
-    supabase.from('match_profiles').update(patch).eq('id', safeMatchId).eq('owner_id', userId));
+  await runOrQueue(expectedUserId, { kind: 'match.update', id: safeMatchId, patch }, (_userId, orgId) =>
+    supabase.from('match_profiles').update(patch).eq('id', safeMatchId).eq('org_id', orgId));
 }
 
 export async function deleteMatchProfile(matchId: string, expectedUserId: string): Promise<void> {
   const safeMatchId = safeId(matchId) as string;
-  await runOrQueue(expectedUserId, { kind: 'match.delete', id: safeMatchId }, (userId) =>
-    supabase.from('match_profiles').delete().eq('id', safeMatchId).eq('owner_id', userId));
+  await runOrQueue(expectedUserId, { kind: 'match.delete', id: safeMatchId }, (_userId, orgId) =>
+    supabase.from('match_profiles').delete().eq('id', safeMatchId).eq('org_id', orgId));
 }
 
 export async function createTouch(touch: Touch, expectedUserId: string): Promise<void> {
@@ -1295,8 +1301,8 @@ export async function updateFollowUp(followUp: FollowUp, expectedUserId: string)
   const row = followUpToRow(followUp);
   const { id, ...patch } = row;
   const safeFollowUpId = safeId(followUp.id) as string;
-  await runOrQueue(expectedUserId, { kind: 'follow_up.update', id: safeFollowUpId, patch }, (userId) =>
-    supabase.from('follow_ups').update(patch).eq('id', safeFollowUpId).eq('owner_id', userId));
+  await runOrQueue(expectedUserId, { kind: 'follow_up.update', id: safeFollowUpId, patch }, (_userId, orgId) =>
+    supabase.from('follow_ups').update(patch).eq('id', safeFollowUpId).eq('org_id', orgId));
 }
 
 export async function completeFollowUpWithNext(
@@ -1345,8 +1351,8 @@ export async function completeFollowUpWithOutcome(
 export async function updateReferralOutcome(id: string, patch: ReferralOutcomePatch, expectedUserId: string): Promise<void> {
   const row = referralOutcomePatchToRow(patch);
   const safeReferralId = safeId(id) as string;
-  await runOrQueue(expectedUserId, { kind: 'referral.update', id: safeReferralId, patch: row }, (userId) =>
-    supabase.from('referrals').update(row).eq('id', safeReferralId).eq('owner_id', userId));
+  await runOrQueue(expectedUserId, { kind: 'referral.update', id: safeReferralId, patch: row }, (_userId, orgId) =>
+    supabase.from('referrals').update(row).eq('id', safeReferralId).eq('org_id', orgId));
 }
 
 export async function updateReferralPacketStamp(
@@ -1357,16 +1363,16 @@ export async function updateReferralPacketStamp(
 ): Promise<void> {
   const patch = { packet_sent_at: packetSentAt, match_profile_id: safeId(matchProfileId) };
   const safeReferralId = safeId(id) as string;
-  await runOrQueue(expectedUserId, { kind: 'referral.update', id: safeReferralId, patch }, (userId) =>
-    supabase.from('referrals').update(patch).eq('id', safeReferralId).eq('owner_id', userId));
+  await runOrQueue(expectedUserId, { kind: 'referral.update', id: safeReferralId, patch }, (_userId, orgId) =>
+    supabase.from('referrals').update(patch).eq('id', safeReferralId).eq('org_id', orgId));
 }
 
 // Attach (or detach) a case on a match profile.
 export async function updateMatchCase(id: string, caseId: string | null, expectedUserId: string): Promise<void> {
   const patch = { case_id: safeId(caseId) };
   const safeMatchId = safeId(id) as string;
-  await runOrQueue(expectedUserId, { kind: 'match.update', id: safeMatchId, patch }, (userId) =>
-    supabase.from('match_profiles').update(patch).eq('id', safeMatchId).eq('owner_id', userId));
+  await runOrQueue(expectedUserId, { kind: 'match.update', id: safeMatchId, patch }, (_userId, orgId) =>
+    supabase.from('match_profiles').update(patch).eq('id', safeMatchId).eq('org_id', orgId));
 }
 
 // Re-hydrate from the server and durably update this account's cache. Returns
