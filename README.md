@@ -30,6 +30,15 @@ to other intervention practices on recurring plans:
    listing (`global_partner_stats`, hourly refresh) is exposed through
    `fetch_global_partner_stats` as aggregates only, behind the same
    five-workspace k-anonymity floor as benchmarks.
+   **Seed orgs:** a workspace owned by a platform admin (`org_is_platform_seed`)
+   is the directory's verified seed. Every treatment program added there is
+   published automatically as an `active`, verified listing (dedup by phone /
+   domain; matching `pending` suggestions from other workspaces go live), edits
+   in the seed workspace flow to the listing and on to every linked copy, and
+   deleting a seed program archives its listing when no other workspace links
+   to it. Interventionist- or therapist-only partners never auto-publish, and
+   ordinary workspaces keep the suggest → pending flow. Rollout steps live in
+   `docs/DIRECTORY_SEED_ROLLOUT.md`.
 4. **Center portal** (`portal/`) — treatment programs claim their listing with
    an admin-issued code and keep it accurate themselves. Verification status
    stays with ReferralFit; claiming never buys ranking (no pay-for-placement,
