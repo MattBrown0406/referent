@@ -123,7 +123,8 @@ import {
   saveDocumentWithEvent,
   deleteContact,
   deleteDocumentRow,
-  fetchCaseData,
+  fetchCaseFile,
+  fetchCaseList,
   isOpenCase,
   logCaseEvent,
   newDocumentId,
@@ -737,7 +738,17 @@ export default function App() {
   // fetched when a case file is opened (kept server-side until then).
   const [cases, setCases] = useState<CaseRecord[]>([]);
   const [activeCaseId, setActiveCaseId] = useState<string | null>(null);
-  const [caseContacts, setCaseContacts] = useState<CaseContact[]>([]);
+  // Every contact in the workspace, loaded with the case list so each case
+  // card can show the family's primary name and phone. The open file's own
+  // contact list is derived below; edits replace that case's slice in here.
+  const [allCaseContacts, setAllCaseContacts] = useState<CaseContact[]>([]);
+  const caseContacts = useMemo(
+    () => (activeCaseId ? allCaseContacts.filter((item) => item.caseId === activeCaseId) : []),
+    [allCaseContacts, activeCaseId],
+  );
+  const setCaseContacts = useCallback((caseId: string, next: CaseContact[]) => {
+    setAllCaseContacts((current) => [...current.filter((item) => item.caseId !== caseId), ...next]);
+  }, []);
   const [caseEvents, setCaseEvents] = useState<CaseEvent[]>([]);
   const [caseDocuments, setCaseDocuments] = useState<CaseDocument[]>([]);
   const [showNewCase, setShowNewCase] = useState(false);
@@ -967,7 +978,7 @@ export default function App() {
     applySnapshot({ partners: [], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} });
     setEntitlements(NO_ENTITLEMENTS);
     setCases([]);
-    setCaseContacts([]);
+    setAllCaseContacts([]);
     setCaseEvents([]);
     setCaseDocuments([]);
     setActiveCaseId(null);
@@ -1063,17 +1074,20 @@ export default function App() {
         if (!active || generation !== authGenerationRef.current) return;
         applySnapshot(result.snapshot);
 
-        let caseData: Awaited<ReturnType<typeof fetchCaseData>> | null = null;
+        // The case list and its contacts load here; each file's timeline and
+        // documents are fetched per case when it is opened.
+        let activeCaseList: CaseRecord[] = [];
+        let activeContacts: CaseContact[] = [];
         try {
-          caseData = await fetchCaseData();
+          ({ cases: activeCaseList, contacts: activeContacts } = await fetchCaseList());
         } catch (error) {
           if (active && generation === authGenerationRef.current) {
             Alert.alert('Case files unavailable', `Case files could not be loaded: ${(error as Error).message}`);
           }
         }
         if (!active || generation !== authGenerationRef.current) return;
-        const activeCaseList = caseData?.cases || [];
         setCases(activeCaseList);
+        setAllCaseContacts(activeContacts);
 
         try {
           const nextBusinessData = await fetchBusinessData();
@@ -1198,9 +1212,12 @@ export default function App() {
           if (refreshed) applySnapshot(refreshed);
         }
         if (!stillCurrent()) return;
-        const refreshedCaseData = await fetchCaseData();
+        // Foreground refresh reloads the case list and contacts; the timeline
+        // is re-read for the one open case file (below), never for every case.
+        const refreshedList = await fetchCaseList();
         if (!stillCurrent()) return;
-        setCases(refreshedCaseData.cases);
+        setCases(refreshedList.cases);
+        setAllCaseContacts(refreshedList.contacts);
         try {
           const nextBusinessData = await fetchBusinessData();
           if (!stillCurrent()) return;
@@ -1218,9 +1235,10 @@ export default function App() {
           // foreground refresh failure; server-side gates remain authoritative.
         }
         if (activeCaseId) {
-          setCaseContacts(refreshedCaseData.caseContacts.filter((item) => item.caseId === activeCaseId));
-          setCaseEvents(refreshedCaseData.caseEvents.filter((item) => item.caseId === activeCaseId));
-          setCaseDocuments(refreshedCaseData.caseDocuments.filter((item) => item.caseId === activeCaseId));
+          const refreshedFile = await fetchCaseFile(activeCaseId);
+          if (!stillCurrent()) return;
+          setCaseEvents(refreshedFile.events);
+          setCaseDocuments(refreshedFile.documents);
         }
         await syncDerived(refreshed || undefined);
       })().catch((error) => {
@@ -1788,8 +1806,8 @@ export default function App() {
 
   const activeCase = cases.find((item) => item.id === activeCaseId) || null;
 
-  // Open a case file: fetch contacts + timeline + documents for just this
-  // case (lists stay server-side until the file is opened).
+  // Open a case file: refresh the list + contacts and fetch the timeline and
+  // documents for just this case (those stay server-side until a file opens).
   function openCase(caseId: string) {
     const userId = activeUserId;
     const generation = ++caseLoadGenerationRef.current;
@@ -1797,17 +1815,16 @@ export default function App() {
     setTimelineDraft('');
     setTimelineKind('note');
     setDocLabel('');
-    fetchCaseData()
-      .then((data) => {
+    Promise.all([fetchCaseList(), fetchCaseFile(caseId)])
+      .then(([list, file]) => {
         if (!userId || activeUserIdRef.current !== userId || caseLoadGenerationRef.current !== generation) return;
-        setCases(data.cases);
-        setCaseContacts(data.caseContacts.filter((item) => item.caseId === caseId));
-        setCaseEvents(data.caseEvents.filter((item) => item.caseId === caseId));
-        setCaseDocuments(data.caseDocuments.filter((item) => item.caseId === caseId));
+        setCases(list.cases);
+        setAllCaseContacts(list.contacts);
+        setCaseEvents(file.events);
+        setCaseDocuments(file.documents);
       })
       .catch(() => {
         if (!userId || activeUserIdRef.current !== userId || caseLoadGenerationRef.current !== generation) return;
-        setCaseContacts([]);
         setCaseEvents([]);
         setCaseDocuments([]);
       });
@@ -1816,7 +1833,6 @@ export default function App() {
   function closeCase() {
     caseLoadGenerationRef.current += 1;
     setActiveCaseId(null);
-    setCaseContacts([]);
     setCaseEvents([]);
     setCaseDocuments([]);
     setCaseContactForm(null);
@@ -2269,13 +2285,13 @@ export default function App() {
     const nextContacts = existing
       ? baseContacts.map((item) => item.id === contact.id ? contact : item)
       : [...baseContacts, contact];
-    setCaseContacts(nextContacts);
+    setCaseContacts(activeCase.id, nextContacts);
     setCaseContactForm(null);
     void settleOptimisticWrite(
       () => saveContactAtomic(contact),
       { partners, referrals, referralMatches, touches, followUps, scorecards },
       { partners, referrals, referralMatches, touches, followUps, scorecards },
-      () => setCaseContacts(previousContacts),
+      () => setCaseContacts(activeCase.id, previousContacts),
       'The case contact', cases, cases,
     );
   }
@@ -2287,12 +2303,12 @@ export default function App() {
         if (!mutationSlotAvailable('The contact removal')) return;
         const previousContacts = caseContacts;
         const nextContacts = caseContacts.filter((item) => item.id !== contact.id);
-        setCaseContacts(nextContacts);
+        setCaseContacts(contact.caseId, nextContacts);
         void settleOptimisticWrite(
           () => deleteContact(contact.id),
           { partners, referrals, referralMatches, touches, followUps, scorecards },
           { partners, referrals, referralMatches, touches, followUps, scorecards },
-          () => setCaseContacts(previousContacts),
+          () => setCaseContacts(contact.caseId, previousContacts),
           'The contact removal', cases, cases,
         );
       } },
@@ -2937,23 +2953,21 @@ export default function App() {
     const clean = (phone: string) => phone.replace(/[^\d+]/g, '');
     if (card.caseId) {
       const record = cases.find((item) => item.id === card.caseId);
-      fetchCaseData()
-        .then((data) => {
-          const contacts = data.caseContacts.filter((item) => item.caseId === card.caseId && item.phone.trim());
-          if (!contacts.length) {
-            Alert.alert('No phone on file', `This case has no contact with a phone number.${record ? ' Add one in the case file.' : ''}`);
-            return;
-          }
-          const primary = contacts.find((item) => item.isPrimary) || contacts[0];
-          if (contacts.length > 1) {
-            setContactPick({ card, action, contacts });
-            return;
-          }
-          launch(clean(primary.phone)).then((opened) => {
-            if (opened) logCardContact(card, action, primary);
-          });
-        })
-        .catch(() => Alert.alert('Offline', 'Case contacts load from the server — try again with a connection.'));
+      // Contacts are loaded for the whole workspace with the case list, so
+      // this works from memory (and offline); foreground refresh keeps it fresh.
+      const contacts = allCaseContacts.filter((item) => item.caseId === card.caseId && item.phone.trim());
+      if (!contacts.length) {
+        Alert.alert('No phone on file', `This case has no contact with a phone number.${record ? ' Add one in the case file.' : ''}`);
+        return;
+      }
+      const primary = contacts.find((item) => item.isPrimary) || contacts[0];
+      if (contacts.length > 1) {
+        setContactPick({ card, action, contacts });
+        return;
+      }
+      launch(clean(primary.phone)).then((opened) => {
+        if (opened) logCardContact(card, action, primary);
+      });
       return;
     }
     if (card.partnerId) {
@@ -3837,11 +3851,11 @@ export default function App() {
   }
 
   // Case list row shared by the main list and search results. The primary
-  // contact shown on the card comes from the shared caseContacts state
-  // (populated when any case file is opened).
+  // contact shown on the card comes from the workspace-wide contact list
+  // loaded with the cases, so it shows without opening the file.
   function CaseRow({ record, lastInGroup }: { record: CaseRecord; lastInGroup?: boolean }) {
     const colors = CASE_STATUS_COLORS[record.status];
-    const primary = caseContacts.find((item) => item.caseId === record.id && item.isPrimary);
+    const primary = allCaseContacts.find((item) => item.caseId === record.id && item.isPrimary);
     return (
       <TouchableOpacity onPress={() => openCase(record.id)} style={[styles.caseRow, lastInGroup && { borderBottomWidth: 0 }]}>
         <View style={[styles.caseRowIcon, { backgroundColor: colors.bg }]}><AppIcon name="folder" size={17} color={colors.fg} /></View>
