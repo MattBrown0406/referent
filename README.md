@@ -71,7 +71,12 @@ mirrored client-side for notification scheduling.
 The session lives in Expo SecureStore so you sign in once per device. Data is
 synced to Supabase on every write and cached in AsyncStorage for offline use —
 when a write cannot reach the server it is queued locally and flushed
-automatically the next time the app is online (last-write-wins).
+automatically the next time the app is online (last-write-wins). Case files
+are the exception: their writes are online-only, but the case list with every
+contact, plus the timeline and document list of the 25 most recently opened
+cases, are kept as read-only saved copies so a family's numbers and history
+are still there with no signal. Every list has pull-to-refresh, and a
+foreground return refreshes at most once every 30 seconds.
 
 ## Run locally
 
