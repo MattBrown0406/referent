@@ -278,10 +278,16 @@ function documentToRow(document: CaseDocument): Record<string, unknown> {
 
 // ─── Read path ──────────────────────────────────────────────────────────────
 
-// One case file's overlays, loaded when the file is opened (or refreshed while
-// it is open). The case list itself is loaded separately by fetchCases.
-export type CaseFile = {
+// The Cases tab: every case in the workspace plus every case contact, so each
+// card can show the family's primary name and phone without opening the file.
+export type CaseList = {
+  cases: CaseRecord[];
   contacts: CaseContact[];
+};
+
+// One case file's lazy overlays, loaded when the file is opened (or refreshed
+// while it is open). Contacts come from CaseList.
+export type CaseFile = {
   events: CaseEvent[];
   documents: CaseDocument[];
 };
@@ -326,41 +332,38 @@ async function withStableCaseAccount<T>(operation: (userId: string, orgId: strin
 // Case files belong to the workspace, not the row creator: every teammate sees
 // (and works) every case in the org. RLS enforces the same boundary server-side.
 //
-// Only the case list loads up front. Contacts, the timeline and documents are
-// per-case overlays fetched when a file is opened: case_events grows with
+// Up front: the case list and every case contact (a handful per case; the
+// card's family name/phone line reads from them). The timeline and documents
+// are per-case overlays fetched when a file is opened: case_events grows with
 // every call, text and status change, and loading the whole workspace's
 // timeline on launch and on every foreground is what does not scale.
 //
 // The list pages on the immutable created_at (plus id) and is re-sorted to
 // the updated_at order the Cases tab shows, so a teammate's edit landing
 // mid-fetch cannot shift a case across a page boundary.
-export async function fetchCases(): Promise<CaseRecord[]> {
+export async function fetchCaseList(): Promise<CaseList> {
   return withStableCaseAccount(async (_userId, orgId) => {
-    const rows = await fetchAllPages<CaseRow>((from, to) => supabase.from('cases').select('*').eq('org_id', orgId).order('created_at', { ascending: false }).order('id').range(from, to));
-    return rows.sort((a, b) => b.updated_at.localeCompare(a.updated_at)).map(mapCaseRow);
+    const [caseRows, contactRows] = await Promise.all([
+      fetchAllPages<CaseRow>((from, to) => supabase.from('cases').select('*').eq('org_id', orgId).order('created_at', { ascending: false }).order('id').range(from, to)),
+      fetchAllPages<CaseContactRow>((from, to) => supabase.from('case_contacts').select('*').eq('org_id', orgId).order('created_at', { ascending: true }).order('id').range(from, to)),
+    ]);
+    return {
+      cases: caseRows.sort((a, b) => b.updated_at.localeCompare(a.updated_at)).map(mapCaseRow),
+      contacts: contactRows.map(mapContactRow),
+    };
   });
 }
 
-async function fetchContactsForCase(orgId: string, caseId: string): Promise<CaseContact[]> {
-  const rows = await fetchAllPages<CaseContactRow>((from, to) => supabase.from('case_contacts').select('*').eq('org_id', orgId).eq('case_id', caseId).order('created_at', { ascending: true }).order('id').range(from, to));
-  return rows.map(mapContactRow);
-}
-
-export async function fetchCaseContacts(caseId: string): Promise<CaseContact[]> {
-  return withStableCaseAccount((_userId, orgId) => fetchContactsForCase(orgId, caseId));
-}
-
-// Everything the open case file renders, for one case only. The timeline is
-// ordered newest-first by the server; the UI sorts again defensively.
+// The open case file's timeline and documents, for one case only. The
+// timeline is ordered newest-first by the server; the UI sorts again
+// defensively.
 export async function fetchCaseFile(caseId: string): Promise<CaseFile> {
   return withStableCaseAccount(async (_userId, orgId) => {
-    const [contacts, eventRows, documentRows] = await Promise.all([
-      fetchContactsForCase(orgId, caseId),
+    const [eventRows, documentRows] = await Promise.all([
       fetchAllPages<CaseEventRow>((from, to) => supabase.from('case_events').select('*').eq('org_id', orgId).eq('case_id', caseId).order('occurred_at', { ascending: false }).order('id').range(from, to)),
       fetchAllPages<CaseDocumentRow>((from, to) => supabase.from('case_documents').select('*').eq('org_id', orgId).eq('case_id', caseId).order('created_at', { ascending: true }).order('id').range(from, to)),
     ]);
     return {
-      contacts,
       events: eventRows.map(mapEventRow),
       documents: documentRows.map(mapDocumentRow),
     };

@@ -78,7 +78,7 @@ for (const [name, text] of [['store', source], ['cases', casesSource], ['busines
   }
 }
 for (const [name, text] of [['store', source], ['cases', casesSource], ['business', businessSource], ['App', await readFile(new URL('../App.tsx', import.meta.url), 'utf8')]]) {
-  assert.doesNotMatch(text, /fetchCaseData|CaseFileData/, `${name} must not load every case's timeline up front`);
+  assert.doesNotMatch(text, /fetchCaseData|CaseFileData|fetchCaseContacts/, `${name} must not load every case's timeline up front`);
 }
 
 // Today is built from OPEN follow-ups only. They load in full, filtered by
@@ -97,8 +97,17 @@ assert.match(source, /local\.followUps\.filter\(\(row\) => row\.id && row\.statu
 assert.match(source, /from\('follow_ups'\)\.select\('\*'\)\.in\('id', chunk\)/, 'merge candidates must be verified against the server by id');
 assert.match(source, /openCandidates\.filter\(\(row\) => !serverById\.has\(row\.id\)\)/, 'only ids unknown to the server may be queued as inserts');
 
-// Case timelines load per case, on open, never for the whole workspace.
-assert.match(casesSource, /export async function fetchCases\(\): Promise<CaseRecord\[\]>/);
+// The case list and every case contact load workspace-wide (each case card
+// shows the family's primary name and phone without opening the file).
+// Timelines and documents load per case, on open, never for the whole workspace.
+const appSource = await readFile(new URL('../App.tsx', import.meta.url), 'utf8');
+assert.match(casesSource, /export async function fetchCaseList\(\): Promise<CaseList>/);
+assert.match(casesSource, /from\('case_contacts'\)\.select\('\*'\)\.eq\('org_id', orgId\)\.order\('created_at'/, 'case contacts must load for the whole workspace, not per case');
+assert.doesNotMatch(casesSource, /from\('case_contacts'\)\.select\('\*'\)\.eq\('org_id', orgId\)\.eq\('case_id'/, 'case contacts must not be lazy per case');
+assert.match(appSource, /const \[allCaseContacts, setAllCaseContacts\] = useState<CaseContact\[\]>\(\[\]\)/, 'App must keep the workspace-wide contact list');
+assert.match(appSource, /const primary = allCaseContacts\.find\(\(item\) => item\.caseId === record\.id && item\.isPrimary\)/, 'case cards must read the primary contact from the workspace-wide list');
+assert.match(appSource, /setAllCaseContacts\(activeContacts\)/, 'hydration must store the workspace-wide contacts');
+assert.match(appSource, /setAllCaseContacts\(refreshedList\.contacts\)/, 'foreground refresh must store the workspace-wide contacts');
 assert.match(casesSource, /export async function fetchCaseFile\(caseId: string\): Promise<CaseFile>/);
 assert.match(casesSource, /from\('case_events'\)\.select\('\*'\)\.eq\('org_id', orgId\)\.eq\('case_id', caseId\)/, 'case events must be scoped to one case');
 assert.doesNotMatch(casesSource, /from\('case_events'\)\.select\('\*'\)\.eq\('org_id', orgId\)\.order/, 'case events must never load for the whole workspace');
