@@ -376,4 +376,19 @@ assert.match(casesSource, /update_case_payment_with_event/, 'payment corrections
 assert.match(casesSource, /Crypto\.randomUUID\(\)/, 'native IDs must use cryptographically secure UUIDs');
 assert.doesNotMatch(casesSource, /Math\.random\(\)/, 'database IDs must not use Math.random');
 
+// Seed-org auto-publish (20260928120000_auto_publish_admin_directory.sql):
+// the partner write paths must stay plain inserts/updates so the database
+// triggers see them, and the snapshot refresh must select every column so the
+// new global_partner_id link is picked up without a client change.
+const seedMigration = await readFile(
+  new URL('../supabase/migrations/20260928120000_auto_publish_admin_directory.sql', import.meta.url),
+  'utf8',
+);
+for (const trigger of ['partners_seed_publish_insert', 'partners_seed_publish_update', 'partners_seed_publish_delete']) {
+  assert.match(seedMigration, new RegExp(`CREATE TRIGGER ${trigger}\\b`), `seed auto-publish migration must define ${trigger}`);
+}
+assert.match(seedMigration, /FUNCTION public\.publish_partner_to_global\(p_partner_id uuid\)/, 'seed auto-publish migration must define the publish function');
+assert.doesNotMatch(source, /global_listing_status/, 'partner write paths must not filter on or depend on global_listing_status');
+assert.match(source, /supabase\.from\('partners'\)\.select\('\*'\)/, 'snapshot refresh must select every partners column so directory links sync');
+
 console.log('store account-scope/durability source invariants: ok');
