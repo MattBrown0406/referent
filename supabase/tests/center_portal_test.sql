@@ -231,9 +231,8 @@ SELECT is(
 );
 
 SELECT ok(
-  NOT ('insurance_networks' = ANY (
-    (SELECT coalesce(local_overrides, '{}') FROM public.partners WHERE id = 'cc100000-0000-0000-0000-0000000000cc')
-  )),
+  (SELECT NOT ('insurance_networks' = ANY (local_overrides))
+     FROM public.partners WHERE id = 'cc100000-0000-0000-0000-0000000000cc'),
   'propagation does not mark the synced field as a local override'
 );
 
