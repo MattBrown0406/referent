@@ -107,10 +107,157 @@ assert.doesNotMatch(casesSource, /from\('case_contacts'\)\.select\('\*'\)\.eq\('
 assert.match(appSource, /const \[allCaseContacts, setAllCaseContacts\] = useState<CaseContact\[\]>\(\[\]\)/, 'App must keep the workspace-wide contact list');
 assert.match(appSource, /const primary = allCaseContacts\.find\(\(item\) => item\.caseId === record\.id && item\.isPrimary\)/, 'case cards must read the primary contact from the workspace-wide list');
 assert.match(appSource, /setAllCaseContacts\(activeContacts\)/, 'hydration must store the workspace-wide contacts');
-assert.match(appSource, /setAllCaseContacts\(refreshedList\.contacts\)/, 'foreground refresh must store the workspace-wide contacts');
+assert.match(appSource, /setAllCaseContacts\(caseLoad\.list\.contacts\)/, 'foreground refresh must store the workspace-wide contacts');
 assert.match(casesSource, /export async function fetchCaseFile\(caseId: string\): Promise<CaseFile>/);
 assert.match(casesSource, /from\('case_events'\)\.select\('\*'\)\.eq\('org_id', orgId\)\.eq\('case_id', caseId\)/, 'case events must be scoped to one case');
 assert.doesNotMatch(casesSource, /from\('case_events'\)\.select\('\*'\)\.eq\('org_id', orgId\)\.order/, 'case events must never load for the whole workspace');
+
+// ─── Offline case files: saved copies, never re-uploaded ────────────────────
+// The case list + every contact and the files the user opened are cached
+// under the same account key and workspace binding as the snapshot, so an
+// interventionist with no signal still has the family's numbers and the
+// timeline. Case writes stay online-only (cases.ts), so nothing cached here
+// may ever be treated as an unsynced local row.
+const caseCacheSource = await readFile(new URL('../src/lib/case-cache.ts', import.meta.url), 'utf8');
+for (const text of [
+  "const CASE_LIST_KEY_PREFIX = 'referralfit-case-list-v1:'",
+  "const CASE_FILE_INDEX_KEY_PREFIX = 'referralfit-case-file-index-v1:'",
+  "const CASE_FILE_KEY_PREFIX = 'referralfit-case-file-v1:'",
+  'export async function loadCaseList(expectedUserId: string): Promise<CaseListLoad>',
+  'export async function loadCaseFile(expectedUserId: string, caseId: string): Promise<CaseFileLoad>',
+  'export async function persistCaseList(list: CaseList, expectedUserId: string)',
+  'export async function persistCaseFile(caseId: string, file: CaseFile, expectedUserId: string)',
+]) assert.ok(source.includes(text), `missing case cache invariant: ${text}`);
+// Cache fallback only for a lost connection; server and session errors surface.
+assert.match(source, /remote = await fetchCaseList\(\);\s*\} catch \(error\) \{\s*if \(!isNetworkError\(error\)\) throw error;/, 'the case list must fall back to the saved copy only on a network error');
+assert.match(source, /remote = await fetchCaseFile\(caseId\);\s*\} catch \(error\) \{\s*if \(!isNetworkError\(error\)\) throw error;/, 'a case file must fall back to the saved copy only on a network error');
+// Same account fence and workspace wipe as the snapshot cache.
+assert.match(source, /export async function persistCaseList\([^)]*\)[^{]*\{[\s\S]{0,200}await assertWorkspaceFence\(fence\);[\s\S]{0,200}writeCaseListCacheUnlocked\(/, 'saving the case list must verify the bound workspace like persistCache');
+assert.match(source, /export async function persistCaseFile\([^)]*\)[^{]*\{[\s\S]{0,200}await assertWorkspaceFence\(fence\);[\s\S]{0,200}writeCaseFileCacheUnlocked\(/, 'saving a case file must verify the bound workspace like persistCache');
+assert.match(source, /async function caseCacheKeys\(userId: string\)/);
+assert.match(source, /AsyncStorage\.getAllKeys\(\)/, 'a workspace wipe must find every saved case file, even ones the index lost');
+for (const wipe of source.match(/AsyncStorage\.multiRemove\(\[[\s\S]*?\]\)/g) || []) {
+  if (!wipe.includes('CACHE_KEY_PREFIX')) continue; // eviction removes individual saved files only
+  assert.ok(wipe.includes('...await caseCacheKeys(fence.userId)'), `snapshot cache wipe must also wipe the case cache: ${wipe}`);
+}
+assert.match(source, /if \(envelope\.version !== 2 \|\| envelope\.userId\?\.toLowerCase\(\) !== fence\.userId\) return null;/);
+assert.match(caseCacheSource, /value\.userId\.toLowerCase\(\) === userId\.toLowerCase\(\)/, 'saved case copies must be validated against the account that reads them');
+// Never merged, never queued, never read from a case table by store.ts.
+assert.doesNotMatch(source, /from\('(?:cases|case_contacts|case_events|case_documents)'\)/, 'store.ts must not read or write case tables itself');
+assert.doesNotMatch(source, /kind: 'case(?:s|_contact|_event|_document)?\.(?:insert|update|delete)'/, 'no queued write may target a case table');
+assert.doesNotMatch(source, /'case\.(?:insert|update|delete)'/, 'no queued write may target a case table');
+const mergeStart = source.indexOf('async function mergeUnsyncedLocal(');
+const mergeEnd = source.indexOf('\n}\n', mergeStart);
+const mergeBody = source.slice(mergeStart, mergeEnd);
+assert.ok(mergeStart > 0 && mergeEnd > mergeStart);
+assert.doesNotMatch(mergeBody, /case/i, 'mergeUnsyncedLocal must not touch case data (cases have no offline insert path)');
+assert.doesNotMatch(mergeBody, /CaseList|CaseFile|CachedCase/, 'mergeUnsyncedLocal must not see the case cache');
+for (const call of source.match(/mergeUnsyncedLocal\((?!remote: Snapshot)[^)]*\)/g) || []) {
+  assert.equal(call, 'mergeUnsyncedLocal(remote, latestLocal)', `merge input must be the Snapshot cache only: ${call}`);
+}
+const snapshotType = source.slice(source.indexOf('export type Snapshot = {'), source.indexOf('};', source.indexOf('export type Snapshot = {')));
+assert.doesNotMatch(snapshotType, /case/i, 'cases must stay out of the merged Snapshot');
+// An offline launch must reach the caches at all: the server-side workspace
+// lookup that opens hydration falls back to the binding last verified on this
+// device, and only for a lost connection.
+assert.match(source, /export async function readBoundWorkspace\(expectedUserId: string\): Promise<string \| null>/);
+assert.match(source, /return stored && isUuid\(stored\) \? stored\.toLowerCase\(\) : null;/);
+assert.match(appSource, /orgId = await fetchCurrentOrgId\(\);\s*\} catch \(error\) \{\s*if \(!isNetworkError\(error\)\) throw error;\s*const bound = await readBoundWorkspace\(userId\);\s*if \(!bound\) throw error;\s*orgId = bound;/, 'hydration must survive an offline workspace lookup using the last verified binding');
+// The App renders the saved copy instead of a blocking alert whenever one exists.
+assert.match(appSource, /const load = await loadCaseList\(userId\);[\s\S]{0,400}Alert\.alert\('Case files unavailable'/, 'hydration must load the case list through the cache-aware loader');
+assert.match(appSource, /setCaseListSource\(caseListLoad\)/);
+assert.match(appSource, /loadCaseFile\(userId, caseId\)[\s\S]{0,600}source: 'unavailable'/, 'opening a case must use the cache-aware loader and mark a missing copy');
+assert.match(appSource, /renderSavedCopyNotice\(caseFileSource, 'case file'\)/, 'a cached case file must say it is a saved copy');
+assert.match(appSource, /renderSavedCopyNotice\(caseListSource, 'case list'\)/, 'a cached case list must say it is a saved copy');
+assert.match(appSource, /Showing saved copy from \$\{relativeActivity\(copy\.savedAt\)/);
+assert.match(appSource, /Opening a document needs a connection\./);
+assert.match(appSource, /if \(isNetworkError\(error\)\) \{\s*Alert\.alert\('Connection needed'/, 'opening a document offline must explain the signed-link requirement');
+// The saved copies follow what is on screen, but a cache-sourced copy is never written back.
+assert.match(appSource, /if \(!caseListSource \|\| caseListSource\.source !== 'remote'\) return;\s*void persistCaseList\(\{ cases, contacts: allCaseContacts \}, caseListSource\.userId\)/);
+assert.match(appSource, /if \(!activeCaseId \|\| !caseFileSource \|\| caseFileSource\.source !== 'remote'\) return;\s*void persistCaseFile\(activeCaseId, \{ events: caseEvents, documents: caseDocuments \}, caseFileSource\.userId\)/);
+// Today's call/text from a case card reads the in-memory contact list, which
+// the cached case list now feeds on an offline launch.
+assert.match(appSource, /const contacts = allCaseContacts\.filter\(\(item\) => item\.caseId === card\.caseId && item\.phone\.trim\(\)\)/);
+
+// ─── Pull-to-refresh + debounced foreground refresh ─────────────────────────
+for (const screen of ['HomeScreen', 'CasesScreen', 'DirectoryScreen', 'ReferralsScreen']) {
+  const start = appSource.indexOf(`function ${screen}() {`);
+  assert.ok(start > 0, `${screen} missing`);
+  const firstScrollView = appSource.indexOf('<ScrollView', start);
+  const tagEnd = appSource.indexOf('>', firstScrollView);
+  const openingTag = appSource.slice(firstScrollView, tagEnd);
+  assert.ok(openingTag.includes('refreshControl={renderRefreshControl()}'), `${screen} list must support pull-to-refresh: ${openingTag}`);
+}
+assert.match(appSource, /<RefreshControl refreshing=\{pullRefreshing\} onRefresh=\{\(\) => \{ void pullToRefresh\(\); \}\}/);
+assert.match(appSource, /const outcome = await refreshFromServer\('pull'\);\s*if \(outcome === 'offline'\) setRefreshNotice\(/, 'a pull with no connection must leave an inline notice, not an alert');
+assert.match(appSource, /\} finally \{\s*setPullRefreshing\(false\);/, 'the spinner must stop on every outcome');
+assert.match(appSource, /const FOREGROUND_REFRESH_MIN_INTERVAL_MS = 30_000;/);
+assert.match(appSource, /if \(trigger === 'foreground' && Date\.now\(\) - lastServerRefreshAtRef\.current < FOREGROUND_REFRESH_MIN_INTERVAL_MS\) return 'ok';/, 'foreground refresh must be debounced');
+assert.match(appSource, /if \(refreshInFlightRef\.current\) return refreshInFlightRef\.current;/, 'concurrent refreshes must coalesce');
+// Unconditional and in order: flush, then snapshot, then cases, then the open file.
+assert.match(appSource, /await flushWriteQueue\(userId\);[\s\S]{0,300}const refreshed = await refreshSnapshot\(userId\);[\s\S]{0,400}const caseLoad = await loadCaseList\(userId\);[\s\S]{0,1200}const fileLoad = await loadCaseFile\(userId, activeCaseId\);/, 'refresh must keep flush → snapshot → cases → open file');
+assert.doesNotMatch(appSource, /if \(flushed > 0\) \{\s*refreshed = await refreshSnapshot/, 'foreground refresh must no longer depend on a flushed write');
+assert.match(appSource, /await refreshFromServer\('foreground'\);/);
+assert.match(appSource, /if \(stillCurrent\(\) && !isNetworkError\(error\)\) Alert\.alert\('Sync issue'/, 'a foreground return with no connection must not alert');
+
+// Bounds + LRU eviction of saved case files, run against the real helpers.
+{
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const tmpDir = path.join(repoRoot, 'node_modules', '.cache', 'store-account-test');
+  const require = createRequire(import.meta.url);
+  const ts = require(path.join(repoRoot, 'node_modules', 'typescript'));
+  mkdirSync(tmpDir, { recursive: true });
+  const js = ts.transpileModule(caseCacheSource, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021, esModuleInterop: true },
+  }).outputText;
+  writeFileSync(path.join(tmpDir, 'case-cache.js'), js);
+  const cache = require(path.join(tmpDir, 'case-cache.js'));
+  assert.equal(cache.MAX_CACHED_CASE_FILES, 25);
+  assert.equal(cache.MAX_CACHED_EVENTS_PER_FILE, 200);
+
+  let index = [];
+  let evictedAll = [];
+  for (let n = 0; n < 30; n += 1) {
+    const next = cache.touchCaseFileIndex(index, `case-${n}`, `2026-09-28T00:00:${String(n).padStart(2, '0')}Z`);
+    index = next.entries;
+    evictedAll.push(...next.evicted);
+  }
+  assert.equal(index.length, 25, 'the index must never exceed the bound');
+  assert.deepEqual(evictedAll, ['case-0', 'case-1', 'case-2', 'case-3', 'case-4'], 'the least recently saved files are evicted first');
+  const bumped = cache.touchCaseFileIndex(index, 'case-5', '2026-09-28T01:00:00Z');
+  assert.deepEqual(bumped.evicted, [], 're-saving a cached file must not evict anything');
+  assert.equal(bumped.entries[bumped.entries.length - 1].caseId, 'case-5', 're-saving moves the file to most recent');
+  assert.equal(bumped.entries.filter((entry) => entry.caseId === 'case-5').length, 1);
+  const afterBump = cache.touchCaseFileIndex(bumped.entries, 'case-99', '2026-09-28T02:00:00Z');
+  assert.deepEqual(afterBump.evicted, ['case-6'], 'the bumped file is no longer the eviction candidate');
+  assert.deepEqual(cache.touchCaseFileIndex([], 'only', 'now', 0).entries.map((entry) => entry.caseId), ['only'], 'a zero limit still keeps the file just saved');
+
+  const events = Array.from({ length: 250 }, (_, i) => ({ id: `e-${i}`, caseId: 'c', kind: 'note', body: '', occurredAt: `2026-01-01T00:00:00.${String(i).padStart(3, '0')}Z` }));
+  const bounded = cache.boundCaseFile({ events, documents: [{ id: 'd' }] });
+  assert.equal(bounded.truncated, true);
+  assert.equal(bounded.file.events.length, 200);
+  assert.equal(bounded.file.events[0].id, 'e-249', 'the newest entries are kept');
+  assert.equal(bounded.file.events[199].id, 'e-50');
+  assert.deepEqual(bounded.file.documents, [{ id: 'd' }], 'document metadata is never truncated');
+  assert.equal(cache.boundCaseFile({ events: events.slice(0, 200), documents: [] }).truncated, false);
+
+  const user = 'ab5c6f7e-1111-4222-8333-444455556666';
+  const file = cache.makeCaseFileEnvelope(user, 'c1', { events, documents: [] }, '2026-09-28T00:00:00Z');
+  assert.equal(file.truncated, true);
+  assert.equal(file.events.length, 200);
+  const parsedFile = cache.parseCachedCaseFile(JSON.parse(JSON.stringify(file)), user.toUpperCase(), 'C1');
+  assert.ok(parsedFile && parsedFile.truncated && parsedFile.file.events.length === 200, 'a saved file round-trips with its bound flag');
+  assert.equal(cache.parseCachedCaseFile(file, 'ffffffff-1111-4222-8333-444455556666', 'c1'), null, 'another account must not read a saved file');
+  assert.equal(cache.parseCachedCaseFile(file, user, 'c2'), null, 'a saved file is bound to its case id');
+  assert.equal(cache.parseCachedCaseFile({ ...file, version: 2 }, user, 'c1'), null, 'unknown versions are ignored');
+  const list = cache.makeCaseListEnvelope(user, { cases: [{ id: 'c1' }], contacts: [{ id: 'k1', caseId: 'c1' }] }, '2026-09-28T00:00:00Z');
+  const parsedList = cache.parseCachedCaseList(JSON.parse(JSON.stringify(list)), user);
+  assert.deepEqual(parsedList, { savedAt: '2026-09-28T00:00:00Z', list: { cases: [{ id: 'c1' }], contacts: [{ id: 'k1', caseId: 'c1' }] } });
+  assert.equal(cache.parseCachedCaseList({ ...list, userId: 'someone-else' }, user), null);
+  assert.equal(cache.parseCachedCaseList({ ...list, contacts: 'nope' }, user), null, 'a list without contacts is not a usable copy');
+  assert.deepEqual(cache.parseCaseFileIndex({ version: 1, userId: user, entries: [{ caseId: 'c1', savedAt: 'x' }, { bogus: true }, null] }, user), [{ caseId: 'c1', savedAt: 'x' }], 'a damaged index keeps only valid entries');
+  assert.deepEqual(cache.parseCaseFileIndex('garbage', user), []);
+}
 
 // fetchAllPages behavior, run against a fake query builder.
 {
@@ -202,10 +349,10 @@ assert.match(
 );
 
 // Every AsyncStorage write is in a catch block that converts failure to StoreError.
-const writes = [...source.matchAll(/await AsyncStorage\.setItem\([^;]+;/g)];
-assert.equal(writes.length, 3, 'unexpected AsyncStorage write path added without durability audit');
+const writes = [...source.matchAll(/await AsyncStorage\.(?:setItem|multiSet)\([^;]+;/g)];
+assert.equal(writes.length, 5, 'unexpected AsyncStorage write path added without durability audit');
 for (const write of writes) {
-  const following = source.slice(write.index, write.index + 240);
+  const following = source.slice(write.index, write.index + 520);
   assert.match(following, /catch \(error\) \{\s*throw persistenceError\(/);
 }
 

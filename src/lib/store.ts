@@ -1,6 +1,17 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { newUuid } from './cases';
+import { fetchCaseFile, fetchCaseList, newUuid, type CaseFile, type CaseList } from './cases';
+import {
+  makeCaseFileEnvelope,
+  makeCaseFileIndexEnvelope,
+  makeCaseListEnvelope,
+  parseCachedCaseFile,
+  parseCachedCaseList,
+  parseCaseFileIndex,
+  touchCaseFileIndex,
+  type CachedCaseFile,
+  type CachedCaseList,
+} from './case-cache';
 import { currentAuthSessionIdentity } from './auth-session';
 import { StoreError } from './errors';
 import { fetchAllPages } from './paging';
@@ -101,6 +112,11 @@ export type HydrateResult = {
 const CACHE_KEY_PREFIX = 'referralfit-cache-v2:';
 const QUEUE_KEY_PREFIX = 'referralfit-write-queue-v2:';
 const WORKSPACE_KEY_PREFIX = 'referralfit-workspace-v1:';
+// Saved copies of case data (see case-cache.ts for shape and bounds). Same
+// account key and workspace binding as the snapshot cache; wiped with it.
+const CASE_LIST_KEY_PREFIX = 'referralfit-case-list-v1:';
+const CASE_FILE_INDEX_KEY_PREFIX = 'referralfit-case-file-index-v1:';
+const CASE_FILE_KEY_PREFIX = 'referralfit-case-file-v1:';
 
 function accountStorageKey(prefix: string, userId: string): string {
   if (!isUuid(userId)) throw new StoreError('Cannot use offline storage without a valid account ID.', false);
@@ -109,7 +125,7 @@ function accountStorageKey(prefix: string, userId: string): string {
 
 // ─── Error classification ───────────────────────────────────────────────────
 
-function isNetworkError(error: unknown): boolean {
+export function isNetworkError(error: unknown): boolean {
   if (!error) return false;
   const anyError = error as { name?: string; message?: string; status?: number; code?: string };
   // PostgREST / Supabase errors carry a status or PG code — those reached the
@@ -468,6 +484,7 @@ export async function prepareForWorkspaceChange(expectedUserId: string): Promise
           accountStorageKey(CACHE_KEY_PREFIX, fence.userId),
           accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
           accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId),
+          ...await caseCacheKeys(fence.userId),
         ]);
       } catch (error) {
         throw persistenceError('cache', error);
@@ -475,6 +492,24 @@ export async function prepareForWorkspaceChange(expectedUserId: string): Promise
       await assertSessionFence(fence);
     });
   });
+}
+
+// The workspace this account's local cache and queue were last bound to, or
+// null if never bound on this device. Used only when the server cannot be
+// asked: an offline launch reads the caches under their last verified
+// binding, and the next foreground return with signal re-verifies (and wipes
+// on a change) exactly as before. Queued writes still flush only after
+// assertWorkspaceFence confirms the server agrees.
+export async function readBoundWorkspace(expectedUserId: string): Promise<string | null> {
+  const fence = await sessionFence(expectedUserId);
+  let stored: string | null;
+  try {
+    stored = await AsyncStorage.getItem(accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId));
+  } catch (error) {
+    throw persistenceError('cache', error);
+  }
+  await assertSessionFence(fence);
+  return stored && isUuid(stored) ? stored.toLowerCase() : null;
 }
 
 // Bind account-local cache/queue data to the authoritative server workspace.
@@ -497,6 +532,7 @@ export async function bindLocalWorkspace(expectedUserId: string, orgId: string):
         await AsyncStorage.multiRemove([
           accountStorageKey(CACHE_KEY_PREFIX, fence.userId),
           accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
+          ...await caseCacheKeys(fence.userId),
         ]);
         await AsyncStorage.setItem(workspaceKey, orgId.toLowerCase());
       } catch (error) {
@@ -1444,4 +1480,159 @@ export async function refreshSnapshot(expectedUserId: string): Promise<Snapshot 
     if (isNetworkError(error)) return null;
     throw error;
   }
+}
+
+// ─── Saved copies of case data ──────────────────────────────────────────────
+// Cases are NOT part of the Snapshot and never pass through mergeUnsyncedLocal:
+// case writes go straight to the server (cases.ts), so a cached case row can
+// never be an unsynced local insert, and nothing here is ever re-uploaded.
+// These copies are read-only fallbacks for an offline launch or a case file
+// opened with no signal. They live under the same account key and workspace
+// binding as the snapshot cache and are wiped with it.
+//
+// Layout: one blob for the case list + every contact (always complete), one
+// small index of saved files (oldest first, bounded, see case-cache.ts) and
+// one blob per saved case file so a timeline edit rewrites one case, not all.
+
+function caseFileStorageKey(userId: string, caseId: string): string {
+  if (!isUuid(caseId)) throw new StoreError('Cannot save a case file without a valid case ID.', false);
+  return `${accountStorageKey(CASE_FILE_KEY_PREFIX, userId)}:${caseId.toLowerCase()}`;
+}
+
+// Every key the case cache owns for one account, including any saved file
+// the index has lost track of, so a workspace change removes them all.
+async function caseCacheKeys(userId: string): Promise<string[]> {
+  const filePrefix = `${accountStorageKey(CASE_FILE_KEY_PREFIX, userId)}:`;
+  let allKeys: readonly string[];
+  try {
+    allKeys = await AsyncStorage.getAllKeys();
+  } catch (error) {
+    throw persistenceError('cache', error);
+  }
+  return [
+    accountStorageKey(CASE_LIST_KEY_PREFIX, userId),
+    accountStorageKey(CASE_FILE_INDEX_KEY_PREFIX, userId),
+    ...allKeys.filter((key) => key.startsWith(filePrefix)),
+  ];
+}
+
+async function readJsonUnlocked(key: string): Promise<unknown> {
+  let raw: string | null;
+  try {
+    raw = await AsyncStorage.getItem(key);
+  } catch (error) {
+    throw persistenceError('cache', error);
+  }
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    // A corrupt saved copy holds no unsynced work; it is simply replaced by
+    // the next successful read from the server.
+    return null;
+  }
+}
+
+async function readCaseListCacheUnlocked(fence: SessionFence): Promise<CachedCaseList | null> {
+  return parseCachedCaseList(await readJsonUnlocked(accountStorageKey(CASE_LIST_KEY_PREFIX, fence.userId)), fence.userId);
+}
+
+async function writeCaseListCacheUnlocked(fence: SessionFence, list: CaseList, savedAt: string): Promise<void> {
+  try {
+    await AsyncStorage.setItem(accountStorageKey(CASE_LIST_KEY_PREFIX, fence.userId), JSON.stringify(makeCaseListEnvelope(fence.userId, list, savedAt)));
+  } catch (error) {
+    throw persistenceError('cache', error);
+  }
+}
+
+async function readCaseFileCacheUnlocked(fence: SessionFence, caseId: string): Promise<CachedCaseFile | null> {
+  return parseCachedCaseFile(await readJsonUnlocked(caseFileStorageKey(fence.userId, caseId)), fence.userId, caseId);
+}
+
+async function writeCaseFileCacheUnlocked(fence: SessionFence, caseId: string, file: CaseFile, savedAt: string): Promise<void> {
+  const indexKey = accountStorageKey(CASE_FILE_INDEX_KEY_PREFIX, fence.userId);
+  const index = touchCaseFileIndex(parseCaseFileIndex(await readJsonUnlocked(indexKey), fence.userId), caseId.toLowerCase(), savedAt);
+  try {
+    await AsyncStorage.multiSet([
+      [caseFileStorageKey(fence.userId, caseId), JSON.stringify(makeCaseFileEnvelope(fence.userId, caseId, file, savedAt))],
+      [indexKey, JSON.stringify(makeCaseFileIndexEnvelope(fence.userId, index.entries))],
+    ]);
+    if (index.evicted.length) await AsyncStorage.multiRemove(index.evicted.map((evictedId) => caseFileStorageKey(fence.userId, evictedId)));
+  } catch (error) {
+    throw persistenceError('cache', error);
+  }
+}
+
+export type CaseListLoad = { list: CaseList; source: 'remote' | 'cache'; savedAt: string };
+export type CaseFileLoad = { file: CaseFile; source: 'remote' | 'cache'; savedAt: string; truncated: boolean };
+
+// The case list and every contact: from the server when it can be reached,
+// otherwise the saved copy. Throws only when neither is available, or for a
+// genuine server/session error. Persisting is the caller's job (persistCaseList)
+// so the saved copy also follows in-memory edits that landed online.
+export async function loadCaseList(expectedUserId: string): Promise<CaseListLoad> {
+  const fence = await sessionFence(expectedUserId);
+  let remote: CaseList;
+  try {
+    remote = await fetchCaseList();
+  } catch (error) {
+    if (!isNetworkError(error)) throw error;
+    await assertSessionFence(fence);
+    const cached = await withCacheLock(async () => {
+      await assertSessionFence(fence);
+      const copy = await readCaseListCacheUnlocked(fence);
+      await assertSessionFence(fence);
+      return copy;
+    });
+    if (!cached) throw error;
+    return { list: cached.list, source: 'cache', savedAt: cached.savedAt };
+  }
+  await assertSessionFence(fence);
+  return { list: remote, source: 'remote', savedAt: new Date().toISOString() };
+}
+
+// One case file's timeline and document metadata, same fallback rules.
+export async function loadCaseFile(expectedUserId: string, caseId: string): Promise<CaseFileLoad> {
+  const fence = await sessionFence(expectedUserId);
+  let remote: CaseFile;
+  try {
+    remote = await fetchCaseFile(caseId);
+  } catch (error) {
+    if (!isNetworkError(error)) throw error;
+    await assertSessionFence(fence);
+    const cached = await withCacheLock(async () => {
+      await assertSessionFence(fence);
+      const copy = await readCaseFileCacheUnlocked(fence, caseId);
+      await assertSessionFence(fence);
+      return copy;
+    });
+    if (!cached) throw error;
+    return { file: cached.file, source: 'cache', savedAt: cached.savedAt, truncated: cached.truncated };
+  }
+  await assertSessionFence(fence);
+  return { file: remote, source: 'remote', savedAt: new Date().toISOString(), truncated: false };
+}
+
+// Save the in-memory case list (server-loaded or edited online) as the
+// offline copy for this account. Never called with a cache-sourced list.
+// Same fence as persistCache: the server must still agree on the bound
+// workspace, so a copy is never written under a binding that has moved on.
+export async function persistCaseList(list: CaseList, expectedUserId: string): Promise<void> {
+  await withCacheLock(async () => {
+    const fence = await sessionFence(expectedUserId);
+    await assertWorkspaceFence(fence);
+    await writeCaseListCacheUnlocked(fence, list, new Date().toISOString());
+    await assertWorkspaceFence(fence);
+  });
+}
+
+// Save one open case file the same way. Bounded and LRU-evicted in
+// writeCaseFileCacheUnlocked.
+export async function persistCaseFile(caseId: string, file: CaseFile, expectedUserId: string): Promise<void> {
+  await withCacheLock(async () => {
+    const fence = await sessionFence(expectedUserId);
+    await assertWorkspaceFence(fence);
+    await writeCaseFileCacheUnlocked(fence, caseId, file, new Date().toISOString());
+    await assertWorkspaceFence(fence);
+  });
 }
