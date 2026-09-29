@@ -24,6 +24,7 @@ import {
 import { type Entitlement, type EntitlementState } from './entitlements';
 import { fetchOrgDirectoryProfile, type OrgDirectoryProfileState } from './directory';
 import { prepareForWorkspaceChange } from './store';
+import { deleteOwnAccount } from './account';
 
 type Props = {
   visible: boolean;
@@ -36,6 +37,9 @@ type Props = {
   // Opens the directory-profile form (owned by the caller so it can reuse
   // the partner form fields). The caller closes this screen first.
   onEditDirectoryProfile: () => void;
+  // The account and its local session are already gone when this fires; the
+  // caller resets in-memory state and lets the auth listener show sign-in.
+  onAccountDeleted: () => void;
 };
 
 const FEATURE_ROWS: { key: Entitlement; label: string; description: string }[] = [
@@ -75,7 +79,7 @@ function profileStatusLabel(profile: NonNullable<OrgDirectoryProfileState['profi
   return profile.verifiedAt ? `Live · Verified ${profile.verifiedAt.slice(0, 10)}` : 'Live in the directory';
 }
 
-export default function WorkspaceScreen({ visible, userId, entitlements, onClose, onWorkspaceChanged, onEditDirectoryProfile }: Props) {
+export default function WorkspaceScreen({ visible, userId, entitlements, onClose, onWorkspaceChanged, onEditDirectoryProfile, onAccountDeleted }: Props) {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [directoryProfile, setDirectoryProfile] = useState<OrgDirectoryProfileState | null>(null);
   const [directoryProfileError, setDirectoryProfileError] = useState('');
@@ -122,6 +126,34 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
     } finally {
       setBusy(false);
     }
+  }
+
+  // App Store guideline 5.1.1(v): in-app account deletion. Two confirmations,
+  // each spelling out exactly what goes away for this account's situation.
+  const otherMembers = Math.max(0, (workspace?.members.length ?? 1) - 1);
+  function confirmDeleteAccount() {
+    if (isOwner && otherMembers > 0) {
+      Alert.alert(
+        'Remove your team first',
+        `Your workspace still has ${otherMembers} other member${otherMembers === 1 ? '' : 's'}. Remove them above (each keeps a workspace of their own), or contact ReferralFit to transfer ownership. Then you can delete your account.`,
+      );
+      return;
+    }
+    const whatIsDeleted = soloOwner
+      ? 'Your sign-in and your entire workspace are deleted permanently: partners, activity, referrals, cases, case documents, follow-ups, invites, and favorites. Any directory listing your practice claimed stays public but becomes unclaimed.'
+      : 'Your sign-in is deleted permanently. Work you added for your practice stays in the practice workspace, no longer attributed to you.';
+    Alert.alert('Delete your account?', `${whatIsDeleted}\n\nThis cannot be undone.`, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Continue', style: 'destructive', onPress: () => {
+        Alert.alert('Delete permanently?', 'You will be signed out on this device immediately and the account cannot be recovered.', [
+          { text: 'Keep my account', style: 'cancel' },
+          { text: 'Delete account', style: 'destructive', onPress: () => run(async () => {
+            await deleteOwnAccount({ userId, removeWorkspaceFiles: soloOwner });
+            onAccountDeleted();
+          }, 'Could not delete the account') },
+        ]);
+      } },
+    ]);
   }
 
   function saveName() {
@@ -399,6 +431,27 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 </View>
               </View>
             ) : null}
+
+            <View style={styles.card}>
+              <Text style={styles.cardLabel}>Delete account</Text>
+              <Text style={styles.helpText}>
+                {isOwner && otherMembers > 0
+                  ? 'Remove the other members of your workspace before deleting your account.'
+                  : soloOwner
+                    ? 'Permanently deletes your sign-in and this workspace, including every partner, case, and document.'
+                    : 'Permanently deletes your sign-in. Work you added for your practice stays with the practice.'}
+              </Text>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel="Delete account"
+                accessibilityState={{ disabled: busy, busy }}
+                disabled={busy}
+                onPress={confirmDeleteAccount}
+                style={[styles.dangerButton, styles.helpTextSpaced]}
+              >
+                <Text style={styles.dangerButtonText}>Delete account…</Text>
+              </TouchableOpacity>
+            </View>
           </ScrollView>
         ) : (
           <View style={styles.centered}>
@@ -462,6 +515,8 @@ const styles = StyleSheet.create({
   memberRole: { fontSize: 13, color: COLORS.gray, marginTop: 2 },
   removeButton: { backgroundColor: COLORS.coralSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 },
   removeText: { color: COLORS.coral, fontWeight: '600' },
+  dangerButton: { alignSelf: 'flex-start', backgroundColor: COLORS.coralSoft, borderRadius: 8, paddingVertical: 10, paddingHorizontal: 14 },
+  dangerButtonText: { color: COLORS.coral, fontWeight: '700' },
   helpText: { fontSize: 14, color: COLORS.gray, lineHeight: 20 },
   helpTextSpaced: { marginTop: 10 },
   inviteRow: {

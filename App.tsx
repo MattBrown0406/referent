@@ -46,6 +46,8 @@ import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
+import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
+import { isRecoveryRedirect, parseAuthRedirect } from './src/lib/auth-flows';
 import { fetchCurrentOrgId } from './src/lib/org';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
@@ -793,6 +795,9 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [authResolved, setAuthResolved] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
+  // True while the app was opened from a password-recovery email link and the
+  // user has not yet set (or declined to set) a new password.
+  const [passwordRecovery, setPasswordRecovery] = useState(false);
   const [offline, setOffline] = useState(false);
   const [queuedWrites, setQueuedWrites] = useState(0);
   const [touches, setTouches] = useState<Touch[]>([]);
@@ -1119,8 +1124,10 @@ export default function App() {
   // the user-id keyed effect below so interactive sign-in follows the same path.
   useEffect(() => {
     let mounted = true;
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, nextSession) => {
       if (!mounted) return;
+      if (event === 'PASSWORD_RECOVERY') setPasswordRecovery(true);
+      if (event === 'SIGNED_OUT') setPasswordRecovery(false);
       setSession(nextSession);
       setAuthResolved(true);
     });
@@ -1136,6 +1143,36 @@ export default function App() {
     return () => {
       mounted = false;
       subscription.unsubscribe();
+    };
+  }, []);
+
+  // Auth deep links (referralfit://auth/recovery, referralfit://auth/confirmed).
+  // supabase.ts sets detectSessionInUrl: false, so the tokens in the link are
+  // exchanged here explicitly. A recovery link then opens ResetPasswordScreen.
+  useEffect(() => {
+    let active = true;
+    async function handleAuthUrl(url: string | null) {
+      const redirect = parseAuthRedirect(url);
+      if (!redirect || !active) return;
+      if (redirect.kind === 'error') {
+        Alert.alert('That link could not be used', `${redirect.description} Request a new one from the sign-in screen.`);
+        return;
+      }
+      const result = redirect.kind === 'tokens'
+        ? await supabase.auth.setSession({ access_token: redirect.accessToken, refresh_token: redirect.refreshToken })
+        : await supabase.auth.exchangeCodeForSession(redirect.code);
+      if (!active) return;
+      if (result.error) {
+        Alert.alert('That link has expired', 'Request a new one from the sign-in screen and open it on this device.');
+        return;
+      }
+      if (isRecoveryRedirect(redirect)) setPasswordRecovery(true);
+    }
+    Linking.getInitialURL().then((url) => { void handleAuthUrl(url); }).catch(() => undefined);
+    const listener = Linking.addEventListener('url', ({ url }) => { void handleAuthUrl(url); });
+    return () => {
+      active = false;
+      listener.remove();
     };
   }, []);
 
@@ -6099,6 +6136,15 @@ export default function App() {
     );
   }
 
+  if (passwordRecovery) {
+    return (
+      <>
+        <StatusBar style="dark" />
+        <ResetPasswordScreen email={session.user?.email ?? null} onDone={() => setPasswordRecovery(false)} />
+      </>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
@@ -6164,6 +6210,11 @@ export default function App() {
           setWorkspaceEpoch((epoch) => epoch + 1);
         }}
         onEditDirectoryProfile={() => { void openOrgProfileForm(true); }}
+        onAccountDeleted={() => {
+          setShowWorkspace(false);
+          cancelReferralFitNotifications().catch(() => undefined);
+          resetAccountState();
+        }}
       />
       {DoneSheet()}
       {NextStepSheet()}
