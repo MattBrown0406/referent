@@ -52,6 +52,16 @@ const COLORS = {
 const PAGE_SIZE = 50;
 const SEARCH_DEBOUNCE_MS = 250;
 
+// Listing-type filter pills. Programs are the treatment levels of care;
+// individual professionals list themselves through their workspace profile.
+type TypeFilter = 'all' | 'programs' | 'interventionists' | 'therapists';
+const TYPE_FILTERS: { key: TypeFilter; label: string; types: string[] }[] = [
+  { key: 'all', label: 'All', types: [] },
+  { key: 'programs', label: 'Programs', types: ['Inpatient', 'IOP / PHP', 'Sober Living', 'Detox'] },
+  { key: 'interventionists', label: 'Interventionists', types: ['Interventionist'] },
+  { key: 'therapists', label: 'Therapists', types: ['Therapist'] },
+];
+
 function statsLine(stats: GlobalPartnerStats | undefined): string {
   if (!stats || !stats.disclosed) return '';
   const parts: string[] = [];
@@ -95,7 +105,9 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
   const [loadError, setLoadError] = useState('');
   const [search, setSearch] = useState('');
   const [stateFilter, setStateFilter] = useState('');
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
   const [importingId, setImportingId] = useState<string | null>(null);
+  const typeFilterTypes = TYPE_FILTERS.find((filter) => filter.key === typeFilter)?.types ?? [];
   const operationGenerationRef = useRef(0);
   const searchGenerationRef = useRef(0);
 
@@ -119,7 +131,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     const generation = ++searchGenerationRef.current;
     setLoadError('');
     const timer = setTimeout(() => {
-      searchGlobalDirectory({ query: search, state: stateFilter, limit: PAGE_SIZE, offset: 0 })
+      searchGlobalDirectory({ query: search, state: stateFilter, types: typeFilterTypes, limit: PAGE_SIZE, offset: 0 })
         .then((page) => {
           if (generation !== searchGenerationRef.current) return;
           setListings(page);
@@ -135,7 +147,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     }, listings === null ? 0 : SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, entitled, userId, search, stateFilter]);
+  }, [visible, entitled, userId, search, stateFilter, typeFilter]);
 
   useEffect(() => {
     operationGenerationRef.current += 1;
@@ -148,7 +160,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     if (loadingMore || !hasMore || listings === null) return;
     const generation = searchGenerationRef.current;
     setLoadingMore(true);
-    searchGlobalDirectory({ query: search, state: stateFilter, limit: PAGE_SIZE, offset: listings.length })
+    searchGlobalDirectory({ query: search, state: stateFilter, types: typeFilterTypes, limit: PAGE_SIZE, offset: listings.length })
       .then((page) => {
         if (generation !== searchGenerationRef.current) return;
         const seen = new Set(listings.map((listing) => listing.id));
@@ -249,10 +261,23 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                 style={styles.searchInput}
                 value={search}
                 onChangeText={setSearch}
-                placeholder="Search programs, levels, populations"
+                placeholder="Search programs, professionals, levels, populations"
                 placeholderTextColor={COLORS.gray}
                 autoCorrect={false}
               />
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.stateRow}>
+                {TYPE_FILTERS.map((filter) => (
+                  <TouchableOpacity
+                    key={filter.key}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: typeFilter === filter.key }}
+                    style={typeFilter === filter.key ? styles.statePillActive : styles.statePill}
+                    onPress={() => setTypeFilter(filter.key)}
+                  >
+                    <Text style={typeFilter === filter.key ? styles.statePillActiveText : styles.statePillText}>{filter.label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.stateRow}>
                 <TouchableOpacity
                   accessibilityRole="button"
@@ -303,8 +328,10 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                         {usage ? <Text style={styles.usage}>{usage}</Text> : null}
                         {listing.verifiedAt ? (
                           listing.verifiedCurrent
-                            ? <Text style={styles.verified}>Verified {listing.verifiedAt.slice(0, 10)}</Text>
-                            : <Text style={styles.verificationStale}>Verification expired — last verified {listing.verifiedAt.slice(0, 10)}</Text>
+                            ? <Text style={styles.verified}>Verified {listing.verifiedAt.slice(0, 10)}{listing.claimed ? <Text style={styles.claimed}>  ·  Claimed</Text> : null}</Text>
+                            : <Text style={styles.verificationStale}>Verification expired — last verified {listing.verifiedAt.slice(0, 10)}{listing.claimed ? <Text style={styles.claimed}>  ·  Claimed</Text> : null}</Text>
+                        ) : listing.claimed ? (
+                          <Text style={styles.claimed}>Claimed</Text>
                         ) : null}
                       </View>
                       <TouchableOpacity
@@ -417,6 +444,7 @@ const styles = StyleSheet.create({
   cardInsurance: { fontSize: 13, color: COLORS.gray, marginTop: 2 },
   cardDescription: { fontSize: 13, color: COLORS.gray, lineHeight: 18, marginTop: 4 },
   verified: { fontSize: 12, fontWeight: '600', color: COLORS.green, marginTop: 4 },
+  claimed: { fontSize: 12, fontWeight: '600', color: COLORS.blue, marginTop: 4 },
   importedBadge: { alignSelf: 'flex-start', backgroundColor: COLORS.greenSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 },
   importedText: { color: COLORS.green, fontWeight: '600', fontSize: 14 },
   addButton: { backgroundColor: COLORS.blue, borderRadius: 10, paddingVertical: 10, alignItems: 'center' },

@@ -187,3 +187,10 @@ workspace itself they show the "Imported" mark because they are linked.
   (and archives the listing under the same rule).
 - Admin edits made directly on a listing (SQL, center portal review) still
   propagate down to the seed copy without creating local overrides.
+- **Claimed listings are authoritative** (`20260928170000`, see
+  `docs/DIRECTORY_OWNERSHIP.md`). Once a program claims its listing in the
+  center portal, or a workspace owns it as its profile, the seed workspace
+  stops pushing into it: seed edits to that copy become local overrides, the
+  claimant's edits flow down to the seed copy instead, deleting the seed copy
+  never archives it, and adding a seed program that matches a claimed listing
+  links the copy without overwriting the listing.

@@ -22,6 +22,7 @@ import {
   type Workspace,
 } from './org';
 import { type Entitlement, type EntitlementState } from './entitlements';
+import { fetchOrgDirectoryProfile, type OrgDirectoryProfileState } from './directory';
 import { prepareForWorkspaceChange } from './store';
 
 type Props = {
@@ -32,6 +33,9 @@ type Props = {
   // Joining another practice changes the account's active workspace, so the
   // caller must rehydrate everything from the server afterward.
   onWorkspaceChanged: () => void;
+  // Opens the directory-profile form (owned by the caller so it can reuse
+  // the partner form fields). The caller closes this screen first.
+  onEditDirectoryProfile: () => void;
 };
 
 const FEATURE_ROWS: { key: Entitlement; label: string; description: string }[] = [
@@ -60,8 +64,21 @@ function inviteExpiryLabel(expiresAt: string): string {
   return days === 1 ? 'expires in 1 day' : `expires in ${days} days`;
 }
 
-export default function WorkspaceScreen({ visible, userId, entitlements, onClose, onWorkspaceChanged }: Props) {
+function profileSummary(profile: NonNullable<OrgDirectoryProfileState['profile']>): string {
+  const place = [profile.city, profile.state].filter(Boolean).join(', ');
+  return [profile.types.join(' · '), place].filter(Boolean).join('  ·  ');
+}
+
+function profileStatusLabel(profile: NonNullable<OrgDirectoryProfileState['profile']>): string {
+  if (profile.status === 'archived') return 'Archived by ReferralFit — not shown in the directory';
+  if (profile.status === 'pending') return 'Pending ReferralFit review';
+  return profile.verifiedAt ? `Live · Verified ${profile.verifiedAt.slice(0, 10)}` : 'Live in the directory';
+}
+
+export default function WorkspaceScreen({ visible, userId, entitlements, onClose, onWorkspaceChanged, onEditDirectoryProfile }: Props) {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [directoryProfile, setDirectoryProfile] = useState<OrgDirectoryProfileState | null>(null);
+  const [directoryProfileError, setDirectoryProfileError] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -77,6 +94,14 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       setLoadError((error as Error).message);
     } finally {
       setLoading(false);
+    }
+    // The profile card is secondary: its failure never blocks the screen.
+    setDirectoryProfileError('');
+    try {
+      setDirectoryProfile(await fetchOrgDirectoryProfile());
+    } catch (error) {
+      setDirectoryProfile(null);
+      setDirectoryProfileError((error as Error).message);
     }
   }, [userId]);
 
@@ -244,12 +269,63 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
             </View>
 
             <View style={styles.card}>
+              <Text style={styles.cardLabel}>Your directory profile</Text>
+              {directoryProfile?.profile ? (
+                <>
+                  <View style={styles.nameRow}>
+                    <Text style={styles.orgName}>{directoryProfile.profile.organization || directoryProfile.profile.name}</Text>
+                    {directoryProfile.canEdit ? (
+                      <TouchableOpacity accessibilityRole="button" onPress={onEditDirectoryProfile} style={styles.smallButtonGhost}>
+                        <Text style={styles.smallButtonGhostText}>Edit</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
+                  <Text style={styles.memberRole}>{profileSummary(directoryProfile.profile)}</Text>
+                  <View style={directoryProfile.profile.status === 'active' ? styles.planBadgeActive : styles.planBadge}>
+                    <Text style={directoryProfile.profile.status === 'active' ? styles.planBadgeActiveText : styles.planBadgeText}>
+                      {profileStatusLabel(directoryProfile.profile)}
+                    </Text>
+                  </View>
+                  <Text style={styles.helpText}>
+                    This is your practice's own listing. Your edits publish immediately and keep it verified; other practices see it in the Directory and can add you to their network.
+                  </Text>
+                </>
+              ) : directoryProfile?.pendingClaim ? (
+                <>
+                  <Text style={styles.helpText}>
+                    We found an existing directory listing that looks like your practice. ReferralFit will confirm you own it before it becomes your profile — nothing else is needed from you.
+                  </Text>
+                  {directoryProfile.pendingClaim.note ? (
+                    <Text style={[styles.memberRole, styles.helpTextSpaced]}>{directoryProfile.pendingClaim.note}</Text>
+                  ) : null}
+                </>
+              ) : directoryProfileError ? (
+                <Text style={styles.helpText}>Your directory profile could not be loaded: {directoryProfileError}</Text>
+              ) : directoryProfile ? (
+                <>
+                  <Text style={styles.helpText}>
+                    Let other practices find you. Your profile appears in the shared Directory as a verified listing you control — programs, interventionists, and therapists alike.
+                  </Text>
+                  {directoryProfile.canEdit ? (
+                    <TouchableOpacity accessibilityRole="button" onPress={onEditDirectoryProfile} style={styles.primaryButton}>
+                      <Text style={styles.primaryButtonText}>Build your verified profile</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <Text style={[styles.helpText, styles.helpTextSpaced]}>The workspace owner can build the profile from this screen.</Text>
+                  )}
+                </>
+              ) : (
+                <ActivityIndicator color={COLORS.blue} />
+              )}
+            </View>
+
+            <View style={styles.card}>
               <Text style={styles.cardLabel}>Your data is private</Text>
               <Text style={styles.helpText}>
                 Everything in this workspace — partners, cases, referrals, notes, and documents — belongs to your practice alone. Other practices using ReferralFit cannot see it, and ReferralFit staff do not have access to it. Only people you invite with a code can join this workspace.
               </Text>
               <Text style={[styles.helpText, styles.helpTextSpaced]}>
-                The only shared space is the Directory, and a program appears there only when you choose to suggest it. Benchmarks use anonymized totals and never identify a practice.
+                The only shared space is the Directory: your own profile if you build one, and a program only when you choose to suggest it. Benchmarks use anonymized totals and never identify a practice.
               </Text>
             </View>
 

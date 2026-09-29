@@ -39,6 +39,18 @@ to other intervention practices on recurring plans:
    to it. Interventionist- or therapist-only partners never auto-publish, and
    ordinary workspaces keep the suggest → pending flow. Rollout steps live in
    `docs/DIRECTORY_SEED_ROLLOUT.md`.
+   **Ownership:** once a listing is claimed — by a program in the center
+   portal (`center_members`) or by a workspace as its own profile
+   (`owner_org_id`) — it is authoritative regardless of who created it: the
+   claimant's edits keep it verified and flow down to every linked copy, and
+   the seed workspace's edits to its copy become local overrides instead of
+   pushing up. Every workspace owner can build one verified profile from
+   Workspace → *Your directory profile* (`upsert_org_directory_profile`,
+   Interventionist/Therapist types included). Duplicates by phone/domain are
+   taken over only on an email-domain, creator, or suggesting-workspace
+   match; otherwise a `center_claim_requests` row waits for admin approval
+   (`approve_center_claim_request`) and nothing is overwritten. Details and
+   the review SQL live in `docs/DIRECTORY_OWNERSHIP.md`.
 4. **Center portal** (`portal/`) — treatment programs claim their listing with
    an admin-issued code and keep it accurate themselves. Verification status
    stays with ReferralFit; claiming never buys ranking (no pay-for-placement,

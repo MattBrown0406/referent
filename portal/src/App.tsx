@@ -235,7 +235,7 @@ export default function App() {
         .maybeSingle();
       if (updateError) throw updateError;
       if (!updated) throw new Error('The listing was not updated. Sign in again and retry.');
-      setNotice('Listing saved. Its verification date was cleared until ReferralFit reviews the updated information.');
+      setNotice('Listing saved. Your listing is the authoritative record for your program, so edits publish immediately and it stays verified.');
       await loadListing();
     } catch (saveError) {
       setError((saveError as Error).message);
@@ -336,8 +336,9 @@ export default function App() {
               {importCount !== null ? <span className="stat"><b>{importCount}</b> {importCount === 1 ? 'practice has' : 'practices have'} added you to their network</span> : null}
             </div>
             <p className="footnote">
-              Edits go live immediately for the fields below and clear the verification date
-              until ReferralFit reviews the updated information. Listing status remains
+              You claimed this listing, so it is the authoritative record for your program.
+              Edits to the fields below go live immediately, flow to every practice that added
+              you to their network, and keep the listing verified. Listing status remains
               controlled by ReferralFit.
             </p>
           </div>

@@ -3,6 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { StatusBar } from 'expo-status-bar';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
   AppState,
   Image,
@@ -48,6 +49,7 @@ import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import { fetchCurrentOrgId } from './src/lib/org';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
+import { fetchOrgDirectoryProfile, upsertOrgDirectoryProfile, type OrgDirectoryProfile } from './src/lib/directory';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
 import {
   type BusinessData,
@@ -173,6 +175,7 @@ const notificationPromptKey = (userId: string) => `referralfit-notification-prom
 const notificationScheduleKey = (userId: string) => `referralfit-notification-scheduling-v2:${userId.toLowerCase()}`;
 const partnerSnoozeKey = (userId: string) => `referralfit-partner-snooze-v2:${userId.toLowerCase()}`;
 const welcomeKey = (userId: string) => `referralfit-welcome-v1:${userId.toLowerCase()}`;
+const profilePromptKey = (userId: string) => `referralfit-profile-prompt-v1:${userId.toLowerCase()}`;
 
 // Every table's PK is a Postgres `uuid` column, so client-generated ids MUST be
 // valid UUIDs — a prefixed string like `p-1785096121092-t1etoz4` is rejected with
@@ -363,6 +366,60 @@ function makeEmptyPartnerForm(): PartnerForm {
   therapies: [],
   note: '',
   touchCadence: '',
+  };
+}
+
+// The workspace's own directory listing: the partner form's public fields
+// (no cadence or private note) plus a public description.
+type OrgProfileForm = {
+  name: string;
+  organization: string;
+  types: Partner['type'][];
+  city: string;
+  state: string;
+  phone: string;
+  email: string;
+  website: string;
+  monthlyCost: string;
+  insurance: string[];
+  insuranceNetworks: Partial<Record<string, InsuranceNetworkPreference[]>>;
+  therapies: string[];
+  description: string;
+};
+
+function makeEmptyOrgProfileForm(): OrgProfileForm {
+  return {
+    name: '',
+    organization: '',
+    types: ['Interventionist'],
+    city: '',
+    state: '',
+    phone: '',
+    email: '',
+    website: '',
+    monthlyCost: '',
+    insurance: [],
+    insuranceNetworks: {},
+    therapies: [],
+    description: '',
+  };
+}
+
+function orgProfileFormFromListing(profile: OrgDirectoryProfile): OrgProfileForm {
+  return {
+    name: profile.name,
+    organization: profile.organization,
+    types: profile.types.length ? profile.types : ['Interventionist'],
+    city: profile.city,
+    state: profile.state,
+    phone: profile.phone,
+    email: profile.email,
+    website: profile.website || '',
+    monthlyCost: profile.monthlyCost ? String(profile.monthlyCost) : '',
+    insurance: profile.insurance,
+    insuranceNetworks: profile.insuranceNetworks,
+    therapies: profile.therapies,
+    description: profile.description,
   };
 }
 
@@ -808,6 +865,13 @@ export default function App() {
   const [outcomeNote, setOutcomeNote] = useState('');
   const [notifPrePromptVisible, setNotifPrePromptVisible] = useState(false);
   const [welcomeVisible, setWelcomeVisible] = useState(false);
+  const [profilePromptVisible, setProfilePromptVisible] = useState(false);
+  const [showOrgProfile, setShowOrgProfile] = useState(false);
+  const [orgProfileForm, setOrgProfileForm] = useState<OrgProfileForm>(makeEmptyOrgProfileForm);
+  const [orgProfileExisting, setOrgProfileExisting] = useState<OrgDirectoryProfile | null>(null);
+  const [orgProfileSaving, setOrgProfileSaving] = useState(false);
+  // Reopen the Workspace screen after the profile form when it launched from there.
+  const orgProfileReturnToWorkspaceRef = useRef(false);
   // The first-run welcome goes before the notification pre-prompt; when both
   // are due, the notification prompt waits until the welcome is dismissed.
   const notifPromptDeferredRef = useRef(false);
@@ -1440,6 +1504,13 @@ export default function App() {
     const plansForState = insuranceProvidersForState(validState ? stateCode : 'ANY').filter((plan) => plan !== 'Cash pay');
     return Array.from(new Set([...plansForState, ...partnerForm.insurance.filter((plan) => plan !== 'Cash pay')]));
   }, [partnerForm.state, partnerForm.insurance]);
+
+  const orgProfileInsuranceOptions = useMemo(() => {
+    const stateCode = orgProfileForm.state.trim().toUpperCase();
+    const validState = stateOptions.some((state) => state.code === stateCode);
+    const plansForState = insuranceProvidersForState(validState ? stateCode : 'ANY').filter((plan) => plan !== 'Cash pay');
+    return Array.from(new Set([...plansForState, ...orgProfileForm.insurance.filter((plan) => plan !== 'Cash pay')]));
+  }, [orgProfileForm.state, orgProfileForm.insurance]);
 
   const matches = useMemo(() => {
     const budget = Number(matchBudget) || Infinity;
@@ -4971,6 +5042,241 @@ export default function App() {
     );
   }
 
+  // ─── Workspace directory profile ──────────────────────────────────────────
+
+  // Show the one-time "build your profile" prompt only to a workspace owner
+  // who has no profile and no open claim request. Any failure means no prompt.
+  async function shouldShowProfilePrompt(userId: string): Promise<boolean> {
+    try {
+      if ((await AsyncStorage.getItem(profilePromptKey(userId))) === 'decided') return false;
+      const state = await fetchOrgDirectoryProfile();
+      return state.canEdit && !state.profile && !state.pendingClaim;
+    } catch {
+      return false;
+    }
+  }
+
+  function showDeferredNotificationPrompt() {
+    if (notifPromptDeferredRef.current) {
+      notifPromptDeferredRef.current = false;
+      setNotifPrePromptVisible(true);
+    }
+  }
+
+  async function openOrgProfileForm(fromWorkspace: boolean) {
+    const userId = activeUserIdRef.current;
+    let existing: OrgDirectoryProfile | null = null;
+    try {
+      existing = (await fetchOrgDirectoryProfile()).profile;
+    } catch (error) {
+      Alert.alert('Could not load your profile', (error as Error).message);
+      return;
+    }
+    if (activeUserIdRef.current !== userId) return;
+    setOrgProfileExisting(existing);
+    setOrgProfileForm(existing ? orgProfileFormFromListing(existing) : makeEmptyOrgProfileForm());
+    orgProfileReturnToWorkspaceRef.current = fromWorkspace;
+    if (fromWorkspace) {
+      // Let the Workspace sheet finish dismissing before presenting another.
+      setShowWorkspace(false);
+      setTimeout(() => { if (activeUserIdRef.current === userId) setShowOrgProfile(true); }, 400);
+    } else {
+      setShowOrgProfile(true);
+    }
+  }
+
+  function closeOrgProfileForm() {
+    setShowOrgProfile(false);
+    if (orgProfileReturnToWorkspaceRef.current) {
+      orgProfileReturnToWorkspaceRef.current = false;
+      setTimeout(() => setShowWorkspace(true), 400);
+    } else {
+      showDeferredNotificationPrompt();
+    }
+  }
+
+  async function saveOrgProfile() {
+    if (orgProfileSaving) return;
+    if (!orgProfileForm.name.trim() || !orgProfileForm.organization.trim()) {
+      Alert.alert('A little more detail', 'Add a contact name and your practice or program name first.');
+      return;
+    }
+    if (!orgProfileForm.types.length) {
+      Alert.alert('Choose a listing type', 'Select at least one level of care or provider type.');
+      return;
+    }
+    const unclassifiedInsurance = orgProfileForm.insurance.find((plan) => !orgProfileForm.insuranceNetworks[plan]?.length);
+    if (unclassifiedInsurance) {
+      Alert.alert('Choose IN or OON', `Mark ${unclassifiedInsurance} as in-network, out-of-network, or both.`);
+      return;
+    }
+    const userId = activeUserIdRef.current;
+    setOrgProfileSaving(true);
+    try {
+      const result = await upsertOrgDirectoryProfile({
+        name: orgProfileForm.name,
+        organization: orgProfileForm.organization,
+        types: orgProfileForm.types,
+        city: orgProfileForm.city,
+        state: orgProfileForm.state,
+        regions: orgProfileExisting?.regions ?? [],
+        phone: orgProfileForm.phone,
+        email: orgProfileForm.email,
+        website: orgProfileForm.website,
+        monthlyCost: Number(orgProfileForm.monthlyCost) || 0,
+        insurance: orgProfileForm.insurance,
+        insuranceNetworks: orgProfileForm.insuranceNetworks,
+        therapies: orgProfileForm.therapies,
+        populations: orgProfileExisting?.populations?.length ? orgProfileExisting.populations : ['Adults'],
+        levels: orgProfileForm.types,
+        description: orgProfileForm.description,
+      });
+      if (activeUserIdRef.current !== userId) return;
+      closeOrgProfileForm();
+      if (result.status === 'claim_requested') {
+        Alert.alert(
+          'We found an existing listing',
+          'A directory listing already matches your phone number or website. ReferralFit will confirm you own it, and then it becomes your profile. Nothing else is needed from you.',
+        );
+      } else if (result.status === 'claimed') {
+        Alert.alert('Profile published', 'An existing listing for your practice is now yours. It is live, verified, and updated with what you entered.');
+      } else {
+        Alert.alert('Profile published', result.status === 'created'
+          ? 'Your verified profile is live in the Directory. Other practices can now find you and add you to their network.'
+          : 'Your changes are live and your listing stays verified.');
+      }
+    } catch (error) {
+      if (activeUserIdRef.current === userId) Alert.alert('Could not publish your profile', (error as Error).message);
+    } finally {
+      if (activeUserIdRef.current === userId) setOrgProfileSaving(false);
+    }
+  }
+
+  function OrgProfileModal() {
+    const isEditing = Boolean(orgProfileExisting);
+    return (
+      <Modal visible={showOrgProfile} animationType="slide" presentationStyle="pageSheet" onRequestClose={closeOrgProfileForm}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityLabel="Close directory profile form" onPress={closeOrgProfileForm} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>{isEditing ? 'Edit your profile' : 'Your directory profile'}</Text>
+              <TouchableOpacity accessibilityRole="button" accessibilityState={{ disabled: orgProfileSaving, busy: orgProfileSaving }} disabled={orgProfileSaving} style={styles.modalHeaderAction} onPress={() => { void saveOrgProfile(); }}><Text style={styles.saveText}>{isEditing ? 'Update' : 'Publish'}</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>{isEditing ? 'Your edits publish immediately and keep your listing verified.' : 'This is what other practices see in the Directory. It is public, verified, and yours to keep current.'}</Text>
+              <FormField label="CONTACT NAME *" value={orgProfileForm.name} onChangeText={(name) => setOrgProfileForm((current) => ({ ...current, name }))} placeholder="Who should practices ask for?" />
+              <FormField label="PRACTICE OR PROGRAM *" value={orgProfileForm.organization} onChangeText={(organization) => setOrgProfileForm((current) => ({ ...current, organization }))} placeholder="Program or practice" />
+              <MultiSelectDropdown
+                label="LISTING TYPES *"
+                values={orgProfileForm.types}
+                options={partnerTypes}
+                icon="layers-outline"
+                onChange={(types) => setOrgProfileForm((current) => ({ ...current, types: types as Partner['type'][] }))}
+                emptyLabel="Select listing types"
+                selectedNoun="types"
+              />
+              <View style={styles.formRow}><View style={{ flex: 2 }}><FormField label="CITY" value={orgProfileForm.city} onChangeText={(city) => setOrgProfileForm((current) => ({ ...current, city }))} placeholder="City" /></View><View style={{ flex: 1 }}><FormField label="STATE" value={orgProfileForm.state} onChangeText={(state) => setOrgProfileForm((current) => ({ ...current, state }))} placeholder="CA" /></View></View>
+              <FormField label="PHONE" value={orgProfileForm.phone} onChangeText={(phone) => setOrgProfileForm((current) => ({ ...current, phone }))} placeholder="Phone number" keyboardType="phone-pad" />
+              <FormField label="EMAIL" value={orgProfileForm.email} onChangeText={(email) => setOrgProfileForm((current) => ({ ...current, email }))} placeholder="name@practice.com" keyboardType="email-address" />
+              <FormField label="WEBSITE" value={orgProfileForm.website} onChangeText={(website) => setOrgProfileForm((current) => ({ ...current, website }))} placeholder="https://practice.com" keyboardType="url" />
+              <FormField label="MONTHLY CASH COST" value={orgProfileForm.monthlyCost} onChangeText={(monthlyCost) => setOrgProfileForm((current) => ({ ...current, monthlyCost }))} placeholder="$0 per month" keyboardType="number-pad" />
+              <MultiSelectDropdown
+                label="INSURANCES ACCEPTED"
+                values={orgProfileForm.insurance}
+                options={orgProfileInsuranceOptions}
+                onChange={(insurance) => setOrgProfileForm((current) => ({
+                  ...current,
+                  insurance,
+                  insuranceNetworks: Object.fromEntries(insurance.map((plan) => [plan, current.insuranceNetworks[plan]?.length ? current.insuranceNetworks[plan] : ['In-network']])),
+                }))}
+                icon="shield-checkmark-outline"
+                emptyLabel="Select accepted insurance plans"
+                selectedNoun="plans"
+              />
+              {orgProfileForm.insurance.map((plan) => (
+                <View key={plan} style={styles.networkPlanRow}>
+                  <Text style={styles.networkPlanName}>{plan}</Text>
+                  {(['In-network', 'Out-of-network'] as InsuranceNetworkPreference[]).map((status) => {
+                    const checked = orgProfileForm.insuranceNetworks[plan]?.includes(status) ?? false;
+                    return (
+                      <TouchableOpacity
+                        key={status}
+                        accessibilityRole="checkbox"
+                        accessibilityLabel={`${plan} ${status}`}
+                        accessibilityState={{ checked }}
+                        style={[styles.networkCheck, checked && styles.networkCheckActive]}
+                        onPress={() => setOrgProfileForm((current) => {
+                          const statuses = current.insuranceNetworks[plan] || [];
+                          const nextStatuses = statuses.includes(status) ? statuses.filter((item) => item !== status) : [...statuses, status];
+                          return { ...current, insuranceNetworks: { ...current.insuranceNetworks, [plan]: nextStatuses } };
+                        })}
+                      >
+                        <AppIcon name={checked ? 'checkbox' : 'square-outline'} size={18} color={checked ? COLORS.forest : COLORS.gray} />
+                        <Text style={[styles.networkCheckText, checked && styles.networkCheckTextActive]}>{status === 'In-network' ? 'IN' : 'OON'}</Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              ))}
+              <MultiSelectDropdown
+                label="THERAPEUTIC NEEDS SERVED"
+                values={orgProfileForm.therapies}
+                options={therapyOptions}
+                onChange={(therapies) => setOrgProfileForm((current) => ({ ...current, therapies }))}
+                icon="medkit-outline"
+                emptyLabel="Select therapeutic needs"
+              />
+              <FormField label="PUBLIC DESCRIPTION" value={orgProfileForm.description} onChangeText={(description) => setOrgProfileForm((current) => ({ ...current, description }))} placeholder="Who you serve, how you work, and what makes a good referral" multiline />
+              <Text style={styles.privacyHint}><AppIcon name="lock-closed" size={13} color={COLORS.gray} /> Everything here is public. Keep client details out of it.</Text>
+              <TouchableOpacity style={styles.primaryButton} disabled={orgProfileSaving} onPress={() => { void saveOrgProfile(); }}>
+                {orgProfileSaving ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.primaryButtonText}>{isEditing ? 'Update profile' : 'Publish verified profile'}</Text>}
+              </TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function ProfilePromptModal() {
+    if (!profilePromptVisible || !session) return null;
+    const userId = session.user.id;
+    const generation = authGenerationRef.current;
+    const accountIsCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
+    const finish = async (buildNow: boolean) => {
+      setProfilePromptVisible(false);
+      if (!accountIsCurrent()) return;
+      try {
+        await AsyncStorage.setItem(profilePromptKey(userId), 'decided');
+      } catch {
+        // Best effort: the prompt simply shows again after the next welcome.
+      }
+      if (!accountIsCurrent()) return;
+      if (buildNow) {
+        void openOrgProfileForm(false);
+      } else {
+        showDeferredNotificationPrompt();
+      }
+    };
+    return (
+      <Modal visible transparent animationType="fade" onRequestClose={() => { void finish(false); }}>
+        <Pressable style={styles.dropdownOverlay} onPress={() => { void finish(false); }}>
+          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
+            <View style={styles.dropdownSheetHandle} />
+            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
+              <View style={styles.prePromptIcon}><AppIcon name="ribbon-outline" size={24} color={COLORS.forest} /></View>
+              <Text style={styles.prePromptTitle}>Let other practices find you</Text>
+              <Text style={styles.prePromptText}>Build a verified profile for your practice in the shared Directory. It takes a minute, you control every word, and you can edit it any time from Workspace.</Text>
+              <TouchableOpacity style={styles.primaryButton} onPress={() => { void finish(true); }}><Text style={styles.primaryButtonText}>Build my profile</Text></TouchableOpacity>
+              <TouchableOpacity onPress={() => { void finish(false); }} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Maybe later</Text></TouchableOpacity>
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    );
+  }
+
   function AddPartnerModal() {
     const isEditing = Boolean(editingPartnerId);
     return (
@@ -5154,15 +5460,17 @@ export default function App() {
     const dismiss = async () => {
       setWelcomeVisible(false);
       if (!accountIsCurrent()) return;
-      if (notifPromptDeferredRef.current) {
-        notifPromptDeferredRef.current = false;
-        setNotifPrePromptVisible(true);
-      }
       try {
         await AsyncStorage.setItem(welcomeKey(userId), 'seen');
       } catch {
         // Best effort: the welcome simply shows again next launch.
       }
+      // One-time offer to build the workspace's directory profile; the
+      // deferred notification prompt follows whichever way it is answered.
+      const offerProfile = await shouldShowProfilePrompt(userId);
+      if (!accountIsCurrent()) return;
+      if (offerProfile) setProfilePromptVisible(true);
+      else showDeferredNotificationPrompt();
     };
     return (
       <Modal visible transparent animationType="fade" onRequestClose={dismiss}>
@@ -5800,9 +6108,11 @@ export default function App() {
       </View>
       {PartnerDetailModal()}
       {AddPartnerModal()}
+      {OrgProfileModal()}
       {AddReferralModal()}
       {LogTouchModal()}
       {WelcomeModal()}
+      {ProfilePromptModal()}
       {NotifPrePromptModal()}
       {PacketComposeModal()}
       {PacketSendConfirmModal()}
@@ -5853,6 +6163,7 @@ export default function App() {
           setShowWorkspace(false);
           setWorkspaceEpoch((epoch) => epoch + 1);
         }}
+        onEditDirectoryProfile={() => { void openOrgProfileForm(true); }}
       />
       {DoneSheet()}
       {NextStepSheet()}
