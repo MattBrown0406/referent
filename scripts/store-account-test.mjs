@@ -391,4 +391,27 @@ assert.match(seedMigration, /FUNCTION public\.publish_partner_to_global\(p_partn
 assert.doesNotMatch(source, /global_listing_status/, 'partner write paths must not filter on or depend on global_listing_status');
 assert.match(source, /supabase\.from\('partners'\)\.select\('\*'\)/, 'snapshot refresh must select every partners column so directory links sync');
 
+// Workspace directory profile (20260928170000_claimed_listings_authoritative.sql):
+// the client payload allowlist must be exactly the database allowlist, so a
+// field added on one side without the other fails here rather than at runtime
+// (the RPC rejects unknown keys outright).
+const directorySource = await readFile(new URL('../src/lib/directory.ts', import.meta.url), 'utf8');
+const claimedMigration = await readFile(
+  new URL('../supabase/migrations/20260928170000_claimed_listings_authoritative.sql', import.meta.url),
+  'utf8',
+);
+const clientFieldsMatch = directorySource.match(/export const ORG_DIRECTORY_PROFILE_FIELDS = \[([\s\S]*?)\] as const;/);
+assert.ok(clientFieldsMatch, 'directory.ts must export ORG_DIRECTORY_PROFILE_FIELDS');
+const clientFields = [...clientFieldsMatch[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]);
+const dbFieldsMatch = claimedMigration.match(/FUNCTION public\.org_directory_profile_fields\(\)[\s\S]*?SELECT ARRAY\[([\s\S]*?)\]\s*\$\$;/);
+assert.ok(dbFieldsMatch, 'migration must define org_directory_profile_fields()');
+const dbFields = [...dbFieldsMatch[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]);
+assert.deepEqual(clientFields, dbFields, 'client profile payload fields must match the database allowlist');
+const payloadFnMatch = directorySource.match(/export function orgDirectoryProfilePayload[\s\S]*?return \{([\s\S]*?)\n  \};/);
+assert.ok(payloadFnMatch, 'directory.ts must build the RPC payload in orgDirectoryProfilePayload');
+const payloadKeys = [...payloadFnMatch[1].matchAll(/^\s{4}([a-z_]+):/gm)].map((m) => m[1]);
+assert.deepEqual(payloadKeys, dbFields, 'orgDirectoryProfilePayload must emit exactly the allowlisted keys');
+assert.match(directorySource, /supabase\.rpc\('upsert_org_directory_profile', \{ p_payload:/, 'profile writes must go through the upsert RPC');
+assert.match(claimedMigration, /FUNCTION public\.global_listing_is_claimed\(p_global_id uuid\)/, 'migration must define the claimed helper');
+
 console.log('store account-scope/durability source invariants: ok');

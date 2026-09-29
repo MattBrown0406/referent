@@ -31,6 +31,10 @@ export type GlobalPartner = {
   verifiedAt?: string;
   // Verification decays after 12 months; only current verifications earn the badge.
   verifiedCurrent?: boolean;
+  // Claimed by the program (center portal) or owned by a workspace as its
+  // own profile. Claimed listings are authoritative: the claimant's edits
+  // keep them verified. Only the search RPC reports this.
+  claimed?: boolean;
 };
 
 // Network-wide, aggregate-only usage for a listing. Fields are null when
@@ -51,6 +55,8 @@ export type DirectorySearchParams = {
   levels?: string[];
   insurance?: string[];
   populations?: string[];
+  // PartnerType values; a listing matches when any of its types overlap.
+  types?: string[];
   limit?: number;
   offset?: number;
 };
@@ -75,6 +81,7 @@ type GlobalPartnerRow = {
   description: string | null;
   verified_at: string | null;
   verified_current?: boolean | null;
+  claimed?: boolean | null;
 };
 
 function mapListing(row: GlobalPartnerRow): GlobalPartner {
@@ -100,6 +107,7 @@ function mapListing(row: GlobalPartnerRow): GlobalPartner {
     verifiedCurrent: typeof row.verified_current === 'boolean'
       ? row.verified_current
       : (row.verified_at ? Date.now() - Date.parse(row.verified_at) < 365 * 24 * 60 * 60 * 1000 : false),
+    claimed: typeof row.claimed === 'boolean' ? row.claimed : undefined,
   };
 }
 
@@ -112,6 +120,7 @@ export async function searchGlobalDirectory(params: DirectorySearchParams = {}):
     p_levels: params.levels && params.levels.length ? params.levels : null,
     p_insurance: params.insurance && params.insurance.length ? params.insurance : null,
     p_populations: params.populations && params.populations.length ? params.populations : null,
+    p_types: params.types && params.types.length ? params.types : null,
     p_limit: params.limit ?? 50,
     p_offset: params.offset ?? 0,
   });
@@ -269,4 +278,146 @@ export async function importGlobalPartner(listing: GlobalPartner, expectedUserId
     outbound: 0,
     lastContact: stamp,
   };
+}
+
+// ─── Workspace directory profile ────────────────────────────────────────────
+//
+// Every workspace can publish one listing about itself (owner_org_id). The
+// owner builds it in the app; it goes live verified, and the owner's edits
+// keep it verified. If the profile collides with an existing listing the
+// server either takes it over (email domain / creator / suggesting workspace
+// match) or files a claim request for ReferralFit to confirm.
+
+// Keys the RPC accepts. Must match public.org_directory_profile_fields();
+// scripts/store-account-test.mjs asserts the two lists agree.
+export const ORG_DIRECTORY_PROFILE_FIELDS = [
+  'name', 'organization', 'types', 'city', 'state', 'regions', 'phone', 'email', 'website',
+  'monthly_cost', 'insurance', 'insurance_networks', 'therapies', 'populations', 'levels', 'description',
+] as const;
+
+export type OrgDirectoryProfileInput = {
+  name: string;
+  organization: string;
+  types: PartnerType[];
+  city: string;
+  state: string;
+  regions: string[];
+  phone: string;
+  email: string;
+  website?: string;
+  monthlyCost: number;
+  insurance: string[];
+  insuranceNetworks: Partial<Record<string, InsuranceNetworkPreference[]>>;
+  therapies: string[];
+  populations: string[];
+  levels: string[];
+  description: string;
+};
+
+export type OrgDirectoryProfile = GlobalPartner & {
+  status: 'active' | 'pending' | 'archived';
+  ownerOrgId: string;
+};
+
+export type OrgDirectoryClaimRequest = {
+  id: string;
+  listingId: string;
+  note: string;
+  createdAt: string;
+};
+
+export type OrgDirectoryProfileState = {
+  // Whether the signed-in user may build or edit the profile (workspace owner).
+  canEdit: boolean;
+  profile: OrgDirectoryProfile | null;
+  // An open request to take over an existing listing, awaiting ReferralFit.
+  pendingClaim: OrgDirectoryClaimRequest | null;
+};
+
+export type UpsertOrgDirectoryProfileResult = {
+  status: 'created' | 'updated' | 'claimed' | 'claim_requested';
+  listingId: string;
+  requestId?: string;
+};
+
+export async function fetchOrgDirectoryProfile(): Promise<OrgDirectoryProfileState> {
+  const [orgResult, roleResult] = await Promise.all([
+    supabase.rpc('current_org_id'),
+    supabase.rpc('current_org_role'),
+  ]);
+  if (orgResult.error || typeof orgResult.data !== 'string' || !orgResult.data) {
+    throw new StoreError(orgResult.error?.message || 'The active workspace could not be verified.', false);
+  }
+  const orgId = orgResult.data;
+  const canEdit = roleResult.data === 'owner';
+
+  const [listingResult, claimResult] = await Promise.all([
+    supabase
+      .from('global_partners')
+      .select('id, name, organization, types, city, state, regions, phone, email, website, monthly_cost, insurance, insurance_networks, therapies, populations, levels, description, verified_at, status, owner_org_id')
+      .eq('owner_org_id', orgId)
+      .maybeSingle(),
+    supabase
+      .from('center_claim_requests')
+      .select('id, global_partner_id, note, created_at')
+      .eq('org_id', orgId)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
+  if (listingResult.error) throw new StoreError(listingResult.error.message || 'Could not load your directory profile.', false);
+  if (claimResult.error) throw new StoreError(claimResult.error.message || 'Could not load your directory profile.', false);
+
+  const row = listingResult.data as (GlobalPartnerRow & { status: string; owner_org_id: string }) | null;
+  const claim = claimResult.data as { id: string; global_partner_id: string; note: string | null; created_at: string } | null;
+  return {
+    canEdit,
+    profile: row
+      ? {
+        ...mapListing(row),
+        claimed: true,
+        status: row.status === 'archived' ? 'archived' : row.status === 'pending' ? 'pending' : 'active',
+        ownerOrgId: row.owner_org_id,
+      }
+      : null,
+    pendingClaim: claim
+      ? { id: claim.id, listingId: claim.global_partner_id, note: claim.note || '', createdAt: claim.created_at }
+      : null,
+  };
+}
+
+export function orgDirectoryProfilePayload(input: OrgDirectoryProfileInput): Record<(typeof ORG_DIRECTORY_PROFILE_FIELDS)[number], unknown> {
+  return {
+    name: input.name.trim(),
+    organization: input.organization.trim(),
+    types: input.types,
+    city: input.city.trim(),
+    state: input.state.trim().toUpperCase(),
+    regions: input.regions,
+    phone: input.phone.trim(),
+    email: input.email.trim(),
+    website: input.website?.trim() || '',
+    monthly_cost: Math.max(0, Math.round(input.monthlyCost || 0)),
+    insurance: input.insurance,
+    insurance_networks: input.insuranceNetworks,
+    therapies: input.therapies,
+    populations: input.populations,
+    levels: input.levels,
+    description: input.description.trim(),
+  };
+}
+
+export async function upsertOrgDirectoryProfile(input: OrgDirectoryProfileInput): Promise<UpsertOrgDirectoryProfileResult> {
+  const { data, error } = await supabase.rpc('upsert_org_directory_profile', { p_payload: orgDirectoryProfilePayload(input) });
+  if (error) throw new StoreError(error.message || 'Could not publish your directory profile.', false);
+  const result = (data || {}) as { status?: string; listing_id?: string; request_id?: string };
+  const status = result.status;
+  if (status !== 'created' && status !== 'updated' && status !== 'claimed' && status !== 'claim_requested') {
+    throw new StoreError('The directory returned an unexpected response. Try again.', false);
+  }
+  if (typeof result.listing_id !== 'string' || !result.listing_id) {
+    throw new StoreError('The directory returned an unexpected response. Try again.', false);
+  }
+  return { status, listingId: result.listing_id, requestId: typeof result.request_id === 'string' ? result.request_id : undefined };
 }

@@ -95,8 +95,8 @@ SELECT throws_ok(
 SELECT is(
   (SELECT status || ':' || (verified_at IS NULL)::text
      FROM public.global_partners WHERE id = 'bb100000-0000-0000-0000-0000000000bb'),
-  'pending:true',
-  'centers cannot change their own verification state'
+  'pending:false',
+  'claiming verifies the listing; a center edit keeps the admin-controlled status and re-attests verification'
 );
 
 SELECT throws_ok(
@@ -190,8 +190,8 @@ UPDATE public.global_partners
 SELECT is(
   (SELECT status || ':' || (verified_at IS NULL)::text
      FROM public.global_partners WHERE id = 'bb100000-0000-0000-0000-0000000000bb'),
-  'active:true',
-  'a center content edit preserves admin-controlled status but clears stale verification'
+  'active:false',
+  'a center content edit preserves admin-controlled status and keeps the claimed listing verified'
 );
 
 -- ─── Network status propagates to linked tenant partners ─────────────────────
