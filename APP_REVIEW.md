@@ -36,9 +36,13 @@ Facts the answer rests on (all verifiable in this repo):
 - The app is free. `public.free_launch_period()` returns `true`
   (`supabase/migrations/20260918230000_free_launch_period.sql`), so every
   workspace has every feature. No plan tiers are shown, sold, or gated.
-- Sign-in is email/password only; there is no self-serve sign-up in the app
-  (`src/lib/LoginScreen.tsx`). Accounts are created by ReferralFit for a
-  practice's staff at no charge.
+- Sign-in is email/password. The sign-in screen also offers self-serve
+  "Create account" (practice name, your name, email, password) and "Forgot
+  password?" (`src/lib/LoginScreen.tsx`). Accounts are free.
+- In-app account deletion (guideline 5.1.1(v)): Workspace screen → "Delete
+  account…" → two confirmations → `public.delete_own_account()` RPC deletes
+  the auth user (and the whole workspace when the user is its sole owner).
+  See `docs/SELF_SERVE_ACCOUNTS.md`.
 - `react-native-purchases` is **not** installed. No RevenueCat products,
   prices, paywalls, or external purchase links exist anywhere in the app.
 - Square and PandaDoc references are optional record links a practice can
@@ -69,9 +73,11 @@ Suggested reply — paste into the App Store Connect message thread:
 > business tool for licensed addiction-intervention practices; it is not
 > offered to consumers or families.
 >
-> **6. How do users obtain an account? Is there a fee?** ReferralFit creates
-> accounts for a practice's staff on request, at no charge. There is no fee
-> to create an account or to use the app. The demo account provided in App
+> **6. How do users obtain an account? Is there a fee?** Anyone can create an
+> account from the sign-in screen ("Create account") at no charge, and can
+> delete it from the Workspace screen. ReferralFit also sets up accounts for a
+> practice's staff on request. There is no fee to create an account or to use
+> the app. The demo account provided in App
 > Review Information has full access to every feature.
 
 If a reviewer asks about the "Square" and "PandaDoc" labels on a case: those
