@@ -388,7 +388,20 @@ for (const trigger of ['partners_seed_publish_insert', 'partners_seed_publish_up
   assert.match(seedMigration, new RegExp(`CREATE TRIGGER ${trigger}\\b`), `seed auto-publish migration must define ${trigger}`);
 }
 assert.match(seedMigration, /FUNCTION public\.publish_partner_to_global\(p_partner_id uuid\)/, 'seed auto-publish migration must define the publish function');
-assert.doesNotMatch(source, /global_listing_status/, 'partner write paths must not filter on or depend on global_listing_status');
+// The read path (mapPartnerRow) surfaces the listing status and review
+// outcome so the app can show "Pending review" (20260930120000_directory_submissions.sql).
+// Those columns are server-owned: the write paths must never send or filter on them.
+const partnerToRowSource = source.match(/function partnerToRow\([\s\S]*?\n}\n/)?.[0] ?? '';
+assert.ok(partnerToRowSource.includes('monthly_cost'), 'partnerToRow must be found for the write-path check');
+const partnerWriteLines = source.split('\n').filter((line) => /from\('partners'\)\.(insert|upsert|update|delete)/.test(line));
+assert.ok(partnerWriteLines.length >= 4, 'partner write statements must be found for the write-path check');
+for (const column of ['global_partner_id', 'global_listing_status', 'directory_rejected_at', 'directory_review_note']) {
+  assert.doesNotMatch(
+    partnerToRowSource + partnerWriteLines.join('\n'),
+    new RegExp(column),
+    `partner write paths must not send, filter on, or depend on ${column}`,
+  );
+}
 assert.match(source, /supabase\.from\('partners'\)\.select\('\*'\)/, 'snapshot refresh must select every partners column so directory links sync');
 
 // Workspace directory profile (20260928170000_claimed_listings_authoritative.sql):

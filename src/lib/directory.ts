@@ -199,12 +199,136 @@ export async function toggleFavorite(target: FavoriteTarget, id: string): Promis
   return Boolean(data);
 }
 
-// Propose one of the workspace's private partners for the shared directory.
-// Returns the global listing id (existing, if the program was already listed).
-export async function suggestGlobalListing(partnerId: string): Promise<string> {
+// ─── Directory submissions ───────────────────────────────────────────────────
+// A practice submits one of its own partners — a program, an interventionist,
+// or a therapist; ReferralFit (a platform admin) reviews it before it appears
+// in the shared directory. The server refuses an incomplete partner — see
+// src/lib/directory-submission.ts for the rule the app mirrors — and a
+// declined one simply stays in the practice's list. The practice's private
+// relationship note is never published (the listing starts with no
+// description) and is never overwritten by the listing. A submitted listing is
+// never owned by the submitter; a practice's own profile is the separate
+// upsertOrgDirectoryProfile path below.
+
+export type DirectorySubmissionResult = {
+  listingId: string;
+  // False when another partner in this workspace already tracks the matching
+  // listing (one linked copy per workspace): this one stays private.
+  linked: boolean;
+  // 'pending' while waiting for review; 'active' when it was already in the
+  // directory and this partner was linked to the existing listing.
+  status: 'active' | 'pending' | 'archived';
+};
+
+export async function submitPartnerToDirectory(partnerId: string): Promise<DirectorySubmissionResult> {
   const { data, error } = await supabase.rpc('suggest_global_listing', { p_partner_id: partnerId });
-  if (error) throw new StoreError(error.message || 'Could not suggest this program.', false);
-  return typeof data === 'string' ? data : String(data);
+  if (error) {
+    // P0002: the partner has not reached the server yet (still queued).
+    const message = error.code === 'P0002'
+      ? 'This partner has not finished saving yet. Give it a moment, then try again.'
+      : error.message || 'Could not submit this partner.';
+    throw new StoreError(message, false);
+  }
+  const listingId = typeof data === 'string' ? data : String(data);
+  const { data: row, error: readError } = await supabase
+    .from('partners')
+    .select('global_partner_id, global_listing_status')
+    .eq('id', partnerId)
+    .maybeSingle();
+  if (readError) throw new StoreError(readError.message || 'Submitted, but the status could not be refreshed.', false);
+  const linked = Boolean(row?.global_partner_id);
+  const status = row?.global_listing_status === 'active' || row?.global_listing_status === 'archived' ? row.global_listing_status : 'pending';
+  return { listingId, linked, status: linked ? status : 'pending' };
+}
+
+// Whether to show the review queue. Display-only: every admin RPC re-checks
+// platform-admin status on the server.
+export async function fetchIsPlatformAdmin(): Promise<boolean> {
+  const { data, error } = await supabase.rpc('is_platform_admin');
+  if (error) throw new StoreError(error.message || 'Could not check the account.', false);
+  return data === true;
+}
+
+export type PendingDirectorySubmission = {
+  id: string;
+  name: string;
+  organization: string;
+  types: string[];
+  city: string;
+  state: string;
+  phone: string;
+  email: string;
+  website: string;
+  monthlyCost: number;
+  insurance: string[];
+  insuranceNetworks: Partial<Record<string, InsuranceNetworkPreference[]>>;
+  therapies: string[];
+  // The listing's public description. A submission never copies the
+  // practice's private note, so this is normally empty.
+  description: string;
+  submittedAt: string;
+  submittedByPractice: string;
+  submittedByMember: string;
+  // Required-field keys the listing itself lacks (normally none).
+  missingFields: string[];
+};
+
+type PendingDirectorySubmissionRow = {
+  id: string;
+  name: string | null;
+  organization: string | null;
+  types: string[] | null;
+  city: string | null;
+  state: string | null;
+  phone: string | null;
+  email: string | null;
+  website: string | null;
+  monthly_cost: number | null;
+  insurance: string[] | null;
+  insurance_networks: Record<string, InsuranceNetworkPreference[]> | null;
+  therapies: string[] | null;
+  description: string | null;
+  submitted_at: string | null;
+  submitted_by_practice: string | null;
+  submitted_by_member: string | null;
+  missing_fields: string[] | null;
+};
+
+// Platform admins only; the server raises for anyone else. Oldest first.
+export async function fetchPendingDirectorySubmissions(): Promise<PendingDirectorySubmission[]> {
+  const { data, error } = await supabase.rpc('list_pending_global_listings');
+  if (error) throw new StoreError(error.message || 'Could not load directory submissions.', false);
+  return ((data || []) as PendingDirectorySubmissionRow[]).map((row) => ({
+    id: row.id,
+    name: row.name || '',
+    organization: row.organization || '',
+    types: row.types || [],
+    city: row.city || '',
+    state: row.state || '',
+    phone: row.phone || '',
+    email: row.email || '',
+    website: row.website || '',
+    monthlyCost: row.monthly_cost || 0,
+    insurance: row.insurance || [],
+    insuranceNetworks: row.insurance_networks || {},
+    therapies: row.therapies || [],
+    description: row.description || '',
+    submittedAt: row.submitted_at || '',
+    submittedByPractice: row.submitted_by_practice || '',
+    submittedByMember: row.submitted_by_member || '',
+    missingFields: row.missing_fields || [],
+  }));
+}
+
+// Approve (the listing goes live, verified) or decline (the partner stays in
+// the submitter's own list, with the optional note).
+export async function reviewDirectorySubmission(listingId: string, approve: boolean, note?: string): Promise<void> {
+  const { error } = await supabase.rpc('review_global_listing', {
+    p_global_id: listingId,
+    p_approve: approve,
+    p_note: note?.trim() || null,
+  });
+  if (error) throw new StoreError(error.message || 'Could not save the review.', false);
 }
 
 // Re-adopt the directory's value for a field the workspace had overridden.

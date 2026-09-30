@@ -215,9 +215,11 @@ SELECT ok(
 SELECT set_config('request.jwt.claim.sub', 'd3000000-0000-0000-0000-00000000000d', true);
 
 SELECT lives_ok(
-  $$ INSERT INTO public.partners (id, name, organization, types, phone, website)
-     VALUES ('f3000000-0000-0000-0000-000000000002', 'Front Desk', 'Private Program', ARRAY['Inpatient'], '(503) 555-0300', 'https://privateprogram.example'),
-            ('f3000000-0000-0000-0000-000000000003', 'Admissions', 'Suggested Program', ARRAY['IOP / PHP'], '(503) 555-0500', '') $$,
+  -- The suggested row is directory-ready: suggest_global_listing refuses
+  -- incomplete partners (20260930120000_directory_submissions.sql).
+  $$ INSERT INTO public.partners (id, name, organization, types, city, state, phone, email, website, monthly_cost, insurance)
+     VALUES ('f3000000-0000-0000-0000-000000000002', 'Front Desk', 'Private Program', ARRAY['Inpatient'], DEFAULT, DEFAULT, '(503) 555-0300', DEFAULT, 'https://privateprogram.example', DEFAULT, DEFAULT),
+            ('f3000000-0000-0000-0000-000000000003', 'Admissions', 'Suggested Program', ARRAY['IOP / PHP'], 'Salem', 'OR', '(503) 555-0500', 'admissions@suggestedprogram.example', 'https://suggestedprogram.example', 18000, ARRAY['Cash pay']) $$,
   'an ordinary practice adds two private programs'
 );
 

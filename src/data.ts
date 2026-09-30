@@ -37,8 +37,14 @@ export type Partner = {
   favorite?: boolean;
   touchCadenceDays?: number;
   createdAt?: string;
-  /** Set when this partner was imported from the shared ReferralFit directory. */
+  /** Set when this partner is linked to a shared ReferralFit directory listing (imported, submitted, or published). */
   globalPartnerId?: string;
+  /** Status of the linked listing: 'pending' while ReferralFit reviews a submission. Meaningful only with globalPartnerId. */
+  globalListingStatus?: 'active' | 'pending' | 'archived';
+  /** Set when ReferralFit declined this partner's directory submission; cleared on resubmission. */
+  directoryRejectedAt?: string;
+  /** The reviewer's note that came with the decline, if any. */
+  directoryReviewNote?: string;
 };
 
 export type Referral = {
