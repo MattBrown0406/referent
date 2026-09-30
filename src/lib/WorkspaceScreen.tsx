@@ -22,7 +22,8 @@ import {
   type Workspace,
 } from './org';
 import { type Entitlement, type EntitlementState } from './entitlements';
-import { fetchOrgDirectoryProfile, type OrgDirectoryProfileState } from './directory';
+import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySubmissions, type OrgDirectoryProfileState } from './directory';
+import DirectoryReviewQueue from './DirectoryReviewQueue';
 import { prepareForWorkspaceChange } from './store';
 import { deleteOwnAccount } from './account';
 
@@ -88,6 +89,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   const [busy, setBusy] = useState(false);
   const [editingName, setEditingName] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState('');
+  // Platform admins only: how many directory submissions are waiting (null
+  // for everyone else, which hides the card), and whether the queue is open.
+  const [pendingSubmissions, setPendingSubmissions] = useState<number | null>(null);
+  const [reviewOpen, setReviewOpen] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -107,10 +112,17 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       setDirectoryProfile(null);
       setDirectoryProfileError((error as Error).message);
     }
+    // Display-only check; the queue RPCs enforce platform-admin status.
+    try {
+      setPendingSubmissions(await fetchIsPlatformAdmin() ? (await fetchPendingDirectorySubmissions()).length : null);
+    } catch {
+      setPendingSubmissions(null);
+    }
   }, [userId]);
 
   useEffect(() => {
     if (visible) void load();
+    else setReviewOpen(false);
   }, [visible, load]);
 
   const isOwner = workspace?.myRole === 'owner';
@@ -227,6 +239,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
       <SafeAreaView style={styles.safe}>
+        {reviewOpen && pendingSubmissions !== null ? (
+          <DirectoryReviewQueue onBack={() => setReviewOpen(false)} onCountChange={setPendingSubmissions} />
+        ) : (
+        <>
         <View style={styles.header}>
           <Text style={styles.headerTitle}>Workspace</Text>
           <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close workspace" onPress={onClose} style={styles.closeButton}>
@@ -351,13 +367,32 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
               )}
             </View>
 
+            {pendingSubmissions !== null ? (
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>Directory submissions</Text>
+                <View style={styles.memberRow}>
+                  <View style={styles.memberInfo}>
+                    <Text style={styles.memberName}>{pendingSubmissions === 0 ? 'Nothing waiting' : `${pendingSubmissions} waiting for review`}</Text>
+                    <Text style={styles.memberRole}>Programs practices submitted for the shared directory</Text>
+                  </View>
+                  <View style={pendingSubmissions > 0 ? styles.planBadgeActive : styles.planBadge}>
+                    <Text accessibilityLabel={`${pendingSubmissions} pending`} style={pendingSubmissions > 0 ? styles.planBadgeActiveText : styles.planBadgeText}>{pendingSubmissions}</Text>
+                  </View>
+                </View>
+                <TouchableOpacity accessibilityRole="button" onPress={() => setReviewOpen(true)} style={styles.primaryButton}>
+                  <Text style={styles.primaryButtonText}>Review submissions</Text>
+                </TouchableOpacity>
+                <Text style={styles.helpText}>Only ReferralFit platform admins see this card.</Text>
+              </View>
+            ) : null}
+
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Your data is private</Text>
               <Text style={styles.helpText}>
                 Everything in this workspace — partners, cases, referrals, notes, and documents — belongs to your practice alone. Other practices using ReferralFit cannot see it, and ReferralFit staff do not have access to it. Only people you invite with a code can join this workspace.
               </Text>
               <Text style={[styles.helpText, styles.helpTextSpaced]}>
-                The only shared space is the Directory: your own profile if you build one, and a program only when you choose to suggest it. Benchmarks use anonymized totals and never identify a practice.
+                The only shared space is the Directory: your own profile if you build one, and a program only when you choose to submit it and ReferralFit approves it. Benchmarks use anonymized totals and never identify a practice.
               </Text>
             </View>
 
@@ -457,6 +492,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
           <View style={styles.centered}>
             <Text style={styles.errorText}>No workspace found for this account yet. Sign out and back in, then try again.</Text>
           </View>
+        )}
+        </>
         )}
       </SafeAreaView>
     </Modal>

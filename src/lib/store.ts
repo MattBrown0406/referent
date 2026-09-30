@@ -571,6 +571,9 @@ type PartnerRow = {
   last_contact_at: string | null;
   created_at: string;
   global_partner_id?: string | null;
+  global_listing_status?: string | null;
+  directory_rejected_at?: string | null;
+  directory_review_note?: string | null;
 };
 
 type ReferralRow = {
@@ -705,6 +708,11 @@ function mapPartnerRow(row: PartnerRow, balance: BalanceRow | undefined): Partne
     touchCadenceDays: row.touch_cadence_days ?? undefined,
     createdAt: row.created_at,
     globalPartnerId: row.global_partner_id ?? undefined,
+    globalListingStatus: row.global_partner_id && (row.global_listing_status === 'pending' || row.global_listing_status === 'archived' || row.global_listing_status === 'active')
+      ? row.global_listing_status
+      : undefined,
+    directoryRejectedAt: row.directory_rejected_at ?? undefined,
+    directoryReviewNote: row.directory_review_note || undefined,
   };
 }
 

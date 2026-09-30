@@ -193,9 +193,11 @@ SELECT is(
 );
 
 SELECT lives_ok(
-  $$ INSERT INTO public.partners (id, name, organization, phone, website)
-     VALUES ('c2000000-0000-0000-0000-000000000010', 'Front Desk', 'New Horizons Ranch', '(503) 555-0150', 'https://www.newhorizons.example/'),
-            ('c2000000-0000-0000-0000-000000000011', 'Clinical Director', 'New Horizons Ranch', '', 'newhorizons.example/team') $$,
+  -- Directory-ready rows: suggest_global_listing refuses incomplete partners
+  -- (20260930120000_directory_submissions.sql).
+  $$ INSERT INTO public.partners (id, name, organization, types, city, state, phone, email, website, monthly_cost, insurance)
+     VALUES ('c2000000-0000-0000-0000-000000000010', 'Front Desk', 'New Horizons Ranch', ARRAY['Inpatient'], 'Bend', 'OR', '(503) 555-0150', 'frontdesk@newhorizons.example', 'https://www.newhorizons.example/', 28000, ARRAY['Aetna']),
+            ('c2000000-0000-0000-0000-000000000011', 'Clinical Director', 'New Horizons Ranch', ARRAY['Inpatient'], 'Bend', 'OR', '(503) 555-0151', 'clinical@newhorizons.example', 'newhorizons.example/team', 28000, ARRAY['Aetna']) $$,
   'practice one adds two private partners for the same program'
 );
 

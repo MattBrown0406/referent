@@ -51,7 +51,8 @@ import { isRecoveryRedirect, parseAuthRedirect } from './src/lib/auth-flows';
 import { fetchCurrentOrgId } from './src/lib/org';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
-import { fetchOrgDirectoryProfile, upsertOrgDirectoryProfile, type OrgDirectoryProfile } from './src/lib/directory';
+import { fetchOrgDirectoryProfile, submitPartnerToDirectory, upsertOrgDirectoryProfile, type OrgDirectoryProfile } from './src/lib/directory';
+import { directoryMissingFields, directoryMissingFieldsMessage, isDirectoryProgram, PRIVATE_PAY_ONLY } from './src/lib/directory-submission';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
 import {
   type BusinessData,
@@ -333,6 +334,8 @@ type PartnerForm = {
   monthlyCost: string;
   insurance: string[];
   insuranceNetworks: Partial<Record<string, InsuranceNetworkPreference[]>>;
+  // The program takes no insurance. Stored as the 'Cash pay' insurance entry.
+  privatePayOnly: boolean;
   therapies: string[];
   note: string;
   touchCadence: string;
@@ -365,6 +368,7 @@ function makeEmptyPartnerForm(): PartnerForm {
   monthlyCost: '',
   insurance: [],
   insuranceNetworks: {},
+  privatePayOnly: false,
   therapies: [],
   note: '',
   touchCadence: '',
@@ -906,6 +910,7 @@ export default function App() {
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
+  const [directorySubmitBusy, setDirectorySubmitBusy] = useState(false);
   // Incremented after the account joins a different practice workspace, which
   // re-homes its rows server-side; bumping it re-runs the hydration effect.
   const [workspaceEpoch, setWorkspaceEpoch] = useState(0);
@@ -3436,6 +3441,7 @@ export default function App() {
       insuranceNetworks: Object.fromEntries(
         partner.insurance.filter((plan) => plan !== 'Cash pay').map((plan) => [plan, networkCapabilitiesForPartner(partner, plan)]),
       ),
+      privatePayOnly: partner.insurance.length > 0 && partner.insurance.every((plan) => plan === PRIVATE_PAY_ONLY),
       therapies: partner.therapies,
       note: partner.note,
       touchCadence: partner.touchCadenceDays ? String(partner.touchCadenceDays) : '',
@@ -3493,7 +3499,7 @@ export default function App() {
       monthlyCost: Number(partnerForm.monthlyCost) || 0,
       cashMin: Number(partnerForm.monthlyCost) || 0,
       cashMax: Number(partnerForm.monthlyCost) || 0,
-      insurance: partnerForm.insurance,
+      insurance: partnerForm.insurance.length ? partnerForm.insurance : partnerForm.privatePayOnly ? [PRIVATE_PAY_ONLY] : [],
       insuranceNetworks: partnerForm.insuranceNetworks,
       therapies: partnerForm.therapies,
       populations: existing?.populations || ['Adults'],
@@ -3505,6 +3511,11 @@ export default function App() {
       favorite: existing?.favorite,
       touchCadenceDays: cadence && cadence > 0 ? cadence : undefined,
       createdAt: existing?.createdAt || new Date().toISOString(),
+      // Directory linkage is server-owned; an edit never changes it.
+      globalPartnerId: existing?.globalPartnerId,
+      globalListingStatus: existing?.globalListingStatus,
+      directoryRejectedAt: existing?.directoryRejectedAt,
+      directoryReviewNote: existing?.directoryReviewNote,
     };
     const nextPartners = existing
       ? partners.map((item) => item.id === partner.id ? partner : item)
@@ -3521,6 +3532,55 @@ export default function App() {
       () => { setPartners(partners); setSelectedPartner(existing || null); },
       'The partner',
     );
+  }
+
+  // Send one of the practice's own programs to ReferralFit for review. The
+  // server is the authority on completeness (suggest_global_listing); the
+  // button only shows when the mirrored rule says the program is ready.
+  async function submitPartnerForDirectory(partner: Partner) {
+    if (directorySubmitBusy) return;
+    // A save still in flight may be the very partner being submitted, and the
+    // server reviews its own copy — so queued edits have to land first.
+    if (!mutationSlotAvailable('The directory submission')) return;
+    if (queuedWrites > 0) {
+      Alert.alert('Still syncing', 'Your latest changes have not finished syncing yet. Submit this program once they are saved.');
+      return;
+    }
+    const userId = activeUserId;
+    setDirectorySubmitBusy(true);
+    try {
+      const result = await submitPartnerToDirectory(partner.id);
+      if (activeUserIdRef.current !== userId) return;
+      if (!result.linked) {
+        Alert.alert('Already in your list', 'Another entry in your list is already linked to this program\'s directory listing, so this one stays in your list only.');
+        return;
+      }
+      const updated: Partner = {
+        ...partner,
+        globalPartnerId: result.listingId,
+        globalListingStatus: result.status,
+        directoryRejectedAt: undefined,
+        directoryReviewNote: undefined,
+      };
+      const nextPartners = partners.map((item) => item.id === updated.id ? { ...item, ...updated } : item);
+      setPartners(nextPartners);
+      setSelectedPartner((current) => current?.id === updated.id ? updated : current);
+      await syncDerived({ partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards }).catch(() => undefined);
+      if (activeUserIdRef.current !== userId) return;
+      if (result.status === 'pending') {
+        Alert.alert('Sent for review', 'ReferralFit will review this program before it appears in the shared directory. It stays in your list either way.');
+      } else {
+        Alert.alert('Already in the directory', 'This program was already listed, so your entry is now linked to that listing.');
+      }
+    } catch (error) {
+      if (activeUserIdRef.current === userId) {
+        Alert.alert('Not submitted yet', isNetworkError(error)
+          ? 'You appear to be offline. The program is saved to your list; submit it once you are connected.'
+          : (error as Error).message);
+      }
+    } finally {
+      setDirectorySubmitBusy(false);
+    }
   }
 
   function addReferral() {
@@ -5058,7 +5118,7 @@ export default function App() {
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Placement details</Text>
               <View style={styles.infoLine}><AppIcon name="wallet-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Monthly cash cost</Text><Text style={styles.infoValue}>{formatMoney(monthlyCostForPartner(selectedPartner))}</Text></View></View>
-              <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Insurance</Text><Text style={styles.infoValue}>{selectedPartner.insurance.map((plan) => `${plan} (${networkCapabilitiesForPartner(selectedPartner, plan).map((status) => status === 'In-network' ? 'IN' : 'OON').join(' + ')})`).join(' · ') || 'Not recorded'}</Text></View></View>
+              <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Insurance</Text><Text style={styles.infoValue}>{selectedPartner.insurance.filter((plan) => plan !== PRIVATE_PAY_ONLY).map((plan) => `${plan} (${networkCapabilitiesForPartner(selectedPartner, plan).map((status) => status === 'In-network' ? 'IN' : 'OON').join(' + ')})`).join(' · ') || (selectedPartner.insurance.includes(PRIVATE_PAY_ONLY) ? 'Private pay only' : 'Not recorded')}</Text></View></View>
               <View style={styles.infoLine}><AppIcon name="location-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Service area</Text><Text style={styles.infoValue}>{selectedPartner.regions.join(' · ')}</Text></View></View>
             </View>
 
@@ -5067,6 +5127,87 @@ export default function App() {
 
             <Text style={styles.infoTitleStandalone}>Relationship notes</Text>
             <View style={styles.noteCard}><Text style={styles.noteText}>{selectedPartner.note || 'No notes yet.'}</Text></View>
+
+            <Text style={styles.infoTitleStandalone}>Shared directory</Text>
+            {(() => {
+              // Linked to a listing: imported, already approved, or waiting for review.
+              if (selectedPartner.globalPartnerId) {
+                const status = selectedPartner.globalListingStatus;
+                return (
+                  <View style={styles.noteCard}>
+                    <View style={styles.directoryStatusRow}>
+                      <View style={styles.typeBadge}><Text style={styles.typeBadgeText}>{status === 'pending' ? 'Pending review' : status === 'archived' ? 'Not currently listed' : 'In the shared directory'}</Text></View>
+                    </View>
+                    <Text style={styles.noteText}>
+                      {status === 'pending'
+                        ? 'ReferralFit is reviewing this program. It will appear in the shared directory once it is approved, and it stays in your list either way.'
+                        : status === 'archived'
+                          ? 'This program\'s directory listing is not active right now. It stays in your list.'
+                          : 'Other practices can find this program in the Directory.'}
+                    </Text>
+                  </View>
+                );
+              }
+              // The server checks the row's own types, so an untyped partner is not ready.
+              const missing = directoryMissingFields({
+                organization: selectedPartner.organization,
+                name: selectedPartner.name,
+                types: selectedPartner.types || [],
+                city: selectedPartner.city,
+                state: selectedPartner.state,
+                phone: selectedPartner.phone,
+                email: selectedPartner.email,
+                website: selectedPartner.website,
+                monthlyCost: monthlyCostForPartner(selectedPartner),
+                insurance: selectedPartner.insurance,
+                insuranceNetworks: selectedPartner.insuranceNetworks,
+              });
+              const individualOnly = Boolean(selectedPartner.types?.length) && !isDirectoryProgram(selectedPartner.types);
+              const declined = Boolean(selectedPartner.directoryRejectedAt);
+              return (
+                <View style={styles.noteCard}>
+                  {declined ? (
+                    <>
+                      <View style={styles.directoryStatusRow}>
+                        <View style={[styles.typeBadge, styles.directoryDeclinedBadge]}><Text style={[styles.typeBadgeText, styles.directoryDeclinedText]}>Not added to the directory</Text></View>
+                      </View>
+                      {selectedPartner.directoryReviewNote ? (
+                        <Text style={styles.noteText}>Note from ReferralFit: {selectedPartner.directoryReviewNote}</Text>
+                      ) : null}
+                      <Text style={[styles.noteText, styles.directoryHint]}>It is still saved to your list. You can update it and submit it again.</Text>
+                    </>
+                  ) : null}
+                  {missing.length === 0 ? (
+                    <>
+                      {!declined ? <Text style={styles.noteText}>This program is saved to your list. ReferralFit reviews each program before it appears in the shared directory.</Text> : null}
+                      <TouchableOpacity
+                        accessibilityRole="button"
+                        accessibilityLabel={declined ? 'Submit to directory again' : 'Submit to directory'}
+                        accessibilityState={{ disabled: directorySubmitBusy, busy: directorySubmitBusy }}
+                        disabled={directorySubmitBusy}
+                        style={[styles.primaryButton, directorySubmitBusy && styles.directoryButtonBusy]}
+                        onPress={() => { void submitPartnerForDirectory(selectedPartner); }}
+                      >
+                        {directorySubmitBusy ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.primaryButtonText}>{declined ? 'Submit again' : 'Submit to directory'}</Text>}
+                      </TouchableOpacity>
+                    </>
+                  ) : (
+                    <>
+                      {!declined ? (
+                        <View style={styles.directoryStatusRow}>
+                          <View style={styles.typeBadge}><Text style={styles.typeBadgeText}>Saved to your list only</Text></View>
+                        </View>
+                      ) : null}
+                      <Text style={[styles.noteText, declined && styles.directoryHint]}>
+                        {individualOnly
+                          ? 'The shared directory lists treatment programs — Inpatient, IOP / PHP, Sober Living, or Detox. This contact stays in your own list.'
+                          : directoryMissingFieldsMessage(missing)}
+                      </Text>
+                    </>
+                  )}
+                </View>
+              );
+            })()}
 
             <View style={styles.contactCard}>
               <View style={styles.contactLine}><AppIcon name="call-outline" size={17} color={COLORS.gray} /><Text style={styles.contactText}>{selectedPartner.phone || 'No phone recorded'}</Text></View>
@@ -5351,6 +5492,7 @@ export default function App() {
                   ...current,
                   insurance,
                   insuranceNetworks: Object.fromEntries(insurance.map((plan) => [plan, current.insuranceNetworks[plan]?.length ? current.insuranceNetworks[plan] : ['In-network']])),
+                  privatePayOnly: insurance.length ? false : current.privatePayOnly,
                 }))}
                 icon="shield-checkmark-outline"
                 emptyLabel="Select accepted insurance plans"
@@ -5381,6 +5523,18 @@ export default function App() {
                   })}
                 </View>
               ))}
+              {partnerForm.insurance.length === 0 ? (
+                <TouchableOpacity
+                  accessibilityRole="checkbox"
+                  accessibilityLabel="Private pay only, no insurance accepted"
+                  accessibilityState={{ checked: partnerForm.privatePayOnly }}
+                  style={styles.networkPlanRow}
+                  onPress={() => setPartnerForm((current) => ({ ...current, privatePayOnly: !current.privatePayOnly }))}
+                >
+                  <AppIcon name={partnerForm.privatePayOnly ? 'checkbox' : 'square-outline'} size={18} color={partnerForm.privatePayOnly ? COLORS.forest : COLORS.gray} />
+                  <Text style={styles.networkPlanName}>Private pay only — no insurance accepted</Text>
+                </TouchableOpacity>
+              ) : null}
               <MultiSelectDropdown
                 label="THERAPEUTIC NEEDS"
                 values={partnerForm.therapies}
@@ -5521,7 +5675,7 @@ export default function App() {
                 Everything you add here — partners, cases, referrals, notes, and documents — belongs to your practice alone. Other practices using ReferralFit cannot see it, and it is never shared or sold.
               </Text>
               <Text style={styles.prePromptText}>
-                The only shared space is the Directory of treatment programs, and a program appears there only if you choose to suggest it. Benchmarks use anonymized totals that never identify a practice.
+                The only shared space is the Directory of treatment programs, and a program appears there only if you choose to submit it and ReferralFit approves it. Benchmarks use anonymized totals that never identify a practice.
               </Text>
               <Text style={styles.prePromptText}>
                 ReferralFit is free to use. There is nothing to buy in this app and no charge to your practice.
@@ -6497,6 +6651,11 @@ const styles = StyleSheet.create({
   specialtyText: { color: COLORS.forest, fontSize: 10, fontWeight: '700' },
   noteCard: { backgroundColor: COLORS.white, borderRadius: 17, padding: 15, marginTop: 9, borderWidth: 1, borderColor: COLORS.line },
   noteText: { color: COLORS.inkSoft, fontSize: 12, lineHeight: 19 },
+  directoryStatusRow: { flexDirection: 'row', marginBottom: 9 },
+  directoryDeclinedBadge: { backgroundColor: COLORS.coralPale },
+  directoryDeclinedText: { color: COLORS.ink },
+  directoryHint: { marginTop: 8 },
+  directoryButtonBusy: { opacity: 0.7 },
   contactCard: { marginTop: 18, backgroundColor: COLORS.white, borderRadius: 17, padding: 14, gap: 11, borderWidth: 1, borderColor: COLORS.line },
   contactLine: { flexDirection: 'row', gap: 9, alignItems: 'center' },
   contactText: { color: COLORS.inkSoft, fontSize: 12 },

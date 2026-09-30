@@ -8,6 +8,10 @@ professional, that becomes authoritative, regardless of who created it*, and
 *every new user can build a verified profile for themselves as they start to
 use the app*.
 
+How an ordinary practice gets one of its *programs* into the directory
+(complete the required fields, submit, admin review) is a separate flow:
+see `docs/DIRECTORY_SUBMISSIONS.md`.
+
 ## The model
 
 Every directory listing (`global_partners`) is in exactly one ownership state.

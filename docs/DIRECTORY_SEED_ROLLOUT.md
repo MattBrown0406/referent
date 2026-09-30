@@ -12,7 +12,11 @@ owner's workspace into the verified seed of the shared directory:
   issued) are **deleted** the moment the migration runs, before the backfill.
 
 Ordinary workspaces are untouched: their partners stay private unless they
-suggest them, and suggestions still land as `pending`.
+suggest them, and suggestions still land as `pending`. (Since
+`20260930120000_directory_submissions.sql` a suggestion must be complete and
+is approved or rejected from the in-app review queue — see
+`docs/DIRECTORY_SUBMISSIONS.md`. Seed auto-publish is not subject to that
+rule.)
 
 The migration is idempotent. Re-running the cleanup and backfill functions
 publishes and deletes nothing new.
