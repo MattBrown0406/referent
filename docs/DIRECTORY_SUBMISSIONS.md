@@ -182,6 +182,15 @@ that contains the new screens ships (the current build never calls
    VALUES ('20260930120000', 'directory_submissions');
    ```
 
+3. Then apply `supabase/migrations/20260930170000_directory_rule_transit_safe.sql`
+   the same way and record it as `('20260930170000', 'directory_rule_transit_safe')`.
+   It redefines `directory_text_is_blank` and `directory_missing_fields` with
+   the same behaviour but no backslash escapes or non-ASCII characters. The
+   originals were altered in transit when the first migration was pasted from
+   a chat client on 2026-09-30; a source fingerprint check caught it. When a
+   migration has to travel through chat, prefer `chr()` over `E'...'` escapes
+   and check the result with a behaviour query rather than trusting the paste.
+
 ## Verify
 
 ```sql
