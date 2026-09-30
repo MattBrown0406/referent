@@ -105,9 +105,10 @@ SELECT ok(
       AND g.created_by = 'd1000000-0000-0000-0000-00000000000d'
       AND g.suggested_by_org_id = (SELECT org_id FROM seed_org)
       AND g.website_domain = 'seedranch.example'
-      AND g.description = 'Owner-verified program'
+      -- 20260930190000: the private note is not published and is protected.
+      AND g.description = ''
       AND p.global_listing_status = 'active'
-      AND p.local_overrides = '{}'
+      AND p.local_overrides = ARRAY['note']
      FROM public.partners p
      JOIN public.global_partners g ON g.id = p.global_partner_id
     WHERE p.id = 'f1000000-0000-0000-0000-000000000001'),
@@ -136,8 +137,8 @@ SELECT is(
 
 SELECT is(
   (SELECT local_overrides FROM public.partners WHERE id = 'f1000000-0000-0000-0000-000000000001'),
-  '{}'::text[],
-  'seed edits are never recorded as local overrides'
+  ARRAY['note'],
+  'seed edits are never recorded as local overrides (only the standing note protection is there)'
 );
 
 SELECT is(
@@ -299,7 +300,7 @@ SELECT lives_ok(
 
 SELECT is(
   (SELECT state || '|' || array_to_string(local_overrides, ',') FROM public.partners WHERE id = 'f1000000-0000-0000-0000-000000000001'),
-  'WA|',
+  'WA|note',
   'the listing edit propagates to the seed partner without recording an override'
 );
 
