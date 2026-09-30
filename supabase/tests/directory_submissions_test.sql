@@ -2,7 +2,7 @@
 -- Run after a local migration reset with: supabase test db
 
 BEGIN;
-SELECT plan(64);
+SELECT plan(72);
 
 -- Actors: e1 is the platform admin (and owns the seed workspace), e2 is an
 -- ordinary practice that submits programs, e3 is another ordinary practice
@@ -126,6 +126,11 @@ SELECT lives_ok(
   'an incomplete program saves to the practice''s own list like any other partner'
 );
 
+-- A private relationship note on the program that is about to be submitted.
+UPDATE public.partners
+   SET note = 'zebraquartz: admissions director is slow to return calls'
+ WHERE id = 'ee200000-0000-0000-0000-000000000002';
+
 SELECT throws_ok(
   $$ SELECT public.suggest_global_listing('ee200000-0000-0000-0000-000000000001') $$,
   '22023',
@@ -159,6 +164,16 @@ SELECT ok(
      JOIN public.global_partners g ON g.id = p.global_partner_id
     WHERE p.id = 'ee200000-0000-0000-0000-000000000002'),
   'the submission lands pending, attributed to the practice, and the partner row shows it'
+);
+
+SELECT ok(
+  (SELECT g.description = ''
+          AND p.note = 'zebraquartz: admissions director is slow to return calls'
+          AND p.local_overrides = ARRAY['note']
+     FROM public.partners p
+     JOIN public.global_partners g ON g.id = p.global_partner_id
+    WHERE p.id = 'ee200000-0000-0000-0000-000000000002'),
+  'the private note is not copied into the pending listing, and is protected as a local override'
 );
 
 SELECT throws_ok(
@@ -212,7 +227,7 @@ SELECT ok(
           AND q.website = 'https://www.cedarridge.example' AND q.city = 'Bend' AND q.state = 'OR'
           AND q.types = ARRAY['Inpatient', 'Detox'] AND q.monthly_cost = 32000 AND q.insurance = ARRAY['Aetna']
           AND q.submitted_by_practice = 'Harbor Family Coaching' AND q.submitted_by_member = 'submitter'
-          AND q.submitted_at IS NOT NULL AND q.missing_fields = '{}'::text[]
+          AND q.submitted_at IS NOT NULL AND q.missing_fields = '{}'::text[] AND q.description = ''
      FROM public.list_pending_global_listings() q),
   'the queue row carries every field the reviewer needs, plus who submitted it and when'
 );
@@ -269,6 +284,60 @@ SELECT ok(
   (SELECT count(*) = 1 AND bool_and(verified_current)
      FROM public.search_global_partners('Cedar Ridge Recovery')),
   'another workspace now finds the approved program in the directory, verified'
+);
+
+SELECT ok(
+  (SELECT bool_and(description = '') FROM public.search_global_partners('Cedar Ridge Recovery'))
+  AND (SELECT count(*) = 0 FROM public.search_global_partners('zebraquartz'))
+  AND NOT EXISTS (SELECT 1 FROM public.global_partners WHERE description ILIKE '%zebraquartz%'),
+  'the approved listing has no description, and the submitter''s private note is not visible or searchable'
+);
+
+-- The other workspace has the same program with its own private note and
+-- submits it: the dedupe branch links it to the existing listing.
+SELECT lives_ok(
+  $$ INSERT INTO public.partners (id, name, organization, types, city, state, phone, email, website, monthly_cost, insurance, note)
+     VALUES ('ee300000-0000-0000-0000-000000000001', 'Dana W.', 'Cedar Ridge', ARRAY['Inpatient'], 'Bend', 'OR', '541.555.0142', 'dana@cedarridge.example', 'https://cedarridge.example', 32000, ARRAY['Aetna'], 'our own candid note') $$,
+  'another workspace keeps the same program with its own private note'
+);
+
+SELECT is(
+  public.suggest_global_listing('ee300000-0000-0000-0000-000000000001'),
+  (SELECT id FROM public.global_partners WHERE phone_digits = '5415550142'),
+  'submitting a program that is already listed matches the existing listing'
+);
+
+SELECT ok(
+  (SELECT global_partner_id IS NOT NULL AND global_listing_status = 'active'
+          AND note = 'our own candid note' AND local_overrides = ARRAY['note']
+     FROM public.partners WHERE id = 'ee300000-0000-0000-0000-000000000001'),
+  'the dedupe link keeps that workspace''s private note and protects it too'
+);
+
+-- A platform admin writes the public description later.
+SELECT set_config('request.jwt.claim.sub', 'e1000000-0000-0000-0000-00000000000e', true);
+
+SELECT lives_ok(
+  $$ UPDATE public.global_partners SET description = 'Residential and detox program in Bend.'
+      WHERE phone_digits = '5415550142' $$,
+  'the admin adds a public description to the approved listing'
+);
+
+SELECT set_config('request.jwt.claim.sub', 'e2000000-0000-0000-0000-00000000000e', true);
+
+SELECT is(
+  (SELECT note FROM public.partners WHERE id = 'ee200000-0000-0000-0000-000000000002'),
+  'zebraquartz: admissions director is slow to return calls',
+  'the submitter''s private note survives approval and a later description edit'
+);
+
+SELECT set_config('request.jwt.claim.sub', 'e3000000-0000-0000-0000-00000000000e', true);
+
+SELECT ok(
+  (SELECT note = 'our own candid note' FROM public.partners WHERE id = 'ee300000-0000-0000-0000-000000000001')
+  AND (SELECT bool_and(description = 'Residential and detox program in Bend.')
+         FROM public.search_global_partners('Cedar Ridge Recovery')),
+  'the linked workspace keeps its note too, while the directory shows the public description'
 );
 
 -- ─── Decline: the private partner stays, with the note ──────────────────────

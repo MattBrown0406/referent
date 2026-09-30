@@ -172,7 +172,8 @@ export default function DirectoryReviewQueue({ onBack, onCountChange }: Props) {
                   <Field label={directoryCostLabel(item.types)} value={item.monthlyCost > 0 ? formatMoney(item.monthlyCost) : ''} />
                   <Field label="Insurance" value={insuranceSummary(item)} />
                   {item.therapies.length ? <Field label="Specialties" value={item.therapies.join(' · ')} /> : null}
-                  {item.description ? <Field label="Notes" value={item.description} /> : null}
+                  {/* The listing's PUBLIC description. Submissions never carry the practice's private note, so this is normally empty. */}
+                  {item.description ? <Field label="Public description" value={item.description} /> : null}
                   <Field label="Submitted by" value={submittedBy(item)} />
                 </View>
 

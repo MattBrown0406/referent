@@ -3569,7 +3569,7 @@ export default function App() {
       await syncDerived({ partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards }).catch(() => undefined);
       if (activeUserIdRef.current !== userId) return;
       if (result.status === 'pending') {
-        Alert.alert('Sent for review', 'ReferralFit will review this listing before it appears in the shared directory. It stays in your list either way.');
+        Alert.alert('Sent for review', 'ReferralFit will review this listing before it appears in the shared directory. It stays in your list either way, and your relationship notes are not shared.');
       } else {
         Alert.alert('Already in the directory', 'This one was already listed, so your entry is now linked to that listing.');
       }
@@ -5174,12 +5174,12 @@ export default function App() {
                       {selectedPartner.directoryReviewNote ? (
                         <Text style={styles.noteText}>Note from ReferralFit: {selectedPartner.directoryReviewNote}</Text>
                       ) : null}
-                      <Text style={[styles.noteText, styles.directoryHint]}>It is still saved to your list. You can update it and submit it again.</Text>
+                      <Text style={[styles.noteText, styles.directoryHint]}>It is still saved to your list. You can update it and submit it again. Your relationship notes stay private.</Text>
                     </>
                   ) : null}
                   {missing.length === 0 ? (
                     <>
-                      {!declined ? <Text style={styles.noteText}>Saved to your list. ReferralFit reviews each submission before it appears in the shared directory.</Text> : null}
+                      {!declined ? <Text style={styles.noteText}>Saved to your list. ReferralFit reviews each submission before it appears in the shared directory. Your relationship notes stay private.</Text> : null}
                       <TouchableOpacity
                         accessibilityRole="button"
                         accessibilityLabel={declined ? 'Submit to directory again' : 'Submit to directory'}

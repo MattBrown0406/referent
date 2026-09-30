@@ -50,6 +50,12 @@ Things worth knowing:
   "$7,500 typical fee" instead of "$7,500/mo"); otherwise **Monthly cash
   cost**. No new column; matching still compares the number to a budget as
   before.
+- **Private notes are never published.** A partner's relationship note
+  (`partners.note`) stays in the practice's workspace. A submitted listing
+  starts with an empty public description (`global_partners.description`);
+  a platform admin, or the program once it claims the listing, can write one
+  later. The submitter's partner also records `note` in `local_overrides`,
+  so a later description edit never replaces their private note.
 - A submitted listing is never owned by the practice that submitted it
   (`owner_org_id` stays NULL, not "claimed"). A practice's *own* verified
   profile is the separate Workspace → *Your directory profile* path.
@@ -114,7 +120,8 @@ the server's rule); browsing and importing still do.
 2. Tap **Review submissions**. Each card leads with the type(s) — Inpatient,
    Interventionist, Therapist, and so on — then the organization, contact,
    phone, email, website, city/state, cost, insurance, which practice
-   submitted it, and when. Oldest first.
+   submitted it, and when. Oldest first. The practice's private notes are
+   not part of a submission, so there is normally no description to read.
 3. **Approve** → the listing becomes `active` and verified, and the
    submitter's partner shows "In the shared directory".
 4. **Reject** → optionally type a note for the practice, then **Reject
@@ -195,8 +202,10 @@ SELECT public.directory_missing_fields_message(
 -- expected: Add email and cost to submit this partner to the shared directory.
 
 -- 3. The new columns exist and nothing was marked rejected by the migration.
+--    pending_with_description should be 0; if not, see "Known limits".
 SELECT count(*) FILTER (WHERE directory_rejected_at IS NOT NULL) AS rejected_partners,
-       (SELECT count(*) FROM public.global_partners WHERE status = 'pending') AS pending_listings
+       (SELECT count(*) FROM public.global_partners WHERE status = 'pending') AS pending_listings,
+       (SELECT count(*) FROM public.global_partners WHERE status = 'pending' AND description <> '') AS pending_with_description
   FROM public.partners;
 -- expected: rejected_partners = 0; pending_listings = whatever was pending before
 ```
@@ -218,7 +227,18 @@ Directory's **Interventionists** filter after approval.
   up, pending or not.)
 - Listings that were already `pending` before this migration appear in the
   queue as they are. If one lacks required fields the card says "Still
-  missing: …"; approving is still your call.
+  missing: …"; approving is still your call. The old
+  `suggest_global_listing` also copied the partner's note into the listing's
+  description, so if a card shows **Public description**, read it before
+  approving — it would be shown to everyone. Clear it first with
+  `UPDATE public.global_partners SET description = '' WHERE id = '…';`
+  (No app screen ever called the old function, so there should be none.)
+- The seed workspace is different by earlier design: auto-publishing a
+  program copies that partner's note into the public description, and note
+  edits on a linked, unclaimed seed partner flow up to the listing. That
+  includes interventionists and therapists the seed workspace submits: the
+  listing starts with no description, but a later edit to the note in the
+  seed workspace becomes the public description. Not changed here.
 - A pending listing that someone has claimed (center account or workspace
   profile) cannot be rejected from the queue; use the claim tools in
   `docs/DIRECTORY_OWNERSHIP.md`.

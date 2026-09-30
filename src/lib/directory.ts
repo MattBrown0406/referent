@@ -204,7 +204,9 @@ export async function toggleFavorite(target: FavoriteTarget, id: string): Promis
 // or a therapist; ReferralFit (a platform admin) reviews it before it appears
 // in the shared directory. The server refuses an incomplete partner — see
 // src/lib/directory-submission.ts for the rule the app mirrors — and a
-// declined one simply stays in the practice's list. A submitted listing is
+// declined one simply stays in the practice's list. The practice's private
+// relationship note is never published (the listing starts with no
+// description) and is never overwritten by the listing. A submitted listing is
 // never owned by the submitter; a practice's own profile is the separate
 // upsertOrgDirectoryProfile path below.
 
@@ -261,6 +263,8 @@ export type PendingDirectorySubmission = {
   insurance: string[];
   insuranceNetworks: Partial<Record<string, InsuranceNetworkPreference[]>>;
   therapies: string[];
+  // The listing's public description. A submission never copies the
+  // practice's private note, so this is normally empty.
   description: string;
   submittedAt: string;
   submittedByPractice: string;

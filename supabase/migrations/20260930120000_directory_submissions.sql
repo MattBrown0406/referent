@@ -22,6 +22,8 @@ BEGIN;
 --   * A rejected submission leaves the submitter's partner in their private
 --     list, unlinked, carrying the reviewer's note so they can fix and
 --     resubmit.
+--   * A submission never publishes the practice's private note: the listing
+--     starts with an empty description (see section 3).
 --
 -- What does not change: the platform seed workspace still auto-publishes its
 -- treatment PROGRAMS and only those (publish_partner_to_global and
@@ -217,7 +219,24 @@ COMMENT ON COLUMN public.partners.directory_rejected_at IS
 
 -- Identical to 20260916170000_fix_directory_platform_rpcs.sql except:
 --   * an incomplete partner is refused before anything is written;
---   * linking clears a previous rejection from the partner row.
+--   * linking clears a previous rejection from the partner row;
+--   * the partner's note is never published, and never overwritten.
+--     partners.note is the practice's PRIVATE relationship note (the app
+--     promises notes are never shared), while global_partners.description
+--     is shown on directory cards to every workspace. The earlier
+--     definition copied note into description; no screen called it, so
+--     nothing leaked, but this migration makes the path reachable. A new
+--     pending listing therefore starts with description = ''; a platform
+--     admin or a claimant can write a public description later.
+--     The other direction is closed too: propagate_global_partner_changes
+--     copies a listing's description into every linked partner's note
+--     unless 'note' is in that partner's local_overrides. Both link
+--     branches below record 'note' as a local override (the existing,
+--     sanctioned mechanism), so a later description edit cannot replace
+--     the submitter's private note. clear_partner_override('note') remains
+--     the deliberate way to adopt the listing's text.
+--     Imports (import_global_partner) and seed auto-publish
+--     (publish_partner_to_global) are not touched.
 -- Directory entitlement is still not required to submit.
 CREATE OR REPLACE FUNCTION public.suggest_global_listing(p_partner_id uuid)
 RETURNS uuid
@@ -280,6 +299,8 @@ BEGIN
        SET global_partner_id = v_existing,
            global_listing_status = g.status,
            global_synced_at = now(),
+           local_overrides = CASE WHEN 'note' = ANY (p.local_overrides) THEN p.local_overrides
+                                  ELSE array_append(p.local_overrides, 'note') END,
            directory_rejected_at = NULL,
            directory_review_note = ''
       FROM public.global_partners g
@@ -296,7 +317,7 @@ BEGIN
     v_partner.name, v_partner.organization, v_partner.types, v_partner.city, v_partner.state, v_partner.regions,
     v_partner.phone, v_partner.email, v_partner.website, v_partner.monthly_cost,
     v_partner.insurance, v_partner.insurance_networks, v_partner.therapies, v_partner.populations, v_partner.levels,
-    left(v_partner.note, 4000), 'pending', v_user, v_org
+    '', 'pending', v_user, v_org
   ) RETURNING id INTO v_new;
 
   PERFORM set_config('referralfit.syncing', 'on', true);
@@ -304,6 +325,8 @@ BEGIN
      SET global_partner_id = v_new,
          global_listing_status = 'pending',
          global_synced_at = now(),
+         local_overrides = CASE WHEN 'note' = ANY (local_overrides) THEN local_overrides
+                                ELSE array_append(local_overrides, 'note') END,
          directory_rejected_at = NULL,
          directory_review_note = ''
    WHERE id = p_partner_id;
@@ -323,6 +346,8 @@ GRANT EXECUTE ON FUNCTION public.suggest_global_listing(uuid) TO authenticated;
 -- only decides what the app displays; both functions below re-check it.
 
 -- Pending submissions, oldest first, with everything a reviewer needs.
+-- description is the listing's PUBLIC description (what directory cards
+-- would show); it is empty for anything submitted through this migration.
 -- missing_fields re-runs the completeness rule on the listing itself, so a
 -- listing that went pending before this rule existed is visible as such.
 CREATE OR REPLACE FUNCTION public.list_pending_global_listings()
