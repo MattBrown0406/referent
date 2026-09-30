@@ -91,14 +91,45 @@ the app never collects payment details.
 
 ## 3. Notes for the reviewer (App Review Information → Notes)
 
-> ReferralFit is a free B2B tool for addiction-intervention practices.
-> Accounts are provisioned by us for a practice's staff at no charge, so
-> there is no sign-up screen; please use the demo credentials above. The demo
-> workspace contains sample data (fictional families and programs) and has
-> access to every feature. Nothing is sold inside the app, there are no
-> subscriptions or in-app purchases, and there are no links to outside
-> purchase. Push notifications are local reminders (daily briefing,
-> follow-up cadence) and are optional.
+Current text for 1.0.3 (8). Fill in the demo password from App Store Connect;
+never write it here.
+
+> ReferralFit is a free B2B tool for addiction-intervention practices. It is
+> not offered to consumers or families. Nothing is sold in the app: no
+> subscriptions, in-app purchases, or links to outside purchase.
+>
+> DEMO ACCOUNT: use the credentials in App Review Information. The demo
+> workspace has sample data (fictional families and programs) and access to
+> every feature. Sign in on the first screen with that email and password.
+>
+> ACCOUNT CREATION: the sign-in screen also offers "Create account" (practice
+> name, your name, email, password). New accounts are free and get their own
+> private workspace immediately. "Forgot password?" sends a reset link that
+> opens the app.
+>
+> ACCOUNT DELETION (5.1.1(v)): Workspace tab → scroll to "Delete account…" →
+> two confirmations. This deletes the sign-in and, for a sole owner, the whole
+> workspace. Please do not delete the demo account; create a throwaway account
+> if you want to test deletion.
+>
+> SHARED DIRECTORY: the Directory tab lists treatment programs and
+> professionals. A practice can submit one of its own partners for review;
+> submissions are checked by ReferralFit staff before they appear. If you tap
+> "Submit to directory" in the demo account, it goes to our review queue and
+> is discarded.
+>
+> The "Square" and "PandaDoc" labels on a case are optional links to a
+> practice's own client invoices and agreements in tools it already uses.
+> They are not a way to pay ReferralFit, and the app never collects payment
+> details.
+>
+> Push notifications are local reminders (daily briefing, follow-up cadence)
+> and are optional.
+
+If email confirmation is turned on in Supabase before the review, add:
+
+> Creating an account sends a confirmation email; the demo account is already
+> confirmed and needs no email step.
 
 ## 4. What changed in the app for the resubmission
 
