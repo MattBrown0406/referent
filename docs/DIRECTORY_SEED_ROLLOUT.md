@@ -7,7 +7,9 @@ owner's workspace into the verified seed of the shared directory:
   `platform_admins`) is published as an `active`, verified `global_partners`
   listing, deduplicated by phone digits / website domain;
 - edits to those programs flow to the listing and from there to every
-  workspace that imported it;
+  workspace that imported it (since `20260930190000` the relationship note
+  is the exception: it never leaves the seed workspace, see "Seed notes are
+  private" below);
 - placeholder listings (rows nobody links to, nobody claimed, no claim code
   issued) are **deleted** the moment the migration runs, before the backfill.
 
@@ -183,9 +185,12 @@ workspace itself they show the "Imported" mark because they are linked.
 
 ## Day-to-day behaviour after rollout
 
-- Adding a program in the seed workspace publishes it immediately.
+- Adding a program in the seed workspace publishes it immediately. The
+  listing starts with an empty public description; the partner's
+  relationship note is not copied into it.
 - Editing a program there updates the listing; other workspaces receive the
-  change unless they overrode that field locally.
+  change unless they overrode that field locally. Editing its relationship
+  note changes nothing outside the workspace.
 - Deleting a program archives its listing only when no other workspace has
   imported it; otherwise the listing stays and only the seed link goes away.
 - Changing a program's type to Interventionist/Therapist only unlinks it
@@ -199,3 +204,117 @@ workspace itself they show the "Imported" mark because they are linked.
   claimant's edits flow down to the seed copy instead, deleting the seed copy
   never archives it, and adding a seed program that matches a claimed listing
   links the copy without overwriting the listing.
+
+## Seed notes are private (`20260930190000_seed_notes_private.sql`)
+
+Matt, 2026-09-30: "Make my partner notes private for sure."
+
+Until this migration, auto-publishing a seed program copied the partner's
+private relationship note (`partners.note`) into the listing's public
+description (`global_partners.description`), and later note edits were
+pushed up too. `20260930120000_directory_submissions.sql` had already
+closed this for every other workspace. Now the seed workspace works the same
+way:
+
+- A newly published listing starts with an empty description. Linking a seed
+  program to an existing listing leaves that listing's description alone.
+- Note edits in the seed workspace are never pushed to the listing. The seed
+  push path works from `seed_partner_pushed_fields()` (every synced field
+  except `note`). `global_partner_synced_fields()` is unchanged, so a
+  listing's description still flows down to workspaces that imported it,
+  and `clear_partner_override(partner, 'note')` still works for them.
+- Every linked seed partner records `note` in `local_overrides`, exactly like
+  a submission does, so a description written later by a claimant or an
+  admin never overwrites the private note. Already-linked seed partners are
+  backfilled (`seed_notes_private_protect()`).
+- One-time cleanup, `seed_notes_private_cleanup()`: for every listing linked
+  from a seed partner that is **not claimed** (no `owner_org_id`, no
+  `center_members` row) and whose description is byte-equal to
+  `left(partner.note, 4000)`, the description is set to `''`. Claimed
+  listings and descriptions that differ from the note (someone wrote them on
+  purpose) are never touched. The function returns the number of listings
+  cleared, runs the protect step first, and stays in the database so it can
+  be re-run (a second run returns 0).
+- That cleanup is an ordinary description edit as far as propagation goes:
+  a workspace that imported one of those listings and never edited its copy
+  of the note receives the empty text too, so the copied note leaves their
+  list as well. A workspace that edited its note keeps it.
+- Unchanged: `search_global_partners`, workspace profiles
+  (`upsert_org_directory_profile` keeps its deliberately public
+  description), claims, RLS, and every grant. Interventionist / Therapist
+  partners are still never auto-published.
+
+The migration is plain ASCII with no backslash escapes (it is pasted by hand
+from a chat client). The phone-digit and website-domain expressions moved
+into `directory_phone_digits(text)` and `directory_website_domain(text)`,
+proven equal to the originals in `supabase/tests/seed_notes_private_test.sql`.
+
+### Preview before applying
+
+Lists exactly the listings the cleanup will clear. Nothing is changed.
+
+```sql
+SELECT g.organization, g.name, left(g.description, 60) AS description_start
+  FROM public.global_partners g
+  JOIN public.partners p ON p.global_partner_id = g.id
+ WHERE public.org_is_platform_seed(p.org_id)
+   AND g.description <> ''
+   AND g.description = left(p.note, 4000)
+   AND NOT public.global_listing_is_claimed(g.id)
+ ORDER BY g.organization, g.name;
+```
+
+Read the list. The rule is "description byte-equal to the seed partner's
+note", which is what the old publish path produced. It cannot tell that
+apart from the one other way the two can be equal: a public description you
+wrote by hand (SQL editor) on an unclaimed listing, which the old propagation
+then copied down into your note. If a row here is one of those, note its
+text; after applying, write it back with
+`UPDATE public.global_partners SET description = '...' WHERE id = '...';`
+(your note is protected by then and will not change).
+
+### Apply
+
+Paste the whole of `supabase/migrations/20260930190000_seed_notes_private.sql`
+into the SQL editor and run it once. It is a single transaction. The final
+`NOTICE` reports both counts:
+
+```
+seed_notes_private: protected N linked seed partner note(s), cleared M auto-copied listing description(s)
+```
+
+Then record it:
+
+```sql
+INSERT INTO supabase_migrations.schema_migrations (version, name)
+VALUES ('20260930190000', 'seed_notes_private');
+```
+
+### Verify
+
+```sql
+-- 1. No unclaimed seed-linked listing still shows a copied note. Expected: 0
+SELECT count(*) AS remaining
+  FROM public.global_partners g
+  JOIN public.partners p ON p.global_partner_id = g.id
+ WHERE public.org_is_platform_seed(p.org_id)
+   AND g.description <> ''
+   AND g.description = left(p.note, 4000)
+   AND NOT public.global_listing_is_claimed(g.id);
+
+-- 2. Every linked seed partner protects its note. Expected: 0
+SELECT count(*) AS unprotected
+  FROM public.partners p
+ WHERE p.global_partner_id IS NOT NULL
+   AND public.org_is_platform_seed(p.org_id)
+   AND NOT ('note' = ANY (p.local_overrides));
+
+-- 3. The push list no longer carries note and the helpers arrived intact.
+--    Expected: false | example.org | 5415550100
+SELECT 'note' = ANY (public.seed_partner_pushed_fields()) AS note_is_pushed,
+       public.directory_website_domain('https://www.example.org/x') AS domain_check,
+       public.directory_phone_digits('(541) 555-0100') AS digits_check;
+```
+
+Re-running the cleanup later is safe: `SELECT public.seed_notes_private_cleanup();`
+returns 0 when there is nothing left to clear.

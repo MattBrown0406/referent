@@ -55,7 +55,9 @@ Things worth knowing:
   starts with an empty public description (`global_partners.description`);
   a platform admin, or the program once it claims the listing, can write one
   later. The submitter's partner also records `note` in `local_overrides`,
-  so a later description edit never replaces their private note.
+  so a later description edit never replaces their private note. Since
+  `20260930190000_seed_notes_private.sql` the seed workspace's auto-published
+  programs follow the same rule (see `docs/DIRECTORY_SEED_ROLLOUT.md`).
 - A submitted listing is never owned by the practice that submitted it
   (`owner_org_id` stays NULL, not "claimed"). A practice's *own* verified
   profile is the separate Workspace → *Your directory profile* path.
@@ -95,7 +97,9 @@ under its existing **Interventionists** and **Therapists** filter pills
 ## The seed workspace
 
 - Programs added in the platform seed workspace still publish on their own,
-  active and verified, complete or not. Nothing about that changed.
+  active and verified, complete or not. Nothing about that changed, except
+  that since `20260930190000` the seed partner's note is not copied into the
+  listing and note edits are not pushed up.
 - Interventionist / Therapist partners in the seed workspace are **never**
   published by a trigger and this migration publishes none of them. To list
   one: fill in the required fields, tap **Submit to directory** in partner
@@ -190,6 +194,15 @@ that contains the new screens ships (the current build never calls
    a chat client on 2026-09-30; a source fingerprint check caught it. When a
    migration has to travel through chat, prefer `chr()` over `E'...'` escapes
    and check the result with a behaviour query rather than trusting the paste.
+4. Then apply `supabase/migrations/20260930190000_seed_notes_private.sql`
+   (seed notes private; see `docs/DIRECTORY_SEED_ROLLOUT.md` for the preview
+   query to run first, the apply step, and the verification queries) and
+   record it:
+
+   ```sql
+   INSERT INTO supabase_migrations.schema_migrations (version, name)
+   VALUES ('20260930190000', 'seed_notes_private');
+   ```
 
 ## Verify
 
@@ -242,12 +255,12 @@ Directory's **Interventionists** filter after approval.
   approving — it would be shown to everyone. Clear it first with
   `UPDATE public.global_partners SET description = '' WHERE id = '…';`
   (No app screen ever called the old function, so there should be none.)
-- The seed workspace is different by earlier design: auto-publishing a
-  program copies that partner's note into the public description, and note
-  edits on a linked, unclaimed seed partner flow up to the listing. That
-  includes interventionists and therapists the seed workspace submits: the
-  listing starts with no description, but a later edit to the note in the
-  seed workspace becomes the public description. Not changed here.
+- The seed workspace used to be different by earlier design: auto-publishing
+  a program copied that partner's note into the public description, and note
+  edits on a linked, unclaimed seed partner flowed up to the listing
+  (including interventionists and therapists the seed workspace submitted).
+  `20260930190000_seed_notes_private.sql` ends that and cleans up what was
+  already copied; see `docs/DIRECTORY_SEED_ROLLOUT.md`.
 - A pending listing that someone has claimed (center account or workspace
   profile) cannot be rejected from the queue; use the claim tools in
   `docs/DIRECTORY_OWNERSHIP.md`.

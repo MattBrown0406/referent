@@ -62,14 +62,16 @@ SELECT ok(
   'the seed program is published and starts unclaimed'
 );
 
-UPDATE public.partners SET note = 'Seed edit while unclaimed' WHERE id = 'f1000000-0000-0000-0000-0000000000c1';
+UPDATE public.partners SET note = 'Seed edit while unclaimed', city = 'Sisters' WHERE id = 'f1000000-0000-0000-0000-0000000000c1';
 
+-- 20260930190000: the note stays private (description is never written from
+-- it) and is the one standing local override; other seed edits still push up.
 SELECT is(
-  (SELECT g.description || '|' || array_to_string(p.local_overrides, ',')
+  (SELECT g.description || '|' || g.city || '|' || array_to_string(p.local_overrides, ',')
      FROM public.partners p JOIN public.global_partners g ON g.id = p.global_partner_id
     WHERE p.id = 'f1000000-0000-0000-0000-0000000000c1'),
-  'Seed edit while unclaimed|',
-  'while unclaimed, seed edits still push up and are not local overrides'
+  '|Sisters|note',
+  'while unclaimed, seed edits still push up (except the private note) and are not local overrides'
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -146,8 +148,8 @@ SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-0000000000c1
 SELECT is(
   (SELECT note || '|' || city || '|' || array_to_string(local_overrides, ',')
      FROM public.partners WHERE id = 'f1000000-0000-0000-0000-0000000000c1'),
-  'Center-owned description|Redmond|',
-  'the center edit propagates down to the seed copy without creating overrides'
+  'Seed edit while unclaimed|Redmond|note',
+  'the center edit propagates down to the seed copy without creating overrides; the protected note is skipped'
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -168,7 +170,7 @@ SELECT is(
 SELECT is(
   (SELECT array_to_string(local_overrides, ',') || '|' || (global_partner_id IS NOT NULL)::text
      FROM public.partners WHERE id = 'f1000000-0000-0000-0000-0000000000c1'),
-  'types,note|true',
+  'note,types|true',
   'the seed copy records the edits as local overrides and stays linked despite the type change'
 );
 
