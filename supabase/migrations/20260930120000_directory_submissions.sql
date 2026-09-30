@@ -9,22 +9,31 @@ BEGIN;
 -- submitted, allow it to be sent to me, the admin, for approval. If someone
 -- doesn't input all the data, only allow the program to be saved to their
 -- own personal list."
+-- Matt, same day: "Let's add categories for therapists and interventionists."
+-- So every partner type can be submitted — treatment programs and individual
+-- professionals alike — under the same required fields.
 --
 -- What changes:
 --   * suggest_global_listing() refuses an incomplete partner (ERRCODE 22023,
 --     message names the missing fields). Saving a partner is never affected:
---     the rule is checked only when a program is submitted.
+--     the rule is checked only when a partner is submitted.
 --   * list_pending_global_listings() / review_global_listing() give platform
 --     admins a review queue (there was no API-callable approval path before).
 --   * A rejected submission leaves the submitter's partner in their private
 --     list, unlinked, carrying the reviewer's note so they can fix and
 --     resubmit.
 --
--- What does not change: the platform seed workspace still auto-publishes
--- (publish_partner_to_global / partners_seed_publish are untouched and are
--- NOT subject to the completeness rule), dedupe by phone digits / website
--- domain, one linked copy per workspace, the verification guard, and every
--- RLS policy. A submitter can already read a listing it suggested
+-- What does not change: the platform seed workspace still auto-publishes its
+-- treatment PROGRAMS and only those (publish_partner_to_global and
+-- partner_is_directory_program are untouched, and auto-publish is NOT subject
+-- to the completeness rule). Its Interventionist / Therapist partners are
+-- never mass-published; the seed workspace submits them through this same
+-- flow and a platform admin approves them (see section 5 for the one trigger
+-- branch that had to learn about that). Also unchanged: dedupe by phone
+-- digits / website domain, one linked copy per workspace, the verification
+-- guard, workspace profiles (upsert_org_directory_profile) and claims, and
+-- every RLS policy. A submitted listing is never owned by its submitter:
+-- owner_org_id stays NULL. A submitter can already read a listing it suggested
 -- ("global_partners: suggester read own"), and the partner row carries the
 -- state the app shows (global_listing_status, directory_rejected_at,
 -- directory_review_note), so no policy is loosened here.
@@ -34,6 +43,7 @@ BEGIN;
 --   2. schema: review audit columns, rejection state on the partner row
 --   3. suggest_global_listing with the completeness check
 --   4. admin queue: list_pending_global_listings, review_global_listing
+--   5. seed workspace: a submitted individual stays linked when edited
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 1. Completeness rule
@@ -58,21 +68,21 @@ REVOKE ALL ON FUNCTION public.directory_text_is_blank(text) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.directory_text_is_blank(text) TO authenticated;
 
 -- Required fields in display order, with the plain-language label used in
--- "Add <label> to submit this program to the shared directory."
+-- "Add <label> to submit this partner to the shared directory."
 CREATE OR REPLACE FUNCTION public.directory_submission_field_labels()
 RETURNS TABLE (field text, label text)
 LANGUAGE sql IMMUTABLE
 AS $$
   VALUES
-    ('organization', 'program name'),
+    ('organization', 'organization name'),
     ('name', 'contact person'),
-    ('types', 'program type'),
+    ('types', 'partner type'),
     ('city', 'city'),
     ('state', 'state'),
     ('phone', '10-digit phone number'),
     ('email', 'email'),
     ('website', 'website'),
-    ('monthly_cost', 'monthly cost'),
+    ('monthly_cost', 'cost'),
     ('insurance', 'insurance or private pay')
 $$;
 REVOKE ALL ON FUNCTION public.directory_submission_field_labels() FROM PUBLIC, anon;
@@ -82,20 +92,23 @@ GRANT EXECUTE ON FUNCTION public.directory_submission_field_labels() TO authenti
 -- directory listing alike. Returns the keys of the missing fields in display
 -- order; an empty array means "directory-ready".
 --
---   organization  program name, not blank
+--   organization  program, practice, or organization name, not blank
 --   name          contact person, not blank
---   types         at least one PROGRAM type: Inpatient, IOP / PHP, Sober
---                 Living, Detox. Unlike partner_is_directory_program() (the
---                 seed auto-publish test) an untyped partner is NOT ready,
---                 and an Interventionist/Therapist-only partner never is.
+--   types         at least one of the six partner types: Inpatient, IOP /
+--                 PHP, Sober Living, Detox, Interventionist, Therapist.
+--                 Unlike partner_is_directory_program() (the seed
+--                 auto-publish test, programs only) an untyped partner is
+--                 NOT ready, and individual professionals ARE submittable.
 --   city, state   not blank
 --   phone         at least 10 digits
 --   email         looks like an address (something@something.tld)
 --   website       not blank
---   monthly_cost  greater than 0
+--   monthly_cost  greater than 0 (a program's monthly cost; an individual
+--                 professional's typical fee — same column)
 --   insurance     at least one entry in insurance or insurance_networks. The
 --                 partner form's "Private pay only" choice stores the
---                 existing 'Cash pay' entry, so it counts as answered.
+--                 existing 'Cash pay' entry, so it counts as answered (the
+--                 usual answer for an interventionist).
 -- Therapies, populations, levels, regions and the description stay optional.
 CREATE OR REPLACE FUNCTION public.directory_missing_fields(
   p_organization text,
@@ -117,7 +130,7 @@ AS $$
     FROM (VALUES
       (1, 'organization', public.directory_text_is_blank(p_organization)),
       (2, 'name', public.directory_text_is_blank(p_name)),
-      (3, 'types', NOT (coalesce(p_types, '{}'::text[]) && ARRAY['Inpatient', 'IOP / PHP', 'Sober Living', 'Detox']::text[])),
+      (3, 'types', NOT (coalesce(p_types, '{}'::text[]) && ARRAY['Inpatient', 'IOP / PHP', 'Sober Living', 'Detox', 'Interventionist', 'Therapist']::text[])),
       (4, 'city', public.directory_text_is_blank(p_city)),
       (5, 'state', public.directory_text_is_blank(p_state)),
       (6, 'phone', length(regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g')) < 10),
@@ -149,8 +162,8 @@ $$;
 REVOKE ALL ON FUNCTION public.partner_directory_missing_fields(public.partners) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.partner_directory_missing_fields(public.partners) TO authenticated;
 
--- "Add monthly cost and email to submit this program to the shared
--- directory." Same sentence the app builds from the same labels.
+-- "Add email and cost to submit this partner to the shared directory."
+-- Same sentence the app builds from the same labels.
 CREATE OR REPLACE FUNCTION public.directory_missing_fields_message(p_fields text[])
 RETURNS text
 LANGUAGE sql IMMUTABLE
@@ -167,7 +180,7 @@ AS $$
            ELSE 'Add ' || array_to_string(items[1:cardinality(items) - 1], ', ') || ', and ' || items[cardinality(items)]
          END
          || CASE WHEN coalesce(cardinality(items), 0) = 0 THEN ''
-                 ELSE ' to submit this program to the shared directory.' END
+                 ELSE ' to submit this partner to the shared directory.' END
     FROM labels
 $$;
 REVOKE ALL ON FUNCTION public.directory_missing_fields_message(text[]) FROM PUBLIC, anon;
@@ -239,7 +252,7 @@ BEGIN
     RAISE EXCEPTION '%', public.directory_missing_fields_message(v_missing)
       USING ERRCODE = '22023',
             DETAIL = 'missing: ' || array_to_string(v_missing, ','),
-            HINT = 'The program stays saved to your own list.';
+            HINT = 'The partner stays saved to your own list.';
   END IF;
 
   v_phone := regexp_replace(coalesce(v_partner.phone, ''), '\D', '', 'g');
@@ -363,7 +376,8 @@ $$;
 REVOKE ALL ON FUNCTION public.list_pending_global_listings() FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.list_pending_global_listings() TO authenticated;
 
--- Approve or decline one pending submission. Returns the listing's new
+-- Approve or decline one pending submission (a program or an individual
+-- professional). Returns the listing's new
 -- status ('active' or 'archived').
 --
 -- Approve: one UPDATE to status 'active' + verified_at now(). The caller is
@@ -429,7 +443,7 @@ BEGIN
   END IF;
 
   IF public.global_listing_is_claimed(p_global_id) THEN
-    RAISE EXCEPTION 'This listing has been claimed by its program and cannot be declined here' USING ERRCODE = '22023';
+    RAISE EXCEPTION 'This listing has been claimed by its owner and cannot be declined here' USING ERRCODE = '22023';
   END IF;
 
   PERFORM set_config('referralfit.syncing', 'on', true);
@@ -454,5 +468,96 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.review_global_listing(uuid, boolean, text) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.review_global_listing(uuid, boolean, text) TO authenticated;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 5. Seed workspace: a submitted individual professional stays linked
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- Auto-publish is unchanged: the seed workspace still publishes programs
+-- only (publish_partner_to_global and partner_is_directory_program are not
+-- touched), so its Interventionist / Therapist partners are never published
+-- by a trigger. They reach the directory the same way everyone else's do:
+-- Submit, then a platform admin approves.
+--
+-- That exposed one branch of partners_seed_publish. On UPDATE of a linked,
+-- unclaimed seed partner it unlinked the partner and retired the listing
+-- whenever the partner was not a program. That was written for "this edit
+-- just stopped it being a program", but it also fired on ANY later edit of
+-- an individual the seed workspace had submitted and an admin had approved:
+-- fixing a phone number would unlink it and archive its listing. The branch
+-- now runs only when the edit itself changed a program into a non-program.
+-- A partner that already was an individual falls through to the normal
+-- path: the seed copy is the source of truth for an unclaimed listing, so
+-- the edit is pushed up (and on to every linked copy), exactly as for
+-- programs. Everything else is identical to
+-- 20260928170000_claimed_listings_authoritative.sql.
+CREATE OR REPLACE FUNCTION public.partners_seed_publish()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_old jsonb;
+  v_new jsonb;
+  v_field text;
+  v_changed text[] := '{}';
+  v_prev text := coalesce(current_setting('referralfit.syncing', true), '');
+BEGIN
+  IF current_setting('referralfit.syncing', true) = 'on' THEN
+    RETURN NULL;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.global_partner_id IS NOT NULL AND public.org_is_platform_seed(OLD.org_id) THEN
+      PERFORM public.retire_orphaned_global_listing(OLD.global_partner_id);
+    END IF;
+    RETURN NULL;
+  END IF;
+
+  IF NOT public.org_is_platform_seed(NEW.org_id) THEN
+    RETURN NULL;
+  END IF;
+
+  BEGIN
+    IF TG_OP = 'INSERT' OR NEW.global_partner_id IS NULL THEN
+      PERFORM public.publish_partner_to_global(NEW.id);
+      RETURN NULL;
+    END IF;
+
+    IF public.global_listing_is_claimed(NEW.global_partner_id) THEN
+      RETURN NULL;
+    END IF;
+
+    -- Only when this edit is what turned a program into a non-program. A
+    -- partner that already was an individual professional is linked because
+    -- it was submitted (or imported), so its edits push up like any other.
+    IF NOT public.partner_is_directory_program(NEW.types)
+       AND public.partner_is_directory_program(OLD.types) THEN
+      PERFORM set_config('referralfit.syncing', 'on', true);
+      UPDATE public.partners
+         SET global_partner_id = NULL, local_overrides = '{}'
+       WHERE id = NEW.id;
+      PERFORM set_config('referralfit.syncing', v_prev, true);
+      PERFORM public.retire_orphaned_global_listing(NEW.global_partner_id);
+      RETURN NULL;
+    END IF;
+
+    v_old := to_jsonb(OLD);
+    v_new := to_jsonb(NEW);
+    FOREACH v_field IN ARRAY public.global_partner_synced_fields() LOOP
+      IF v_new -> v_field IS DISTINCT FROM v_old -> v_field THEN
+        v_changed := array_append(v_changed, v_field);
+      END IF;
+    END LOOP;
+    PERFORM public.push_seed_partner_fields(NEW, v_changed);
+  EXCEPTION WHEN OTHERS THEN
+    PERFORM set_config('referralfit.syncing', v_prev, true);
+    RAISE WARNING 'seed directory publish skipped for partner % (%): %', NEW.id, SQLSTATE, SQLERRM;
+  END;
+  RETURN NULL;
+END
+$$;
+REVOKE ALL ON FUNCTION public.partners_seed_publish() FROM PUBLIC, anon, authenticated;
 
 COMMIT;

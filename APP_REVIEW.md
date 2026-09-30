@@ -22,8 +22,8 @@ every screen.
    workspace that has any other member.
 3. **Sign in once yourself** on a device with those credentials and tap
    through Today, Partners, Matching, Cases, Business, Directory, Workspace.
-   The sample programs are complete, so partner detail shows **Submit to
-   directory**. If a reviewer taps it, an `example.com` program lands in
+   The sample partners are complete, so partner detail shows **Submit to
+   directory**. If a reviewer taps it, an `example.com` listing lands in
    Workspace → *Directory submissions*; reject it
    (`docs/DIRECTORY_SUBMISSIONS.md`).
 4. **App Store Connect → App Information → App Review Information.**

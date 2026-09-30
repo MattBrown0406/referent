@@ -19,7 +19,14 @@ assert.match(source, /deleteMatchProfile\(item\.id, activeUserId\)/, 'removing a
 assert.match(source, /Existing case and referral records will not be deleted\./, 'the removal confirmation must explain what is and is not deleted');
 assert.match(source, /accessibilityLabel=\{`Remove \$\{item\.clientLabel\} from active referral matches`\}/, 'each active match must expose a clear accessible remove action');
 assert.match(source, /const stillCurrent = \(\) => active[\s\S]*activeUserIdRef\.current === userId/);
-assert.match(source, /label="MONTHLY CASH COST"/);
+// One cost field (no cash min/max). Its wording follows the partner's types:
+// "MONTHLY CASH COST" for programs, "TYPICAL FEE" for an interventionist or
+// therapist (src/lib/directory-submission.ts directoryCostLabel).
+assert.match(source, /label=\{directoryCostLabel\(partnerForm\.types\)\.toUpperCase\(\)\}/);
+assert.match(
+  await readFile(new URL('../src/lib/directory-submission.ts', import.meta.url), 'utf8'),
+  /isIndividualProfessional\(types\) \? 'Typical fee' : 'Monthly cash cost'/,
+);
 assert.doesNotMatch(source, /label="CASH MIN"|label="CASH MAX"/);
 assert.match(source, /accessibilityLabel=\{`\$\{plan\} \$\{status\}`\}/);
 assert.match(source, /insuranceNetworks: partnerForm\.insuranceNetworks/);

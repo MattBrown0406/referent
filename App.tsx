@@ -52,7 +52,7 @@ import { fetchCurrentOrgId } from './src/lib/org';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
 import { fetchOrgDirectoryProfile, submitPartnerToDirectory, upsertOrgDirectoryProfile, type OrgDirectoryProfile } from './src/lib/directory';
-import { directoryMissingFields, directoryMissingFieldsMessage, isDirectoryProgram, PRIVATE_PAY_ONLY } from './src/lib/directory-submission';
+import { directoryCostLabel, directoryMissingFields, directoryMissingFieldsMessage, isIndividualProfessional, PRIVATE_PAY_ONLY } from './src/lib/directory-submission';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
 import {
   type BusinessData,
@@ -3534,16 +3534,17 @@ export default function App() {
     );
   }
 
-  // Send one of the practice's own programs to ReferralFit for review. The
-  // server is the authority on completeness (suggest_global_listing); the
-  // button only shows when the mirrored rule says the program is ready.
+  // Send one of the practice's own partners — a program, an interventionist,
+  // or a therapist — to ReferralFit for review. The server is the authority
+  // on completeness (suggest_global_listing); the button only shows when the
+  // mirrored rule says the partner is ready.
   async function submitPartnerForDirectory(partner: Partner) {
     if (directorySubmitBusy) return;
     // A save still in flight may be the very partner being submitted, and the
     // server reviews its own copy — so queued edits have to land first.
     if (!mutationSlotAvailable('The directory submission')) return;
     if (queuedWrites > 0) {
-      Alert.alert('Still syncing', 'Your latest changes have not finished syncing yet. Submit this program once they are saved.');
+      Alert.alert('Still syncing', 'Your latest changes have not finished syncing yet. Submit this partner once they are saved.');
       return;
     }
     const userId = activeUserId;
@@ -3552,7 +3553,7 @@ export default function App() {
       const result = await submitPartnerToDirectory(partner.id);
       if (activeUserIdRef.current !== userId) return;
       if (!result.linked) {
-        Alert.alert('Already in your list', 'Another entry in your list is already linked to this program\'s directory listing, so this one stays in your list only.');
+        Alert.alert('Already in your list', 'Another entry in your list is already linked to this directory listing, so this one stays in your list only.');
         return;
       }
       const updated: Partner = {
@@ -3568,14 +3569,14 @@ export default function App() {
       await syncDerived({ partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards }).catch(() => undefined);
       if (activeUserIdRef.current !== userId) return;
       if (result.status === 'pending') {
-        Alert.alert('Sent for review', 'ReferralFit will review this program before it appears in the shared directory. It stays in your list either way.');
+        Alert.alert('Sent for review', 'ReferralFit will review this listing before it appears in the shared directory. It stays in your list either way.');
       } else {
-        Alert.alert('Already in the directory', 'This program was already listed, so your entry is now linked to that listing.');
+        Alert.alert('Already in the directory', 'This one was already listed, so your entry is now linked to that listing.');
       }
     } catch (error) {
       if (activeUserIdRef.current === userId) {
         Alert.alert('Not submitted yet', isNetworkError(error)
-          ? 'You appear to be offline. The program is saved to your list; submit it once you are connected.'
+          ? 'You appear to be offline. It is saved to your list; submit it once you are connected.'
           : (error as Error).message);
       }
     } finally {
@@ -4334,7 +4335,7 @@ export default function App() {
           <AppIcon name="globe-outline" size={20} color={COLORS.blue} />
           <View style={styles.globalDirectoryCopy}>
             <Text style={styles.globalDirectoryTitle}>ReferralFit Directory</Text>
-            <Text style={styles.globalDirectorySubtitle}>Verified programs, ready to add to your network</Text>
+            <Text style={styles.globalDirectorySubtitle}>Verified programs and professionals, ready to add to your network</Text>
           </View>
           <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
         </TouchableOpacity>
@@ -5117,7 +5118,7 @@ export default function App() {
 
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Placement details</Text>
-              <View style={styles.infoLine}><AppIcon name="wallet-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Monthly cash cost</Text><Text style={styles.infoValue}>{formatMoney(monthlyCostForPartner(selectedPartner))}</Text></View></View>
+              <View style={styles.infoLine}><AppIcon name="wallet-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>{directoryCostLabel(typesForPartner(selectedPartner))}</Text><Text style={styles.infoValue}>{formatMoney(monthlyCostForPartner(selectedPartner))}</Text></View></View>
               <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Insurance</Text><Text style={styles.infoValue}>{selectedPartner.insurance.filter((plan) => plan !== PRIVATE_PAY_ONLY).map((plan) => `${plan} (${networkCapabilitiesForPartner(selectedPartner, plan).map((status) => status === 'In-network' ? 'IN' : 'OON').join(' + ')})`).join(' · ') || (selectedPartner.insurance.includes(PRIVATE_PAY_ONLY) ? 'Private pay only' : 'Not recorded')}</Text></View></View>
               <View style={styles.infoLine}><AppIcon name="location-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Service area</Text><Text style={styles.infoValue}>{selectedPartner.regions.join(' · ')}</Text></View></View>
             </View>
@@ -5140,10 +5141,10 @@ export default function App() {
                     </View>
                     <Text style={styles.noteText}>
                       {status === 'pending'
-                        ? 'ReferralFit is reviewing this program. It will appear in the shared directory once it is approved, and it stays in your list either way.'
+                        ? 'ReferralFit is reviewing this listing. It will appear in the shared directory once it is approved, and it stays in your list either way.'
                         : status === 'archived'
-                          ? 'This program\'s directory listing is not active right now. It stays in your list.'
-                          : 'Other practices can find this program in the Directory.'}
+                          ? 'This directory listing is not active right now. It stays in your list.'
+                          : 'Other practices can find this listing in the Directory.'}
                     </Text>
                   </View>
                 );
@@ -5162,7 +5163,6 @@ export default function App() {
                 insurance: selectedPartner.insurance,
                 insuranceNetworks: selectedPartner.insuranceNetworks,
               });
-              const individualOnly = Boolean(selectedPartner.types?.length) && !isDirectoryProgram(selectedPartner.types);
               const declined = Boolean(selectedPartner.directoryRejectedAt);
               return (
                 <View style={styles.noteCard}>
@@ -5179,7 +5179,7 @@ export default function App() {
                   ) : null}
                   {missing.length === 0 ? (
                     <>
-                      {!declined ? <Text style={styles.noteText}>This program is saved to your list. ReferralFit reviews each program before it appears in the shared directory.</Text> : null}
+                      {!declined ? <Text style={styles.noteText}>Saved to your list. ReferralFit reviews each submission before it appears in the shared directory.</Text> : null}
                       <TouchableOpacity
                         accessibilityRole="button"
                         accessibilityLabel={declined ? 'Submit to directory again' : 'Submit to directory'}
@@ -5199,9 +5199,7 @@ export default function App() {
                         </View>
                       ) : null}
                       <Text style={[styles.noteText, declined && styles.directoryHint]}>
-                        {individualOnly
-                          ? 'The shared directory lists treatment programs — Inpatient, IOP / PHP, Sober Living, or Detox. This contact stays in your own list.'
-                          : directoryMissingFieldsMessage(missing)}
+                        {directoryMissingFieldsMessage(missing)}
                       </Text>
                     </>
                   )}
@@ -5358,7 +5356,7 @@ export default function App() {
               <FormField label="PHONE" value={orgProfileForm.phone} onChangeText={(phone) => setOrgProfileForm((current) => ({ ...current, phone }))} placeholder="Phone number" keyboardType="phone-pad" />
               <FormField label="EMAIL" value={orgProfileForm.email} onChangeText={(email) => setOrgProfileForm((current) => ({ ...current, email }))} placeholder="name@practice.com" keyboardType="email-address" />
               <FormField label="WEBSITE" value={orgProfileForm.website} onChangeText={(website) => setOrgProfileForm((current) => ({ ...current, website }))} placeholder="https://practice.com" keyboardType="url" />
-              <FormField label="MONTHLY CASH COST" value={orgProfileForm.monthlyCost} onChangeText={(monthlyCost) => setOrgProfileForm((current) => ({ ...current, monthlyCost }))} placeholder="$0 per month" keyboardType="number-pad" />
+              <FormField label={directoryCostLabel(orgProfileForm.types).toUpperCase()} value={orgProfileForm.monthlyCost} onChangeText={(monthlyCost) => setOrgProfileForm((current) => ({ ...current, monthlyCost }))} placeholder={isIndividualProfessional(orgProfileForm.types) ? '$0' : '$0 per month'} keyboardType="number-pad" />
               <MultiSelectDropdown
                 label="INSURANCES ACCEPTED"
                 values={orgProfileForm.insurance}
@@ -5483,7 +5481,7 @@ export default function App() {
               <FormField label="PHONE" value={partnerForm.phone} onChangeText={(phone) => setPartnerForm((current) => ({ ...current, phone }))} placeholder="Phone number" keyboardType="phone-pad" />
               <FormField label="EMAIL" value={partnerForm.email} onChangeText={(email) => setPartnerForm((current) => ({ ...current, email }))} placeholder="name@program.com" keyboardType="email-address" />
               <FormField label="WEBSITE" value={partnerForm.website} onChangeText={(website) => setPartnerForm((current) => ({ ...current, website }))} placeholder="https://program.com" keyboardType="url" />
-              <FormField label="MONTHLY CASH COST" value={partnerForm.monthlyCost} onChangeText={(monthlyCost) => setPartnerForm((current) => ({ ...current, monthlyCost }))} placeholder="$0 per month" keyboardType="number-pad" />
+              <FormField label={directoryCostLabel(partnerForm.types).toUpperCase()} value={partnerForm.monthlyCost} onChangeText={(monthlyCost) => setPartnerForm((current) => ({ ...current, monthlyCost }))} placeholder={isIndividualProfessional(partnerForm.types) ? '$0' : '$0 per month'} keyboardType="number-pad" />
               <MultiSelectDropdown
                 label="INSURANCES ACCEPTED"
                 values={partnerForm.insurance}
@@ -5675,7 +5673,7 @@ export default function App() {
                 Everything you add here — partners, cases, referrals, notes, and documents — belongs to your practice alone. Other practices using ReferralFit cannot see it, and it is never shared or sold.
               </Text>
               <Text style={styles.prePromptText}>
-                The only shared space is the Directory of treatment programs, and a program appears there only if you choose to submit it and ReferralFit approves it. Benchmarks use anonymized totals that never identify a practice.
+                The only shared space is the Directory of programs and professionals, and one of your partners appears there only if you choose to submit it and ReferralFit approves it. Benchmarks use anonymized totals that never identify a practice.
               </Text>
               <Text style={styles.prePromptText}>
                 ReferralFit is free to use. There is nothing to buy in this app and no charge to your practice.

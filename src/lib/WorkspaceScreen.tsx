@@ -373,7 +373,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 <View style={styles.memberRow}>
                   <View style={styles.memberInfo}>
                     <Text style={styles.memberName}>{pendingSubmissions === 0 ? 'Nothing waiting' : `${pendingSubmissions} waiting for review`}</Text>
-                    <Text style={styles.memberRole}>Programs practices submitted for the shared directory</Text>
+                    <Text style={styles.memberRole}>Programs and professionals that practices submitted for the shared directory</Text>
                   </View>
                   <View style={pendingSubmissions > 0 ? styles.planBadgeActive : styles.planBadge}>
                     <Text accessibilityLabel={`${pendingSubmissions} pending`} style={pendingSubmissions > 0 ? styles.planBadgeActiveText : styles.planBadgeText}>{pendingSubmissions}</Text>
@@ -392,7 +392,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 Everything in this workspace — partners, cases, referrals, notes, and documents — belongs to your practice alone. Other practices using ReferralFit cannot see it, and ReferralFit staff do not have access to it. Only people you invite with a code can join this workspace.
               </Text>
               <Text style={[styles.helpText, styles.helpTextSpaced]}>
-                The only shared space is the Directory: your own profile if you build one, and a program only when you choose to submit it and ReferralFit approves it. Benchmarks use anonymized totals and never identify a practice.
+                The only shared space is the Directory: your own profile if you build one, and one of your partners only when you choose to submit it and ReferralFit approves it. Benchmarks use anonymized totals and never identify a practice.
               </Text>
             </View>
 

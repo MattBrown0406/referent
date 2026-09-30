@@ -26,12 +26,15 @@ mkdirSync(tmpDir, { recursive: true });
 writeFileSync(path.join(tmpDir, 'directory-submission.js'), js);
 
 const {
+  DIRECTORY_LISTABLE_TYPES,
   DIRECTORY_SUBMISSION_FIELDS,
   PRIVATE_PAY_ONLY,
   directoryMissingFields,
   directoryMissingFieldsMessage,
+  directoryCostLabel,
   directoryTextIsBlank,
-  isDirectoryProgram,
+  hasDirectoryType,
+  isIndividualProfessional,
 } = require(path.join(tmpDir, 'directory-submission.js'));
 
 let failures = 0;
@@ -77,8 +80,10 @@ check('a network entry alone answers the insurance question', keys({
 }), []);
 check('a blank insurance entry does not', keys({ ...complete, insurance: [' '], insuranceNetworks: {} }), ['insurance']);
 check('no insurance answer at all', keys({ ...complete, insurance: [], insuranceNetworks: {} }), ['insurance']);
-check('Interventionist / Therapist only → program type missing', keys({ ...complete, types: ['Interventionist', 'Therapist'] }), ['types']);
-check('untyped partner → program type missing', keys({ ...complete, types: [] }), ['types']);
+check('a complete Interventionist is directory-ready', keys({ ...complete, types: ['Interventionist'], insurance: [PRIVATE_PAY_ONLY], insuranceNetworks: {} }), []);
+check('a complete Therapist is directory-ready', keys({ ...complete, types: ['Therapist'] }), []);
+check('untyped partner → partner type missing', keys({ ...complete, types: [] }), ['types']);
+check('unrecognised type → partner type missing', keys({ ...complete, types: ['Wizard'] }), ['types']);
 check('mixed types with one program type are fine', keys({ ...complete, types: ['Therapist', 'Sober Living'] }), []);
 check('monthly cost must be greater than zero', keys({ ...complete, monthlyCost: 0 }), ['monthly_cost']);
 check('phone with country code and punctuation', keys({ ...complete, phone: '+1 (541) 555-0142' }), []);
@@ -92,24 +97,30 @@ check("directoryTextIsBlank('—')", directoryTextIsBlank('—'), true);
 check("directoryTextIsBlank(' - ')", directoryTextIsBlank(' - '), true);
 check("directoryTextIsBlank('Winston-Salem')", directoryTextIsBlank('Winston-Salem'), false);
 check('directoryTextIsBlank(undefined)', directoryTextIsBlank(undefined), true);
-check("isDirectoryProgram(['IOP / PHP'])", isDirectoryProgram(['IOP / PHP']), true);
-check("isDirectoryProgram(['Therapist'])", isDirectoryProgram(['Therapist']), false);
-check('isDirectoryProgram(undefined)', isDirectoryProgram(undefined), false);
+check("hasDirectoryType(['IOP / PHP'])", hasDirectoryType(['IOP / PHP']), true);
+check("hasDirectoryType(['Therapist'])", hasDirectoryType(['Therapist']), true);
+check('hasDirectoryType(undefined)', hasDirectoryType(undefined), false);
+check("isIndividualProfessional(['Interventionist', 'Therapist'])", isIndividualProfessional(['Interventionist', 'Therapist']), true);
+check("isIndividualProfessional(['Therapist', 'Sober Living'])", isIndividualProfessional(['Therapist', 'Sober Living']), false);
+check('isIndividualProfessional([])', isIndividualProfessional([]), false);
+check("directoryCostLabel(['Interventionist'])", directoryCostLabel(['Interventionist']), 'Typical fee');
+check("directoryCostLabel(['Inpatient'])", directoryCostLabel(['Inpatient']), 'Monthly cash cost');
+check("directoryCostLabel(['Therapist', 'IOP / PHP'])", directoryCostLabel(['Therapist', 'IOP / PHP']), 'Monthly cash cost');
 
 console.log('\n— directoryMissingFieldsMessage (mirrors public.directory_missing_fields_message) —');
 const pick = (...wanted) => DIRECTORY_SUBMISSION_FIELDS.filter((field) => wanted.includes(field.key));
 check('nothing missing', directoryMissingFieldsMessage([]), '');
 check('one field', directoryMissingFieldsMessage(pick('types')),
-  'Add program type to submit this program to the shared directory.');
+  'Add partner type to submit this partner to the shared directory.');
 check('two fields', directoryMissingFieldsMessage(pick('email', 'monthly_cost')),
-  'Add email and monthly cost to submit this program to the shared directory.');
+  'Add email and cost to submit this partner to the shared directory.');
 check('three fields', directoryMissingFieldsMessage(pick('city', 'state', 'website')),
-  'Add city, state, and website to submit this program to the shared directory.');
+  'Add city, state, and website to submit this partner to the shared directory.');
 check('the sparse-program sentence the server raises',
   directoryMissingFieldsMessage(directoryMissingFields({
     organization: 'Halfway There House', name: 'Front Desk', types: ['Sober Living'], phone: '(541) 555-0101',
   })),
-  'Add city, state, email, website, monthly cost, and insurance or private pay to submit this program to the shared directory.');
+  'Add city, state, email, website, cost, and insurance or private pay to submit this partner to the shared directory.');
 
 console.log('\n— lockstep with the SQL definition —');
 // Latest migration that defines directory_submission_field_labels().
@@ -124,8 +135,8 @@ if (defining.length > 0) {
   const body = sql.slice(start, sql.indexOf('$$;', start));
   const sqlFields = [...body.matchAll(/\('([a-z_]+)',\s*'([^']+)'\)/g)].map((match) => ({ key: match[1], label: match[2] }));
   check(`keys and labels match ${defining[defining.length - 1]}`, sqlFields, DIRECTORY_SUBMISSION_FIELDS);
-  check('the SQL program-type list matches DIRECTORY_PROGRAM_TYPES',
-    sql.includes("ARRAY['Inpatient', 'IOP / PHP', 'Sober Living', 'Detox']::text[]"), true);
+  const typeList = `ARRAY[${DIRECTORY_LISTABLE_TYPES.map((type) => `'${type}'`).join(', ')}]::text[]`;
+  check('the SQL type list matches DIRECTORY_LISTABLE_TYPES', sql.includes(typeList), true);
 }
 
 console.log(failures === 0 ? '\nAll directory-submission checks passed.' : `\n${failures} directory-submission check(s) FAILED.`);

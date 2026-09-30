@@ -200,18 +200,21 @@ export async function toggleFavorite(target: FavoriteTarget, id: string): Promis
 }
 
 // ─── Directory submissions ───────────────────────────────────────────────────
-// A practice submits one of its own programs; ReferralFit (a platform admin)
-// reviews it before it appears in the shared directory. The server refuses
-// an incomplete program — see src/lib/directory-submission.ts for the rule
-// the app mirrors — and a declined one simply stays in the practice's list.
+// A practice submits one of its own partners — a program, an interventionist,
+// or a therapist; ReferralFit (a platform admin) reviews it before it appears
+// in the shared directory. The server refuses an incomplete partner — see
+// src/lib/directory-submission.ts for the rule the app mirrors — and a
+// declined one simply stays in the practice's list. A submitted listing is
+// never owned by the submitter; a practice's own profile is the separate
+// upsertOrgDirectoryProfile path below.
 
 export type DirectorySubmissionResult = {
   listingId: string;
   // False when another partner in this workspace already tracks the matching
   // listing (one linked copy per workspace): this one stays private.
   linked: boolean;
-  // 'pending' while waiting for review; 'active' when the program was
-  // already in the directory and this partner was linked to it.
+  // 'pending' while waiting for review; 'active' when it was already in the
+  // directory and this partner was linked to the existing listing.
   status: 'active' | 'pending' | 'archived';
 };
 
@@ -220,8 +223,8 @@ export async function submitPartnerToDirectory(partnerId: string): Promise<Direc
   if (error) {
     // P0002: the partner has not reached the server yet (still queued).
     const message = error.code === 'P0002'
-      ? 'This program has not finished saving yet. Give it a moment, then try again.'
-      : error.message || 'Could not submit this program.';
+      ? 'This partner has not finished saving yet. Give it a moment, then try again.'
+      : error.message || 'Could not submit this partner.';
     throw new StoreError(message, false);
   }
   const listingId = typeof data === 'string' ? data : String(data);
@@ -313,7 +316,7 @@ export async function fetchPendingDirectorySubmissions(): Promise<PendingDirecto
   }));
 }
 
-// Approve (the listing goes live, verified) or decline (the program stays in
+// Approve (the listing goes live, verified) or decline (the partner stays in
 // the submitter's own list, with the optional note).
 export async function reviewDirectorySubmission(listingId: string, approve: boolean, note?: string): Promise<void> {
   const { error } = await supabase.rpc('review_global_listing', {

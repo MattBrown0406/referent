@@ -2,15 +2,19 @@
 
 Migration `20260930120000_directory_submissions.sql` gives every practice a
 real path into the shared directory, with ReferralFit (a platform admin)
-approving each program first.
+approving each listing first.
 
-Product rule (Matt Brown, 2026-09-30): a program can be sent to the admin
+Product rule (Matt Brown, 2026-09-30): a partner can be sent to the admin
 only when **all** of its information is filled in. Until then it is simply
-saved to the practice's own list. Saving is never blocked.
+saved to the practice's own list. Saving is never blocked. The same day:
+"Let's add categories for therapists and interventionists" — so all six
+partner types can be submitted, programs and individual professionals alike.
 
-The platform seed workspace is unchanged: its programs still publish
-automatically (`docs/DIRECTORY_SEED_ROLLOUT.md`) and are not subject to this
-rule. Workspace profiles and claims are unchanged too
+The platform seed workspace's auto-publish is unchanged: its treatment
+**programs** still publish automatically (`docs/DIRECTORY_SEED_ROLLOUT.md`)
+and are not subject to this rule. Its interventionists and therapists are
+**not** published automatically; it submits them through this same flow (see
+"The seed workspace" below). Workspace profiles and claims are unchanged too
 (`docs/DIRECTORY_OWNERSHIP.md`).
 
 ## The rule
@@ -19,26 +23,36 @@ A partner is **directory-ready** when every line below holds.
 
 | Field | Requirement |
 | --- | --- |
-| Program name (`organization`) | not blank |
+| Organization name (`organization`) — program or practice | not blank |
 | Contact person (`name`) | not blank |
-| Program type (`types`) | at least one of Inpatient, IOP / PHP, Sober Living, Detox |
+| Partner type (`types`) | at least one of Inpatient, IOP / PHP, Sober Living, Detox, Interventionist, Therapist |
 | City, State | not blank (the form's `—` placeholder counts as blank) |
 | Phone | at least 10 digits |
 | Email | looks like an address (`name@domain.tld`) |
 | Website | not blank |
-| Monthly cost | greater than 0 |
+| Cost (`monthly_cost`) | greater than 0 |
 | Insurance | at least one plan, **or** "Private pay only" |
 
 Therapies, populations, levels, regions, and notes stay optional.
 
-Two consequences worth knowing:
+Things worth knowing:
 
-- An Interventionist- or Therapist-only partner cannot be submitted. The
-  directory lists programs; individual professionals are listed through
-  Workspace → *Your directory profile*.
+- An untyped partner is not ready. The partner form always requires a type,
+  so this only affects older or imported rows; opening and saving the
+  partner fixes it.
 - "Private pay only" is a checkbox in the partner form, shown when no
-  insurance plan is selected. It is stored as the existing `Cash pay`
-  insurance entry, which the rest of the app already treats as "no plan".
+  insurance plan is selected — the usual answer for an interventionist. It
+  is stored as the existing `Cash pay` insurance entry, which the rest of
+  the app already treats as "no plan".
+- Cost is one column for everyone. For a partner whose types are all
+  Interventionist / Therapist the app labels it **Typical fee** (form,
+  partner detail, review queue, and directory cards, which show
+  "$7,500 typical fee" instead of "$7,500/mo"); otherwise **Monthly cash
+  cost**. No new column; matching still compares the number to a budget as
+  before.
+- A submitted listing is never owned by the practice that submitted it
+  (`owner_org_id` stays NULL, not "claimed"). A practice's *own* verified
+  profile is the separate Workspace → *Your directory profile* path.
 
 The rule lives in two places that must stay in lockstep:
 
@@ -46,7 +60,7 @@ The rule lives in two places that must stay in lockstep:
   `partner_directory_missing_fields(partner)`,
   `directory_submission_field_labels()`, `directory_missing_fields_message(text[])`.
   `suggest_global_listing` raises `22023` with a sentence such as
-  *"Add email and monthly cost to submit this program to the shared directory."*
+  *"Add email and cost to submit this partner to the shared directory."*
 - TypeScript (what the app shows): `src/lib/directory-submission.ts`.
 
 `scripts/directory-submission-test.mjs` (part of `npm test`) reads the
@@ -62,11 +76,32 @@ Partner detail → **Shared directory**:
 | Ready | "Submit to directory", with a line saying ReferralFit reviews it first. |
 | Submitted | "Pending review". |
 | Approved | "In the shared directory". |
-| Not approved | "Not added to the directory", the reviewer's note, and "Submit again" once the program is ready. |
+| Not approved | "Not added to the directory", the reviewer's note, and "Submit again" once it is ready. |
 
-If the program is already in the directory (same phone digits or website
-domain), submitting links the partner to the existing listing instead of
-creating a duplicate — same as before.
+If the program or professional is already in the directory (same phone
+digits or website domain), submitting links the partner to the existing
+listing instead of creating a duplicate — same as before.
+
+Approved interventionists and therapists are found in the Directory screen
+under its existing **Interventionists** and **Therapists** filter pills
+(`search_global_partners` `p_types`), next to **Programs** and **All**.
+
+## The seed workspace
+
+- Programs added in the platform seed workspace still publish on their own,
+  active and verified, complete or not. Nothing about that changed.
+- Interventionist / Therapist partners in the seed workspace are **never**
+  published by a trigger and this migration publishes none of them. To list
+  one: fill in the required fields, tap **Submit to directory** in partner
+  detail, then approve it in Workspace → **Review submissions**.
+- One trigger branch changed to make that hold. `partners_seed_publish` used
+  to unlink a linked seed partner and retire its listing on *any* edit while
+  the partner was not a program. That was meant for "this edit just stopped
+  it being a program", but it would also have archived an approved
+  interventionist the first time its phone number was corrected. The branch
+  now runs only when the edit itself turns a program into a non-program.
+  Edits to an already-listed professional in the seed workspace flow up to
+  the listing, the same way program edits do.
 
 Submitting does not require the `directory` entitlement (that was already
 the server's rule); browsing and importing still do.
@@ -76,13 +111,14 @@ the server's rule); browsing and importing still do.
 1. Open **Workspace**. Platform admins see a **Directory submissions** card
    with the number waiting. Nobody else sees it, and the server refuses the
    queue to anyone who is not in `platform_admins`.
-2. Tap **Review submissions**. Each card shows the program, contact, phone,
-   email, website, city/state, types, monthly cost, insurance, which practice
+2. Tap **Review submissions**. Each card leads with the type(s) — Inpatient,
+   Interventionist, Therapist, and so on — then the organization, contact,
+   phone, email, website, city/state, cost, insurance, which practice
    submitted it, and when. Oldest first.
 3. **Approve** → the listing becomes `active` and verified, and the
    submitter's partner shows "In the shared directory".
 4. **Reject** → optionally type a note for the practice, then **Reject
-   submission**. Their program stays in their own list, unlinked, with your
+   submission**. Their partner stays in their own list, unlinked, with your
    note.
 
 ### What "rejected" means in the data
@@ -124,8 +160,9 @@ COMMIT;
 ## Apply the migration
 
 The migration is `supabase/migrations/20260930120000_directory_submissions.sql`.
-It adds nullable/defaulted columns and functions only; no existing row is
-rewritten and nothing is deleted. It is safe to apply before the app build
+It adds nullable/defaulted columns and functions, and replaces two existing
+functions (`suggest_global_listing`, `partners_seed_publish`); no existing
+row is rewritten, nothing is published, and nothing is deleted. It is safe to apply before the app build
 that contains the new screens ships (the current build never calls
 `suggest_global_listing`).
 
@@ -155,7 +192,7 @@ SELECT p.oid::regprocedure AS fn,
 SELECT public.directory_missing_fields_message(
          public.directory_missing_fields('Example Program', 'Front Desk', ARRAY['Inpatient'],
                                          'Bend', 'OR', '(541) 555-0100', '', 'example.org', 0, ARRAY['Cash pay'], '{}'::jsonb));
--- expected: Add email and monthly cost to submit this program to the shared directory.
+-- expected: Add email and cost to submit this partner to the shared directory.
 
 -- 3. The new columns exist and nothing was marked rejected by the migration.
 SELECT count(*) FILTER (WHERE directory_rejected_at IS NOT NULL) AS rejected_partners,
@@ -165,24 +202,34 @@ SELECT count(*) FILTER (WHERE directory_rejected_at IS NOT NULL) AS rejected_par
 ```
 
 End-to-end check on a device (needs the app build that includes this
-change): in an ordinary practice, open a program with a field missing and
+change): in an ordinary practice, open a partner with a field missing and
 confirm it says "Saved to your list only"; fill everything in, tap **Submit
 to directory**, and confirm "Pending review"; then sign in as the platform
 admin, open Workspace → **Review submissions**, and approve or reject it.
+Repeat once with an interventionist and confirm it appears under the
+Directory's **Interventionists** filter after approval.
 
 ## Known limits
 
-- The pending listing is a snapshot taken when the program is submitted.
+- The pending listing is a snapshot taken when the partner is submitted.
   Edits the practice makes while it is pending stay in their own copy; to
-  send corrected details they resubmit after a rejection.
+  send corrected details they resubmit after a rejection. (The seed
+  workspace is the exception: its edits to a linked, unclaimed listing flow
+  up, pending or not.)
 - Listings that were already `pending` before this migration appear in the
   queue as they are. If one lacks required fields the card says "Still
   missing: …"; approving is still your call.
-- A pending listing that a program has claimed (center account or workspace
+- A pending listing that someone has claimed (center account or workspace
   profile) cannot be rejected from the queue; use the claim tools in
   `docs/DIRECTORY_OWNERSHIP.md`.
+- The existing anti-hijack rule lets a workspace take over an **unclaimed**
+  listing it suggested when it later builds its own profile with the same
+  phone or website (`docs/DIRECTORY_OWNERSHIP.md`). That rule is unchanged,
+  and it now also covers third-party professionals a practice submitted.
+- The ranked-match budget check treats the cost number the same way for
+  every type; "Typical fee" is wording only.
 - The practice is not notified when a review happens; they see the outcome
   the next time the app refreshes their partners.
-- The App Review demo account's sample programs are complete, so a reviewer
-  can submit them. Those would land in the queue as `example.com` programs;
+- The App Review demo account's sample partners are complete, so a reviewer
+  can submit them. Those would land in the queue as `example.com` listings;
   reject them.

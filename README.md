@@ -39,16 +39,18 @@ to other intervention practices on recurring plans:
    to it. Interventionist- or therapist-only partners never auto-publish, and
    ordinary workspaces keep the suggest → pending flow. Rollout steps live in
    `docs/DIRECTORY_SEED_ROLLOUT.md`.
-   **Submissions:** an ordinary practice submits a program from partner
-   detail → *Shared directory* once it is directory-ready (program name,
-   contact, a program type, city/state, 10-digit phone, email, website,
-   monthly cost, insurance or private pay — `directory_missing_fields`,
-   mirrored in `src/lib/directory-submission.ts`). Anything less stays saved
-   to the practice's own list; saving is never blocked. Platform admins
-   review the queue from Workspace → *Directory submissions*
+   **Submissions:** a practice submits a partner of any type — program,
+   interventionist, or therapist — from partner detail → *Shared directory*
+   once it is directory-ready (organization name, contact, a type,
+   city/state, 10-digit phone, email, website, cost, insurance or private
+   pay — `directory_missing_fields`, mirrored in
+   `src/lib/directory-submission.ts`). Anything less stays saved to the
+   practice's own list; saving is never blocked. Platform admins review the
+   queue from Workspace → *Directory submissions*
    (`list_pending_global_listings`, `review_global_listing`); a rejected
-   program stays in the submitter's list with the reviewer's note. See
-   `docs/DIRECTORY_SUBMISSIONS.md`.
+   partner stays in the submitter's list with the reviewer's note. The seed
+   workspace's interventionists and therapists go through the same flow
+   (only its programs auto-publish). See `docs/DIRECTORY_SUBMISSIONS.md`.
    **Ownership:** once a listing is claimed — by a program in the center
    portal (`center_members`) or by a workspace as its own profile
    (`owner_org_id`) — it is authoritative regardless of who created it: the

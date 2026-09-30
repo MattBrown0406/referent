@@ -22,6 +22,7 @@ import {
   type GlobalPartner,
   type GlobalPartnerStats,
 } from './directory';
+import { isIndividualProfessional } from './directory-submission';
 import type { Partner } from '../data';
 
 type Props = {
@@ -90,7 +91,10 @@ function listingSubtitle(listing: GlobalPartner): string {
   const parts = [
     [listing.city, listing.state].filter(Boolean).join(', '),
     listing.levels.slice(0, 2).join(' · '),
-    listing.monthlyCost > 0 ? `$${listing.monthlyCost.toLocaleString()}/mo` : '',
+    // One cost column: a program's monthly cost, a professional's typical fee.
+    listing.monthlyCost > 0
+      ? `$${listing.monthlyCost.toLocaleString()}${isIndividualProfessional(listing.types) ? ' typical fee' : '/mo'}`
+      : '',
   ].filter(Boolean);
   return parts.join('  ·  ');
 }
@@ -215,7 +219,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
       })
       .catch((error) => {
         if (operationGeneration !== operationGenerationRef.current) return;
-        Alert.alert('Could not add program', (error as Error).message);
+        Alert.alert('Could not add to your network', (error as Error).message);
       })
       .finally(() => {
         if (operationGeneration === operationGenerationRef.current) setImportingId(null);
@@ -240,9 +244,9 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
           <View style={styles.centered}>
             <Text style={styles.teaserTitle}>A verified network, maintained for you</Text>
             <Text style={styles.teaserBody}>
-              The ReferralFit Directory is a continuously verified list of treatment programs —
-              levels of care, insurance panels, and admissions contacts — ready to add to your
-              network in one tap.
+              The ReferralFit Directory is a continuously verified list of treatment programs,
+              interventionists, and therapists — levels of care, insurance, and contacts — ready
+              to add to your network in one tap.
             </Text>
             <Text style={styles.teaserFootnote}>
               The Directory is not enabled for this workspace yet. Contact ReferralFit if you expected it.
@@ -304,8 +308,8 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
               {filtered.length === 0 ? (
                 <Text style={styles.emptyText}>
                   {listings.length === 0
-                    ? 'The directory is filling up — verified programs appear here as they are added.'
-                    : 'No programs match this search.'}
+                    ? 'The directory is filling up — verified programs and professionals appear here as they are added.'
+                    : 'Nothing matches this search.'}
                 </Text>
               ) : filtered.map((listing) => {
                 const imported = importedGlobalIds.has(listing.id);
@@ -372,7 +376,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                   onPress={loadMore}
                   style={styles.loadMore}
                 >
-                  {loadingMore ? <ActivityIndicator color={COLORS.blue} /> : <Text style={styles.loadMoreText}>Load more programs</Text>}
+                  {loadingMore ? <ActivityIndicator color={COLORS.blue} /> : <Text style={styles.loadMoreText}>Load more</Text>}
                 </TouchableOpacity>
               ) : null}
             </ScrollView>

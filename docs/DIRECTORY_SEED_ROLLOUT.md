@@ -16,7 +16,8 @@ suggest them, and suggestions still land as `pending`. (Since
 `20260930120000_directory_submissions.sql` a suggestion must be complete and
 is approved or rejected from the in-app review queue — see
 `docs/DIRECTORY_SUBMISSIONS.md`. Seed auto-publish is not subject to that
-rule.)
+rule, and still covers programs only: the seed workspace's interventionists
+and therapists are submitted and approved through that same queue.)
 
 The migration is idempotent. Re-running the cleanup and backfill functions
 publishes and deletes nothing new.

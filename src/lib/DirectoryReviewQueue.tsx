@@ -16,10 +16,10 @@ import {
   reviewDirectorySubmission,
   type PendingDirectorySubmission,
 } from './directory';
-import { DIRECTORY_SUBMISSION_FIELDS, PRIVATE_PAY_ONLY } from './directory-submission';
+import { DIRECTORY_SUBMISSION_FIELDS, PRIVATE_PAY_ONLY, directoryCostLabel } from './directory-submission';
 
-// Platform-admin review queue for programs practices submitted to the shared
-// directory. Rendered inside the Workspace sheet (no second modal). Showing
+// Platform-admin review queue for the programs and professionals practices
+// submitted to the shared directory. Rendered inside the Workspace sheet (no second modal). Showing
 // it is only a convenience: list_pending_global_listings and
 // review_global_listing both re-check platform-admin status on the server.
 
@@ -113,7 +113,7 @@ export default function DirectoryReviewQueue({ onBack, onCountChange }: Props) {
 
   function confirmApprove(item: PendingDirectorySubmission) {
     Alert.alert(
-      'Approve this program?',
+      'Approve this listing?',
       `${item.organization || item.name} will appear in the shared directory as a verified listing.`,
       [
         { text: 'Cancel', style: 'cancel' },
@@ -144,27 +144,32 @@ export default function DirectoryReviewQueue({ onBack, onCountChange }: Props) {
       ) : items.length === 0 ? (
         <View style={styles.centered}>
           <Text style={styles.emptyTitle}>Nothing waiting for review</Text>
-          <Text style={styles.helpText}>When a practice submits a complete program, it shows up here.</Text>
+          <Text style={styles.helpText}>When a practice submits a complete program or professional, it shows up here.</Text>
         </View>
       ) : (
         <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
           <Text style={styles.helpText}>
-            Oldest first. Approving publishes the program as a verified listing. Rejecting leaves it in the practice's own list and shows them your note.
+            Oldest first. Approving publishes it as a verified listing. Rejecting leaves it in the practice's own list and shows them your note.
           </Text>
           {items.map((item) => {
             const busy = busyId === item.id;
             const place = [item.city, item.state].filter(Boolean).join(', ');
             return (
               <View key={item.id} style={styles.card}>
+                <View style={styles.typeRow}>
+                  {(item.types.length ? item.types : ['No type']).map((type) => (
+                    <View key={type} style={styles.typePill}><Text style={styles.typePillText}>{type}</Text></View>
+                  ))}
+                </View>
                 <Text style={styles.orgName}>{item.organization || item.name}</Text>
-                <Text style={styles.subtle}>{[item.types.join(' · '), place].filter(Boolean).join('  ·  ')}</Text>
+                {place ? <Text style={styles.subtle}>{place}</Text> : null}
 
                 <View style={styles.fieldList}>
                   <Field label="Contact" value={item.name} />
                   <Field label="Phone" value={item.phone} />
                   <Field label="Email" value={item.email} />
                   <Field label="Website" value={item.website} />
-                  <Field label="Monthly cost" value={item.monthlyCost > 0 ? formatMoney(item.monthlyCost) : ''} />
+                  <Field label={directoryCostLabel(item.types)} value={item.monthlyCost > 0 ? formatMoney(item.monthlyCost) : ''} />
                   <Field label="Insurance" value={insuranceSummary(item)} />
                   {item.therapies.length ? <Field label="Specialties" value={item.therapies.join(' · ')} /> : null}
                   {item.description ? <Field label="Notes" value={item.description} /> : null}
@@ -183,7 +188,7 @@ export default function DirectoryReviewQueue({ onBack, onCountChange }: Props) {
                       style={styles.noteInput}
                       value={rejectNote}
                       onChangeText={setRejectNote}
-                      placeholder="Optional note for the practice — what would help this program get listed?"
+                      placeholder="Optional note for the practice — what would help this get listed?"
                       placeholderTextColor={COLORS.gray}
                       accessibilityLabel="Note for the practice"
                       multiline
@@ -256,6 +261,9 @@ const styles = StyleSheet.create({
     padding: 16,
     gap: 10,
   },
+  typeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  typePill: { backgroundColor: COLORS.blueSoft, borderRadius: 999, paddingVertical: 4, paddingHorizontal: 10 },
+  typePillText: { fontSize: 13, fontWeight: '700', color: COLORS.blue },
   orgName: { fontSize: 18, fontWeight: '700', color: COLORS.ink },
   subtle: { fontSize: 13, color: COLORS.gray },
   fieldList: { gap: 8, marginTop: 2 },

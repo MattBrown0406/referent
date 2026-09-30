@@ -1,6 +1,7 @@
-// The "directory-ready" rule: what a program needs before a practice can
-// submit it to the shared directory for ReferralFit's review. Until then it
-// is simply saved to the practice's own list — saving is never blocked.
+// The "directory-ready" rule: what a partner — a treatment program, an
+// interventionist, or a therapist — needs before a practice can submit it to
+// the shared directory for ReferralFit's review. Until then it is simply
+// saved to the practice's own list — saving is never blocked.
 //
 // Pure functions, no React/Supabase imports — unit-testable in plain node
 // (scripts/directory-submission-test.mjs).
@@ -8,14 +9,18 @@
 // KEEP IN LOCKSTEP with supabase/migrations/20260930120000_directory_submissions.sql
 // (directory_text_is_blank, directory_submission_field_labels,
 // directory_missing_fields, directory_missing_fields_message). The server is
-// the authority — suggest_global_listing refuses an incomplete program — and
+// the authority — suggest_global_listing refuses an incomplete partner — and
 // this mirror only decides what the app shows. The field keys, their order,
 // their labels, and each test below have a line-for-line twin there; the node
 // test reads the migration and fails when the key/label list drifts.
 
-// Program types the shared directory lists. Interventionists and therapists
-// are individual professionals and are not submitted as programs.
-export const DIRECTORY_PROGRAM_TYPES: readonly string[] = ['Inpatient', 'IOP / PHP', 'Sober Living', 'Detox'];
+// Every partner type can be submitted: treatment programs and individual
+// professionals alike. (Only programs auto-publish from the seed workspace;
+// that is a separate server rule, partner_is_directory_program.)
+export const DIRECTORY_LISTABLE_TYPES: readonly string[] = ['Inpatient', 'IOP / PHP', 'Sober Living', 'Detox', 'Interventionist', 'Therapist'];
+
+// Individual professionals, as opposed to programs.
+export const INDIVIDUAL_PROFESSIONAL_TYPES: readonly string[] = ['Interventionist', 'Therapist'];
 
 // The partner form's "Private pay only" choice is stored as this existing
 // insurance entry, which the rest of the app already treats as "no plan".
@@ -36,17 +41,17 @@ export type DirectorySubmissionFieldKey =
 export type DirectorySubmissionField = { key: DirectorySubmissionFieldKey; label: string };
 
 // Required fields in display order, with the plain-language label used in
-// "Add <label> to submit this program to the shared directory."
+// "Add <label> to submit this partner to the shared directory."
 export const DIRECTORY_SUBMISSION_FIELDS: readonly DirectorySubmissionField[] = [
-  { key: 'organization', label: 'program name' },
+  { key: 'organization', label: 'organization name' },
   { key: 'name', label: 'contact person' },
-  { key: 'types', label: 'program type' },
+  { key: 'types', label: 'partner type' },
   { key: 'city', label: 'city' },
   { key: 'state', label: 'state' },
   { key: 'phone', label: '10-digit phone number' },
   { key: 'email', label: 'email' },
   { key: 'website', label: 'website' },
-  { key: 'monthly_cost', label: 'monthly cost' },
+  { key: 'monthly_cost', label: 'cost' },
   { key: 'insurance', label: 'insurance or private pay' },
 ];
 
@@ -72,21 +77,35 @@ export function directoryTextIsBlank(value: string | null | undefined): boolean 
   return (value ?? '').replace(/^[ \t\n\r—–-]+|[ \t\n\r—–-]+$/g, '') === '';
 }
 
-export function isDirectoryProgram(types: readonly string[] | null | undefined): boolean {
-  return (types ?? []).some((type) => DIRECTORY_PROGRAM_TYPES.includes(type));
+export function hasDirectoryType(types: readonly string[] | null | undefined): boolean {
+  return (types ?? []).some((type) => DIRECTORY_LISTABLE_TYPES.includes(type));
+}
+
+// True when every type is an individual professional (and there is at least
+// one). Display-only: picks the wording for the cost field, which is one
+// column (monthly_cost) for programs and professionals alike.
+export function isIndividualProfessional(types: readonly string[] | null | undefined): boolean {
+  const list = types ?? [];
+  return list.length > 0 && list.every((type) => INDIVIDUAL_PROFESSIONAL_TYPES.includes(type));
+}
+
+// "Monthly cash cost" for a program, "Typical fee" for an interventionist or
+// therapist.
+export function directoryCostLabel(types: readonly string[] | null | undefined): string {
+  return isIndividualProfessional(types) ? 'Typical fee' : 'Monthly cash cost';
 }
 
 const EMAIL_PATTERN = /^[^@ \t\n\r]+@[^@ \t\n\r]+\.[^@ \t\n\r]+$/;
 
 // The missing required fields in display order; an empty list means the
-// program is directory-ready.
+// partner is directory-ready.
 export function directoryMissingFields(input: DirectorySubmissionInput): DirectorySubmissionField[] {
   const networks = input.insuranceNetworks;
   const missing: Record<DirectorySubmissionFieldKey, boolean> = {
     organization: directoryTextIsBlank(input.organization),
     name: directoryTextIsBlank(input.name),
     // Unlike the seed auto-publish test, an untyped partner is not ready.
-    types: !isDirectoryProgram(input.types),
+    types: !hasDirectoryType(input.types),
     city: directoryTextIsBlank(input.city),
     state: directoryTextIsBlank(input.state),
     phone: (input.phone ?? '').replace(/[^0-9]/g, '').length < 10,
@@ -101,8 +120,8 @@ export function directoryMissingFields(input: DirectorySubmissionInput): Directo
   return DIRECTORY_SUBMISSION_FIELDS.filter((field) => missing[field.key]);
 }
 
-// "Add monthly cost and email to submit this program to the shared
-// directory." Returns '' when nothing is missing. Same sentence the server
+// "Add email and cost to submit this partner to the shared directory."
+// Returns '' when nothing is missing. Same sentence the server
 // raises from suggest_global_listing.
 export function directoryMissingFieldsMessage(missing: readonly DirectorySubmissionField[]): string {
   const labels = missing.map((field) => field.label);
@@ -112,5 +131,5 @@ export function directoryMissingFieldsMessage(missing: readonly DirectorySubmiss
     : labels.length === 2
       ? `${labels[0]} and ${labels[1]}`
       : `${labels.slice(0, -1).join(', ')}, and ${labels[labels.length - 1]}`;
-  return `Add ${list} to submit this program to the shared directory.`;
+  return `Add ${list} to submit this partner to the shared directory.`;
 }

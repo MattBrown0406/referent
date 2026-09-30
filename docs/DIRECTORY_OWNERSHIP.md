@@ -8,9 +8,11 @@ professional, that becomes authoritative, regardless of who created it*, and
 *every new user can build a verified profile for themselves as they start to
 use the app*.
 
-How an ordinary practice gets one of its *programs* into the directory
-(complete the required fields, submit, admin review) is a separate flow:
-see `docs/DIRECTORY_SUBMISSIONS.md`.
+How a practice gets one of its *partners* — a program, an interventionist,
+or a therapist it works with — into the directory (complete the required
+fields, submit, admin review) is a separate flow: see
+`docs/DIRECTORY_SUBMISSIONS.md`. A submitted listing is never owned by the
+practice that submitted it.
 
 ## The model
 
