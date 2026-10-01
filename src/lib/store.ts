@@ -17,12 +17,17 @@ import { StoreError } from './errors';
 import { fetchAllPages } from './paging';
 import { supabase } from './supabase';
 import type {
+  ClientPopulation,
+  FinancialRelationship,
   InsuranceNetworkPreference,
+  LocationPreference,
   Partner,
   PartnerType,
+  PlacementReason,
   Referral,
   ReferralMatch,
 } from '../data';
+import type { PlacementCandidate } from './matching';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -96,6 +101,25 @@ export type PacketCaseEvent = {
   referralId?: string;
   contactId?: string;
   occurredAt: string;
+};
+
+/**
+ * Why a program was chosen from a match: the shortlist the clinician saw,
+ * with scores, the pick and its rank, and the reason when it was not the top
+ * result. Written right after the assignment (placement_decisions).
+ */
+export type PlacementDecision = {
+  id: string;
+  matchProfileId: string;
+  caseId?: string;
+  referralId?: string;
+  chosenPartnerId: string;
+  chosenRank: number;
+  reason?: PlacementReason;
+  reasonNote?: string;
+  candidates: PlacementCandidate[];
+  weights: Record<string, number>;
+  decidedAt: string;
 };
 
 export type HydrateResult = {
@@ -207,7 +231,8 @@ type QueueOp =
   | { kind: 'referral.assign_match'; referral: Record<string, unknown>; match: Record<string, unknown> }
   | { kind: 'packet.finalize'; referral: Record<string, unknown>; match: Record<string, unknown> | null; touch: Record<string, unknown>; followUp: Record<string, unknown>; event: Record<string, unknown> | null }
   | { kind: 'contact.log_activity'; event: Record<string, unknown> | null; touch: Record<string, unknown> | null }
-  | { kind: 'referral.update'; id: string; patch: Record<string, unknown> };
+  | { kind: 'referral.update'; id: string; patch: Record<string, unknown> }
+  | { kind: 'placement.insert'; row: Record<string, unknown> };
 
 type QueueEnvelope = { version: 2; userId: string; ops: QueueOp[] };
 let queueMutex: Promise<void> = Promise.resolve();
@@ -227,7 +252,7 @@ async function withQueueLock<T>(work: () => Promise<T>): Promise<T> {
 function isQueueOp(value: unknown): value is QueueOp {
   if (!value || typeof value !== 'object') return false;
   const op = value as { kind?: unknown; row?: unknown; id?: unknown; patch?: unknown; completed?: unknown; next?: unknown; event?: unknown; referralId?: unknown; outcome?: unknown; referral?: unknown; match?: unknown; caseId?: unknown; touch?: unknown; followUp?: unknown };
-  const insertKinds = ['partner.insert', 'referral.insert', 'match.insert', 'touch.insert', 'follow_up.insert'];
+  const insertKinds = ['partner.insert', 'referral.insert', 'match.insert', 'touch.insert', 'follow_up.insert', 'placement.insert'];
   const updateKinds = ['partner.update', 'match.update', 'follow_up.update', 'referral.update'];
   if (typeof op.kind !== 'string') return false;
   if (insertKinds.includes(op.kind)) return Boolean(op.row && typeof op.row === 'object');
@@ -376,6 +401,9 @@ async function applyQueueOp(op: QueueOp, userId: string, orgId: string): Promise
       break;
     case 'referral.update':
       ({ error } = await supabase.from('referrals').update(op.patch).eq('id', op.id).eq('org_id', orgId));
+      break;
+    case 'placement.insert':
+      ({ error } = await supabase.from('placement_decisions').upsert({ ...op.row, owner_id: userId }, { onConflict: 'id', ignoreDuplicates: true }));
       break;
   }
   if (error) throw error;
@@ -574,6 +602,10 @@ type PartnerRow = {
   global_listing_status?: string | null;
   directory_rejected_at?: string | null;
   directory_review_note?: string | null;
+  // Matching integrity (20261001130000). Private to the workspace; never
+  // part of any directory field list.
+  financial_relationship?: string | null;
+  financial_relationship_note?: string | null;
 };
 
 type ReferralRow = {
@@ -608,6 +640,10 @@ type MatchRow = {
   case_id: string | null; // v3 case-files linkage
   created_at: string;
   updated_at: string;
+  // Matching integrity (20261001130000)
+  must_have_therapies?: string[] | null;
+  population?: string | null;
+  location_preference?: string | null;
 };
 
 type TouchRow = {
@@ -713,7 +749,24 @@ function mapPartnerRow(row: PartnerRow, balance: BalanceRow | undefined): Partne
       : undefined,
     directoryRejectedAt: row.directory_rejected_at ?? undefined,
     directoryReviewNote: row.directory_review_note || undefined,
+    financialRelationship: sanitizeFinancialRelationship(row.financial_relationship),
+    financialRelationshipNote: row.financial_relationship_note || undefined,
   };
+}
+
+const financialRelationships = new Set<FinancialRelationship>(['none', 'consulting_fee', 'marketing_agreement', 'speaking_fee', 'shared_ownership', 'other']);
+function sanitizeFinancialRelationship(value: unknown): FinancialRelationship {
+  return typeof value === 'string' && financialRelationships.has(value as FinancialRelationship) ? (value as FinancialRelationship) : 'none';
+}
+
+const clientPopulationValues = new Set<ClientPopulation>(['Any', 'Men', 'Women', 'Adolescent']);
+function sanitizePopulation(value: unknown): ClientPopulation {
+  return typeof value === 'string' && clientPopulationValues.has(value as ClientPopulation) ? (value as ClientPopulation) : 'Any';
+}
+
+const locationPreferenceValues = new Set<LocationPreference>(['No preference', 'Close to family', 'Away from home']);
+function sanitizeLocationPreference(value: unknown): LocationPreference {
+  return typeof value === 'string' && locationPreferenceValues.has(value as LocationPreference) ? (value as LocationPreference) : 'No preference';
 }
 
 function mapReferralRow(row: ReferralRow): Referral {
@@ -745,6 +798,11 @@ function mapMatchRow(row: MatchRow): ReferralMatch {
     networkPreferences: (row.network_preferences || []) as InsuranceNetworkPreference[],
     maxBudget: row.max_budget ?? undefined,
     therapies: row.therapies || [],
+    // Rows from before 20261001130000 have no must-have list; leaving it
+    // undefined lets the matcher apply the defaults (MAT only).
+    mustHaveTherapies: Array.isArray(row.must_have_therapies) ? row.must_have_therapies : undefined,
+    population: sanitizePopulation(row.population),
+    locationPreference: sanitizeLocationPreference(row.location_preference),
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -828,6 +886,8 @@ function partnerToRow(partner: Partner): Record<string, unknown> {
     note: partner.note,
     favorite: Boolean(partner.favorite),
     touch_cadence_days: partner.touchCadenceDays ?? null,
+    financial_relationship: partner.financialRelationship || 'none',
+    financial_relationship_note: partner.financialRelationshipNote || '',
   };
 }
 
@@ -869,10 +929,29 @@ function matchToRow(match: ReferralMatch): Record<string, unknown> {
     network_preferences: match.networkPreferences || [],
     max_budget: match.maxBudget ?? null,
     therapies: match.therapies,
+    must_have_therapies: match.mustHaveTherapies ?? null,
+    population: match.population || 'Any',
+    location_preference: match.locationPreference || 'No preference',
     status: match.status,
     assigned_partner_id: safeId(match.assignedPartnerId),
     referral_id: safeId(match.referralId),
     case_id: safeId(match.caseId),
+  };
+}
+
+function placementToRow(decision: PlacementDecision): Record<string, unknown> {
+  return {
+    id: safeId(decision.id),
+    match_profile_id: safeId(decision.matchProfileId),
+    case_id: safeId(decision.caseId),
+    referral_id: safeId(decision.referralId),
+    chosen_partner_id: safeId(decision.chosenPartnerId),
+    chosen_rank: decision.chosenRank,
+    reason: decision.reason ?? null,
+    reason_note: decision.reasonNote ?? '',
+    candidates: decision.candidates.map((candidate) => ({ ...candidate, partnerId: safeId(candidate.partnerId) })),
+    weights: decision.weights,
+    decided_at: decision.decidedAt,
   };
 }
 
@@ -1347,6 +1426,17 @@ export async function assignMatchReferral(referral: Referral, match: ReferralMat
   const matchRow = matchToRow(match);
   await runOrQueue(expectedUserId, { kind: 'referral.assign_match', referral: referralRow, match: matchRow }, (userId) =>
     supabase.rpc('assign_match_referral', { p_expected_owner_id: userId, p_referral: referralRow, p_match: matchRow }));
+}
+
+// The placement record follows the assignment write (never precedes it): if
+// the assignment is rejected the record is not attempted, and offline both
+// queue FIFO so the referral lands first.
+export async function recordPlacementDecision(decision: PlacementDecision, expectedUserId: string): Promise<void> {
+  const row = placementToRow(decision);
+  await runOrQueue(expectedUserId, { kind: 'placement.insert', row }, (userId) =>
+    // Append-only on the server (insert + select policies): a retried op
+    // that already landed is a no-op, never an update.
+    supabase.from('placement_decisions').upsert({ ...row, owner_id: userId }, { onConflict: 'id', ignoreDuplicates: true }));
 }
 
 export async function finalizeMatchPacket(

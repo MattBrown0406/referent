@@ -1,5 +1,6 @@
-import { formatMoney, stateOptions } from '../data';
+import { financialRelationshipLabel, formatMoney, stateOptions } from '../data';
 import type { InsuranceNetworkPreference, Partner, ReferralMatch } from '../data';
+import { hasFinancialRelationship, type ProgramScore } from './matching';
 
 // ─── Match Packet generator ─────────────────────────────────────────────────
 // Pure text builder — no React, no Supabase, no side effects — so it can be
@@ -9,16 +10,36 @@ import type { InsuranceNetworkPreference, Partner, ReferralMatch } from '../data
 
 export type PacketAudience = 'family' | 'partner';
 
-// Concrete fit signals, computed by the caller from the SAME inputs the
-// matcher's useMemo already derives in App.tsx (network status, matched
-// therapies, eligibility dimensions). Keeping this as a plain input type
-// means the packet always reflects the actual match logic — no generic fluff.
-export type PacketFitInput = {
-  networkStatus: InsuranceNetworkPreference | null; // null when cash pay
-  matchedTherapies: string[]; // needs the partner actually serves
-  regionFit: boolean;
+// The fit signals come straight from the ranking (src/lib/matching.ts
+// scoreProgram), so the packet always says what the matcher actually found:
+// the same components, no generic fluff. Scores stay out of the text; the
+// packet is for a family, not a leaderboard.
+export type PacketFitInput = Pick<ProgramScore,
+  'networkStatus' | 'verifyBenefits' | 'requiredNeeds' | 'matchedNeeds' | 'regionFit' | 'sameState'
+> & {
   paymentFit: boolean;
+  locationPreference?: ReferralMatch['locationPreference'];
 };
+
+export function packetFitInput(score: ProgramScore, profile: Pick<ReferralMatch, 'locationPreference'>): PacketFitInput {
+  return {
+    networkStatus: score.networkStatus,
+    verifyBenefits: score.verifyBenefits,
+    requiredNeeds: score.requiredNeeds,
+    matchedNeeds: score.matchedNeeds,
+    regionFit: score.regionFit,
+    sameState: score.sameState,
+    paymentFit: !score.failedRequirements.includes('payment'),
+    locationPreference: profile.locationPreference,
+  };
+}
+
+// Plain disclosure wording. Needs healthcare counsel review before launch.
+export function disclosureLine(partner: Pick<Partner, 'financialRelationship' | 'financialRelationshipNote'>): string | null {
+  if (!hasFinancialRelationship(partner)) return null;
+  const note = partner.financialRelationshipNote?.trim();
+  return `Disclosure: our practice has a financial relationship with this program (${financialRelationshipLabel(partner.financialRelationship).toLowerCase()}${note ? `: ${note}` : ''}). It played no part in this recommendation, which is based on fit alone. You are free to choose any program.`;
+}
 
 // De-identification heuristic (per brief): two or more capitalized words
 // looks like a full name. Used to show a gentle inline reminder in the
@@ -55,10 +76,16 @@ export function buildFitReasons(matchProfile: ReferralMatch, partner: Partner, f
   } else if (fit.networkStatus === 'Out-of-network') {
     reasons.push(`Accepts ${matchProfile.insurance} out-of-network — verify benefits`);
   }
-  if (fit.regionFit && matchProfile.state !== 'ANY') {
-    reasons.push(`Serves ${stateName(matchProfile.state)}`);
+  if (fit.regionFit && matchProfile.state && matchProfile.state !== 'ANY') {
+    const preference = fit.locationPreference;
+    if (preference === 'Close to family' && fit.sameState) reasons.push(`In ${stateName(matchProfile.state)}, close to family`);
+    else if (preference === 'Away from home' && fit.sameState === false) reasons.push(`Outside ${stateName(matchProfile.state)}, away from home`);
+    else reasons.push(`Serves ${stateName(matchProfile.state)}`);
   }
-  for (const therapy of fit.matchedTherapies.slice(0, 2)) {
+  if (fit.requiredNeeds.length) {
+    reasons.push(`Provides ${fit.requiredNeeds.join(', ')} (required)`);
+  }
+  for (const therapy of fit.matchedNeeds.slice(0, 2)) {
     reasons.push(`Offers ${therapy}`);
   }
   return reasons.slice(0, 5);
@@ -78,7 +105,10 @@ export function buildPacket(matchProfile: ReferralMatch, partner: Partner, fitRe
     matchProfile.insurance === 'Cash pay' && matchProfile.maxBudget != null
       ? `- Budget: up to ${formatMoney(matchProfile.maxBudget)}`
       : '',
+    matchProfile.population && matchProfile.population !== 'Any' ? `- Client: ${matchProfile.population}` : '',
+    matchProfile.locationPreference && matchProfile.locationPreference !== 'No preference' ? `- Location preference: ${matchProfile.locationPreference}` : '',
     matchProfile.therapies.length ? `- Needs: ${matchProfile.therapies.join(', ')}` : '',
+    matchProfile.mustHaveTherapies?.length ? `- Must have: ${matchProfile.mustHaveTherapies.join(', ')}` : '',
   ].filter(Boolean);
 
   const programLines = [
@@ -93,14 +123,18 @@ export function buildPacket(matchProfile: ReferralMatch, partner: Partner, fitRe
 
   const whyLines = ['WHY THIS FITS', ...fitReasons.map((reason) => `- ${reason}`)];
 
+  // A financial relationship is always disclosed, in every audience's copy.
+  const disclosure = disclosureLine(partner);
+  const disclosureLines = disclosure ? ['', disclosure] : [];
+
   const partnerLead = [
     `Looking for placement for ${matchProfile.clientLabel}. Details below — does this look like a fit for your program?`,
     '',
   ];
 
   const body = audience === 'partner'
-    ? [header, '', ...partnerLead, ...criteriaLines, '', ...whyLines, '', ...programLines]
-    : [header, '', ...programLines, '', ...whyLines, '', ...criteriaLines];
+    ? [header, '', ...partnerLead, ...criteriaLines, '', ...whyLines, ...disclosureLines, '', ...programLines]
+    : [header, '', ...programLines, '', ...whyLines, ...disclosureLines, '', ...criteriaLines];
 
   return [...body, '', 'Sent via ReferralFit'].join('\n');
 }

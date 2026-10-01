@@ -31,6 +31,7 @@ execFileSync('mkdir', ['-p', tmpDir]);
 // self-contained, so we can load the real thing. packet.ts imports '../data'
 // — mirror that relative layout inside the temp dir (lib/packet.js → data.js).
 transpileTo('src/data.ts', 'data.js');
+transpileTo('src/lib/matching.ts', 'lib/matching.js');
 transpileTo('src/lib/packet.ts', 'lib/packet.js');
 
 const { buildFitReasons, buildPacket, labelLooksLikeFullName } = require(path.join(tmpDir, 'lib', 'packet.js'));
@@ -121,8 +122,22 @@ const profileCash = {
 
 // ─── 1. Family-audience packet (insurance fixture) ─────────────────────────
 
-const fitA = { networkStatus: 'In-network', matchedTherapies: ['Trauma', 'Dual diagnosis'], regionFit: true, paymentFit: true };
+// Fit inputs carry the ranker's components (src/lib/matching.ts scoreProgram).
+const fitA = { networkStatus: 'In-network', verifyBenefits: false, requiredNeeds: [], matchedNeeds: ['Trauma', 'Dual diagnosis'], regionFit: true, sameState: true, paymentFit: true, locationPreference: 'No preference' };
 const reasonsA = buildFitReasons(profileInsurance, partnerA, fitA);
+assert.deepEqual(reasonsA, ['Provides Inpatient level of care', 'In-network with Aetna', 'Serves Oregon', 'Offers Trauma', 'Offers Dual diagnosis']);
+// A must-have is named as required; close-to-family reads from the same state flag.
+const reasonsRequired = buildFitReasons({ ...profileInsurance, locationPreference: 'Close to family', mustHaveTherapies: ['MAT'] }, partnerA, { ...fitA, requiredNeeds: ['MAT'], locationPreference: 'Close to family' });
+assert.deepEqual(reasonsRequired, ['Provides Inpatient level of care', 'In-network with Aetna', 'In Oregon, close to family', 'Provides MAT (required)', 'Offers Trauma']);
+// A disclosed financial relationship is always in the packet, both audiences; none means no line.
+assert.ok(!buildPacket(profileInsurance, partnerA, reasonsA, 'family').includes('Disclosure:'));
+const disclosedPartner = { ...partnerA, financialRelationship: 'consulting_fee', financialRelationshipNote: 'quarterly training' };
+for (const audience of ['family', 'partner']) {
+  const text = buildPacket(profileInsurance, disclosedPartner, reasonsA, audience);
+  assert.ok(text.includes('Disclosure: our practice has a financial relationship with this program (consulting fee: quarterly training). It played no part in this recommendation'), `${audience} packet carries the disclosure`);
+}
+// Scores never appear in a packet.
+assert.ok(!/\b\d{1,3}\s*\/\s*100\b|fit score/i.test(buildPacket(profileInsurance, disclosedPartner, reasonsA, 'family')));
 console.log('═'.repeat(64));
 console.log('PACKET 1 — audience: FAMILY (insurance / in-network fixture)');
 console.log('═'.repeat(64));
@@ -137,7 +152,7 @@ console.log(buildPacket(profileInsurance, partnerA, reasonsA, 'partner'));
 
 // ─── 3. Cash-pay packet with budget (family audience) ──────────────────────
 
-const fitB = { networkStatus: null, matchedTherapies: ['Men only'], regionFit: true, paymentFit: true };
+const fitB = { networkStatus: null, verifyBenefits: false, requiredNeeds: ['Men only'], matchedNeeds: [], regionFit: true, sameState: true, paymentFit: true, locationPreference: 'No preference' };
 const reasonsB = buildFitReasons(profileCash, partnerB, fitB);
 assert(reasonsB.includes('Monthly cash cost is $2,400 — within the $2,500 budget'));
 assert(!reasonsB.some((reason) => reason.includes('starts at') || reason.includes('rates $')));
@@ -155,4 +170,5 @@ for (const label of ['J.R.', 'K.M. — Bend family', 'John Robinson', 'J.R. Port
 }
 
 unlinkSync(path.join(tmpDir, 'data.js'));
+unlinkSync(path.join(tmpDir, 'lib', 'matching.js'));
 unlinkSync(path.join(tmpDir, 'lib', 'packet.js'));

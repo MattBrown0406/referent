@@ -24,16 +24,25 @@ import {
 } from 'react-native';
 import type { Session } from '@supabase/supabase-js';
 import {
+  ClientPopulation,
+  clientPopulations,
+  FinancialRelationship,
+  financialRelationshipLabel,
+  financialRelationshipOptions,
   formatMoney,
   initialPartners,
   initialReferralMatches,
   initialReferrals,
   InsuranceNetworkPreference,
   insuranceProvidersForState,
+  LocationPreference,
+  locationPreferences,
   medicaidPlansByState,
   nationalInsuranceProviders,
   Partner,
   partnerTypes,
+  PlacementReason,
+  placementReasonOptions,
   Referral,
   ReferralDirection,
   ReferralMatch,
@@ -42,6 +51,22 @@ import {
   stateOptions,
   therapyOptions,
 } from './src/data';
+import {
+  defaultMustHaveNeeds,
+  hasFinancialRelationship,
+  isPopulationNeed,
+  monthlyCostForPartner,
+  networkCapabilitiesForPartner,
+  placementCandidates,
+  PlacementCandidate,
+  ProgramScore,
+  rankOfPartner,
+  rankPrograms,
+  scoreProgram,
+  scoringWeights,
+  trackRecordPrior,
+  typesForPartner,
+} from './src/lib/matching';
 import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
@@ -85,7 +110,9 @@ import {
   persistCache,
   persistCaseFile,
   persistCaseList,
+  PlacementDecision,
   readBoundWorkspace,
+  recordPlacementDecision,
   refreshSnapshot,
   saveMatchWithCase,
   Snapshot,
@@ -123,6 +150,7 @@ import {
   labelLooksLikeFullName,
   PacketAudience,
   PacketFitInput,
+  packetFitInput,
 } from './src/lib/packet';
 import * as ImagePicker from 'expo-image-picker';
 import { MAX_CACHED_EVENTS_PER_FILE } from './src/lib/case-cache';
@@ -346,6 +374,9 @@ type PartnerForm = {
   therapies: string[];
   note: string;
   touchCadence: string;
+  // Disclosed to families and shown on cards; never part of the ranking.
+  financialRelationship: FinancialRelationship;
+  financialRelationshipNote: string;
 };
 
 function localDateStamp() {
@@ -379,6 +410,8 @@ function makeEmptyPartnerForm(): PartnerForm {
   therapies: [],
   note: '',
   touchCadence: '',
+  financialRelationship: 'none',
+  financialRelationshipNote: '',
   };
 }
 
@@ -436,24 +469,21 @@ function orgProfileFormFromListing(profile: OrgDirectoryProfile): OrgProfileForm
   };
 }
 
-function typesForPartner(partner: Partner): Partner['type'][] {
-  if (partner.types?.length) return partner.types;
-  const legacyTypes = (partner.levels || []).filter((level): level is Partner['type'] => partnerTypes.includes(level as Partner['type']));
-  return legacyTypes.length ? legacyTypes : [partner.type];
-}
-
+// typesForPartner, monthlyCostForPartner and networkCapabilitiesForPartner
+// live in src/lib/matching.ts so the ranking and the UI read one definition.
 function partnerTypeLabel(partner: Partner) {
   return typesForPartner(partner).join(' · ');
 }
 
-function monthlyCostForPartner(partner: Partner): number {
-  return partner.monthlyCost ?? partner.cashMax ?? partner.cashMin ?? 0;
-}
-
-function networkCapabilitiesForPartner(partner: Partner, insurance: string): InsuranceNetworkPreference[] {
-  const explicit = partner.insuranceNetworks?.[insurance];
-  if (explicit?.length) return explicit;
-  return partner.insurance.includes(insurance) ? ['In-network'] : [];
+// Neutral activity line for partner cards and profiles: when, how many
+// received, how many sent. No tallies of who owes whom.
+function partnerActivityLine(partner: Partner, lastReferralOn?: string): string {
+  const parts = [
+    lastReferralOn ? `Last referral ${shortDate(lastReferralOn)}` : 'No referrals yet',
+    `${partner.inbound} received`,
+    `${partner.outbound} sent`,
+  ];
+  return parts.join(' · ');
 }
 
 function partnerShareMessage(partner: Partner) {
@@ -707,13 +737,14 @@ function PartnerCard({
   onPress,
   onShare,
   compact = false,
+  lastReferralOn,
 }: {
   partner: Partner;
   onPress: () => void;
   onShare?: () => void;
   compact?: boolean;
+  lastReferralOn?: string;
 }) {
-  const balance = partner.inbound - partner.outbound;
   const insurancePlanCount = partner.insurance.filter((plan) => plan !== 'Cash pay').length;
   return (
     <View style={[styles.partnerCard, compact && styles.partnerCardCompact]}>
@@ -739,10 +770,11 @@ function PartnerCard({
       </TouchableOpacity>
       {!compact ? (
         <View style={styles.partnerFooter}>
-            <Text style={styles.partnerFooterText}>{insurancePlanCount ? `${insurancePlanCount} insurance ${insurancePlanCount === 1 ? 'plan' : 'plans'}` : 'Cash pay only'}</Text>
-            <View style={[styles.balanceBadge, balance > 0 && styles.balanceBadgeWarm]}>
-              <AppIcon name={balance > 0 ? 'arrow-undo' : 'swap-horizontal'} size={13} color={balance > 0 ? COLORS.coral : COLORS.forest} />
-              <Text style={[styles.balanceText, balance > 0 && styles.balanceTextWarm]}>{balance > 0 ? `${balance} to return` : 'Balanced'}</Text>
+            <View style={{ flex: 1, flexShrink: 1 }}>
+              <Text style={styles.partnerFooterText}>{insurancePlanCount ? `${insurancePlanCount} insurance ${insurancePlanCount === 1 ? 'plan' : 'plans'}` : 'Cash pay only'} · {partnerActivityLine(partner, lastReferralOn)}</Text>
+              {hasFinancialRelationship(partner) ? (
+                <View style={[styles.disclosureBadge, { alignSelf: 'flex-start', marginTop: 6 }]}><AppIcon name="information-circle-outline" size={12} color={COLORS.coral} /><Text style={styles.disclosureBadgeText}>Disclosed relationship · {financialRelationshipLabel(partner.financialRelationship)}</Text></View>
+              ) : null}
             </View>
             {onShare ? (
               <TouchableOpacity accessibilityLabel={`Share ${partner.organization}`} accessibilityRole="button" onPress={onShare} style={styles.cardShareButton}>
@@ -940,6 +972,17 @@ export default function App() {
   const [matchState, setMatchState] = useState('ANY');
   const [matchBudget, setMatchBudget] = useState('');
   const [matchTherapies, setMatchTherapies] = useState<string[]>([]);
+  // Matching integrity: who the client is, where the family wants care, and
+  // which selected needs are must-haves (hide a program) versus preferred
+  // (score it). MAT is must-have by default when selected.
+  const [matchPopulation, setMatchPopulation] = useState<ClientPopulation>('Any');
+  const [matchLocationPreference, setMatchLocationPreference] = useState<LocationPreference>('No preference');
+  const [matchMustHave, setMatchMustHave] = useState<string[]>([]);
+  // The shortlist the clinician saw when they started an assignment, so the
+  // placement record can say what was shown and at what rank the pick sat.
+  const [pendingPlacement, setPendingPlacement] = useState<{ matchProfileId: string; rankedIds: string[]; candidates: PlacementCandidate[] } | null>(null);
+  const [placementReason, setPlacementReason] = useState<PlacementReason | null>(null);
+  const [placementReasonNote, setPlacementReasonNote] = useState('');
   const matchClientLabelRef = useRef<TextInput>(null);
   // Bind every mutation to the account from the render that initiated it. If
   // auth changes mid-flight, store.ts rejects the stale account ID.
@@ -1541,8 +1584,18 @@ export default function App() {
   const totals = useMemo(() => ({
     inbound: partners.reduce((sum, partner) => sum + partner.inbound, 0),
     outbound: partners.reduce((sum, partner) => sum + partner.outbound, 0),
-    reciprocal: partners.filter((partner) => partner.inbound > partner.outbound).length,
+    active: partners.filter((partner) => partner.inbound + partner.outbound > 0).length,
   }), [partners]);
+
+  // Most recent referral date per partner, either direction, for the neutral
+  // activity line on cards and profiles.
+  const lastReferralByPartner = useMemo(() => {
+    const latest: Record<string, string> = {};
+    for (const referral of referrals) {
+      if (!latest[referral.partnerId] || referral.date > latest[referral.partnerId]) latest[referral.partnerId] = referral.date;
+    }
+    return latest;
+  }, [referrals]);
 
   const directoryPartners = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -1585,57 +1638,33 @@ export default function App() {
     return Array.from(new Set([...plansForState, ...orgProfileForm.insurance.filter((plan) => plan !== 'Cash pay')]));
   }, [orgProfileForm.state, orgProfileForm.insurance]);
 
-  const matches = useMemo(() => {
-    const budget = Number(matchBudget) || Infinity;
-    return partners
-      .map((partner) => {
-        const typeFit = matchType === 'Any type' || typesForPartner(partner).includes(matchType as Partner['type']);
-        const networkCapabilities = matchInsurance === 'Cash pay' ? [] : networkCapabilitiesForPartner(partner, matchInsurance);
-        const isInNetwork = networkCapabilities.includes('In-network');
-        const isOutOfNetwork = networkCapabilities.includes('Out-of-network');
-        const paymentFit = matchInsurance === 'Cash pay'
-          ? monthlyCostForPartner(partner) <= budget
-          : (matchNetworkPreferences.includes('In-network') && isInNetwork)
-            || (matchNetworkPreferences.includes('Out-of-network') && isOutOfNetwork);
-        const matchNetworkStatus: InsuranceNetworkPreference | null = matchInsurance === 'Cash pay'
-          ? null
-          : isInNetwork && matchNetworkPreferences.includes('In-network')
-            ? 'In-network'
-            : isOutOfNetwork ? 'Out-of-network' : null;
-        const regionFit = matchState === 'ANY' || partner.state === matchState || partner.regions.includes('Nationwide');
-        const matchesNeed = (need: string) => {
-          if (need === 'Men only') return partner.therapies.includes(need) || (partner.populations.includes('Men') && !partner.populations.includes('Women'));
-          if (need === 'Women only') return partner.therapies.includes(need) || (partner.populations.includes('Women') && !partner.populations.includes('Men'));
-          if (need === 'LGBTQ+') return partner.therapies.includes(need) || partner.populations.includes('LGBTQ+');
-          if (need === 'Adolescent') return partner.therapies.includes(need) || partner.populations.some((population) => ['Adolescent', 'Adolescents', 'Teens'].includes(population));
-          return partner.therapies.includes(need);
-        };
-        const matchedTherapies = matchTherapies.filter(matchesNeed);
-        const clinicalCoverage = matchTherapies.length ? matchedTherapies.length / matchTherapies.length : 1;
-        const eligible = typeFit && paymentFit && regionFit && (matchTherapies.length === 0 || matchedTherapies.length > 0);
-        const clinicalScore = Math.round(62 + clinicalCoverage * 30 + (paymentFit ? 4 : 0) + (regionFit ? 4 : 0));
-        const reciprocity = partner.inbound - partner.outbound;
-        // The exact fit signals the Match Packet's "why this fits" section is
-        // generated from — same dimensions this memo already computes.
-        const fitInput: PacketFitInput = { networkStatus: matchNetworkStatus, matchedTherapies, regionFit, paymentFit };
-        const scorecard = scorecards[partner.id];
-        const avgFamilyExperience = scorecard?.avgFamilyExperience ?? null;
-        const decided = (scorecard?.admits || 0) + (scorecard?.nonAdmits || 0);
-        const admitRate = decided > 0 ? (scorecard?.admits || 0) / decided : null;
-        return { partner, matchedTherapies, clinicalScore: Math.min(clinicalScore, 100), reciprocity, eligible, networkStatus: matchNetworkStatus, fitInput, avgFamilyExperience, admitRate };
-      })
-      .filter((match) => match.eligible)
-      // Tie-break order after fit score (v1 scorecard change): average family
-      // experience, then admit rate, then the pre-existing reciprocity
-      // tie-breaker. Reciprocity stays — it just now comes after outcomes.
-      // nulls sort last within each tier.
-      .sort((a, b) =>
-        b.clinicalScore - a.clinicalScore
-        || (b.avgFamilyExperience ?? -1) - (a.avgFamilyExperience ?? -1)
-        || (b.admitRate ?? -1) - (a.admitRate ?? -1)
-        || b.reciprocity - a.reciprocity
-        || monthlyCostForPartner(a.partner) - monthlyCostForPartner(b.partner));
-  }, [partners, matchType, matchInsurance, matchNetworkPreferences, matchState, matchBudget, matchTherapies, scorecards]);
+  // The criteria as they stand in the form, in the shape the ranker and the
+  // packet read. A profile that is not saved yet ranks under a fixed draft
+  // id, so its tie rotation is stable while the clinician edits.
+  const draftMatchProfile = useMemo((): ReferralMatch => ({
+    id: selectedMatchId || 'draft',
+    clientLabel: matchClientLabel,
+    levelOfCare: matchType as ReferralMatch['levelOfCare'],
+    state: matchState,
+    insurance: matchInsurance,
+    networkPreferences: matchNetworkPreferences,
+    maxBudget: matchInsurance === 'Cash pay' && matchBudget.trim() ? Number(matchBudget) || undefined : undefined,
+    therapies: matchTherapies,
+    mustHaveTherapies: matchMustHave,
+    population: matchPopulation,
+    locationPreference: matchLocationPreference,
+    status: 'Matching',
+    createdAt: '',
+    updatedAt: '',
+  }), [selectedMatchId, matchClientLabel, matchType, matchState, matchInsurance, matchNetworkPreferences, matchBudget, matchTherapies, matchMustHave, matchPopulation, matchLocationPreference]);
+
+  // Hard requirements hide, the 0-100 score orders, cost then a seeded
+  // rotation breaks ties (src/lib/matching.ts). Referral counts are not an
+  // input: the ranker never reads inbound/outbound.
+  const matches = useMemo(
+    () => rankPrograms(draftMatchProfile, partners, scorecards),
+    [draftMatchProfile, partners, scorecards],
+  );
 
   const sortedReferrals = referrals
     .slice()
@@ -1669,6 +1698,23 @@ export default function App() {
     setMatchNetworkPreferences(referralMatch.networkPreferences?.length ? referralMatch.networkPreferences : ['In-network']);
     setMatchBudget(referralMatch.maxBudget ? String(referralMatch.maxBudget) : '');
     setMatchTherapies(referralMatch.therapies);
+    setMatchMustHave(referralMatch.mustHaveTherapies ?? defaultMustHaveNeeds(referralMatch.therapies));
+    setMatchPopulation(referralMatch.population || 'Any');
+    setMatchLocationPreference(referralMatch.locationPreference || 'No preference');
+  }
+
+  // Needs and must-haves move together: a need that leaves the selection
+  // leaves the must-have list, and a newly selected MAT starts as must-have.
+  function updateMatchTherapies(next: string[]) {
+    setMatchMustHave((current) => [
+      ...current.filter((need) => next.includes(need)),
+      ...defaultMustHaveNeeds(next.filter((need) => !matchTherapies.includes(need) && !current.includes(need))),
+    ]);
+    setMatchTherapies(next);
+  }
+
+  function toggleMustHave(need: string) {
+    setMatchMustHave((current) => (current.includes(need) ? current.filter((item) => item !== need) : [...current, need]));
   }
 
   function toggleMatchNetworkPreference(preference: InsuranceNetworkPreference) {
@@ -1688,6 +1734,9 @@ export default function App() {
     setMatchNetworkPreferences(['In-network']);
     setMatchBudget('');
     setMatchTherapies([]);
+    setMatchMustHave([]);
+    setMatchPopulation('Any');
+    setMatchLocationPreference('No preference');
     requestAnimationFrame(() => matchClientLabelRef.current?.focus());
   }
 
@@ -1755,6 +1804,9 @@ export default function App() {
       networkPreferences: matchNetworkPreferences,
       maxBudget: matchInsurance === 'Cash pay' && matchBudget.trim() ? Number(matchBudget) || undefined : undefined,
       therapies: matchTherapies,
+      mustHaveTherapies: matchMustHave.filter((need) => matchTherapies.includes(need)),
+      population: matchPopulation,
+      locationPreference: matchLocationPreference,
       status: existing?.status || 'Matching',
       createdAt: existing?.createdAt || now,
       updatedAt: now,
@@ -1794,6 +1846,9 @@ export default function App() {
   async function openMatchedReferral(partnerId: string) {
     const referralMatch = await saveCurrentReferralMatch();
     if (!referralMatch) return;
+    setPendingPlacement({ matchProfileId: referralMatch.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
+    setPlacementReason(null);
+    setPlacementReasonNote('');
     setActiveReferralMatchId(referralMatch.id);
     setReferralForm({
       ...emptyReferral,
@@ -1826,39 +1881,40 @@ export default function App() {
     return saveCurrentReferralMatch();
   }
 
-  // Build the PacketFitInput the pure generator expects, using the same
-  // formulas as the matches memo (they share PacketFitInput field names).
+  // The packet's "why this fits" comes from the same scoring the ranker ran
+  // (src/lib/matching.ts scoreProgram), so the two can never disagree.
   function fitInputForMatch(matchProfile: ReferralMatch, partner: Partner): PacketFitInput {
-    const capabilities = matchProfile.insurance === 'Cash pay' ? [] : networkCapabilitiesForPartner(partner, matchProfile.insurance);
-    const isInNetwork = capabilities.includes('In-network');
-    const isOutOfNetwork = capabilities.includes('Out-of-network');
-    const preferences = matchProfile.networkPreferences?.length ? matchProfile.networkPreferences : (['In-network'] as InsuranceNetworkPreference[]);
-    const paymentFit = matchProfile.insurance === 'Cash pay'
-      ? monthlyCostForPartner(partner) <= (matchProfile.maxBudget ?? Infinity)
-      : (preferences.includes('In-network') && isInNetwork)
-        || (preferences.includes('Out-of-network') && isOutOfNetwork);
-    const networkStatus: InsuranceNetworkPreference | null = matchProfile.insurance === 'Cash pay'
-      ? null
-      : isInNetwork && preferences.includes('In-network')
-        ? 'In-network'
-        : isOutOfNetwork ? 'Out-of-network' : null;
-    const regionFit = !matchProfile.state || matchProfile.state === 'ANY' || partner.state === matchProfile.state || partner.regions.includes('Nationwide');
-    const matchesNeed = (need: string) => {
-      if (need === 'Men only') return partner.therapies.includes(need) || (partner.populations.includes('Men') && !partner.populations.includes('Women'));
-      if (need === 'Women only') return partner.therapies.includes(need) || (partner.populations.includes('Women') && !partner.populations.includes('Men'));
-      if (need === 'LGBTQ+') return partner.therapies.includes(need) || partner.populations.includes('LGBTQ+');
-      if (need === 'Adolescent') return partner.therapies.includes(need) || partner.populations.some((population) => ['Adolescent', 'Adolescents', 'Teens'].includes(population));
-      return partner.therapies.includes(need);
-    };
-    return { networkStatus, matchedTherapies: matchProfile.therapies.filter(matchesNeed), regionFit, paymentFit };
+    const score = scoreProgram(matchProfile, partner, scorecards[partner.id], trackRecordPrior(scorecards));
+    return packetFitInput(score, matchProfile);
+  }
+
+  // A program with a disclosed financial relationship needs one more tap
+  // before it is assigned, in either flow. The wording is plain on purpose.
+  function confirmDisclosedRelationship(partner: Partner, proceed: () => void) {
+    if (!hasFinancialRelationship(partner)) {
+      proceed();
+      return;
+    }
+    Alert.alert(
+      'Disclosed relationship',
+      `${partner.organization} has a disclosed financial relationship with your practice (${financialRelationshipLabel(partner.financialRelationship).toLowerCase()}). It did not affect the ranking, and the family packet will say so. Continue with this program?`,
+      [
+        { text: 'Go back', style: 'cancel' },
+        { text: 'Continue', onPress: proceed },
+      ],
+    );
   }
 
   // From a recommended match card: the profile only gets assigned (status →
-  // Referred) if the packet is actually sent.
-  async function openPacketComposer(partner: Partner, fitInput: PacketFitInput) {
+  // Referred) if the packet is actually sent. The shortlist is captured now,
+  // while the card order the clinician saw is still on screen.
+  async function openPacketComposer(partner: Partner, score: ProgramScore) {
     const matchProfile = await currentOrSavedMatch();
     if (!matchProfile) return;
-    const reasons = buildFitReasons(matchProfile, partner, fitInput);
+    setPendingPlacement({ matchProfileId: matchProfile.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
+    setPlacementReason(null);
+    setPlacementReasonNote('');
+    const reasons = buildFitReasons(matchProfile, partner, packetFitInput(score, matchProfile));
     setPacketTarget({ partner, match: matchProfile, assignOnSend: true });
     setPacketAudience('family');
     setPacketText(buildPacket(matchProfile, partner, reasons, 'family'));
@@ -1881,10 +1937,43 @@ export default function App() {
   function switchPacketAudience(audience: PacketAudience) {
     if (!packetTarget) return;
     setPacketAudience(audience);
-    const fitInput = packetTarget.match.status === 'Referred'
-      ? fitInputForMatch(packetTarget.match, packetTarget.partner)
-      : matches.find((item) => item.partner.id === packetTarget.partner.id)?.fitInput || fitInputForMatch(packetTarget.match, packetTarget.partner);
+    const fitInput = fitInputForMatch(packetTarget.match, packetTarget.partner);
     setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput), audience));
+  }
+
+  // The placement record for an assignment made from a match: what was
+  // shown, what was picked, at what rank, and why when it was not the top.
+  function buildPlacementDecision(matchProfile: ReferralMatch, partner: Partner, referralId: string, now: Date): PlacementDecision | null {
+    const placement = pendingPlacement && pendingPlacement.matchProfileId === matchProfile.id
+      ? pendingPlacement
+      : { matchProfileId: matchProfile.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) };
+    const rank = rankOfPartner(placement.rankedIds.map((id) => ({ partner: { id } })), partner.id);
+    if (rank > 1 && !placementReason) return null;
+    return {
+      id: makeId('pd'),
+      matchProfileId: matchProfile.id,
+      caseId: matchProfile.caseId,
+      referralId,
+      chosenPartnerId: partner.id,
+      chosenRank: rank,
+      reason: rank > 1 ? placementReason || undefined : undefined,
+      reasonNote: rank > 1 ? placementReasonNote.trim() : '',
+      candidates: placement.candidates,
+      weights: scoringWeights(),
+      decidedAt: now.toISOString(),
+    };
+  }
+
+  function placementRankFor(matchProfileId: string, partnerId: string): number {
+    const placement = pendingPlacement && pendingPlacement.matchProfileId === matchProfileId ? pendingPlacement : null;
+    const rankedIds = placement ? placement.rankedIds : matches.map((item) => item.partner.id);
+    return rankOfPartner(rankedIds.map((id) => ({ partner: { id } })), partnerId);
+  }
+
+  function clearPendingPlacement() {
+    setPendingPlacement(null);
+    setPlacementReason(null);
+    setPlacementReasonNote('');
   }
 
   async function sharePacketText() {
@@ -1911,6 +2000,7 @@ export default function App() {
     setPacketTarget(null);
     setPacketSendConfirm(false);
     setPacketAudience('family');
+    clearPendingPlacement();
   }
 
   // Post-send automation ("the loop"): referral + touch + follow-up, all
@@ -1918,12 +2008,25 @@ export default function App() {
   // If the profile wasn't assigned yet, this runs the SAME assignment code
   // path as the manual "Assign & refer" flow (assignMatchReferral: referral
   // insert first, then the match profile update) — not a duplicate of it.
-  function finalizePacketSend() {
+  function finalizePacketSend(disclosureConfirmed = false) {
     if (!packetTarget) return;
+    // Assigning from a packet: a pick below the top needs a reason, and a
+    // program with a disclosed relationship needs one more tap.
+    if (packetTarget.assignOnSend) {
+      if (placementRankFor(packetTarget.match.id, packetTarget.partner.id) > 1 && !placementReason) {
+        Alert.alert('One more thing', 'This program was not the top match. Choose the reason so the placement record is complete.');
+        return;
+      }
+      if (!disclosureConfirmed && hasFinancialRelationship(packetTarget.partner)) {
+        confirmDisclosedRelationship(packetTarget.partner, () => finalizePacketSend(true));
+        return;
+      }
+    }
     if (!mutationSlotAvailable('The packet log')) return;
     const previousMatchUi = {
       selectedMatchId, matchClientLabel, matchType, matchInsurance,
       matchNetworkPreferences, matchState, matchBudget, matchTherapies,
+      matchMustHave, matchPopulation, matchLocationPreference,
       tab, packetTarget, packetSendConfirm, packetAudience, packetText,
     };
     const { partner, match, assignOnSend } = packetTarget;
@@ -1997,8 +2100,9 @@ export default function App() {
     const nextReferrals = [referral, ...referrals.filter((item) => item.id !== referralId)];
     const nextTouches = [touch, ...touches];
     const nextFollowUps = [followUp, ...followUps];
-    // Balance + last-contact optimistic bumps mirror addReferral/saveTouch;
-    // the server (balances view, touches trigger) stays canonical.
+    // Activity-count + last-contact optimistic bumps mirror addReferral/saveTouch;
+    // the server (counts view, touches trigger) stays canonical. These counts
+    // are shown as activity only; the ranker never reads them.
     const nextPartners = partners.map((item) => item.id === partner.id
       ? {
           ...item,
@@ -2028,8 +2132,13 @@ export default function App() {
       applyCaseEvent(packetEvent);
     }
 
+    // The placement record is written after the assignment it describes.
+    const decision = assignOnSend && assignedMatch ? buildPlacementDecision(assignedMatch, partner, referralId, now) : null;
     void settleOptimisticWrite(
-      () => finalizeMatchPacket(referral, assignedMatch, touch, followUp, packetEvent, activeUserId),
+      async () => {
+        await finalizeMatchPacket(referral, assignedMatch, touch, followUp, packetEvent, activeUserId);
+        if (decision) await recordPlacementDecision(decision, activeUserId);
+      },
       snapshot,
       previousSnapshot,
       () => {
@@ -2044,6 +2153,9 @@ export default function App() {
         setMatchState(previousMatchUi.matchState);
         setMatchBudget(previousMatchUi.matchBudget);
         setMatchTherapies(previousMatchUi.matchTherapies);
+        setMatchMustHave(previousMatchUi.matchMustHave);
+        setMatchPopulation(previousMatchUi.matchPopulation);
+        setMatchLocationPreference(previousMatchUi.matchLocationPreference);
         setTab(previousMatchUi.tab);
         setPacketTarget(previousMatchUi.packetTarget);
         setPacketSendConfirm(previousMatchUi.packetSendConfirm);
@@ -3586,6 +3698,8 @@ export default function App() {
       therapies: partner.therapies,
       note: partner.note,
       touchCadence: partner.touchCadenceDays ? String(partner.touchCadenceDays) : '',
+      financialRelationship: partner.financialRelationship || 'none',
+      financialRelationshipNote: partner.financialRelationshipNote || '',
     });
     setSelectedPartner(null);
     setShowAddPartner(true);
@@ -3651,6 +3765,8 @@ export default function App() {
       lastContact: existing?.lastContact || localDateStamp(),
       favorite: existing?.favorite,
       touchCadenceDays: cadence && cadence > 0 ? cadence : undefined,
+      financialRelationship: partnerForm.financialRelationship,
+      financialRelationshipNote: partnerForm.financialRelationship === 'none' ? '' : partnerForm.financialRelationshipNote.trim(),
       createdAt: existing?.createdAt || new Date().toISOString(),
       // Directory linkage is server-owned; an edit never changes it.
       globalPartnerId: existing?.globalPartnerId,
@@ -3725,16 +3841,30 @@ export default function App() {
     }
   }
 
-  function addReferral() {
+  function addReferral(disclosureConfirmed = false) {
     if (!referralForm.partnerId || !referralForm.clientLabel.trim()) {
       Alert.alert('A little more detail', 'Choose a partner and add a client or family label.');
       return;
+    }
+    const chosenPartner = partners.find((item) => item.id === referralForm.partnerId);
+    if (activeReferralMatchId && chosenPartner) {
+      // Assigning from a match: a pick below the top needs a reason, and a
+      // program with a disclosed relationship needs one more tap.
+      if (placementRankFor(activeReferralMatchId, chosenPartner.id) > 1 && !placementReason) {
+        Alert.alert('One more thing', 'This program was not the top match. Choose the reason so the placement record is complete.');
+        return;
+      }
+      if (!disclosureConfirmed && hasFinancialRelationship(chosenPartner)) {
+        confirmDisclosedRelationship(chosenPartner, () => addReferral(true));
+        return;
+      }
     }
     if (!mutationSlotAvailable('The referral')) return;
     const previousReferralUi = {
       referralForm, showAddReferral, activeReferralMatchId, tab,
       selectedMatchId, matchClientLabel, matchType, matchInsurance,
       matchNetworkPreferences, matchState, matchBudget, matchTherapies,
+      matchMustHave, matchPopulation, matchLocationPreference,
     };
     const referral: Referral = {
       id: makeId('r'),
@@ -3780,11 +3910,19 @@ export default function App() {
     if (activeReferralMatchId) setTab('referrals');
     setActiveReferralMatchId(null);
     const snapshot: Snapshot = { partners: nextPartners, referrals: nextReferrals, referralMatches: nextMatches, touches, followUps, scorecards };
+    // The placement record is written after the assignment it describes.
+    const decision = assignedMatch && chosenPartner ? buildPlacementDecision(assignedMatch, chosenPartner, referral.id, new Date()) : null;
+    clearPendingPlacement();
     // Assignment flow: referral first, then the match profile update.
     void settleOptimisticWrite(
-      () => assignedMatch
-        ? assignMatchReferral(referral, { ...assignedMatch, clientLabel: referral.clientLabel, status: 'Referred', assignedPartnerId: referral.partnerId, referralId: referral.id, updatedAt: new Date().toISOString() }, activeUserId)
-        : createReferral(referral, activeUserId),
+      async () => {
+        if (assignedMatch) {
+          await assignMatchReferral(referral, { ...assignedMatch, clientLabel: referral.clientLabel, status: 'Referred', assignedPartnerId: referral.partnerId, referralId: referral.id, updatedAt: new Date().toISOString() }, activeUserId);
+          if (decision) await recordPlacementDecision(decision, activeUserId);
+        } else {
+          await createReferral(referral, activeUserId);
+        }
+      },
       snapshot,
       { partners, referrals, referralMatches, touches, followUps, scorecards },
       () => {
@@ -3801,6 +3939,9 @@ export default function App() {
         setMatchState(previousReferralUi.matchState);
         setMatchBudget(previousReferralUi.matchBudget);
         setMatchTherapies(previousReferralUi.matchTherapies);
+        setMatchMustHave(previousReferralUi.matchMustHave);
+        setMatchPopulation(previousReferralUi.matchPopulation);
+        setMatchLocationPreference(previousReferralUi.matchLocationPreference);
       },
       'The referral',
     );
@@ -4013,9 +4154,11 @@ export default function App() {
     const loadLine = todayCounts.actions === 0
       ? 'Nothing on the list — enjoy the quiet, or add something below.'
       : `${todayCounts.actions} ${todayCounts.actions === 1 ? 'action' : 'actions'}${todayCounts.overdueCount > 0 ? ` · ${todayCounts.overdueCount} overdue` : ''}`;
-    const giveBack = partners
-      .filter((partner) => partner.inbound > partner.outbound)
-      .sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound))
+    // Recent partner activity, newest referral first. No tallies of who owes
+    // whom: placement follows fit, and relationships run on their cadence.
+    const recentPartners = partners
+      .filter((partner) => lastReferralByPartner[partner.id])
+      .sort((a, b) => lastReferralByPartner[b.id].localeCompare(lastReferralByPartner[a.id]))
       .slice(0, 3);
     const openCases = cases.filter(isOpenCase).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return (
@@ -4108,23 +4251,22 @@ export default function App() {
                 </>
               ) : null}
 
-              <SectionTitle title="Relationships to return" action="View all" onPress={() => setTab('referrals')} />
+              <SectionTitle title="Partner activity" action="View all" onPress={() => setTab('referrals')} />
               <View style={styles.returnCard}>
                 <View style={styles.returnIntro}>
-                  <View style={styles.returnIcon}><AppIcon name="heart-half" size={20} color={COLORS.coral} /></View>
+                  <View style={styles.returnIcon}><AppIcon name="people" size={20} color={COLORS.forest} /></View>
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.returnTitle}>{totals.reciprocal} partners have sent more than they’ve received</Text>
-                    <Text style={styles.returnBody}>Keep these relationships in mind only after client-fit factors are satisfied.</Text>
+                    <Text style={styles.returnTitle}>{totals.active} {totals.active === 1 ? 'partner has' : 'partners have'} referral activity</Text>
+                    <Text style={styles.returnBody}>Stay in touch on the cadence you set. Every placement follows the client's fit.</Text>
                   </View>
                 </View>
-                {giveBack.map((partner, index) => (
-                  <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={[styles.returnPartner, index === giveBack.length - 1 && { borderBottomWidth: 0 }]}>
+                {recentPartners.map((partner, index) => (
+                  <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={[styles.returnPartner, index === recentPartners.length - 1 && { borderBottomWidth: 0 }]}>
                     <Initials name={partner.organization} size={36} />
                     <View style={{ flex: 1 }}>
                       <Text style={styles.returnPartnerName}>{partner.organization}</Text>
-                      <Text numberOfLines={1} style={styles.returnPartnerType}>{partnerTypeLabel(partner)} · {partner.city}</Text>
+                      <Text numberOfLines={1} style={styles.returnPartnerType}>{partnerActivityLine(partner, lastReferralByPartner[partner.id])}</Text>
                     </View>
-                    <Text style={styles.returnCount}>+{partner.inbound - partner.outbound}</Text>
                     <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
                   </TouchableOpacity>
                 ))}
@@ -4295,13 +4437,45 @@ export default function App() {
             </View>
           ) : null}
 
+          <Text style={styles.fieldLabel}>CLIENT</Text>
+          <View style={styles.wrapPills}>
+            {clientPopulations.map((population) => <Pill key={population} label={population === 'Any' ? 'Any adult or teen' : population} active={matchPopulation === population} onPress={() => setMatchPopulation(population)} />)}
+          </View>
+          <Text style={styles.matchFieldHint}>A requirement, not a preference: a client marked Women never sees a men-only program, and an adolescent never sees an adult-only one.</Text>
+
+          <Text style={styles.fieldLabel}>LOCATION PREFERENCE</Text>
+          <View style={styles.wrapPills}>
+            {locationPreferences.map((preference) => <Pill key={preference} label={preference} active={matchLocationPreference === preference} onPress={() => setMatchLocationPreference(preference)} />)}
+          </View>
+          <Text style={styles.matchFieldHint}>{matchState === 'ANY' ? 'Choose a state above to score close-to-family or away-from-home.' : 'Close to family means in the same state; away from home means outside it.'}</Text>
+
           <MultiSelectDropdown
             label="THERAPEUTIC NEEDS"
             values={matchTherapies}
             options={therapyOptions}
-            onChange={setMatchTherapies}
+            onChange={updateMatchTherapies}
             icon="medkit-outline"
           />
+          {matchTherapies.length ? (
+            <View style={styles.mustHaveBlock}>
+              <Text style={styles.inputCaption}>Tap a need to make it a must-have. Must-haves hide programs that lack them; the rest shape the score.</Text>
+              <View style={[styles.wrapPills, { marginTop: 8 }]}>
+                {matchTherapies.map((need) => {
+                  const required = isPopulationNeed(need) || matchMustHave.includes(need);
+                  return (
+                    <Pill
+                      key={need}
+                      label={required ? `${need} · must have` : need}
+                      active={required}
+                      disabled={isPopulationNeed(need)}
+                      icon={required ? 'lock-closed' : undefined}
+                      onPress={() => toggleMustHave(need)}
+                    />
+                  );
+                })}
+              </View>
+            </View>
+          ) : null}
         </View>
 
         <View style={styles.resultsHeading}>
@@ -4322,11 +4496,15 @@ export default function App() {
                     <Text numberOfLines={2} style={styles.matchOrg}>{match.partner.organization}</Text>
                     <Text numberOfLines={1} style={styles.matchLocation}>{partnerTypeLabel(match.partner)} · {match.partner.city}, {match.partner.state}</Text>
                   </View>
-                  <View style={styles.scoreBlock}><Text style={styles.scoreNumber}>{match.clinicalScore}%</Text><Text style={styles.scoreLabel}>FIT</Text></View>
+                  <View style={styles.scoreBlock}><Text style={styles.scoreNumber}>{Math.round(match.total)}</Text><Text style={styles.scoreLabel}>FIT / 100</Text></View>
                 </View>
                 <View style={styles.matchReason}>
                   <AppIcon name="checkmark-circle" size={17} color={COLORS.forest} />
-                  <Text style={styles.matchReasonText}>{match.matchedTherapies.length ? `Matches ${match.matchedTherapies.join(', ')}` : 'Matches selected eligibility filters'}</Text>
+                  <Text style={styles.matchReasonText}>{[
+                    match.requiredNeeds.length ? `Required: ${match.requiredNeeds.join(', ')}` : '',
+                    match.matchedNeeds.length ? `Offers ${match.matchedNeeds.join(', ')}` : '',
+                    match.missingNeeds.length ? `Not listed: ${match.missingNeeds.join(', ')}` : '',
+                  ].filter(Boolean).join(' · ') || 'Meets every requirement'}</Text>
                 </View>
                 <View style={styles.matchDetails}>
                   <Text numberOfLines={1} style={[styles.matchDetailText, styles.matchInsuranceText]}>{matchInsurance === 'Cash pay'
@@ -4334,13 +4512,16 @@ export default function App() {
                     : `${match.networkStatus} · ${matchInsurance}`}</Text>
                   <Text numberOfLines={1} style={styles.matchPriceText}>{formatMoney(monthlyCostForPartner(match.partner))}/month</Text>
                 </View>
-                {match.reciprocity > 0 ? (
-                  <View style={styles.reciprocityNote}><AppIcon name="heart" size={13} color={COLORS.coral} /><Text style={styles.reciprocityNoteText}>Tie-breaker: sent you {match.reciprocity} more than received</Text></View>
+                {match.verifyBenefits || match.disclosure ? (
+                  <View style={styles.matchFlags}>
+                    {match.verifyBenefits ? <View style={styles.verifyBadge}><AppIcon name="alert-circle-outline" size={12} color={COLORS.inkSoft} /><Text style={styles.verifyBadgeText}>Verify benefits</Text></View> : null}
+                    {match.disclosure ? <View style={styles.disclosureBadge}><AppIcon name="information-circle-outline" size={12} color={COLORS.coral} /><Text style={styles.disclosureBadgeText}>Disclosed relationship · {financialRelationshipLabel(match.partner.financialRelationship)}</Text></View> : null}
+                  </View>
                 ) : null}
               </View>
             </TouchableOpacity>
             <View style={styles.matchActionRow}>
-              <TouchableOpacity style={styles.packetButton} onPress={() => openPacketComposer(match.partner, match.fitInput)}>
+              <TouchableOpacity style={styles.packetButton} onPress={() => openPacketComposer(match.partner, match)}>
                 <AppIcon name="document-text" size={16} color={COLORS.forest} />
                 <Text style={styles.packetButtonText}>Send packet</Text>
               </TouchableOpacity>
@@ -4525,7 +4706,7 @@ export default function App() {
           />
         </View>
         <View style={styles.directoryCountRow}><Text style={styles.directoryCount}>{directoryPartners.length} RESULTS</Text><AppIcon name="options-outline" size={18} color={COLORS.gray} /></View>
-        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
+        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} lastReferralOn={lastReferralByPartner[partner.id]} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
         {!directoryPartners.length ? <EmptyState icon="people-outline" title="No partners found" body="Try another search or add a new relationship." /> : null}
       </ScrollView>
     );
@@ -4537,7 +4718,7 @@ export default function App() {
         {renderHeader('Referral ledger')}
         {renderRefreshNotice()}
         <View style={styles.directoryTitleRow}>
-          <View><Text style={styles.screenTitle}>Give & receive</Text><Text style={styles.screenSubtitle}>Relationship history at a glance</Text></View>
+          <View><Text style={styles.screenTitle}>Referrals</Text><Text style={styles.screenSubtitle}>Referral history at a glance</Text></View>
           <TouchableOpacity accessibilityRole="button" accessibilityLabel="Add inbound referral" style={styles.roundAdd} onPress={() => openReferral('Inbound')}><AppIcon name="add" size={24} color={COLORS.white} /></TouchableOpacity>
         </View>
 
@@ -4553,8 +4734,8 @@ export default function App() {
           </View>
           <View style={styles.ledgerDivider} />
           <View style={styles.ledgerMetric}>
-            <View style={[styles.ledgerIcon, { backgroundColor: COLORS.coralPale }]}><AppIcon name="heart" size={18} color={COLORS.coral} /></View>
-            <Text style={styles.ledgerNumber}>{totals.reciprocal}</Text><Text style={styles.ledgerLabel}>To return</Text>
+            <View style={[styles.ledgerIcon, { backgroundColor: COLORS.coralPale }]}><AppIcon name="people" size={18} color={COLORS.coral} /></View>
+            <Text style={styles.ledgerNumber}>{totals.active}</Text><Text style={styles.ledgerLabel}>Active partners</Text>
           </View>
         </View>
 
@@ -4606,17 +4787,13 @@ export default function App() {
           })}
         </View> : <EmptyState icon="swap-horizontal-outline" title="No matching referrals" body={referrals.length ? 'Try another search or direction filter.' : 'Add a partner, then log your first inbound or outbound referral.'} />}
 
-        <SectionTitle title="Relationship balance" />
-        {partners.length ? partners.slice().sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound)).slice(0, 5).map((partner) => {
-          const total = Math.max(partner.inbound + partner.outbound, 1);
-          const inboundWidth = `${Math.round((partner.inbound / total) * 100)}%` as `${number}%`;
-          return (
-            <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={styles.balanceRow}>
-              <View style={styles.balanceNameRow}><Text style={styles.balanceName} numberOfLines={1}>{partner.organization}</Text><Text style={styles.balanceNumbers}>{partner.inbound} in · {partner.outbound} out</Text></View>
-              <View style={styles.balanceTrack}><View style={[styles.balanceInbound, { width: inboundWidth }]} /></View>
-            </TouchableOpacity>
-          );
-        }) : <EmptyState icon="people-outline" title="No relationships yet" body="Your give-and-receive balance will appear after you add referral partners." />}
+        <SectionTitle title="Partner activity" />
+        {partners.length ? partners.slice().sort((a, b) => (lastReferralByPartner[b.id] || '').localeCompare(lastReferralByPartner[a.id] || '') || a.organization.localeCompare(b.organization)).slice(0, 5).map((partner) => (
+          <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={styles.balanceRow}>
+            <View style={styles.balanceNameRow}><Text style={styles.balanceName} numberOfLines={1}>{partner.organization}</Text></View>
+            <Text style={styles.balanceNumbers}>{partnerActivityLine(partner, lastReferralByPartner[partner.id])}</Text>
+          </TouchableOpacity>
+        )) : <EmptyState icon="people-outline" title="No partners yet" body="Referral activity will appear here after you add referral partners." />}
       </ScrollView>
     );
   }
@@ -5213,7 +5390,6 @@ export default function App() {
 
   function PartnerDetailModal() {
     if (!selectedPartner) return null;
-    const balance = selectedPartner.inbound - selectedPartner.outbound;
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setSelectedPartner(null)}>
         <SafeAreaView style={styles.modalPage}>
@@ -5241,9 +5417,21 @@ export default function App() {
             </View>
 
             <View style={styles.profileBalanceCard}>
-              <View><Text style={styles.fieldLabel}>RELATIONSHIP BALANCE</Text><Text style={styles.profileBalanceTitle}>{balance > 0 ? `They’ve sent ${balance} more` : balance < 0 ? `You’ve sent ${Math.abs(balance)} more` : 'Perfectly balanced'}</Text></View>
-              <View style={styles.profileCounts}><Text style={styles.profileCount}><Text style={{ color: COLORS.forest }}>{selectedPartner.inbound}</Text> in</Text><Text style={styles.profileCount}><Text style={{ color: COLORS.blue }}>{selectedPartner.outbound}</Text> out</Text></View>
+              <View><Text style={styles.fieldLabel}>REFERRAL ACTIVITY</Text><Text style={styles.profileBalanceTitle}>{lastReferralByPartner[selectedPartner.id] ? `Last referral ${shortDate(lastReferralByPartner[selectedPartner.id])}` : 'No referrals yet'}</Text></View>
+              <View style={styles.profileCounts}><Text style={styles.profileCount}><Text style={{ color: COLORS.forest }}>{selectedPartner.inbound}</Text> received</Text><Text style={styles.profileCount}><Text style={{ color: COLORS.blue }}>{selectedPartner.outbound}</Text> sent</Text></View>
             </View>
+            {hasFinancialRelationship(selectedPartner) ? (
+              <View style={[styles.infoCard, { marginBottom: 12 }]}>
+                <Text style={styles.infoTitle}>Disclosed relationship</Text>
+                <View style={[styles.infoLine, { borderBottomWidth: 0 }]}>
+                  <AppIcon name="information-circle-outline" size={18} color={COLORS.coral} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.infoValue}>{financialRelationshipLabel(selectedPartner.financialRelationship)}{selectedPartner.financialRelationshipNote ? ` · ${selectedPartner.financialRelationshipNote}` : ''}</Text>
+                    <Text style={styles.infoLabel}>Shown to families in every packet. Never part of the ranking.</Text>
+                  </View>
+                </View>
+              </View>
+            ) : null}
 
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Staying in touch</Text>
@@ -5713,6 +5901,16 @@ export default function App() {
                 emptyLabel="Select therapeutic needs"
               />
               <FormField label="NOTES" value={partnerForm.note} onChangeText={(note) => setPartnerForm((current) => ({ ...current, note }))} placeholder="Relationship and program notes" multiline />
+              <Text style={styles.fieldLabel}>FINANCIAL RELATIONSHIP</Text>
+              <View style={[styles.wrapPills, { marginBottom: 8 }]}>
+                {financialRelationshipOptions.map((option) => (
+                  <Pill key={option.value} label={option.label} active={partnerForm.financialRelationship === option.value} onPress={() => setPartnerForm((current) => ({ ...current, financialRelationship: option.value }))} />
+                ))}
+              </View>
+              <Text style={styles.matchFieldHint}>Any money that moves between your practice and this program. It is disclosed on cards and in every family packet, stays private to your workspace, and never changes a match.</Text>
+              {partnerForm.financialRelationship !== 'none' ? (
+                <FormField label="DISCLOSURE NOTE (OPTIONAL)" value={partnerForm.financialRelationshipNote} onChangeText={(financialRelationshipNote) => setPartnerForm((current) => ({ ...current, financialRelationshipNote }))} placeholder="A few words families will see" />
+              ) : null}
               <Text style={styles.fieldLabel}>STAY IN TOUCH EVERY ___ DAYS</Text>
               <View style={styles.cadenceRow}>
                 {['7', '30', '60', '90'].map((preset) => (
@@ -5749,7 +5947,7 @@ export default function App() {
             <View style={styles.modalHeader}>
               <TouchableOpacity accessibilityLabel="Close referral form" onPress={closeReferralModal} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
               <Text style={styles.modalHeaderTitle}>{matchedReferral ? 'Assign referral' : 'Log a referral'}</Text>
-              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={addReferral}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => addReferral()}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               {matchedReferral ? (
@@ -5770,12 +5968,33 @@ export default function App() {
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.partnerPicker}>
                 {partners.slice().sort((a, b) => Number(b.id === referralForm.partnerId) - Number(a.id === referralForm.partnerId)).map((partner) => <TouchableOpacity key={partner.id} onPress={() => setReferralForm({ ...referralForm, partnerId: partner.id })} style={[styles.partnerPick, referralForm.partnerId === partner.id && styles.partnerPickActive]}><Initials name={partner.organization} size={34} /><Text numberOfLines={2} style={[styles.partnerPickText, referralForm.partnerId === partner.id && styles.partnerPickTextActive]}>{partner.organization}</Text></TouchableOpacity>)}
               </ScrollView>
+              {matchedReferral && referralForm.partnerId ? (() => {
+                const chosen = partners.find((item) => item.id === referralForm.partnerId);
+                const rank = placementRankFor(matchedReferral.id, referralForm.partnerId);
+                return (
+                  <>
+                    {chosen && hasFinancialRelationship(chosen) ? (
+                      <View style={[styles.disclosureBadge, { alignSelf: 'flex-start', marginBottom: 12 }]}><AppIcon name="information-circle-outline" size={12} color={COLORS.coral} /><Text style={styles.disclosureBadgeText}>Disclosed relationship · {financialRelationshipLabel(chosen.financialRelationship)} · one more confirmation on save</Text></View>
+                    ) : null}
+                    {rank > 1 ? (
+                      <View style={styles.placementReasonBlock}>
+                        <Text style={styles.fieldLabel}>WHY THIS PROGRAM?</Text>
+                        <Text style={styles.placementReasonHint}>{rank <= (pendingPlacement?.rankedIds.length ?? 0) ? `It ranked #${rank} on the match.` : 'It was not on the match list.'} The reason goes on the placement record, not to the family.</Text>
+                        <View style={styles.wrapPills}>{placementReasonOptions.map((option) => <Pill key={option.value} label={option.label} active={placementReason === option.value} onPress={() => setPlacementReason(option.value)} />)}</View>
+                        {placementReason === 'other' ? (
+                          <TextInput value={placementReasonNote} onChangeText={setPlacementReasonNote} placeholder="A few words" placeholderTextColor="#99A6A1" style={[styles.formInput, { marginTop: 10 }]} />
+                        ) : null}
+                      </View>
+                    ) : null}
+                  </>
+                );
+              })() : null}
               <FormField label="CLIENT / FAMILY LABEL *" value={referralForm.clientLabel} onChangeText={(clientLabel) => setReferralForm({ ...referralForm, clientLabel })} placeholder="Use initials or a private label" />
               <Text style={styles.privacyHint}><AppIcon name="lock-closed" size={13} color={COLORS.gray} /> Keep this de-identified; avoid clinical details or protected health information.</Text>
               <Text style={styles.fieldLabel}>OUTCOME</Text>
               <View style={styles.wrapPills}>{(['Introduced', 'Consulted', 'Placed', 'Pending'] as Referral['outcome'][]).map((outcome) => <Pill key={outcome} label={outcome} active={referralForm.outcome === outcome} onPress={() => setReferralForm({ ...referralForm, outcome })} />)}</View>
               <FormField label="NOTE" value={referralForm.note} onChangeText={(note) => setReferralForm({ ...referralForm, note })} placeholder="Optional relationship note" multiline />
-              <TouchableOpacity style={styles.primaryButton} onPress={addReferral}><Text style={styles.primaryButtonText}>{matchedReferral ? 'Save to referrals' : 'Save referral'}</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.primaryButton} onPress={() => addReferral()}><Text style={styles.primaryButtonText}>{matchedReferral ? 'Save to referrals' : 'Save referral'}</Text></TouchableOpacity>
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
@@ -5978,7 +6197,17 @@ export default function App() {
               <View style={styles.prePromptIcon}><AppIcon name="paper-plane" size={24} color={COLORS.forest} /></View>
               <Text style={styles.prePromptTitle}>Did you send it?</Text>
               <Text style={styles.prePromptText}>iOS can't always tell us whether the packet actually went out. Confirming logs the referral, records the touch, and sets the check-in follow-up.</Text>
-              <TouchableOpacity style={styles.primaryButton} onPress={finalizePacketSend}><Text style={styles.primaryButtonText}>Sent — log it</Text></TouchableOpacity>
+              {packetTarget.assignOnSend && placementRankFor(packetTarget.match.id, packetTarget.partner.id) > 1 ? (
+                <View style={styles.placementReasonBlock}>
+                  <Text style={styles.fieldLabel}>WHY THIS PROGRAM?</Text>
+                  <Text style={styles.placementReasonHint}>It was not the top match. The reason goes on the placement record, not to the family.</Text>
+                  <View style={styles.wrapPills}>{placementReasonOptions.map((option) => <Pill key={option.value} label={option.label} active={placementReason === option.value} onPress={() => setPlacementReason(option.value)} />)}</View>
+                  {placementReason === 'other' ? (
+                    <TextInput value={placementReasonNote} onChangeText={setPlacementReasonNote} placeholder="A few words" placeholderTextColor="#99A6A1" style={[styles.formInput, { marginTop: 10 }]} />
+                  ) : null}
+                </View>
+              ) : null}
+              <TouchableOpacity style={styles.primaryButton} onPress={() => finalizePacketSend()}><Text style={styles.primaryButtonText}>Sent — log it</Text></TouchableOpacity>
               <TouchableOpacity onPress={() => setPacketSendConfirm(false)} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel — don't log</Text></TouchableOpacity>
             </ScrollView>
           </Pressable>
@@ -6609,7 +6838,6 @@ const styles = StyleSheet.create({
   returnPartner: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   returnPartnerName: { color: COLORS.ink, fontSize: 13, fontWeight: '700' },
   returnPartnerType: { color: COLORS.gray, fontSize: 11, marginTop: 2 },
-  returnCount: { color: COLORS.coral, fontSize: 13, fontWeight: '800' },
   activityCard: { backgroundColor: COLORS.white, borderRadius: 22, paddingHorizontal: 16, borderWidth: 1, borderColor: '#E5E8E3' },
   activityRow: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   directionIcon: { width: 34, height: 34, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
@@ -6713,8 +6941,15 @@ const styles = StyleSheet.create({
   matchDetailText: { color: COLORS.gray, fontSize: 10, fontWeight: '600' },
   matchInsuranceText: { flex: 1, flexShrink: 1, marginRight: 8 },
   matchPriceText: { flexShrink: 0, color: COLORS.gray, fontSize: 10, fontWeight: '600', textAlign: 'right' },
-  reciprocityNote: { flexDirection: 'row', gap: 5, alignItems: 'center', marginTop: 9 },
-  reciprocityNoteText: { flex: 1, flexShrink: 1, color: COLORS.coral, fontSize: 10, lineHeight: 14, fontWeight: '700' },
+  matchFlags: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 9 },
+  verifyBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#F3F3EF', borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5 },
+  verifyBadgeText: { color: COLORS.inkSoft, fontSize: 9, fontWeight: '800' },
+  disclosureBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.coralPale, borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5, flexShrink: 1 },
+  disclosureBadgeText: { color: COLORS.coral, fontSize: 9, fontWeight: '800', flexShrink: 1 },
+  matchFieldHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: 8, marginBottom: 14, paddingHorizontal: 2 },
+  mustHaveBlock: { marginTop: -4, marginBottom: 12 },
+  placementReasonBlock: { marginTop: 4, marginBottom: 16 },
+  placementReasonHint: { color: COLORS.gray, fontSize: 11, lineHeight: 16, marginTop: -4, marginBottom: 10 },
   assignReferralButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: COLORS.forest, borderRadius: 13, marginTop: 13 },
   assignReferralButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
   directoryTitleRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 18 },
@@ -6754,10 +6989,6 @@ const styles = StyleSheet.create({
   moreTags: { color: COLORS.gray, fontSize: 10, alignSelf: 'center', fontWeight: '700' },
   partnerFooter: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#EFF1EF' },
   partnerFooterText: { flex: 1, flexShrink: 1, color: COLORS.gray, fontSize: 10, fontWeight: '600' },
-  balanceBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5 },
-  balanceBadgeWarm: { backgroundColor: COLORS.coralPale },
-  balanceText: { color: COLORS.forest, fontSize: 9, fontWeight: '800' },
-  balanceTextWarm: { color: COLORS.coral },
   cardShareButton: { width: 44, height: 44, borderRadius: 11, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.mint },
   emptyState: { alignItems: 'center', paddingVertical: 36, paddingHorizontal: 28 },
   emptyIcon: { width: 52, height: 52, borderRadius: 18, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
@@ -6791,8 +7022,6 @@ const styles = StyleSheet.create({
   balanceNameRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 12, marginBottom: 7 },
   balanceName: { flex: 1, color: COLORS.ink, fontSize: 12, fontWeight: '700' },
   balanceNumbers: { color: COLORS.gray, fontSize: 10 },
-  balanceTrack: { height: 7, borderRadius: 4, backgroundColor: '#DCE7EA', overflow: 'hidden' },
-  balanceInbound: { height: '100%', borderRadius: 4, backgroundColor: COLORS.sage },
   bottomNav: { flexDirection: 'row', paddingTop: 8, paddingBottom: Platform.OS === 'ios' ? 7 : 10, backgroundColor: COLORS.white, borderTopWidth: 1, borderTopColor: COLORS.line, shadowColor: COLORS.ink, shadowOpacity: 0.06, shadowRadius: 10, shadowOffset: { width: 0, height: -4 } },
   navItem: { flex: 1, minHeight: 48, alignItems: 'center', justifyContent: 'center', gap: 3 },
   navIconWrap: { width: 40, height: 32, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
