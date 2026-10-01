@@ -125,6 +125,15 @@ never write it here.
 >
 > Push notifications are local reminders (daily briefing, follow-up cadence)
 > and are optional.
+>
+> NEW LEAD / INTAKE LINK: "New lead" on Today is a quick form for a practice
+> to record an inbound call (name and phone are enough); the lead then shows
+> under NEW LEADS with a clock until the practice calls back. Workspace →
+> "Your intake link" is a public web page, branded with the practice name,
+> that a family can fill in to ask the practice to call them. It is hosted
+> by us, collects only a name, phone, optional email, and who the call is
+> about, and states that it is not emergency care. It involves no payment
+> and no account.
 
 If email confirmation is turned on in Supabase before the review, add:
 

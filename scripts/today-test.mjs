@@ -208,5 +208,55 @@ check('the saved case list falls back only when the server is unreachable',
 check('Today has pull-to-refresh on its list',
   /function HomeScreen\(\) \{[\s\S]{0,900}<ScrollView[^>]*refreshControl=\{renderRefreshControl\(\)\}/.test(appSource));
 
+// ─── 7. NEW LEADS ───────────────────────────────────────────────────────────
+// A lead waits in NEW LEADS until it is touched: lead_captured_at set, no
+// first_touch_at, still open, first-call follow-up still open. Its first
+// call is shown there once, not again under TODAY/OVERDUE.
+console.log('\n── NEW LEADS ──');
+const minutesAgo = (minutes) => new Date(NOW.getTime() - minutes * 60000).toISOString();
+const leadCase = (overrides) => ({
+  id: overrides.id, title: overrides.title || overrides.id, status: overrides.status || 'inquiry',
+  leadSource: overrides.leadSource || 'Unspecified', leadCapturedAt: overrides.leadCapturedAt,
+  firstTouchAt: overrides.firstTouchAt, leadUrgency: overrides.leadUrgency,
+});
+const leadCases = [
+  leadCase({ id: 'c-lead-1', title: 'Maria Lopez — son Jake', leadSource: 'Website', leadCapturedAt: minutesAgo(20) }),
+  leadCase({ id: 'c-lead-2', title: 'Dan Ortiz — wife Elena', leadSource: 'Inbound call', leadCapturedAt: minutesAgo(5), leadUrgency: 'immediate_danger' }),
+  leadCase({ id: 'c-lead-3', title: 'Oldest waiting', leadCapturedAt: minutesAgo(90) }),
+  leadCase({ id: 'c-lead-touched', title: 'Already called', leadCapturedAt: minutesAgo(40), firstTouchAt: minutesAgo(30) }),
+  leadCase({ id: 'c-lead-lost', title: 'Lost lead', status: 'lost', leadCapturedAt: minutesAgo(40) }),
+  leadCase({ id: 'c-lead-done', title: 'First call done', leadCapturedAt: minutesAgo(40) }),
+  leadCase({ id: 'c-plain', title: 'Not a lead' }),
+];
+const leadContacts = [
+  { caseId: 'c-lead-1', name: 'Maria Lopez', relationship: 'mother', isPrimary: true },
+  { caseId: 'c-lead-1', name: 'Jake', relationship: 'son', isPrimary: false },
+  { caseId: 'c-lead-2', name: 'Dan Ortiz', relationship: '', isPrimary: false },
+];
+const leadFollowUps = [
+  ...followUps,
+  fu({ id: 'f-lead-1', title: 'First call — Maria Lopez — son Jake', dueOn: STAMP, kind: 'first_call', caseId: 'c-lead-1' }),
+  fu({ id: 'f-lead-2', title: 'First call — Dan Ortiz — wife Elena', dueOn: STAMP, kind: 'first_call', caseId: 'c-lead-2' }),
+  fu({ id: 'f-lead-3', title: 'First call — Oldest waiting', dueOn: '2026-07-22', kind: 'first_call', caseId: 'c-lead-3' }),
+  fu({ id: 'f-lead-touched', title: 'First call — Already called', dueOn: STAMP, kind: 'first_call', caseId: 'c-lead-touched' }),
+  fu({ id: 'f-lead-lost', title: 'First call — Lost lead', dueOn: STAMP, kind: 'first_call', caseId: 'c-lead-lost' }),
+  fu({ id: 'f-lead-done', title: 'First call — First call done', dueOn: STAMP, kind: 'first_call', caseId: 'c-lead-done', status: 'done' }),
+];
+const leadCards = today.newLeadCards(leadCases, leadContacts, leadFollowUps, 15, NOW);
+eq('NEW LEADS ids (immediate danger first, then longest waiting)', leadCards.map((c) => c.id), ['f-lead-2', 'f-lead-3', 'f-lead-1']);
+eq('a lead card is backed by its first-call follow-up and linked to the case', [leadCards[2].kind, leadCards[2].followUp?.id, leadCards[2].caseId], ['first_call', 'f-lead-1', 'c-lead-1']);
+eq('lead subtitle: primary contact with relationship, then the source', leadCards[2].subtitle, 'Maria Lopez (mother) · Website');
+eq('lead info carries arrival, target, danger and contact', leadCards[1].lead, { arrivedAt: minutesAgo(90), targetMinutes: 15, leadSource: 'Unspecified', immediateDanger: false, contactName: '' });
+check('touched, lost, done-first-call and non-lead cases are excluded', !leadCards.some((c) => ['f-lead-touched', 'f-lead-lost', 'f-lead-done'].includes(c.id)));
+const leadSections = today.buildTodaySections(leadFollowUps, due, NOW, contextFor, leadCards);
+eq('NEW LEADS is its own section', leadSections.newLeads.map((c) => c.id), ['f-lead-2', 'f-lead-3', 'f-lead-1']);
+check('a lead first call is not repeated under TODAY', !leadSections.today.some((c) => c.id === 'f-lead-1' || c.id === 'f-lead-2'));
+check('a lead first call is not repeated under OVERDUE even when its due date passed', !leadSections.overdue.some((c) => c.id === 'f-lead-3'));
+check('a touched lead first call still shows under TODAY like any follow-up', leadSections.today.some((c) => c.id === 'f-lead-touched'));
+eq('sections without leads are unchanged', [leadSections.overdue.length, leadSections.partnersDue.length], [sections.overdue.length + 0, sections.partnersDue.length]);
+eq('minutesWaiting counts whole minutes and never goes negative', [today.minutesWaiting(minutesAgo(20), NOW), today.minutesWaiting(minutesAgo(-5), NOW)], [20, 0]);
+eq('formatWaiting', [4, 59, 60, 75, 1439, 1500, 3000].map(today.formatWaiting), ['4m', '59m', '1h 0m', '1h 15m', '23h 59m', '1d 1h', '2d 2h']);
+for (const c of leadCards) console.log(`    ${today.formatWaiting(today.minutesWaiting(c.lead.arrivedAt, NOW)).padEnd(7)} ${c.lead.immediateDanger ? '⚠ ' : '  '}${c.title}  — ${c.subtitle}`);
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

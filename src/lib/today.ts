@@ -1,4 +1,5 @@
 import type { Partner } from '../data';
+import type { CaseContact, CaseRecord } from './cases';
 import type { FollowUp, FollowUpKind } from './store';
 
 // ─── Today Command Center — pure engine ─────────────────────────────────────
@@ -29,9 +30,22 @@ export type TodayCard = {
   waitingOn?: string;
   context: TodayContext;
   virtual?: { partnerId: string; overdueBy: number }; // cadence cards only
+  lead?: LeadCardInfo; // NEW LEADS cards only
+};
+
+// A lead waiting for its first touch. The card is backed by the first-call
+// follow-up (so Done works like any other card) and carries what the clock
+// and the one-tap call/text need.
+export type LeadCardInfo = {
+  arrivedAt: string; // ISO timestamptz (cases.lead_captured_at)
+  targetMinutes: number;
+  leadSource: string;
+  immediateDanger: boolean;
+  contactName: string;
 };
 
 export type TodaySections = {
+  newLeads: TodayCard[];
   overdue: TodayCard[];
   today: TodayCard[];
   partnersDue: TodayCard[];
@@ -199,6 +213,74 @@ export function partnerDueToCard(due: PartnerDue): TodayCard {
   };
 }
 
+// ─── NEW LEADS ──────────────────────────────────────────────────────────────
+// A lead stays here until the practice touches it: it has lead_captured_at,
+// no first_touch_at yet, is still open, and its first-call follow-up is
+// still open. Logging a call or text (first_touch_at lands server-side and
+// the client mirrors it) or completing the first call removes it.
+// Immediate-danger leads first, then the longest-waiting.
+
+export function minutesWaiting(arrivedAt: string, now: Date): number {
+  const elapsed = now.getTime() - new Date(arrivedAt).getTime();
+  return Number.isFinite(elapsed) ? Math.max(0, Math.floor(elapsed / 60000)) : 0;
+}
+
+// "4m", "1h 12m", "2d 3h" — compact enough for a badge, honest past a day.
+export function formatWaiting(minutes: number): string {
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h`;
+}
+
+type LeadCaseFields = Pick<CaseRecord, 'id' | 'title' | 'status' | 'leadSource' | 'leadCapturedAt' | 'firstTouchAt' | 'leadUrgency'>;
+type LeadContactFields = Pick<CaseContact, 'caseId' | 'name' | 'relationship' | 'isPrimary'>;
+
+export function newLeadCards(
+  cases: LeadCaseFields[],
+  contacts: LeadContactFields[],
+  followUps: FollowUp[],
+  targetMinutes: number,
+  now: Date,
+): TodayCard[] {
+  const cards: TodayCard[] = [];
+  for (const record of cases) {
+    if (!record.leadCapturedAt || record.firstTouchAt) continue;
+    if (record.status === 'closed' || record.status === 'lost') continue;
+    const firstCall = followUps.find((item) => item.caseId === record.id && item.kind === 'first_call' && item.status === 'open');
+    if (!firstCall) continue;
+    const caseContacts = contacts.filter((item) => item.caseId === record.id);
+    const contact = caseContacts.find((item) => item.isPrimary) || caseContacts[0];
+    const bits: string[] = [];
+    if (contact) bits.push(contact.relationship ? `${contact.name} (${contact.relationship})` : contact.name);
+    if (record.leadSource && record.leadSource !== 'Unspecified') bits.push(record.leadSource);
+    cards.push({
+      id: firstCall.id,
+      kind: 'first_call',
+      title: record.title,
+      subtitle: bits.join(' · '),
+      daysOverdue: 0,
+      followUp: firstCall,
+      caseId: record.id,
+      context: { caseTitle: record.title },
+      lead: {
+        arrivedAt: record.leadCapturedAt,
+        targetMinutes,
+        leadSource: record.leadSource || 'Unspecified',
+        immediateDanger: record.leadUrgency === 'immediate_danger',
+        contactName: contact?.name || '',
+      },
+    });
+  }
+  return cards.sort((a, b) => {
+    const dangerA = a.lead?.immediateDanger ? 1 : 0;
+    const dangerB = b.lead?.immediateDanger ? 1 : 0;
+    if (dangerA !== dangerB) return dangerB - dangerA;
+    return (a.lead?.arrivedAt || '').localeCompare(b.lead?.arrivedAt || '') || a.title.localeCompare(b.title);
+  });
+}
+
 // ─── Section bucketing ──────────────────────────────────────────────────────
 // OVERDUE: any backed card with daysOverdue > 0, most-overdue first (virtual
 // partner cadence cards never go here — they live in PARTNERS DUE).
@@ -221,13 +303,17 @@ export function buildTodaySections(
   partnersDue: PartnerDue[],
   today: Date,
   contextFor: (followUp: FollowUp) => TodayContext,
+  newLeads: TodayCard[] = [],
 ): TodaySections {
   const todayStamp = dateStamp(today);
   const overdue: TodayCard[] = [];
   const dueToday: TodayCard[] = [];
+  // A lead's first call is shown once, in NEW LEADS, not again below.
+  const leadFollowUpIds = new Set(newLeads.map((card) => card.id));
 
   for (const followUp of followUps) {
     if (followUp.status !== 'open') continue;
+    if (leadFollowUpIds.has(followUp.id)) continue;
     // Snooze mirrors the server view (today_actions uses
     // coalesce(snoozed_until, due_on) <= CURRENT_DATE).
     const effectiveDue = followUp.snoozedUntil || followUp.dueOn;
@@ -248,5 +334,5 @@ export function buildTodaySections(
     .filter((card) => !(card.kind === 'consult' && card.dueTime))
     .sort((a, b) => (TODAY_KIND_ORDER[a.kind] ?? 9) - (TODAY_KIND_ORDER[b.kind] ?? 9) || a.title.localeCompare(b.title));
 
-  return { overdue, today: [...timedConsults, ...rest], partnersDue: partnersDue.map(partnerDueToCard) };
+  return { newLeads, overdue, today: [...timedConsults, ...rest], partnersDue: partnersDue.map(partnerDueToCard) };
 }
