@@ -101,6 +101,11 @@ export type Referral = {
   admittedOn?: string; // YYYY-MM-DD
   familyExperience?: number | null; // 1-5
   outcomeNote?: string;
+  // Outcomes loop (migration 20261001160000): what the check-ins record.
+  completed?: boolean | null; // finished the program? null = not yet known
+  completedOn?: string; // YYYY-MM-DD
+  stillEnrolled?: boolean | null;
+  lastCheckInAt?: string; // ISO timestamptz, server-stamped by record_placement_outcome
 };
 
 export type ReferralMatch = {

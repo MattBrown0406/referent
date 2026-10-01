@@ -88,11 +88,13 @@ import {
   fetchBusinessData,
   LEAD_SOURCES,
 } from './src/lib/business';
+import { billsOutOfNetwork, checkInSchedule, formatDays, formatRate } from './src/lib/outcomes';
 import {
   assignMatchReferral,
   completeFollowUpWithNext,
-  completeFollowUpWithOutcome,
   createFollowUp,
+  recordPlacementOutcome,
+  type ReferralOutcomePatch,
   createMatchProfile,
   deleteMatchProfile,
   createPartner,
@@ -372,6 +374,7 @@ function todayKindIcon(card: TodayCard): IconName {
     case 'consult': return 'calendar';
     case 'waiting_on': return 'hourglass-outline';
     case 'touch': return 'hand-left-outline';
+    case 'check_in': return 'clipboard-outline';
     case 'cadence': return 'repeat';
     default: return 'return-up-back';
   }
@@ -931,6 +934,9 @@ export default function App() {
   const [outcomeAdmittedOn, setOutcomeAdmittedOn] = useState('');
   const [outcomeStars, setOutcomeStars] = useState(0);
   const [outcomeNote, setOutcomeNote] = useState('');
+  // Post-placement check-ins (kind 'check_in') reuse the same sheet with one
+  // question: still enrolled, completed, or left before completing.
+  const [outcomeStatus, setOutcomeStatus] = useState<'enrolled' | 'completed' | 'left' | null>(null);
   const [notifPrePromptVisible, setNotifPrePromptVisible] = useState(false);
   const [welcomeVisible, setWelcomeVisible] = useState(false);
   const [profilePromptVisible, setProfilePromptVisible] = useState(false);
@@ -3403,6 +3409,23 @@ export default function App() {
     const card = doneCard;
     if (!card?.followUp || caseCloseLoopSaving) return;
     const followUp = card.followUp;
+    if (card.kind === 'check_in' && card.referralId) {
+      // A post-placement check-in: same sheet, one question, stars
+      // pre-filled with the current family experience.
+      const referral = referrals.find((item) => item.id === card.referralId);
+      setDoneCard(null);
+      requestAnimationFrame(() => {
+        setOutcomeFollowUp(followUp);
+        setOutcomeAnswer(null);
+        setOutcomeAdmittedOn(referral?.admittedOn || localDateStamp());
+        setOutcomeStars(referral?.familyExperience || 0);
+        setOutcomeNote('');
+        setOutcomeStatus(referral?.completed === true ? 'completed'
+          : referral?.completed === false ? 'left'
+            : referral?.stillEnrolled === true ? 'enrolled' : null);
+      });
+      return;
+    }
     if (card.referralId && card.context.referralAwaitingAnswer) {
       // Reuse the packet outcome sheet as-is (admitted? experience stars).
       setDoneCard(null);
@@ -3805,11 +3828,18 @@ export default function App() {
     setOutcomeAnswer(null);
     setOutcomeStars(0);
     setOutcomeNote('');
+    setOutcomeStatus(null);
   }
 
+  // The admit question and every later check-in go through one server path
+  // (record_placement_outcome): it updates the referral, completes the
+  // follow-up, and creates the 7 / 30 / 90 day check-ins once for an
+  // admission. Those check-ins are server-made, so a refresh follows.
   function saveOutcome() {
     const followUp = outcomeFollowUp;
-    if (!followUp || !outcomeAnswer) return;
+    if (!followUp) return;
+    const checkIn = followUp.kind === 'check_in';
+    if (checkIn ? !outcomeStatus : !outcomeAnswer) return;
     if (!mutationSlotAvailable('The outcome')) return;
     const now = new Date().toISOString();
     const completed: FollowUp = { ...followUp, status: 'done', completedAt: now };
@@ -3817,14 +3847,43 @@ export default function App() {
     setFollowUps(nextFollowUps);
     let nextReferrals = referrals;
     let write: () => Promise<void>;
+    let admission = false;
     if (followUp.referralId) {
+      const referralId = followUp.referralId;
+      const current = referrals.find((item) => item.id === referralId);
       const stars = outcomeStars > 0 ? outcomeStars : null;
-      const patch = outcomeAnswer === 'yes'
-        ? { admitted: true, admittedOn: outcomeAdmittedOn || localDateStamp(), outcome: 'Placed' as Referral['outcome'], familyExperience: stars, outcomeNote: outcomeNote.trim() }
-        : { admitted: false, outcomeNote: outcomeNote.trim() };
-      nextReferrals = referrals.map((item) => (item.id === followUp.referralId ? { ...item, ...patch } : item));
+      const note = outcomeNote.trim();
+      let patch: ReferralOutcomePatch;
+      if (checkIn) {
+        const completedProgram = outcomeStatus === 'completed' ? true : outcomeStatus === 'left' ? false : null;
+        patch = {
+          stillEnrolled: outcomeStatus === 'enrolled',
+          completed: completedProgram,
+          completedOn: completedProgram ? (current?.completedOn || localDateStamp()) : null,
+          familyExperience: stars,
+          checkIn: true,
+          ...(note ? { outcomeNote: current?.outcomeNote ? `${current.outcomeNote}\n${note}` : note } : {}),
+        };
+      } else if (outcomeAnswer === 'yes') {
+        admission = true;
+        patch = { admitted: true, admittedOn: outcomeAdmittedOn || localDateStamp(), outcome: 'Placed', familyExperience: stars, outcomeNote: note };
+      } else {
+        patch = { admitted: false, outcomeNote: note };
+      }
+      const local: Partial<Referral> = {
+        ...(patch.admitted !== undefined ? { admitted: patch.admitted } : {}),
+        ...(patch.admittedOn ? { admittedOn: patch.admittedOn } : {}),
+        ...(patch.outcome ? { outcome: patch.outcome } : {}),
+        ...(patch.familyExperience !== undefined ? { familyExperience: patch.familyExperience } : {}),
+        ...(patch.outcomeNote !== undefined ? { outcomeNote: patch.outcomeNote } : {}),
+        ...(patch.completed !== undefined ? { completed: patch.completed } : {}),
+        ...(patch.completedOn !== undefined ? { completedOn: patch.completedOn || undefined } : {}),
+        ...(patch.stillEnrolled !== undefined ? { stillEnrolled: patch.stillEnrolled } : {}),
+        ...(patch.checkIn ? { lastCheckInAt: now } : {}),
+      };
+      nextReferrals = referrals.map((item) => (item.id === referralId ? { ...item, ...local } : item));
       setReferrals(nextReferrals);
-      write = () => completeFollowUpWithOutcome(completed, followUp.referralId!, patch, activeUserId);
+      write = () => recordPlacementOutcome(referralId, patch, completed, activeUserId);
     } else {
       write = () => updateFollowUp(completed, activeUserId);
     }
@@ -3838,7 +3897,11 @@ export default function App() {
         setReferrals(referrals);
       },
       'The outcome',
-    );
+    ).then((saved) => {
+      // Pull the server-created check-ins onto Today (no-op when offline:
+      // they arrive with the next successful refresh after the queue flushes).
+      if (saved && admission) void refreshFromServer('pull');
+    });
   }
 
   function outcomeNotYet() {
@@ -5702,6 +5765,16 @@ export default function App() {
               // the partner has actually received at least one referral.
               const scorecard = scorecards[selectedPartner.id];
               if (!scorecard || scorecard.referralsSent === 0) return null;
+              // Outcomes loop: what the check-ins have recorded for this
+              // program. Plain counts and rates for this workspace only —
+              // never a ranking, never per person.
+              const outOfNetwork = billsOutOfNetwork(selectedPartner);
+              const details = [
+                scorecard.decidedPlacements ? `${formatRate(scorecard.completionRate ?? null)} completed the program (${scorecard.completed ?? 0} of ${scorecard.decidedPlacements} decided)` : null,
+                scorecard.medianDaysToAdmit != null ? `Typically ${formatDays(scorecard.medianDaysToAdmit)} from referral to admission` : null,
+                scorecard.stillEnrolled ? `${scorecard.stillEnrolled} still enrolled` : null,
+                outOfNetwork ? 'Bills some carriers out-of-network (from the directory listing)' : null,
+              ].filter((line): line is string => Boolean(line));
               return (
                 <View style={[styles.infoCard, { marginTop: 12 }]}>
                   <Text style={styles.infoTitle}>Track record</Text>
@@ -5711,6 +5784,7 @@ export default function App() {
                       <Text style={styles.infoValue}>
                         {scorecard.referralsSent} sent · {scorecard.admits} admitted{scorecard.avgFamilyExperience != null ? ` · ${scorecard.avgFamilyExperience}★ family experience` : ''}
                       </Text>
+                      {details.map((line) => <Text key={line} style={styles.todayRowMeta}>{line}</Text>)}
                     </View>
                   </View>
                 </View>
@@ -6478,6 +6552,57 @@ export default function App() {
   function OutcomeCaptureModal() {
     if (!outcomeFollowUp) return null;
     const referral = referrals.find((item) => item.id === outcomeFollowUp.referralId);
+    const checkIn = outcomeFollowUp.kind === 'check_in';
+    if (checkIn) {
+      const partnerName = partners.find((item) => item.id === (referral?.partnerId || outcomeFollowUp.partnerId))?.organization;
+      const intro = [referral?.clientLabel, partnerName ? `at ${partnerName}` : '', referral?.admittedOn ? `· admitted ${shortDate(referral.admittedOn)}` : '']
+        .filter(Boolean).join(' ');
+      const statusOptions: { value: 'enrolled' | 'completed' | 'left'; label: string }[] = [
+        { value: 'enrolled', label: 'Still enrolled' },
+        { value: 'completed', label: 'Completed the program' },
+        { value: 'left', label: 'Left before completing' },
+      ];
+      return (
+        <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={closeOutcomeSheet}>
+          <SafeAreaView style={styles.modalPage}>
+            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+              <View style={styles.modalHandle} />
+              <View style={styles.modalHeader}>
+                <TouchableOpacity accessibilityLabel="Close check-in" onPress={closeOutcomeSheet} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+                <Text style={styles.modalHeaderTitle}>{outcomeFollowUp.checkInDays ? `${outcomeFollowUp.checkInDays}-day check-in` : 'Check-in'}</Text>
+                <View style={styles.closeButton} />
+              </View>
+              <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+                <Text style={styles.formIntro}>{intro || outcomeFollowUp.title}</Text>
+                <Text style={styles.fieldLabel}>HOW IS IT GOING?</Text>
+                <View style={styles.wrapPills}>
+                  {statusOptions.map((option) => (
+                    <Pill key={option.value} label={option.label} active={outcomeStatus === option.value} onPress={() => setOutcomeStatus(option.value)} />
+                  ))}
+                </View>
+                <TouchableOpacity onPress={outcomeNotYet} style={styles.outcomeNotYet}>
+                  <AppIcon name="time-outline" size={15} color={COLORS.blue} />
+                  <Text style={styles.outcomeNotYetText}>Haven't reached them — snooze this check-in 4 days</Text>
+                </TouchableOpacity>
+                <Text style={styles.fieldLabel}>HOW HAS THE FAMILY'S EXPERIENCE BEEN? (OPTIONAL)</Text>
+                <View style={styles.starRow}>
+                  {[1, 2, 3, 4, 5].map((star) => (
+                    <TouchableOpacity key={star} accessibilityLabel={`${star} star${star === 1 ? '' : 's'}`} onPress={() => setOutcomeStars(star === outcomeStars ? 0 : star)} style={styles.starButton}>
+                      <AppIcon name={star <= outcomeStars ? 'star' : 'star-outline'} size={30} color={star <= outcomeStars ? COLORS.gold : COLORS.gray} />
+                    </TouchableOpacity>
+                  ))}
+                </View>
+                <FormField label="NOTE (OPTIONAL)" value={outcomeNote} onChangeText={setOutcomeNote} placeholder="What the family told you, in a line" multiline />
+                <TouchableOpacity style={[styles.primaryButton, !outcomeStatus && { opacity: 0.45 }]} disabled={!outcomeStatus} onPress={saveOutcome}>
+                  <Text style={styles.primaryButtonText}>Save check-in</Text>
+                </TouchableOpacity>
+              </ScrollView>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
+      );
+    }
+    const upcomingCheckIns = outcomeAnswer === 'yes' ? checkInSchedule(outcomeAdmittedOn || localDateStamp(), localDateStamp()) : [];
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={closeOutcomeSheet}>
         <SafeAreaView style={styles.modalPage}>
@@ -6520,6 +6645,11 @@ export default function App() {
                       return { label: index === 0 ? `Today (${shortDate(stamp)})` : shortDate(stamp), value: stamp };
                     })}
                   />
+                  {upcomingCheckIns.length ? (
+                    <Text style={styles.todayRowMeta}>
+                      Check-ins will land on Today {upcomingCheckIns.map((item) => `${shortDate(item.dueOn)} (${item.days} days)`).join(', ')}.
+                    </Text>
+                  ) : null}
                   <Text style={styles.fieldLabel}>HOW WAS THE FAMILY'S EXPERIENCE SO FAR? (OPTIONAL)</Text>
                   <View style={styles.starRow}>
                     {[1, 2, 3, 4, 5].map((star) => (
@@ -6705,7 +6835,7 @@ export default function App() {
                 <Text style={styles.primaryButtonText}>Next step…</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.sheetSecondaryButton} onPress={confirmDoneCloseLoop}>
-                <Text style={styles.sheetSecondaryButtonText}>{referralAwaiting ? 'Close the loop — record the outcome' : doneCard.caseId ? 'Close the loop — complete & set case status' : 'Close the loop — just complete'}</Text>
+                <Text style={styles.sheetSecondaryButtonText}>{doneCard.kind === 'check_in' && doneCard.referralId ? 'Close the loop — record the check-in' : referralAwaiting ? 'Close the loop — record the outcome' : doneCard.caseId ? 'Close the loop — complete & set case status' : 'Close the loop — just complete'}</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Not yet</Text></TouchableOpacity>
                 </>

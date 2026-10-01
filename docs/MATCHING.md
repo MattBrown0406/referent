@@ -41,7 +41,7 @@ Four parts, each a named constant in `src/lib/matching.ts`:
 | Clinical fit | 50 | `WEIGHT_CLINICAL_FIT` | Share of the client's preferred (non-must-have) needs the program offers. No preferred needs = full points. Must-haves are requirements and are not re-counted here. |
 | Cost to the family | 25 | `WEIGHT_FAMILY_COST` | In-network: full. Out-of-network: `OUT_OF_NETWORK_COST_SHARE` (0.5) of the points plus a "Verify benefits" flag on the card. Cash pay with a budget: `CASH_AT_BUDGET_COST_SHARE` (0.5) at exactly the budget, rising toward full the further under budget. Cash pay without a budget: `CASH_NO_BUDGET_COST_SHARE` (0.5); cost still breaks ties. |
 | Location preference | 10 | `WEIGHT_LOCATION` | New per-client field: `No preference` (full), `Close to family` (full when the program is in the client's state, else none), `Away from home` (the reverse). The only location data on both sides is the state, so same state versus different state is the distance proxy. With no client state the score is half. |
-| Track record | 15 | `WEIGHT_TRACK_RECORD` | From `partner_scorecard`: family-experience average and admit rate, each blended toward the case-weighted network average with a prior of `TRACK_RECORD_PRIOR_CASES` (5) decided cases. A program with no decided cases scores exactly half (7.5). |
+| Track record | 15 | `WEIGHT_TRACK_RECORD` | From `partner_scorecard`: family-experience average, completion rate (outcomes loop) and admit rate, each blended toward the prior with `TRACK_RECORD_PRIOR_CASES` (5) prior cases, then combined per `TRACK_RECORD_BLEND`: 60% family experience, 25% completion, 15% admit rate. A program with no decided cases scores exactly half (7.5). |
 
 The parts sum to the total; the maximum is `MAX_SCORE` (100). Components are
 rounded to one decimal.
@@ -52,6 +52,26 @@ network itself averages under about 4.5 stars (the test uses a network near
 4.1). If a whole network really averages above 4.5, a 4.6 program is merely
 average there, and a single 5-star can edge it. Raise `TRACK_RECORD_PRIOR_CASES`
 to make small samples count for less.
+
+The outcomes loop (`docs/OUTCOMES.md`) adds two things here:
+
+- **Completion joins the blend.** `completionRate` is completed placements
+  over decided placements (admitted referrals whose "completed" answer is
+  known either way). It is shrunk toward the prior with the same k, weighted
+  by decided placements rather than decided cases, so a program with
+  admissions but no completion answers yet sits exactly on the prior. The
+  weights live in `TRACK_RECORD_BLEND` (experience 0.6, completion 0.25,
+  admit rate 0.15); they sum to one, so the component can never exceed 15.
+- **The network as the prior for thin history.** When this workspace has
+  fewer than `TRACK_RECORD_PRIOR_CASES` decided cases with a program and the
+  directory discloses network figures for its listing (five distinct
+  referring workspaces; see `fetch_global_partner_stats`), those figures
+  replace the workspace averages as that program's prior, signal by signal
+  (`priorForCard`). A figure the directory withheld falls back to the
+  workspace average. With five or more local cases the network figure is not
+  consulted. The figures ride along on `PartnerScorecard.network`, loaded
+  best-effort with the snapshot; without the directory plan, or offline,
+  ranking simply uses local history.
 
 ### Step 3: ties
 

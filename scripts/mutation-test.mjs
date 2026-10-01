@@ -108,7 +108,7 @@ assert.match(source, /withTimeout\(\s*rescheduleNotifications\(/, 'native notifi
 
 for (const operation of [
   'completeFollowUpWithNext', 'completeFollowUpWithCase',
-  'completeFollowUpWithOutcome', 'finalizeMatchPacket',
+  'recordPlacementOutcome', 'finalizeMatchPacket',
 ]) {
   // Either `() => op(` or the awaited form `async () => { await op(` (used
   // where the placement record follows the assignment inside the same fence).

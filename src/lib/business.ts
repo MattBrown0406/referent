@@ -2,6 +2,7 @@ import type { Referral } from '../data';
 import type { CaseRecord, CaseStatus } from './cases';
 import { StoreError } from './errors';
 import { currentAuthSessionIdentity } from './auth-session';
+import { type OutcomeSummary, summarizeOutcomes } from './outcomes';
 import { fetchAllPages } from './paging';
 import { supabase } from './supabase';
 
@@ -144,6 +145,9 @@ export type BusinessDashboardMetrics = {
   pendingContractRevenue: number;
   openInvoices: number;
   overdueInvoices: number;
+  // Outcomes loop: outbound referrals in the period (by referral date),
+  // summarised the way partner_scorecard does it (src/lib/outcomes.ts).
+  outcomes: OutcomeSummary;
 };
 
 export function parseOptionalPositiveUsdCents(input: string): number | null | undefined {
@@ -456,5 +460,6 @@ export function computeBusinessDashboard(
     ),
     openInvoices: openInvoices.length,
     overdueInvoices: openInvoices.filter((item) => Boolean(item.dueOn && item.dueOn < today)).length,
+    outcomes: summarizeOutcomes(outboundReferrals),
   };
 }

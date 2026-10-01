@@ -340,6 +340,55 @@ const ids = (ranked) => ranked.map((score) => score.partner.id);
   assert.ok(strong > 7.5 && strong <= 15 && weak < 7.5 && weak >= 0);
 }
 
+// ─── (g) outcomes loop: completion joins the blend; network prior for thin history ──
+
+{
+  const { TRACK_RECORD_BLEND, priorForCard } = m;
+  assert.ok(Math.abs(TRACK_RECORD_BLEND.experience + TRACK_RECORD_BLEND.completion + TRACK_RECORD_BLEND.admitRate - 1) < 1e-9, 'the blend sums to one');
+  assert.ok(TRACK_RECORD_BLEND.experience > TRACK_RECORD_BLEND.completion && TRACK_RECORD_BLEND.experience > TRACK_RECORD_BLEND.admitRate, 'family experience stays the primary signal');
+  const card = (id, decided, admits, experience, placements, completion) => [id, {
+    partnerId: id, referralsSent: decided, admits, nonAdmits: decided - admits, avgFamilyExperience: experience, lastReferralOn: null,
+    decidedPlacements: placements, completionRate: completion,
+  }];
+  const cards = Object.fromEntries([
+    card('one-five', 1, 1, 5.0, 1, 1),
+    card('twenty', 20, 18, 4.6, 15, 0.8),
+    card('n1', 12, 8, 4.0, 6, 0.5), card('n2', 9, 6, 3.8, 4, 0.75), card('n3', 15, 11, 4.2, 8, 0.625), card('n4', 7, 5, 4.1, 3, 0.67),
+  ]);
+  const prior = trackRecordPrior(cards);
+  assert.ok(prior.completion > 0.5 && prior.completion < 0.8, `completion prior is case-weighted (${prior.completion})`);
+  // A partner with no data is neutral, with or without completion data.
+  assert.equal(trackRecordScore(undefined, prior).score, 7.5);
+  assert.equal(trackRecordScore({ admits: 0, nonAdmits: 0, avgFamilyExperience: 5, decidedPlacements: 0, completionRate: 1 }, prior).score, 7.5);
+  // Completion cannot push above the max, even with absurd inputs.
+  const perfect = trackRecordScore({ admits: 50, nonAdmits: 0, avgFamilyExperience: 5, decidedPlacements: 50, completionRate: 1 }, { experience: 1, admitRate: 1, completion: 1 }).score;
+  assert.ok(Math.abs(perfect - WEIGHT_TRACK_RECORD) < 1e-9, `everything perfect scores exactly the weight (${perfect})`);
+  const overcooked = trackRecordScore({ admits: 50, nonAdmits: 0, avgFamilyExperience: 5, decidedPlacements: 500, completionRate: 7 }, prior).score;
+  assert.ok(overcooked <= WEIGHT_TRACK_RECORD, 'more placements than cases, or a rate above one, cannot exceed the weight');
+  // One 5-star with one perfect completion still cannot beat twenty 4.6s.
+  assert.ok(trackRecordScore(cards.twenty, prior).score > trackRecordScore(cards['one-five'], prior).score);
+  // Completion moves the score in the right direction, everything else fixed.
+  const base = { admits: 10, nonAdmits: 2, avgFamilyExperience: 4.2 };
+  const high = trackRecordScore({ ...base, decidedPlacements: 8, completionRate: 1 }, prior).score;
+  const none = trackRecordScore({ ...base }, prior).score;
+  const low = trackRecordScore({ ...base, decidedPlacements: 8, completionRate: 0 }, prior).score;
+  assert.ok(high > none && none > low, `completion ranks ${high} > ${none} > ${low}`);
+  // Network prior: a thin local history leans on the disclosed network
+  // figures; enough local history ignores them; withheld figures fall back.
+  const network = { admitRate: 0.95, familyExperience: 4.9, completionRate: 0.95 };
+  const thin = { admits: 1, nonAdmits: 1, avgFamilyExperience: 3, decidedPlacements: 1, completionRate: 0 };
+  assert.ok(trackRecordScore({ ...thin, network }, prior).score > trackRecordScore(thin, prior).score, 'a strong network record lifts a thin local one');
+  const rich = { admits: 20, nonAdmits: 2, avgFamilyExperience: 4.4, decidedPlacements: 10, completionRate: 0.7 };
+  assert.equal(trackRecordScore({ ...rich, network }, prior).score, trackRecordScore(rich, prior).score, 'with enough local history the network prior is not used');
+  assert.deepEqual(priorForCard({ ...thin, network: { admitRate: null, familyExperience: null, completionRate: null } }, prior), prior, 'withheld network figures fall back to the workspace prior');
+  // Referral counts still never change the order, with completion in play.
+  const programs = ['one-five', 'twenty', 'n1', 'n2'].map((id) => partner({ id }));
+  const order = ids(rankPrograms(profile({ id: 'm-outcomes', insurance: 'Cash pay' }), programs, cards));
+  const permuted = programs.map((item, index) => ({ ...item, inbound: 40 - index * 7, outbound: index * 11 }));
+  assert.deepEqual(ids(rankPrograms(profile({ id: 'm-outcomes', insurance: 'Cash pay' }), permuted, cards)), order);
+  assert.equal(order[0], 'twenty');
+}
+
 // ─── Placement helpers ──────────────────────────────────────────────────────
 
 {

@@ -237,6 +237,16 @@ export type TrackRecord = {
   admits: number;
   nonAdmits: number;
   avgFamilyExperience: number | null; // 1-5
+  /** Admitted referrals whose completed flag has been answered (outcomes loop). */
+  decidedPlacements?: number;
+  /** completed / decidedPlacements, 0-1; null until something is decided. */
+  completionRate?: number | null;
+  /** Disclosed network figures for the listing behind this partner, if any. */
+  network?: {
+    admitRate: number | null; // 0-1
+    familyExperience: number | null; // 1-5
+    completionRate: number | null; // 0-1
+  };
 };
 
 export type TrackRecordPrior = {
@@ -244,18 +254,35 @@ export type TrackRecordPrior = {
   experience: number;
   /** Network-average admit rate, 0-1 (0.5 when nobody has data). */
   admitRate: number;
+  /** Network-average completion rate, 0-1 (0.5 when nobody has data). */
+  completion: number;
 };
+
+/**
+ * How the three track-record signals combine, once each has been shrunk
+ * toward the prior. Family experience is the primary signal; completion
+ * (did the family finish the program) is the outcomes-loop addition; admit
+ * rate (does the program take what we send) keeps a smaller share. The three
+ * sum to 1, so WEIGHT_TRACK_RECORD is the ceiling whatever the inputs.
+ */
+export const TRACK_RECORD_BLEND = { experience: 0.6, completion: 0.25, admitRate: 0.15 } as const;
 
 function normaliseExperience(avg: number): number {
   return Math.max(0, Math.min(1, (avg - 1) / 4));
 }
 
-/** Case-weighted network averages; the prior every program is shrunk toward. */
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+/** Case-weighted averages across this workspace; the prior every program is shrunk toward. */
 export function trackRecordPrior(scorecards: Record<string, TrackRecord | undefined>): TrackRecordPrior {
   let decidedTotal = 0;
   let admitsTotal = 0;
   let experienceWeight = 0;
   let experienceTotal = 0;
+  let completionWeight = 0;
+  let completionTotal = 0;
   for (const card of Object.values(scorecards)) {
     if (!card) continue;
     const decided = card.admits + card.nonAdmits;
@@ -266,26 +293,61 @@ export function trackRecordPrior(scorecards: Record<string, TrackRecord | undefi
       experienceWeight += decided;
       experienceTotal += decided * normaliseExperience(card.avgFamilyExperience);
     }
+    const placements = card.decidedPlacements ?? 0;
+    if (placements > 0 && card.completionRate != null) {
+      completionWeight += placements;
+      completionTotal += placements * clamp01(card.completionRate);
+    }
   }
   return {
     experience: experienceWeight > 0 ? experienceTotal / experienceWeight : 0.5,
     admitRate: decidedTotal > 0 ? admitsTotal / decidedTotal : 0.5,
+    completion: completionWeight > 0 ? completionTotal / completionWeight : 0.5,
+  };
+}
+
+/**
+ * The prior for one program. With fewer than TRACK_RECORD_PRIOR_CASES decided
+ * cases here, the disclosed network figures for its listing stand in for
+ * this workspace's averages, signal by signal; a network figure the directory
+ * withheld falls back to the workspace average.
+ */
+export function priorForCard(card: TrackRecord | undefined, prior: TrackRecordPrior): TrackRecordPrior {
+  if (!card?.network) return prior;
+  const decided = card.admits + card.nonAdmits;
+  if (decided >= TRACK_RECORD_PRIOR_CASES) return prior;
+  const { network } = card;
+  return {
+    experience: network.familyExperience != null ? normaliseExperience(network.familyExperience) : prior.experience,
+    admitRate: network.admitRate != null ? clamp01(network.admitRate) : prior.admitRate,
+    completion: network.completionRate != null ? clamp01(network.completionRate) : prior.completion,
   };
 }
 
 /**
  * 0..WEIGHT_TRACK_RECORD. No decided cases scores neutral (half). Otherwise
- * each signal is blended with TRACK_RECORD_PRIOR_CASES network-average cases,
- * so one great review cannot outrank twenty good ones.
+ * each signal is blended with TRACK_RECORD_PRIOR_CASES prior cases (the
+ * workspace average, or the network figure when this workspace has too
+ * little history with the program), so one great review cannot outrank
+ * twenty good ones. The signals combine per TRACK_RECORD_BLEND.
  */
 export function trackRecordScore(card: TrackRecord | undefined, prior: TrackRecordPrior): { score: number; decidedCases: number } {
   const decided = card ? card.admits + card.nonAdmits : 0;
   if (!card || decided <= 0) return { score: WEIGHT_TRACK_RECORD / 2, decidedCases: 0 };
   const k = TRACK_RECORD_PRIOR_CASES;
-  const admitRate = (card.admits + k * prior.admitRate) / (decided + k);
-  const experienceRaw = card.avgFamilyExperience != null ? normaliseExperience(card.avgFamilyExperience) : prior.experience;
-  const experience = (decided * experienceRaw + k * prior.experience) / (decided + k);
-  return { score: WEIGHT_TRACK_RECORD * (0.5 * experience + 0.5 * admitRate), decidedCases: decided };
+  const p = priorForCard(card, prior);
+  const admitRate = (card.admits + k * p.admitRate) / (decided + k);
+  const experienceRaw = card.avgFamilyExperience != null ? normaliseExperience(card.avgFamilyExperience) : p.experience;
+  const experience = (decided * experienceRaw + k * p.experience) / (decided + k);
+  // Completion is weighted by decided placements, which can only be a subset
+  // of decided cases; with none decided it sits exactly on the prior.
+  const placements = Math.max(0, Math.min(decided, card.decidedPlacements ?? 0));
+  const completionRaw = placements > 0 && card.completionRate != null ? clamp01(card.completionRate) : p.completion;
+  const completion = (placements * completionRaw + k * p.completion) / (placements + k);
+  const blended = TRACK_RECORD_BLEND.experience * experience
+    + TRACK_RECORD_BLEND.completion * completion
+    + TRACK_RECORD_BLEND.admitRate * admitRate;
+  return { score: WEIGHT_TRACK_RECORD * clamp01(blended), decidedCases: decided };
 }
 
 // ─── Scoring ────────────────────────────────────────────────────────────────
