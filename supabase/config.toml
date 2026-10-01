@@ -396,6 +396,10 @@ verify_jwt = false
 [functions.revenuecat-webhook]
 verify_jwt = false
 
+# Guarded by its own shared secret (or the service-role key); see docs/NOTIFICATIONS.md.
+[functions.push-dispatch]
+verify_jwt = false
+
 [functions.intake]
 verify_jwt = false
 

@@ -7,6 +7,7 @@ import {
   ScrollView,
   Share,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -32,6 +33,17 @@ import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySu
 import DirectoryReviewQueue from './DirectoryReviewQueue';
 import { prepareForWorkspaceChange } from './store';
 import { deleteOwnAccount } from './account';
+import {
+  enablePush,
+  fetchNotificationPreferences,
+  NOTIFICATION_KIND_ROWS,
+  preferenceFor,
+  saveNotificationPreferences,
+  unregisterThisDevice,
+  withPreference,
+  type NotificationKind,
+  type PreferencesState,
+} from './push';
 
 type Props = {
   visible: boolean;
@@ -104,6 +116,12 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   // for everyone else, which hides the card), and whether the queue is open.
   const [pendingSubmissions, setPendingSubmissions] = useState<number | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
+  // "Notify me about..." (server-sent push). null while loading; available
+  // false when the server does not have push yet, in which case the card
+  // explains instead of offering switches.
+  const [notify, setNotify] = useState<PreferencesState | null>(null);
+  const [notifyError, setNotifyError] = useState('');
+  const [notifyNote, setNotifyNote] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -114,6 +132,13 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       setLoadError((error as Error).message);
     } finally {
       setLoading(false);
+    }
+    // Push preferences are secondary too.
+    try {
+      setNotify(await fetchNotificationPreferences(userId));
+      setNotifyError('');
+    } catch (error) {
+      setNotifyError((error as Error).message);
     }
     // The profile card is secondary: its failure never blocks the screen.
     setDirectoryProfileError('');
@@ -238,6 +263,43 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       await load();
       onLeadSettingsChanged?.();
     }, 'Could not save the target');
+  }
+
+  // Turning push on is the only place the OS permission prompt is raised.
+  function togglePush(on: boolean) {
+    if (!notify) return;
+    setNotifyNote('');
+    void run(async () => {
+      if (!on) {
+        const next = { ...notify.preferences, pushEnabled: false };
+        await saveNotificationPreferences(userId, next);
+        await unregisterThisDevice();
+        setNotify({ ...notify, preferences: next });
+        return;
+      }
+      const registration = await enablePush();
+      if (!registration.ok) {
+        setNotifyNote(registration.reason);
+        return;
+      }
+      const next = { ...notify.preferences, pushEnabled: true };
+      await saveNotificationPreferences(userId, next);
+      setNotify({ ...notify, preferences: next });
+    }, on ? 'Could not turn push on' : 'Could not turn push off');
+  }
+
+  function toggleKind(kind: NotificationKind, value: boolean) {
+    if (!notify) return;
+    const next = withPreference(notify.preferences, kind, value);
+    setNotify({ ...notify, preferences: next });
+    void run(async () => {
+      try {
+        await saveNotificationPreferences(userId, next);
+      } catch (error) {
+        setNotify((current) => (current ? { ...current, preferences: notify.preferences } : current));
+        throw error;
+      }
+    }, 'Could not save that choice');
   }
 
   function makeInvite() {
@@ -436,6 +498,49 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                   ) : null}
                 </View>
               ))}
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.cardLabel}>Notify me about...</Text>
+              {notify === null ? (
+                notifyError ? <Text style={styles.helpText}>Notification settings could not be loaded: {notifyError}</Text> : <ActivityIndicator color={COLORS.blue} />
+              ) : !notify.available ? (
+                <Text style={styles.helpText}>Push notifications are not available yet. They switch on here once the server update is applied; nothing else is needed from you.</Text>
+              ) : (
+                <>
+                  <View style={styles.memberRow}>
+                    <View style={styles.memberInfo}>
+                      <Text style={styles.memberName}>Push notifications on this phone</Text>
+                      <Text style={styles.memberRole}>A short, generic heads-up. Names and case details never leave the app; tap to open the item.</Text>
+                    </View>
+                    <Switch
+                      accessibilityLabel="Push notifications on this phone"
+                      value={notify.preferences.pushEnabled}
+                      disabled={busy}
+                      onValueChange={togglePush}
+                      trackColor={{ true: COLORS.blue }}
+                    />
+                  </View>
+                  {notifyNote ? <Text style={[styles.helpText, styles.helpTextSpaced]}>{notifyNote}</Text> : null}
+                  {notify.preferences.pushEnabled ? NOTIFICATION_KIND_ROWS
+                    .filter((row) => !row.adminOnly || pendingSubmissions !== null)
+                    .map((row) => (
+                      <View key={row.key} style={styles.memberRow}>
+                        <View style={styles.memberInfo}>
+                          <Text style={styles.memberName}>{row.label}</Text>
+                          <Text style={styles.memberRole}>{row.description}</Text>
+                        </View>
+                        <Switch
+                          accessibilityLabel={row.label}
+                          value={preferenceFor(notify.preferences, row.key)}
+                          disabled={busy}
+                          onValueChange={(value) => toggleKind(row.key, value)}
+                          trackColor={{ true: COLORS.blue }}
+                        />
+                      </View>
+                    )) : null}
+                </>
+              )}
             </View>
 
             <View style={styles.card}>

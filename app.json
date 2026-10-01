@@ -10,6 +10,9 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.mattbrown.referralfit",
       "buildNumber": "8",
+      "entitlements": {
+        "aps-environment": "production"
+      },
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }

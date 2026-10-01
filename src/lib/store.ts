@@ -61,6 +61,12 @@ export type FollowUp = {
   dueTime?: string; // HH:MM (24h, from the DB time column) — consults mostly
   waitingOn?: string; // who/what we're waiting on, when kind='waiting_on'
   snoozedUntil?: string; // YYYY-MM-DD — hides the item from Today until then
+  // Team basics. assignedTo: a workspace member's user id; null means
+  // "explicitly unassigned" (sent to the server), undefined means untouched
+  // (omitted from writes, so a build that predates the column still saves).
+  // A follow-up with no assignee belongs to whoever its case is assigned to.
+  assignedTo?: string | null;
+  completedBy?: string; // server-stamped; never written by the client
 };
 
 export type PartnerScorecard = {
@@ -674,6 +680,8 @@ type FollowUpRow = {
   due_time: string | null; // Postgres time serializes as "HH:MM:SS"
   waiting_on: string | null;
   snoozed_until: string | null;
+  assigned_to?: string | null;
+  completed_by?: string | null;
 };
 
 type ScorecardRow = {
@@ -838,6 +846,8 @@ function mapFollowUpRow(row: FollowUpRow): FollowUp {
     dueTime: row.due_time ? row.due_time.slice(0, 5) : undefined,
     waitingOn: row.waiting_on || undefined,
     snoozedUntil: row.snoozed_until || undefined,
+    assignedTo: row.assigned_to ? String(row.assigned_to).toLowerCase() : undefined,
+    completedBy: row.completed_by ? String(row.completed_by).toLowerCase() : undefined,
   };
 }
 
@@ -980,6 +990,8 @@ function followUpToRow(followUp: FollowUp): Record<string, unknown> {
     due_time: followUp.dueTime ?? null,
     waiting_on: followUp.waitingOn ?? '',
     snoozed_until: followUp.snoozedUntil ?? null,
+    // completed_by is stamped server-side from the signed-in member.
+    ...(followUp.assignedTo === undefined ? {} : { assigned_to: followUp.assignedTo ? safeId(followUp.assignedTo) : null }),
   };
 }
 

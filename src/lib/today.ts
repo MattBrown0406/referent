@@ -281,6 +281,46 @@ export function newLeadCards(
   });
 }
 
+// ─── Mine / Everyone ────────────────────────────────────────────────────────
+// A practice with staff can narrow Today to its own work. "Mine" keeps a
+// card when it is assigned to me OR to nobody: an unowned item must never
+// disappear from everyone's list at once. A follow-up with no assignee of
+// its own belongs to whoever its case is assigned to. Partner cadence cards
+// are nobody's and always show. Solo workspaces default to Everyone and see
+// no filter at all.
+
+export type TodayScope = 'mine' | 'everyone';
+
+export function defaultTodayScope(memberCount: number): TodayScope {
+  return memberCount > 1 ? 'mine' : 'everyone';
+}
+
+export function cardAssignee(card: TodayCard, caseAssignee: (caseId: string) => string | undefined): string | undefined {
+  if (!card.followUp) return undefined;
+  if (card.followUp.assignedTo) return card.followUp.assignedTo.toLowerCase();
+  return card.caseId ? caseAssignee(card.caseId)?.toLowerCase() : undefined;
+}
+
+export function filterTodaySections(
+  sections: TodaySections,
+  scope: TodayScope,
+  userId: string,
+  caseAssignee: (caseId: string) => string | undefined,
+): TodaySections {
+  if (scope === 'everyone') return sections;
+  const me = userId.toLowerCase();
+  const keep = (card: TodayCard) => {
+    const assignee = cardAssignee(card, caseAssignee);
+    return !assignee || assignee === me;
+  };
+  return {
+    newLeads: sections.newLeads.filter(keep),
+    overdue: sections.overdue.filter(keep),
+    today: sections.today.filter(keep),
+    partnersDue: sections.partnersDue,
+  };
+}
+
 // ─── Section bucketing ──────────────────────────────────────────────────────
 // OVERDUE: any backed card with daysOverdue > 0, most-overdue first (virtual
 // partner cadence cards never go here — they live in PARTNERS DUE).
