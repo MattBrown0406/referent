@@ -82,6 +82,8 @@ function statsLine(stats: GlobalPartnerStats | undefined): string {
   if (stats.referrals12m !== null && stats.referrals12m > 0) parts.push(`${stats.referrals12m} referrals this year`);
   if (stats.admitRate !== null) parts.push(`${Math.round(stats.admitRate * 100)}% admitted`);
   if (stats.familyExperience !== null) parts.push(`${stats.familyExperience.toFixed(1)}/5 family experience`);
+  if (stats.completionRate !== null) parts.push(`${Math.round(stats.completionRate * 100)}% completed`);
+  if (stats.medianDaysToAdmit !== null) parts.push(`typically ${Math.round(stats.medianDaysToAdmit)} days to admit`);
   return parts.join('  ·  ');
 }
 

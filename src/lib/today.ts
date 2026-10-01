@@ -181,6 +181,7 @@ export function followUpToCard(
   if (context.caseTitle) bits.push(context.caseTitle);
   if (context.partnerName) bits.push(context.partnerName);
   if (kind === 'waiting_on' && followUp.waitingOn) bits.push(`Waiting on: ${followUp.waitingOn}`);
+  if (kind === 'check_in') bits.push(followUp.checkInDays ? `${followUp.checkInDays}-day outcome check-in` : 'Outcome check-in');
   if (followUp.dueTime) bits.push(`due ${formatDueTime(followUp.dueTime)}`);
   return {
     id: followUp.id,
@@ -336,6 +337,7 @@ const TODAY_KIND_ORDER: Record<string, number> = {
   consult: 3,
   touch: 4,
   follow_up: 5,
+  check_in: 6, // a scheduled outcome check-in; never more urgent than a call
 };
 
 export function buildTodaySections(

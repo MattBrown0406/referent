@@ -45,7 +45,9 @@ export type FollowUpStatus = 'open' | 'done' | 'skipped';
 
 // v4 Today Command Center kinds (migration 20260724190000). 'touch' is a
 // partner-relationship touch (Done → Log touch); the rest are self-evident.
-export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch';
+// 'check_in' (migration 20261001160000) is a post-placement outcome check-in
+// created by the server 7, 30 and 90 days after admission.
+export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch' | 'check_in';
 
 export type FollowUp = {
   id: string;
@@ -67,6 +69,19 @@ export type FollowUp = {
   // A follow-up with no assignee belongs to whoever its case is assigned to.
   assignedTo?: string | null;
   completedBy?: string; // server-stamped; never written by the client
+  checkInDays?: number; // 7 | 30 | 90 when kind='check_in'; server-written
+};
+
+/**
+ * Network-wide figures for the listing behind a partner, from
+ * fetch_global_partner_stats. Present only when the directory discloses them
+ * (five distinct referring workspaces). Matching uses them as the prior for
+ * a partner this workspace has little history with.
+ */
+export type NetworkTrackRecord = {
+  admitRate: number | null; // 0-1
+  familyExperience: number | null; // 1-5
+  completionRate: number | null; // 0-1
 };
 
 export type PartnerScorecard = {
@@ -76,6 +91,14 @@ export type PartnerScorecard = {
   nonAdmits: number;
   avgFamilyExperience: number | null;
   lastReferralOn: string | null; // YYYY-MM-DD
+  // Outcomes loop (migration 20261001160000). Absent on cached cards from
+  // older builds; readers treat missing as zero / unknown.
+  completed?: number;
+  decidedPlacements?: number;
+  completionRate?: number | null; // completed / decided placements
+  medianDaysToAdmit?: number | null;
+  stillEnrolled?: number;
+  network?: NetworkTrackRecord;
 };
 
 // Patch for the v2 outcome-enrichment columns on referrals (admitted,
@@ -88,6 +111,11 @@ export type ReferralOutcomePatch = {
   familyExperience?: number | null; // 1-5
   outcomeNote?: string;
   outcome?: Referral['outcome'];
+  // Outcomes loop. checkIn stamps referrals.last_check_in_at on the server.
+  completed?: boolean | null;
+  completedOn?: string | null; // YYYY-MM-DD
+  stillEnrolled?: boolean | null;
+  checkIn?: boolean;
 };
 
 export type Snapshot = {
@@ -238,7 +266,8 @@ type QueueOp =
   | { kind: 'packet.finalize'; referral: Record<string, unknown>; match: Record<string, unknown> | null; touch: Record<string, unknown>; followUp: Record<string, unknown>; event: Record<string, unknown> | null }
   | { kind: 'contact.log_activity'; event: Record<string, unknown> | null; touch: Record<string, unknown> | null }
   | { kind: 'referral.update'; id: string; patch: Record<string, unknown> }
-  | { kind: 'placement.insert'; row: Record<string, unknown> };
+  | { kind: 'placement.insert'; row: Record<string, unknown> }
+  | { kind: 'referral.record_outcome'; referralId: string; outcome: Record<string, unknown>; completed: Record<string, unknown> | null };
 
 type QueueEnvelope = { version: 2; userId: string; ops: QueueOp[] };
 let queueMutex: Promise<void> = Promise.resolve();
@@ -269,6 +298,10 @@ function isQueueOp(value: unknown): value is QueueOp {
   }
   if (op.kind === 'follow_up.complete_outcome') {
     return Boolean(op.completed && typeof op.completed === 'object' && typeof op.referralId === 'string' && op.outcome && typeof op.outcome === 'object');
+  }
+  if (op.kind === 'referral.record_outcome') {
+    return typeof op.referralId === 'string' && Boolean(op.outcome && typeof op.outcome === 'object')
+      && (op.completed === null || Boolean(op.completed && typeof op.completed === 'object'));
   }
   if (op.kind === 'match.save_case') return Boolean(op.match && typeof op.match === 'object' && typeof op.caseId === 'string');
   if (op.kind === 'referral.assign_match') return Boolean(op.referral && typeof op.referral === 'object' && op.match && typeof op.match === 'object');
@@ -410,6 +443,11 @@ async function applyQueueOp(op: QueueOp, userId: string, orgId: string): Promise
       break;
     case 'placement.insert':
       ({ error } = await supabase.from('placement_decisions').upsert({ ...op.row, owner_id: userId }, { onConflict: 'id', ignoreDuplicates: true }));
+      break;
+    case 'referral.record_outcome':
+      ({ error } = await supabase.rpc('record_placement_outcome', {
+        p_referral_id: op.referralId, p_outcome: op.outcome, p_completed: op.completed,
+      }));
       break;
   }
   if (error) throw error;
@@ -629,6 +667,11 @@ type ReferralRow = {
   packet_sent_at: string | null;
   match_profile_id: string | null;
   case_id: string | null; // v3 case-files linkage
+  // Outcomes loop (20261001160000); optional so older rows still map.
+  completed?: boolean | null;
+  completed_on?: string | null;
+  still_enrolled?: boolean | null;
+  last_check_in_at?: string | null;
 };
 
 type MatchRow = {
@@ -682,6 +725,7 @@ type FollowUpRow = {
   snoozed_until: string | null;
   assigned_to?: string | null;
   completed_by?: string | null;
+  check_in_days?: number | null;
 };
 
 type ScorecardRow = {
@@ -691,6 +735,19 @@ type ScorecardRow = {
   non_admits: number | string | null;
   avg_family_experience: number | string | null;
   last_referral_on: string | null;
+  completed?: number | string | null;
+  decided_placements?: number | string | null;
+  completion_rate?: number | string | null;
+  median_days_to_admit?: number | string | null;
+  still_enrolled?: number | string | null;
+};
+
+type NetworkStatsRow = {
+  global_partner_id: string;
+  admit_rate: number | string | null;
+  family_experience: number | string | null;
+  completion_rate?: number | string | null;
+  disclosed: boolean;
 };
 
 function toNumber(value: number | string | null | undefined): number {
@@ -793,6 +850,10 @@ function mapReferralRow(row: ReferralRow): Referral {
     admittedOn: row.admitted_on || undefined,
     familyExperience: row.family_experience,
     outcomeNote: row.outcome_note || '',
+    completed: row.completed ?? null,
+    completedOn: row.completed_on || undefined,
+    stillEnrolled: row.still_enrolled ?? null,
+    lastCheckInAt: row.last_check_in_at || undefined,
   };
 }
 
@@ -848,6 +909,7 @@ function mapFollowUpRow(row: FollowUpRow): FollowUp {
     snoozedUntil: row.snoozed_until || undefined,
     assignedTo: row.assigned_to ? String(row.assigned_to).toLowerCase() : undefined,
     completedBy: row.completed_by ? String(row.completed_by).toLowerCase() : undefined,
+    checkInDays: row.check_in_days ?? undefined,
   };
 }
 
@@ -865,7 +927,35 @@ function mapScorecardRow(row: ScorecardRow): PartnerScorecard {
     nonAdmits: toNumber(row.non_admits),
     avgFamilyExperience: toNullableNumber(row.avg_family_experience),
     lastReferralOn: row.last_referral_on,
+    completed: toNumber(row.completed),
+    decidedPlacements: toNumber(row.decided_placements),
+    completionRate: toNullableNumber(row.completion_rate),
+    medianDaysToAdmit: toNullableNumber(row.median_days_to_admit),
+    stillEnrolled: toNumber(row.still_enrolled),
   };
+}
+
+// Network priors for matching: the disclosed directory figures for every
+// listing this workspace's partners are linked to. Best effort — a workspace
+// without the directory entitlement, or offline, simply ranks on its own
+// history (the RPC error is swallowed, never surfaced).
+async function fetchNetworkTrackRecords(globalPartnerIds: string[]): Promise<Map<string, NetworkTrackRecord>> {
+  const result = new Map<string, NetworkTrackRecord>();
+  const ids = Array.from(new Set(globalPartnerIds.filter(Boolean)));
+  for (let index = 0; index < ids.length; index += 200) {
+    const chunk = ids.slice(index, index + 200);
+    const { data, error } = await supabase.rpc('fetch_global_partner_stats', { p_ids: chunk });
+    if (error) return result;
+    for (const row of (data || []) as NetworkStatsRow[]) {
+      if (!row.disclosed) continue;
+      result.set(row.global_partner_id, {
+        admitRate: toNullableNumber(row.admit_rate),
+        familyExperience: toNullableNumber(row.family_experience),
+        completionRate: toNullableNumber(row.completion_rate ?? null),
+      });
+    }
+  }
+  return result;
 }
 
 // App type → insert/update rows. `id` is included so optimistic local objects
@@ -926,6 +1016,11 @@ function referralToRow(referral: Referral): Record<string, unknown> {
     admitted_on: referral.admittedOn ?? null,
     family_experience: referral.familyExperience ?? null,
     outcome_note: referral.outcomeNote ?? '',
+    // Outcomes loop columns are only sent when set, so a build that predates
+    // migration 20261001160000 on the server still inserts cleanly.
+    ...(referral.completed === undefined ? {} : { completed: referral.completed }),
+    ...(referral.completedOn === undefined ? {} : { completed_on: referral.completedOn || null }),
+    ...(referral.stillEnrolled === undefined ? {} : { still_enrolled: referral.stillEnrolled }),
   };
 }
 
@@ -1009,6 +1104,10 @@ function referralOutcomePatchToRow(patch: ReferralOutcomePatch): Record<string, 
   if (patch.familyExperience !== undefined) row.family_experience = patch.familyExperience;
   if (patch.outcomeNote !== undefined) row.outcome_note = patch.outcomeNote;
   if (patch.outcome !== undefined) row.outcome = patch.outcome;
+  if (patch.completed !== undefined) row.completed = patch.completed;
+  if (patch.completedOn !== undefined) row.completed_on = patch.completedOn;
+  if (patch.stillEnrolled !== undefined) row.still_enrolled = patch.stillEnrolled;
+  if (patch.checkIn !== undefined) row.check_in = patch.checkIn;
   return row;
 }
 
@@ -1277,15 +1376,22 @@ async function fetchSnapshot(): Promise<Snapshot> {
     fetchAllPages<TouchRow>((from, to) => supabase.from('touches').select('*').order('occurred_at', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<BalanceRow>((from, to) => supabase.from('partner_balances').select('partner_id, inbound, outbound').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
     fetchAllPages<FollowUpRow>((from, to) => supabase.from('follow_ups').select('*').eq('status', 'open').order('created_at', { ascending: false }).order('id').range(from, to)),
-    fetchAllPages<ScorecardRow>((from, to) => supabase.from('partner_scorecard').select('partner_id, referrals_sent, admits, non_admits, avg_family_experience, last_referral_on').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
+    fetchAllPages<ScorecardRow>((from, to) => supabase.from('partner_scorecard').select('partner_id, referrals_sent, admits, non_admits, avg_family_experience, last_referral_on, completed, decided_placements, completion_rate, median_days_to_admit, still_enrolled').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
   ]);
 
   const balanceByPartner = new Map<string, BalanceRow>();
   for (const row of balanceRows) balanceByPartner.set(row.partner_id, row);
 
+  const networkByListing = await fetchNetworkTrackRecords(partnerRows.map((row) => row.global_partner_id as string).filter(Boolean));
+  const listingByPartner = new Map<string, string>();
+  for (const row of partnerRows) if (row.global_partner_id) listingByPartner.set(row.id, row.global_partner_id as string);
+
   const scorecards: Record<string, PartnerScorecard> = {};
   for (const row of scorecardRows) {
-    scorecards[row.partner_id] = mapScorecardRow(row);
+    const card = mapScorecardRow(row);
+    const listingId = listingByPartner.get(row.partner_id);
+    const network = listingId ? networkByListing.get(listingId) : undefined;
+    scorecards[row.partner_id] = network ? { ...card, network } : card;
   }
 
   return {
@@ -1536,6 +1642,31 @@ export async function completeFollowUpWithOutcome(
       p_completed: completedRow,
       p_referral_id: safeReferralId,
       p_outcome: outcomeRow,
+    }),
+  );
+}
+
+// Outcomes loop: one server path (record_placement_outcome) for the admit
+// question and for every check-in. It updates the referral, optionally
+// completes the follow-up that prompted it, and creates the 7 / 30 / 90 day
+// check-ins once when the referral is an admission. Queued offline like any
+// other write; the check-ins themselves arrive on the next refresh.
+export async function recordPlacementOutcome(
+  referralId: string,
+  outcome: ReferralOutcomePatch,
+  completed: FollowUp | null,
+  expectedUserId: string,
+): Promise<void> {
+  const safeReferralId = safeId(referralId) as string;
+  const outcomeRow = referralOutcomePatchToRow(outcome);
+  const completedRow = completed ? followUpToRow(completed) : null;
+  await runOrQueue(
+    expectedUserId,
+    { kind: 'referral.record_outcome', referralId: safeReferralId, outcome: outcomeRow, completed: completedRow },
+    () => supabase.rpc('record_placement_outcome', {
+      p_referral_id: safeReferralId,
+      p_outcome: outcomeRow,
+      p_completed: completedRow,
     }),
   );
 }

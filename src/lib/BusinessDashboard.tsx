@@ -13,6 +13,7 @@ import {
 import { formatMoney, type Referral } from '../data';
 import BenchmarksPanel from './BenchmarksPanel';
 import type { CaseRecord } from './cases';
+import { formatDays, formatRate, formatStars } from './outcomes';
 import {
   type BusinessData,
   type BusinessPeriod,
@@ -248,6 +249,34 @@ export default function BusinessDashboard({
               <Text style={styles.summaryLabel}>SUCCESS</Text>
             </View>
           </View>
+
+          <Text style={styles.sectionTitle}>Outcomes</Text>
+          <Text style={styles.sectionNote}>Outbound referrals in the period, by referral date. What the check-ins record: who admitted, who finished, how long admission took, and how the family experienced it.</Text>
+          <View style={styles.metricGrid}>
+            <View style={styles.metricCard}>
+              <Text style={styles.metricLabel}>PLACEMENTS</Text>
+              <Text style={styles.metricValue}>{metrics.outcomes.placements}</Text>
+              <Text style={styles.metricDetail}>{metrics.outcomes.stillEnrolled} still enrolled</Text>
+            </View>
+            <View style={styles.metricCard}>
+              <Text style={styles.metricLabel}>COMPLETED</Text>
+              <Text style={styles.metricValue}>{formatRate(metrics.outcomes.completionRate)}</Text>
+              <Text style={styles.metricDetail}>{metrics.outcomes.completed} of {metrics.outcomes.decidedPlacements} decided</Text>
+            </View>
+            <View style={styles.metricCard}>
+              <Text style={styles.metricLabel}>TIME TO ADMIT</Text>
+              <Text style={styles.metricValue}>{formatDays(metrics.outcomes.medianDaysToAdmit)}</Text>
+              <Text style={styles.metricDetail}>median, referral to admission</Text>
+            </View>
+            <View style={styles.metricCard}>
+              <Text style={styles.metricLabel}>FAMILY EXPERIENCE</Text>
+              <Text style={styles.metricValue}>{formatStars(metrics.outcomes.averageFamilyExperience)}</Text>
+              <Text style={styles.metricDetail}>{metrics.outcomes.rated} rated</Text>
+            </View>
+          </View>
+          {metrics.outcomes.placements === 0 ? (
+            <Text style={styles.emptyFootnote}>Record an admission from a referral check-in and the 7, 30 and 90 day check-ins fill this in.</Text>
+          ) : null}
 
           <Text style={styles.sectionTitle}>Square + PandaDoc</Text>
           <View style={styles.pendingRevenueCard}>

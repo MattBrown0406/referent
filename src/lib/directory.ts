@@ -50,6 +50,10 @@ export type GlobalPartnerStats = {
   referrals12m: number | null;
   admitRate: number | null;
   familyExperience: number | null;
+  // Outcomes loop (20261001160000): disclosed under the same five-workspace
+  // rule, plus at least five decided placements / dated admits.
+  completionRate: number | null; // 0-1
+  medianDaysToAdmit: number | null;
   lastReferralOn: string | null;
   disclosed: boolean;
 };
@@ -210,6 +214,8 @@ type GlobalPartnerStatsRow = {
   referrals_12m: number | null;
   admit_rate: number | string | null;
   family_experience: number | string | null;
+  completion_rate?: number | string | null;
+  median_days_to_admit?: number | string | null;
   last_referral_on: string | null;
   disclosed: boolean;
 };
@@ -232,6 +238,8 @@ export async function fetchGlobalPartnerStats(ids: string[]): Promise<Map<string
       referrals12m: row.referrals_12m ?? null,
       admitRate: toNumber(row.admit_rate),
       familyExperience: toNumber(row.family_experience),
+      completionRate: toNumber(row.completion_rate ?? null),
+      medianDaysToAdmit: toNumber(row.median_days_to_admit ?? null),
       lastReferralOn: row.last_referral_on ?? null,
       disclosed: Boolean(row.disclosed),
     });
