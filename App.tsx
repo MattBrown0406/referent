@@ -90,6 +90,25 @@ import {
 } from './src/lib/business';
 import { billsOutOfNetwork, checkInSchedule, formatDays, formatRate } from './src/lib/outcomes';
 import {
+  type CaseBenefits,
+  type PartnerPlanStatus,
+  type SubscriberRelationship,
+  type VobRequest,
+  type VobStatus,
+  VOB_STATUSES,
+  SUBSCRIBER_RELATIONSHIPS,
+  isVobAnswered,
+  memberIdLast4,
+  nextBusinessDay,
+  planLabel,
+  planNetworkStatusForPartner,
+  planStatusLine,
+  sortPlanStatuses,
+  subscriberRelationshipLabel,
+  vobChaseTitle,
+  vobStatusLabel,
+} from './src/lib/insurance';
+import {
   assignMatchReferral,
   completeFollowUpWithNext,
   createFollowUp,
@@ -176,8 +195,12 @@ import {
   createCaseBundle,
   createCaseFileSignedUrl,
   createLead,
+  fetchCaseBenefits,
+  fetchPartnersForPlan,
   leadCaseTitle,
   leadFollowUpTitle,
+  requestVob,
+  saveCaseBenefits,
   saveDocumentWithEvent,
   deleteContact,
   deleteDocumentRow,
@@ -196,6 +219,7 @@ import {
   updateCaseDetailsWithEvent,
   updateCasePaymentWithEvent,
   updateCaseWithEvent,
+  updateVobStatus,
   uploadCaseFile,
 } from './src/lib/cases';
 
@@ -317,6 +341,31 @@ type CasePaymentFormState = {
   eventId: string;
   amount: string;
   note: string;
+};
+
+// Insurance workflow (migration 20261001170000). The plan editor keeps the
+// last four of the member id only: memberIdLast4() trims whatever is typed
+// before it is held in state, so the full id never sits in memory either.
+type CaseBenefitsFormState = {
+  carrier: string;
+  planName: string;
+  memberIdLast4: string;
+  subscriberRelationship: SubscriberRelationship;
+};
+
+type VobRequestFormState = {
+  caseId: string;
+  partnerId: string | null;
+  programName: string; // free text when no partner is chosen
+  note: string;
+};
+
+type VobAnswerFormState = {
+  requestId: string;
+  status: VobStatus;
+  answeredBy: string;
+  note: string;
+  quoted: string; // whole dollars as typed
 };
 
 // "2:14 PM" in the device's local time.
@@ -895,6 +944,21 @@ export default function App() {
   }, []);
   const [caseEvents, setCaseEvents] = useState<CaseEvent[]>([]);
   const [caseDocuments, setCaseDocuments] = useState<CaseDocument[]>([]);
+  // Insurance workflow: the family's plan and the VOB requests, per case,
+  // read from the server when a case opens or a match links to one. Not
+  // part of the offline copy: a case file opened without a connection shows
+  // "needs a connection" on the Benefits card instead.
+  const [benefitsByCase, setBenefitsByCase] = useState<Record<string, CaseBenefits | null>>({});
+  const [vobsByCase, setVobsByCase] = useState<Record<string, VobRequest[]>>({});
+  const [benefitsLoadedFor, setBenefitsLoadedFor] = useState<Record<string, 'remote' | 'unavailable'>>({});
+  const [benefitsForm, setBenefitsForm] = useState<CaseBenefitsFormState | null>(null);
+  const [vobForm, setVobForm] = useState<VobRequestFormState | null>(null);
+  const [vobAnswerForm, setVobAnswerForm] = useState<VobAnswerFormState | null>(null);
+  const [vobSaving, setVobSaving] = useState(false);
+  // "Which of my partners take this plan?" from partners_for_plan, keyed by
+  // "<plan>|<state>". The Directory filter and the VOB suggestion list read it.
+  const [planStatuses, setPlanStatuses] = useState<Record<string, PartnerPlanStatus[]>>({});
+  const [directoryPlan, setDirectoryPlan] = useState('');
   const [caseListSource, setCaseListSource] = useState<CachedCopyState | null>(null);
   const [caseFileSource, setCaseFileSource] = useState<CachedCopyState | null>(null);
   // Pull-to-refresh on the Today, Cases, Directory and Referrals lists.
@@ -1177,6 +1241,14 @@ export default function App() {
     setAllCaseContacts([]);
     setCaseEvents([]);
     setCaseDocuments([]);
+    setBenefitsByCase({});
+    setVobsByCase({});
+    setBenefitsLoadedFor({});
+    setBenefitsForm(null);
+    setVobForm(null);
+    setVobAnswerForm(null);
+    setPlanStatuses({});
+    setDirectoryPlan('');
     setCaseListSource(null);
     setCaseFileSource(null);
     setPullRefreshing(false);
@@ -1519,6 +1591,8 @@ export default function App() {
         setCaseEvents(fileLoad.file.events);
         setCaseDocuments(fileLoad.file.documents);
         setCaseFileSource({ userId, source: fileLoad.source, savedAt: fileLoad.savedAt, truncated: fileLoad.truncated });
+        await loadCaseBenefits(activeCaseId);
+        if (!stillCurrent()) return 'ok';
       }
       try {
         const nextMembers = await fetchWorkspaceMembers();
@@ -1675,13 +1749,23 @@ export default function App() {
     return latest;
   }, [referrals]);
 
+  // "Takes <plan>": partners_for_plan decides (the linked listing counts);
+  // until it answers, the partner's own data stands in with the same rule.
+  const directoryPlanStatuses = directoryPlan ? planStatuses[`${directoryPlan}|ANY`] : undefined;
+  useEffect(() => {
+    if (!directoryPlan || directoryPlanStatuses) return;
+    void loadPlanStatuses(directoryPlan, 'ANY');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [directoryPlan, directoryPlanStatuses]);
+
   const directoryPartners = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return partners
       .filter((partner) => directoryType === 'All' || typesForPartner(partner).includes(directoryType as Partner['type']))
       .filter((partner) => !needle || `${partner.name} ${partner.organization} ${partner.city} ${partner.state} ${partnerTypeLabel(partner)} ${partner.therapies.join(' ')}`.toLowerCase().includes(needle))
+      .filter((partner) => !directoryPlan || (directoryPlanStatuses?.find((item) => item.partnerId === partner.id)?.networkStatus || planNetworkStatusForPartner(partner, directoryPlan)) === 'in_network')
       .sort((a, b) => Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)) || a.organization.localeCompare(b.organization));
-  }, [partners, directoryType, search]);
+  }, [partners, directoryType, search, directoryPlan, directoryPlanStatuses]);
 
   const insuranceOptions = useMemo(() => insuranceProvidersForState(matchState), [matchState]);
 
@@ -1735,6 +1819,20 @@ export default function App() {
     createdAt: '',
     updatedAt: '',
   }), [selectedMatchId, matchClientLabel, matchType, matchState, matchInsurance, matchNetworkPreferences, matchBudget, matchTherapies, matchMustHave, matchPopulation, matchLocationPreference]);
+
+  // The case behind the match profile on screen (a saved profile's case, or
+  // the case "Find placement" started from). Its VOB answers label the
+  // results; "Request VOB" lands there.
+  const matchCaseId = useMemo(() => {
+    const saved = selectedMatchId ? referralMatches.find((item) => item.id === selectedMatchId) : undefined;
+    return saved?.caseId || pendingCaseMatchId || null;
+  }, [selectedMatchId, referralMatches, pendingCaseMatchId]);
+  const matchCaseVobs = matchCaseId ? vobsByCase[matchCaseId] || [] : [];
+  useEffect(() => {
+    if (tab !== 'match' || !matchCaseId || benefitsLoadedFor[matchCaseId]) return;
+    void loadCaseBenefits(matchCaseId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, matchCaseId]);
 
   // Live bed counts for partners linked to a directory listing, read from
   // the listing itself (fetch_listing_beds). Refreshed when the set of linked
@@ -2311,6 +2409,7 @@ export default function App() {
         setCaseDocuments([]);
         setCaseFileSource({ userId, source: 'unavailable', savedAt: '', truncated: false });
       });
+    void loadCaseBenefits(caseId);
   }
 
   function closeCase() {
@@ -2326,6 +2425,328 @@ export default function App() {
     setCaseNextStepCaseId(null);
     setQuickNoteContact(null);
     setDocView(null);
+    setBenefitsForm(null);
+    setVobForm(null);
+    setVobAnswerForm(null);
+  }
+
+  // ─── Insurance workflow: the Benefits card ──────────────────────────────
+  // The plan and the VOB requests for one case, straight from the server.
+  // Never cached: a case opened offline shows the card as unavailable.
+  async function loadCaseBenefits(caseId: string): Promise<void> {
+    const userId = activeUserId;
+    if (!userId) return;
+    try {
+      const file = await fetchCaseBenefits(caseId);
+      if (activeUserIdRef.current !== userId) return;
+      setBenefitsByCase((current) => ({ ...current, [caseId]: file.plan }));
+      setVobsByCase((current) => ({ ...current, [caseId]: file.requests }));
+      setBenefitsLoadedFor((current) => ({ ...current, [caseId]: 'remote' }));
+    } catch {
+      if (activeUserIdRef.current !== userId) return;
+      setBenefitsLoadedFor((current) => ({ ...current, [caseId]: 'unavailable' }));
+    }
+  }
+
+  // partners_for_plan for one plan (and optional state), cached by key for
+  // the session. Returns the cached answer at once when it is there.
+  async function loadPlanStatuses(plan: string, state: string): Promise<PartnerPlanStatus[] | null> {
+    const key = `${plan}|${state || 'ANY'}`;
+    if (planStatuses[key]) return planStatuses[key];
+    const userId = activeUserId;
+    if (!userId || !plan || plan === 'Cash pay') return null;
+    try {
+      const rows = await fetchPartnersForPlan(plan, state || 'ANY');
+      if (activeUserIdRef.current !== userId) return null;
+      setPlanStatuses((current) => ({ ...current, [key]: rows }));
+      return rows;
+    } catch {
+      return null;
+    }
+  }
+
+  // The client-side reading of a partner's own data, used while the server
+  // answer is loading or unreachable. Same rule as partners_for_plan minus
+  // the linked listing, which the server reads.
+  function planStatusFor(partner: Partner, plan: string, state: string): PartnerPlanStatus {
+    const key = `${plan}|${state || 'ANY'}`;
+    const fromServer = planStatuses[key]?.find((item) => item.partnerId === partner.id);
+    if (fromServer) return fromServer;
+    return {
+      partnerId: partner.id,
+      organization: partner.organization,
+      networkStatus: planNetworkStatusForPartner(partner, plan),
+      source: planNetworkStatusForPartner(partner, plan) === 'unknown' ? 'none' : 'partner',
+      sameState: !state || state === 'ANY' ? null : partner.state === state,
+    };
+  }
+
+  function openBenefitsEditor(record: CaseRecord) {
+    const plan = benefitsByCase[record.id];
+    setBenefitsForm({
+      carrier: plan?.carrier || '',
+      planName: plan?.planName || '',
+      memberIdLast4: plan?.memberIdLast4 || '',
+      subscriberRelationship: plan?.subscriberRelationship || '',
+    });
+  }
+
+  function saveBenefits(record: CaseRecord) {
+    const form = benefitsForm;
+    if (!form) return;
+    if (!mutationSlotAvailable('The insurance plan')) return;
+    const last4 = memberIdLast4(form.memberIdLast4);
+    if (form.memberIdLast4.trim() && last4.length !== 4) {
+      Alert.alert('Member id', 'Enter the last four characters of the member id, or leave it blank.');
+      return;
+    }
+    const previousPlan = benefitsByCase[record.id] ?? null;
+    const optimistic: CaseBenefits = {
+      caseId: record.id,
+      carrier: form.carrier.trim(),
+      planName: form.planName.trim(),
+      memberIdLast4: last4,
+      subscriberRelationship: form.subscriberRelationship,
+      updatedAt: new Date().toISOString(),
+    };
+    setBenefitsByCase((current) => ({ ...current, [record.id]: optimistic }));
+    setBenefitsForm(null);
+    const eventId = makeId('e');
+    let saved: Awaited<ReturnType<typeof saveCaseBenefits>> | null = null;
+    void settleOptimisticWrite(
+      async () => {
+        saved = await saveCaseBenefits(record.id, eventId, {
+          carrier: optimistic.carrier,
+          planName: optimistic.planName,
+          memberIdLast4: optimistic.memberIdLast4,
+          subscriberRelationship: optimistic.subscriberRelationship,
+        });
+      },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => setBenefitsByCase((current) => ({ ...current, [record.id]: previousPlan })),
+      'The insurance plan',
+    ).then((ok) => {
+      if (!ok || !saved) return;
+      const confirmed = saved as Awaited<ReturnType<typeof saveCaseBenefits>>;
+      setBenefitsByCase((current) => ({
+        ...current,
+        [record.id]: { ...optimistic, carrier: confirmed.carrier, planName: confirmed.planName, memberIdLast4: confirmed.memberIdLast4, subscriberRelationship: confirmed.subscriberRelationship, updatedAt: confirmed.occurredAt },
+      }));
+      if (confirmed.eventBody && activeCaseId === record.id) {
+        applyCaseEvent({ id: eventId, caseId: record.id, kind: 'system', body: confirmed.eventBody, occurredAt: confirmed.occurredAt, actorId: activeUserId.toLowerCase() });
+      }
+    });
+  }
+
+  // "Request VOB" from the Benefits card: opens the picker, pre-filled with
+  // the partners that take the plan (in-network first) when a plan is set.
+  function openVobRequest(record: CaseRecord, partnerId: string | null = null) {
+    const plan = benefitsByCase[record.id];
+    const linked = referralMatches.find((item) => item.id === record.matchProfileId) || referralMatches.find((item) => item.caseId === record.id);
+    if (plan?.carrier) void loadPlanStatuses(plan.carrier, linked?.state || 'ANY');
+    setVobForm({ caseId: record.id, partnerId, programName: '', note: '' });
+  }
+
+  // Creates the request (status requested), the chase follow-up due the
+  // next business day and assigned to whoever asked, and the timeline entry,
+  // in one server transaction. The optimistic rows match what lands.
+  function submitVobRequest(form: VobRequestFormState) {
+    const record = cases.find((item) => item.id === form.caseId);
+    if (!record) return;
+    const partner = form.partnerId ? partners.find((item) => item.id === form.partnerId) : undefined;
+    const programName = partner ? partner.organization : form.programName.trim();
+    if (!programName) {
+      Alert.alert('Which program?', 'Pick a partner or type the program name.');
+      return;
+    }
+    if (!mutationSlotAvailable('The VOB request')) return;
+    const now = new Date();
+    const id = makeId('v');
+    const followUpId = makeId('f');
+    const eventId = makeId('e');
+    const dueOn = nextBusinessDay(localDateStamp());
+    const optimistic: VobRequest = {
+      id,
+      caseId: record.id,
+      partnerId: partner?.id,
+      globalPartnerId: partner?.globalPartnerId,
+      programName,
+      status: 'requested',
+      requestedAt: now.toISOString(),
+      requestedBy: activeUserId.toLowerCase(),
+      answeredBy: '',
+      note: form.note.trim(),
+      quotedOutOfPocket: null,
+      followUpId,
+    };
+    const followUp: FollowUp = {
+      id: followUpId,
+      caseId: record.id,
+      partnerId: partner?.id,
+      kind: 'waiting_on',
+      waitingOn: programName,
+      title: vobChaseTitle(programName),
+      dueOn,
+      note: '',
+      status: 'open',
+      assignedTo: activeUserId.toLowerCase(),
+    };
+    const previousVobs = vobsByCase[record.id] || [];
+    const previousFollowUps = followUps;
+    const nextFollowUps = [followUp, ...previousFollowUps];
+    setVobsByCase((current) => ({ ...current, [record.id]: [optimistic, ...previousVobs] }));
+    setFollowUps(nextFollowUps);
+    setVobForm(null);
+    const eventBody = `VOB requested: ${programName}`;
+    if (activeCaseId === record.id) {
+      applyCaseEvent({ id: eventId, caseId: record.id, kind: 'system', body: eventBody, occurredAt: optimistic.requestedAt, actorId: activeUserId.toLowerCase() });
+    }
+    let saved: Awaited<ReturnType<typeof requestVob>> | null = null;
+    void settleOptimisticWrite(
+      async () => {
+        saved = await requestVob({
+          id, caseId: record.id, partnerId: partner?.id, programName, note: optimistic.note, dueOn, followUpId, eventId,
+        });
+      },
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps: previousFollowUps, scorecards },
+      () => {
+        setVobsByCase((current) => ({ ...current, [record.id]: previousVobs }));
+        setFollowUps(previousFollowUps);
+        setCaseEvents((current) => current.filter((item) => item.id !== eventId));
+      },
+      'The VOB request',
+    ).then((ok) => {
+      if (!ok || !saved) return;
+      const confirmed = saved as Awaited<ReturnType<typeof requestVob>>;
+      setVobsByCase((current) => ({
+        ...current,
+        [record.id]: (current[record.id] || []).map((item) => item.id === id
+          ? { ...item, programName: confirmed.programName, globalPartnerId: confirmed.globalPartnerId, requestedAt: confirmed.requestedAt, followUpId: confirmed.followUpId }
+          : item),
+      }));
+      if (confirmed.dueOn && confirmed.dueOn !== dueOn) {
+        setFollowUps((current) => current.map((item) => item.id === followUpId ? { ...item, dueOn: confirmed.dueOn as string } : item));
+      }
+    });
+  }
+
+  // One tap from a match result or a partner profile. The case comes from
+  // the match profile when it is linked to one; otherwise the user picks
+  // among the most recently active open cases.
+  function quickRequestVob(partner: Partner, caseId?: string) {
+    const submit = (targetCaseId: string) => {
+      const record = cases.find((item) => item.id === targetCaseId);
+      if (!record) return;
+      const already = (vobsByCase[targetCaseId] || []).find((item) => item.partnerId === partner.id && !isVobAnswered(item.status));
+      if (already) {
+        Alert.alert('Already asked', `A VOB request to ${partner.organization} is still open on ${record.title}.`);
+        return;
+      }
+      Alert.alert(
+        'Request VOB',
+        `Ask ${partner.organization} to verify benefits for ${record.title}? A reminder to check on it lands on your Today list the next business day.`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Request VOB', onPress: () => submitVobRequest({ caseId: targetCaseId, partnerId: partner.id, programName: '', note: '' }) },
+        ],
+      );
+    };
+    if (caseId && cases.some((item) => item.id === caseId)) {
+      submit(caseId);
+      return;
+    }
+    const candidates = cases.filter(isOpenCase).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 5);
+    if (!candidates.length) {
+      Alert.alert('No open case', 'Open a case file for the family first, then request the VOB from there.');
+      return;
+    }
+    Alert.alert('Which family?', 'The VOB request lands on the case file.', [
+      ...candidates.map((record): { text: string; onPress: () => void } => ({
+        text: record.title,
+        onPress: () => submit(record.id),
+      })),
+      { text: 'Cancel', style: 'cancel' },
+    ]);
+  }
+
+  function openVobAnswer(request: VobRequest) {
+    setVobAnswerForm({
+      requestId: request.id,
+      status: request.status,
+      answeredBy: request.answeredBy,
+      note: request.note,
+      quoted: request.quotedOutOfPocket == null ? '' : String(request.quotedOutOfPocket),
+    });
+  }
+
+  // Records what the program said. A status change is written to the
+  // timeline by the server with the member who recorded it; an answer also
+  // completes the chase follow-up.
+  function saveVobAnswer(record: CaseRecord) {
+    const form = vobAnswerForm;
+    if (!form || vobSaving) return;
+    const current = (vobsByCase[record.id] || []).find((item) => item.id === form.requestId);
+    if (!current) return;
+    const quotedRaw = form.quoted.replace(/[^\d]/g, '');
+    if (form.quoted.trim() && !quotedRaw) {
+      Alert.alert('Out of pocket', 'Enter whole dollars, or leave it blank.');
+      return;
+    }
+    if (!mutationSlotAvailable('The VOB update')) return;
+    const quoted = quotedRaw ? Number(quotedRaw) : null;
+    const nowIso = new Date().toISOString();
+    const statusChanged = form.status !== current.status;
+    const optimistic: VobRequest = {
+      ...current,
+      status: form.status,
+      answeredBy: form.answeredBy.trim(),
+      note: form.note.trim(),
+      quotedOutOfPocket: quoted,
+      answeredAt: isVobAnswered(form.status) ? (statusChanged || !current.answeredAt ? nowIso : current.answeredAt) : undefined,
+    };
+    const previousVobs = vobsByCase[record.id] || [];
+    const previousFollowUps = followUps;
+    const nextFollowUps = statusChanged && isVobAnswered(form.status) && current.followUpId
+      ? previousFollowUps.map((item) => item.id === current.followUpId && item.status === 'open' ? { ...item, status: 'done' as const, completedAt: nowIso } : item)
+      : previousFollowUps;
+    setVobsByCase((state) => ({ ...state, [record.id]: previousVobs.map((item) => item.id === current.id ? optimistic : item) }));
+    setFollowUps(nextFollowUps);
+    setVobAnswerForm(null);
+    setVobSaving(true);
+    const eventId = makeId('e');
+    let saved: Awaited<ReturnType<typeof updateVobStatus>> | null = null;
+    void settleOptimisticWrite(
+      async () => {
+        saved = await updateVobStatus(current.id, eventId, {
+          status: form.status,
+          answeredBy: optimistic.answeredBy,
+          note: optimistic.note,
+          quotedOutOfPocket: quoted,
+        });
+      },
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps: previousFollowUps, scorecards },
+      () => {
+        setVobsByCase((state) => ({ ...state, [record.id]: previousVobs }));
+        setFollowUps(previousFollowUps);
+      },
+      'The VOB update',
+    ).then((ok) => {
+      setVobSaving(false);
+      if (!ok || !saved) return;
+      const confirmed = saved as Awaited<ReturnType<typeof updateVobStatus>>;
+      setVobsByCase((state) => ({
+        ...state,
+        [record.id]: (state[record.id] || []).map((item) => item.id === current.id
+          ? { ...item, status: confirmed.status, answeredAt: confirmed.answeredAt, answeredBy: confirmed.answeredBy, note: confirmed.note, quotedOutOfPocket: confirmed.quotedOutOfPocket }
+          : item),
+      }));
+      if (confirmed.eventBody && activeCaseId === record.id) {
+        applyCaseEvent({ id: eventId, caseId: record.id, kind: 'system', body: confirmed.eventBody, occurredAt: confirmed.occurredAt, actorId: activeUserId.toLowerCase() });
+      }
+    });
   }
 
   // Insert or replace an event in the local timeline and reflect the
@@ -4795,9 +5216,21 @@ export default function App() {
                 {bedLineForPartner(match.partner) ? (
                   <Text numberOfLines={1} style={bedLineForPartner(match.partner).endsWith('Unconfirmed') ? styles.bedLineUnconfirmed : styles.bedLineOpen}>{bedLineForPartner(match.partner)}</Text>
                 ) : null}
-                {match.verifyBenefits || match.disclosure ? (
+                {matchInsurance !== 'Cash pay' ? (() => {
+                  // Honest label: the directory's network status is what the
+                  // program reports ("per program"); a VOB answer on the linked
+                  // case is what the carrier said, for that family only.
+                  const line = planStatusLine(planNetworkStatusForPartner(match.partner, matchInsurance), matchCaseVobs, match.partner.id);
+                  return <Text numberOfLines={1} style={line.confirmed ? styles.bedLineOpen : styles.bedLineUnconfirmed}>{line.text}</Text>;
+                })() : null}
+                {match.verifyBenefits || match.disclosure || matchInsurance !== 'Cash pay' ? (
                   <View style={styles.matchFlags}>
                     {match.verifyBenefits ? <View style={styles.verifyBadge}><AppIcon name="alert-circle-outline" size={12} color={COLORS.inkSoft} /><Text style={styles.verifyBadgeText}>Verify benefits</Text></View> : null}
+                    {matchInsurance !== 'Cash pay' ? (
+                      <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Request a verification of benefits from ${match.partner.organization}`} onPress={() => quickRequestVob(match.partner, matchCaseId || undefined)} style={styles.verifyBadge}>
+                        <AppIcon name="shield-checkmark-outline" size={12} color={COLORS.forest} /><Text style={[styles.verifyBadgeText, { color: COLORS.forest }]}>Request VOB</Text>
+                      </TouchableOpacity>
+                    ) : null}
                     {match.disclosure ? <View style={styles.disclosureBadge}><AppIcon name="information-circle-outline" size={12} color={COLORS.coral} /><Text style={styles.disclosureBadgeText}>Disclosed relationship · {financialRelationshipLabel(match.partner.financialRelationship)}</Text></View> : null}
                   </View>
                 ) : null}
@@ -4988,9 +5421,24 @@ export default function App() {
             options={[{ label: 'All categories', value: 'All' }, ...partnerTypes.map((type) => ({ label: type, value: type }))]}
           />
         </View>
+        <View style={styles.directoryDropdown}>
+          <DropdownField
+            label="TAKES PLAN"
+            value={directoryPlan}
+            icon="shield-checkmark-outline"
+            onChange={setDirectoryPlan}
+            options={[{ label: 'Any plan', value: '' }, ...insuranceProvidersForState('ANY').filter((plan) => plan !== 'Cash pay').map((plan) => ({ label: plan, value: plan }))]}
+          />
+        </View>
+        {directoryPlan ? (
+          <View style={[styles.wrapPills, { marginBottom: 10 }]}>
+            <Pill label={`Takes ${directoryPlan} · per program`} active icon="close" onPress={() => setDirectoryPlan('')} />
+            <Text style={styles.inputCaption}>{directoryPlanStatuses ? 'In-network as each program reports it, from your partner records and linked directory listings. Confirm with a VOB before placement.' : 'Checking the directory…'}</Text>
+          </View>
+        ) : null}
         <View style={styles.directoryCountRow}><Text style={styles.directoryCount}>{directoryPartners.length} RESULTS</Text><AppIcon name="options-outline" size={18} color={COLORS.gray} /></View>
         {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} lastReferralOn={lastReferralByPartner[partner.id]} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
-        {!directoryPartners.length ? <EmptyState icon="people-outline" title="No partners found" body="Try another search or add a new relationship." /> : null}
+        {!directoryPartners.length ? <EmptyState icon="people-outline" title={directoryPlan ? `Nobody lists ${directoryPlan} in-network` : 'No partners found'} body={directoryPlan ? 'Programs report their own networks and lists are often incomplete. Clear the plan filter, or request a VOB from the case to find out for sure.' : 'Try another search or add a new relationship.'} /> : null}
       </ScrollView>
     );
   }
@@ -5120,6 +5568,9 @@ export default function App() {
     if (caseContactForm) return CaseContactModal();
     if (quickNoteContact) return QuickNoteModal();
     if (docView) return DocViewModal();
+    if (benefitsForm) return CaseBenefitsModal(activeCase);
+    if (vobForm) return VobRequestModal(activeCase);
+    if (vobAnswerForm) return VobAnswerModal(activeCase);
     const record = activeCase;
     const colors = CASE_STATUS_COLORS[record.status];
     const linkedMatch = referralMatches.find((item) => item.id === record.matchProfileId)
@@ -5303,6 +5754,88 @@ export default function App() {
                 </TouchableOpacity>
                 <Text style={styles.casePaymentHint}>Enter a quote to mark the case quoted automatically. Use “Record another payment” for each coaching session or installment. Every change lands on the timeline.</Text>
               </View>
+
+              {/* Benefits: the family's plan and the VOB requests */}
+              {(() => {
+                const plan = benefitsByCase[record.id] ?? null;
+                const requests = (vobsByCase[record.id] || []).slice().sort((a, b) => b.requestedAt.localeCompare(a.requestedAt));
+                const loaded = benefitsLoadedFor[record.id];
+                return (
+                  <View style={styles.infoCard}>
+                    <View style={styles.caseSectionHeader}>
+                      <View>
+                        <Text style={styles.infoTitle}>Benefits</Text>
+                        <Text style={styles.caseSectionHint}>Carrier, plan, and the last four of the member id. Nothing more is kept.</Text>
+                      </View>
+                      <TouchableOpacity
+                        accessibilityRole="button"
+                        accessibilityLabel={plan ? 'Edit the insurance plan' : 'Add the insurance plan'}
+                        onPress={() => openBenefitsEditor(record)}
+                        style={styles.caseSectionAction}
+                      >
+                        <AppIcon name={plan ? 'create-outline' : 'add'} size={14} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>{plan ? 'Edit' : 'Add plan'}</Text>
+                      </TouchableOpacity>
+                    </View>
+                    {loaded === 'unavailable' ? (
+                      <Text style={styles.caseEmptyNote}>Benefits need a connection. Pull to refresh once you are back online.</Text>
+                    ) : null}
+                    {plan && (plan.carrier || plan.planName || plan.memberIdLast4) ? (
+                      <View style={styles.businessDetailRow}>
+                        <View style={styles.businessDetailMetric}>
+                          <Text style={styles.infoLabel}>PLAN</Text>
+                          <Text style={styles.businessDetailValue}>{planLabel(plan) || 'Not set'}</Text>
+                        </View>
+                        <View style={styles.businessDetailMetric}>
+                          <Text style={styles.infoLabel}>MEMBER ID</Text>
+                          <Text style={styles.businessDetailValue}>{plan.memberIdLast4 ? `ending ${plan.memberIdLast4}` : '—'}</Text>
+                        </View>
+                        <View style={styles.businessDetailMetric}>
+                          <Text style={styles.infoLabel}>SUBSCRIBER</Text>
+                          <Text style={styles.businessDetailValue}>{subscriberRelationshipLabel(plan.subscriberRelationship)}</Text>
+                        </View>
+                      </View>
+                    ) : loaded === 'remote' ? (
+                      <Text style={styles.caseEmptyNote}>No plan on file yet. Add the carrier and plan so VOB requests go out with the right details.</Text>
+                    ) : null}
+                    <View style={[styles.caseSectionHeader, { marginTop: 12 }]}>
+                      <Text style={styles.infoLabel}>VOB REQUESTS</Text>
+                      <TouchableOpacity
+                        accessibilityRole="button"
+                        accessibilityLabel={`Request a verification of benefits for ${record.title}`}
+                        onPress={() => openVobRequest(record)}
+                        style={styles.caseSectionAction}
+                      >
+                        <AppIcon name="shield-checkmark-outline" size={14} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Request VOB</Text>
+                      </TouchableOpacity>
+                    </View>
+                    {requests.length ? requests.map((request) => {
+                      const tone = request.status === 'in_network' ? { bg: COLORS.mintPale, fg: COLORS.forest }
+                        : request.status === 'out_of_network' ? { bg: '#FFF3E8', fg: COLORS.coral }
+                          : request.status === 'not_accepted' ? { bg: '#F3F3EF', fg: COLORS.inkSoft }
+                            : { bg: '#EEF3FB', fg: COLORS.blue };
+                      const meta = [
+                        `asked ${shortDate(request.requestedAt.slice(0, 10))}`,
+                        request.answeredAt ? `answered ${shortDate(request.answeredAt.slice(0, 10))}${request.answeredBy ? ` by ${request.answeredBy}` : ''}` : '',
+                        request.quotedOutOfPocket != null ? `about ${formatMoney(request.quotedOutOfPocket)} out of pocket` : '',
+                      ].filter(Boolean).join(' · ');
+                      return (
+                        <TouchableOpacity key={request.id} accessibilityRole="button" accessibilityLabel={`${request.programName}: ${vobStatusLabel(request.status)}. Tap to record the answer.`} onPress={() => openVobAnswer(request)} style={styles.caseNextStepRow}>
+                          <View style={[styles.followUpIcon, { width: 30, height: 30 }]}><AppIcon name="shield-checkmark-outline" size={15} color={tone.fg} /></View>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.touchLogTitle}>{request.programName}</Text>
+                            <Text style={styles.touchLogNote}>{meta}</Text>
+                            {request.note ? <Text numberOfLines={2} style={styles.touchLogNote}>{request.note}</Text> : null}
+                          </View>
+                          <View style={[styles.caseChip, { backgroundColor: tone.bg }]}><Text style={[styles.caseChipText, { color: tone.fg }]}>{vobStatusLabel(request.status)}</Text></View>
+                        </TouchableOpacity>
+                      );
+                    }) : loaded === 'remote' ? (
+                      <Text style={styles.caseEmptyNote}>No VOB requested yet. One tap asks a program and puts a reminder on Today for the next business day.</Text>
+                    ) : null}
+                    <Text style={styles.casePaymentHint}>Network status on partners and match results is what each program reports about itself. An answer recorded here is what the carrier said for this family only; it never changes the partner's listing.</Text>
+                  </View>
+                );
+              })()}
 
               <CaseIntegrationPanel record={record} integrations={businessData.integrations} onChanged={refreshBusiness} />
 
@@ -5811,7 +6344,7 @@ export default function App() {
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Placement details</Text>
               <View style={styles.infoLine}><AppIcon name="wallet-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>{directoryCostLabel(typesForPartner(selectedPartner))}</Text><Text style={styles.infoValue}>{formatMoney(monthlyCostForPartner(selectedPartner))}</Text></View></View>
-              <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Insurance</Text><Text style={styles.infoValue}>{selectedPartner.insurance.filter((plan) => plan !== PRIVATE_PAY_ONLY).map((plan) => `${plan} (${networkCapabilitiesForPartner(selectedPartner, plan).map((status) => status === 'In-network' ? 'IN' : 'OON').join(' + ')})`).join(' · ') || (selectedPartner.insurance.includes(PRIVATE_PAY_ONLY) ? 'Private pay only' : 'Not recorded')}</Text></View></View>
+              <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Insurance (per program)</Text><Text style={styles.infoValue}>{selectedPartner.insurance.filter((plan) => plan !== PRIVATE_PAY_ONLY).map((plan) => `${plan} (${networkCapabilitiesForPartner(selectedPartner, plan).map((status) => status === 'In-network' ? 'IN' : 'OON').join(' + ')})`).join(' · ') || (selectedPartner.insurance.includes(PRIVATE_PAY_ONLY) ? 'Private pay only' : 'Not recorded')}</Text><TouchableOpacity accessibilityRole="button" accessibilityLabel={`Request a verification of benefits from ${selectedPartner.organization}`} onPress={() => quickRequestVob(selectedPartner, activeCaseId || undefined)} style={[styles.caseSectionAction, { alignSelf: 'flex-start', marginTop: 6 }]}><AppIcon name="shield-checkmark-outline" size={14} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Request VOB</Text></TouchableOpacity></View></View>
               <View style={styles.infoLine}><AppIcon name="location-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Service area</Text><Text style={styles.infoValue}>{selectedPartner.regions.join(' · ')}</Text></View></View>
             </View>
 
@@ -6749,6 +7282,148 @@ export default function App() {
         ) : null}
         <FormField label="NOTE (OPTIONAL)" value={stepForm.note} onChangeText={(note) => setStepForm((current) => ({ ...current, note }))} placeholder="Anything to remember when this comes due" multiline />
       </>
+    );
+  }
+
+  // ─── Insurance workflow editors (swapped inside the case sheet) ──────────
+
+  function CaseBenefitsModal(record: CaseRecord) {
+    if (!benefitsForm) return null;
+    const close = () => setBenefitsForm(null);
+    const linked = referralMatches.find((item) => item.id === record.matchProfileId) || referralMatches.find((item) => item.caseId === record.id);
+    const carriers = insuranceProvidersForState(linked?.state || 'ANY').filter((plan) => plan !== 'Cash pay');
+    const carrierOptions = [
+      { label: 'Not set', value: '' },
+      ...(benefitsForm.carrier && !carriers.includes(benefitsForm.carrier) ? [{ label: benefitsForm.carrier, value: benefitsForm.carrier }] : []),
+      ...carriers.map((plan) => ({ label: plan, value: plan })),
+    ];
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Back to case file" onPress={close} style={styles.closeButton}><AppIcon name="arrow-back" size={21} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Insurance plan</Text>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => saveBenefits(record)}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>Just enough to ask a program for a VOB. Only the last four of the member id are kept; no date of birth, no SSN. Keep the card photo under Documents.</Text>
+              <DropdownField label="CARRIER" value={benefitsForm.carrier} icon="shield-checkmark-outline" onChange={(carrier) => setBenefitsForm((current) => (current ? { ...current, carrier } : current))} options={carrierOptions} />
+              <FormField label="PLAN NAME (OPTIONAL)" value={benefitsForm.planName} onChangeText={(planName) => setBenefitsForm((current) => (current ? { ...current, planName } : current))} placeholder="PPO Choice, HMO, Medicaid plan name" />
+              <FormField label="MEMBER ID, LAST FOUR ONLY" value={benefitsForm.memberIdLast4} onChangeText={(value) => setBenefitsForm((current) => (current ? { ...current, memberIdLast4: memberIdLast4(value) } : current))} placeholder="1234" />
+              <DropdownField label="SUBSCRIBER" value={benefitsForm.subscriberRelationship} icon="person-outline" onChange={(value) => setBenefitsForm((current) => (current ? { ...current, subscriberRelationship: value as SubscriberRelationship } : current))} options={SUBSCRIBER_RELATIONSHIPS.map((item) => ({ label: item.label, value: item.value }))} />
+              <TouchableOpacity accessibilityRole="button" style={styles.primaryButton} onPress={() => saveBenefits(record)}>
+                <Text style={styles.primaryButtonText}>Save plan</Text>
+              </TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function VobRequestModal(record: CaseRecord) {
+    if (!vobForm) return null;
+    const close = () => setVobForm(null);
+    const plan = benefitsByCase[record.id] ?? null;
+    const linked = referralMatches.find((item) => item.id === record.matchProfileId) || referralMatches.find((item) => item.caseId === record.id);
+    const state = linked?.state || 'ANY';
+    const requests = vobsByCase[record.id] || [];
+    const suggestions = plan?.carrier
+      ? sortPlanStatuses(partners.map((partner) => planStatusFor(partner, plan.carrier, state)))
+      : partners.slice().sort((a, b) => a.organization.localeCompare(b.organization)).map((partner): PartnerPlanStatus => ({ partnerId: partner.id, organization: partner.organization, networkStatus: 'unknown', source: 'none', sameState: null }));
+    const serverAnswered = Boolean(plan?.carrier && planStatuses[`${plan.carrier}|${state}`]);
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Back to case file" onPress={close} style={styles.closeButton}><AppIcon name="arrow-back" size={21} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Request VOB</Text>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => submitVobRequest(vobForm)}><Text style={styles.saveText}>Request</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>
+                {plan?.carrier
+                  ? `Partners that report taking ${plan.carrier} are listed first. The label is what each program says about itself${serverAnswered ? '' : ' (checking the directory)'}; the VOB is how you find out for sure.`
+                  : 'Add the family’s plan on the Benefits card to see which partners report taking it. You can still ask any program now.'}
+              </Text>
+              <Text style={styles.fieldLabel}>WHICH PROGRAM</Text>
+              <View style={styles.followUpCard}>
+                {suggestions.map((item, index) => {
+                  const selected = vobForm.partnerId === item.partnerId;
+                  const partner = partners.find((candidate) => candidate.id === item.partnerId);
+                  const line = plan?.carrier ? planStatusLine(item.networkStatus, requests, item.partnerId) : null;
+                  const open = requests.find((request) => request.partnerId === item.partnerId && !isVobAnswered(request.status));
+                  return (
+                    <TouchableOpacity
+                      key={item.partnerId}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected }}
+                      onPress={() => setVobForm((current) => (current ? { ...current, partnerId: selected ? null : item.partnerId, programName: '' } : current))}
+                      style={[styles.caseNextStepRow, index === suggestions.length - 1 && { borderBottomWidth: 0 }]}
+                    >
+                      <View style={[styles.followUpIcon, { width: 30, height: 30 }]}><AppIcon name={selected ? 'radio-button-on' : 'radio-button-off'} size={17} color={selected ? COLORS.forest : COLORS.gray} /></View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.touchLogTitle}>{item.organization}</Text>
+                        <Text style={styles.touchLogNote}>
+                          {[partner ? `${partner.city}, ${partner.state}` : '', line ? line.text : '', open ? 'VOB already open' : ''].filter(Boolean).join(' · ')}
+                        </Text>
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
+                {!suggestions.length ? <Text style={styles.caseEmptyNote}>No partners in your network yet. Type the program below.</Text> : null}
+              </View>
+              <FormField label="OR A PROGRAM BY NAME" value={vobForm.programName} onChangeText={(programName) => setVobForm((current) => (current ? { ...current, programName, partnerId: programName.trim() ? null : current.partnerId } : current))} placeholder="A program outside your network" />
+              <FormField label="NOTE (OPTIONAL)" value={vobForm.note} onChangeText={(note) => setVobForm((current) => (current ? { ...current, note } : current))} placeholder="Who you spoke with, fax or portal used, what they need from you" multiline />
+              <TouchableOpacity accessibilityRole="button" style={styles.primaryButton} onPress={() => submitVobRequest(vobForm)}>
+                <Text style={styles.primaryButtonText}>Request VOB</Text>
+              </TouchableOpacity>
+              <Text style={styles.casePaymentHint}>A reminder to check on it lands on your Today list the next business day. The request is logged on the timeline.</Text>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function VobAnswerModal(record: CaseRecord) {
+    if (!vobAnswerForm) return null;
+    const close = () => setVobAnswerForm(null);
+    const request = (vobsByCase[record.id] || []).find((item) => item.id === vobAnswerForm.requestId);
+    if (!request) return null;
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Back to case file" onPress={close} style={styles.closeButton}><AppIcon name="arrow-back" size={21} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>VOB answer</Text>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => saveVobAnswer(record)} disabled={vobSaving}><Text style={[styles.saveText, vobSaving && { opacity: 0.45 }]}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>{request.programName}, asked {shortDate(request.requestedAt.slice(0, 10))}. What did they say?</Text>
+              <Text style={styles.fieldLabel}>STATUS</Text>
+              <View style={[styles.wrapPills, { marginBottom: 14 }]}>
+                {VOB_STATUSES.map((status) => (
+                  <Pill key={status} label={vobStatusLabel(status)} active={vobAnswerForm.status === status} onPress={() => setVobAnswerForm((current) => (current ? { ...current, status } : current))} />
+                ))}
+              </View>
+              <FormField label="WHO ANSWERED (OPTIONAL)" value={vobAnswerForm.answeredBy} onChangeText={(answeredBy) => setVobAnswerForm((current) => (current ? { ...current, answeredBy } : current))} placeholder="Maria in admissions" />
+              <FormField label="QUOTED OUT OF POCKET, DOLLARS (OPTIONAL)" value={vobAnswerForm.quoted} onChangeText={(quoted) => setVobAnswerForm((current) => (current ? { ...current, quoted } : current))} placeholder="500" keyboardType="number-pad" />
+              <FormField label="NOTES" value={vobAnswerForm.note} onChangeText={(note) => setVobAnswerForm((current) => (current ? { ...current, note } : current))} placeholder="Deductible, coinsurance, authorization needed, what the family was told" multiline />
+              <TouchableOpacity accessibilityRole="button" style={[styles.primaryButton, vobSaving && { opacity: 0.45 }]} onPress={() => saveVobAnswer(record)} disabled={vobSaving}>
+                <Text style={styles.primaryButtonText}>{vobSaving ? 'Saving…' : 'Save answer'}</Text>
+              </TouchableOpacity>
+              <Text style={styles.casePaymentHint}>A status change is written to the timeline with your name. An answer also closes the reminder to check on it. This applies to this family only and never changes the partner's own network listing.</Text>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
     );
   }
 

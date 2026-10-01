@@ -13,6 +13,7 @@ import {
 import { formatMoney, type Referral } from '../data';
 import BenchmarksPanel from './BenchmarksPanel';
 import type { CaseRecord } from './cases';
+import { formatTurnaroundDays } from './insurance';
 import { formatDays, formatRate, formatStars } from './outcomes';
 import {
   type BusinessData,
@@ -276,6 +277,24 @@ export default function BusinessDashboard({
           </View>
           {metrics.outcomes.placements === 0 ? (
             <Text style={styles.emptyFootnote}>Record an admission from a referral check-in and the 7, 30 and 90 day check-ins fill this in.</Text>
+          ) : null}
+
+          <Text style={styles.sectionTitle}>Benefits checks</Text>
+          <Text style={styles.sectionNote}>VOB requests made in the period, by the day they were asked. The clock runs from the request to the program's answer. Workspace totals only.</Text>
+          <View style={styles.metricGrid}>
+            <View style={styles.metricCard}>
+              <Text style={styles.metricLabel}>VOB TURNAROUND</Text>
+              <Text style={styles.metricValue}>{formatTurnaroundDays(metrics.vob.medianDays)}</Text>
+              <Text style={styles.metricDetail}>median, requested to answered</Text>
+            </View>
+            <View style={styles.metricCard}>
+              <Text style={styles.metricLabel}>ANSWERED</Text>
+              <Text style={styles.metricValue}>{metrics.vob.answered}</Text>
+              <Text style={styles.metricDetail}>of {metrics.vob.requested} {metrics.vob.requested === 1 ? 'request' : 'requests'}</Text>
+            </View>
+          </View>
+          {metrics.vob.requested === 0 ? (
+            <Text style={styles.emptyFootnote}>Tap Request VOB on a case, a match result, or a partner and this fills in.</Text>
           ) : null}
 
           <Text style={styles.sectionTitle}>Square + PandaDoc</Text>
