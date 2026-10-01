@@ -12,10 +12,12 @@ import {
   View,
 } from 'react-native';
 
+import { bedsCadenceLine, bedsLine, listingCarriesBeds, type BedGender, type ListingBeds } from './beds';
 import {
   fetchFavoriteIds,
   fetchGlobalDirectoryStates,
   fetchGlobalPartnerStats,
+  fetchIsPlatformAdmin,
   importGlobalPartner,
   searchGlobalDirectory,
   toggleFavorite,
@@ -23,6 +25,7 @@ import {
   type GlobalPartnerStats,
 } from './directory';
 import { isIndividualProfessional } from './directory-submission';
+import ListingBedsEditor from './ListingBedsEditor';
 import type { Partner } from '../data';
 
 type Props = {
@@ -63,6 +66,15 @@ const TYPE_FILTERS: { key: TypeFilter; label: string; types: string[] }[] = [
   { key: 'therapists', label: 'Therapists', types: ['Therapist'] },
 ];
 
+// "Has a bed for" pills. A hard filter on the server: a confirmed 0 and a
+// count older than seven days drop out; a program that has not said stays.
+type BedFilter = '' | BedGender;
+const BED_FILTERS: { key: BedFilter; label: string }[] = [
+  { key: '', label: 'Any bed status' },
+  { key: 'men', label: 'Has a bed for men' },
+  { key: 'women', label: 'Has a bed for women' },
+];
+
 function statsLine(stats: GlobalPartnerStats | undefined): string {
   if (!stats || !stats.disclosed) return '';
   const parts: string[] = [];
@@ -70,6 +82,8 @@ function statsLine(stats: GlobalPartnerStats | undefined): string {
   if (stats.referrals12m !== null && stats.referrals12m > 0) parts.push(`${stats.referrals12m} referrals this year`);
   if (stats.admitRate !== null) parts.push(`${Math.round(stats.admitRate * 100)}% admitted`);
   if (stats.familyExperience !== null) parts.push(`${stats.familyExperience.toFixed(1)}/5 family experience`);
+  if (stats.completionRate !== null) parts.push(`${Math.round(stats.completionRate * 100)}% completed`);
+  if (stats.medianDaysToAdmit !== null) parts.push(`typically ${Math.round(stats.medianDaysToAdmit)} days to admit`);
   return parts.join('  ·  ');
 }
 
@@ -110,7 +124,12 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
   const [search, setSearch] = useState('');
   const [stateFilter, setStateFilter] = useState('');
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
+  const [bedFilter, setBedFilter] = useState<BedFilter>('');
   const [importingId, setImportingId] = useState<string | null>(null);
+  // Platform admins may set any program's beds from the card. Display-only:
+  // set_listing_beds re-checks on the server.
+  const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
+  const [editingBedsId, setEditingBedsId] = useState<string | null>(null);
   const typeFilterTypes = TYPE_FILTERS.find((filter) => filter.key === typeFilter)?.types ?? [];
   const operationGenerationRef = useRef(0);
   const searchGenerationRef = useRef(0);
@@ -125,6 +144,9 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     fetchFavoriteIds('global_partner')
       .then((next) => { if (active) setFavoriteIds(next); })
       .catch(() => { /* favorites are non-blocking */ });
+    fetchIsPlatformAdmin()
+      .then((next) => { if (active) setIsPlatformAdmin(next); })
+      .catch(() => { if (active) setIsPlatformAdmin(false); });
     return () => { active = false; };
   }, [visible, entitled, userId]);
 
@@ -135,7 +157,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     const generation = ++searchGenerationRef.current;
     setLoadError('');
     const timer = setTimeout(() => {
-      searchGlobalDirectory({ query: search, state: stateFilter, types: typeFilterTypes, limit: PAGE_SIZE, offset: 0 })
+      searchGlobalDirectory({ query: search, state: stateFilter, types: typeFilterTypes, bedFor: bedFilter || undefined, limit: PAGE_SIZE, offset: 0 })
         .then((page) => {
           if (generation !== searchGenerationRef.current) return;
           setListings(page);
@@ -151,7 +173,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     }, listings === null ? 0 : SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, entitled, userId, search, stateFilter, typeFilter]);
+  }, [visible, entitled, userId, search, stateFilter, typeFilter, bedFilter]);
 
   useEffect(() => {
     operationGenerationRef.current += 1;
@@ -164,7 +186,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     if (loadingMore || !hasMore || listings === null) return;
     const generation = searchGenerationRef.current;
     setLoadingMore(true);
-    searchGlobalDirectory({ query: search, state: stateFilter, types: typeFilterTypes, limit: PAGE_SIZE, offset: listings.length })
+    searchGlobalDirectory({ query: search, state: stateFilter, types: typeFilterTypes, bedFor: bedFilter || undefined, limit: PAGE_SIZE, offset: listings.length })
       .then((page) => {
         if (generation !== searchGenerationRef.current) return;
         const seen = new Set(listings.map((listing) => listing.id));
@@ -205,6 +227,12 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
         });
         Alert.alert('Could not update favorite', (error as Error).message);
       });
+  }
+
+  // After an admin confirms beds, the card shows the new line without a
+  // round trip; the next search re-reads it from the server anyway.
+  function applyBeds(listingId: string, beds: ListingBeds) {
+    setListings((current) => (current ? current.map((listing) => (listing.id === listingId ? { ...listing, beds } : listing)) : current));
   }
 
   function addToNetwork(listing: GlobalPartner) {
@@ -282,6 +310,21 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                   </TouchableOpacity>
                 ))}
               </ScrollView>
+              {typeFilter === 'all' || typeFilter === 'programs' ? (
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.stateRow}>
+                  {BED_FILTERS.map((filter) => (
+                    <TouchableOpacity
+                      key={filter.key || 'any'}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: bedFilter === filter.key }}
+                      style={bedFilter === filter.key ? styles.statePillActive : styles.statePill}
+                      onPress={() => setBedFilter(filter.key)}
+                    >
+                      <Text style={bedFilter === filter.key ? styles.statePillActiveText : styles.statePillText}>{filter.label}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              ) : null}
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.stateRow}>
                 <TouchableOpacity
                   accessibilityRole="button"
@@ -316,6 +359,12 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                 const isFavorite = favoriteIds.has(listing.id);
                 const usage = statsLine(stats.get(listing.id));
                 const insurance = insuranceLine(listing);
+                const carriesBeds = listingCarriesBeds(listing.types);
+                const beds = carriesBeds ? bedsLine(listing.beds) : '';
+                const cadence = carriesBeds ? bedsCadenceLine(listing.beds) : '';
+                const contact = carriesBeds && listing.beds?.admissionsContactName
+                  ? [listing.beds.admissionsContactName, listing.beds.admissionsContactPhone].filter(Boolean).join(' · ')
+                  : '';
                 return (
                   <View key={listing.id} style={styles.card}>
                     <View style={styles.cardHeaderRow}>
@@ -325,6 +374,9 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                           <Text style={styles.cardContact}>{listing.name}</Text>
                         ) : null}
                         <Text style={styles.cardSubtitle}>{listingSubtitle(listing)}</Text>
+                        {beds ? <Text style={beds.endsWith('Unconfirmed') ? styles.bedsUnconfirmed : styles.beds}>{beds}</Text> : null}
+                        {cadence ? <Text style={styles.cadence}>{cadence}</Text> : null}
+                        {contact ? <Text style={styles.cardInsurance}>Admissions: {contact}</Text> : null}
                         {insurance ? <Text style={styles.cardInsurance}>Insurance: {insurance}</Text> : null}
                         {listing.description ? (
                           <Text style={styles.cardDescription} numberOfLines={3}>{listing.description}</Text>
@@ -349,6 +401,25 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                         <Text style={isFavorite ? styles.favoriteOn : styles.favoriteOff}>{isFavorite ? '★' : '☆'}</Text>
                       </TouchableOpacity>
                     </View>
+                    {isPlatformAdmin && carriesBeds ? (
+                      editingBedsId === listing.id ? (
+                        <ListingBedsEditor
+                          listingId={listing.id}
+                          beds={listing.beds}
+                          onSaved={(next) => applyBeds(listing.id, next)}
+                          onClose={() => setEditingBedsId(null)}
+                        />
+                      ) : (
+                        <TouchableOpacity
+                          accessibilityRole="button"
+                          accessibilityLabel={`Update beds for ${listing.organization || listing.name}`}
+                          onPress={() => setEditingBedsId(listing.id)}
+                          style={styles.bedsButton}
+                        >
+                          <Text style={styles.bedsButtonText}>Update beds (ReferralFit admin)</Text>
+                        </TouchableOpacity>
+                      )
+                    ) : null}
                     {imported ? (
                       <View style={styles.importedBadge}><Text style={styles.importedText}>In your network</Text></View>
                     ) : (
@@ -449,6 +520,11 @@ const styles = StyleSheet.create({
   cardDescription: { fontSize: 13, color: COLORS.gray, lineHeight: 18, marginTop: 4 },
   verified: { fontSize: 12, fontWeight: '600', color: COLORS.green, marginTop: 4 },
   claimed: { fontSize: 12, fontWeight: '600', color: COLORS.blue, marginTop: 4 },
+  beds: { fontSize: 13, fontWeight: '700', color: COLORS.green, marginTop: 2 },
+  bedsUnconfirmed: { fontSize: 13, fontWeight: '700', color: COLORS.amber, marginTop: 2 },
+  cadence: { fontSize: 12, color: COLORS.gray },
+  bedsButton: { alignSelf: 'flex-start', backgroundColor: COLORS.blueSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 },
+  bedsButtonText: { color: COLORS.blue, fontWeight: '600', fontSize: 13 },
   importedBadge: { alignSelf: 'flex-start', backgroundColor: COLORS.greenSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 },
   importedText: { color: COLORS.green, fontWeight: '600', fontSize: 14 },
   addButton: { backgroundColor: COLORS.blue, borderRadius: 10, paddingVertical: 10, alignItems: 'center' },

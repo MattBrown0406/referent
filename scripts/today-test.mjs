@@ -258,5 +258,27 @@ eq('minutesWaiting counts whole minutes and never goes negative', [today.minutes
 eq('formatWaiting', [4, 59, 60, 75, 1439, 1500, 3000].map(today.formatWaiting), ['4m', '59m', '1h 0m', '1h 15m', '23h 59m', '1d 1h', '2d 2h']);
 for (const c of leadCards) console.log(`    ${today.formatWaiting(today.minutesWaiting(c.lead.arrivedAt, NOW)).padEnd(7)} ${c.lead.immediateDanger ? '⚠ ' : '  '}${c.title}  — ${c.subtitle}`);
 
+// ─── Mine / Everyone (team basics) ──────────────────────────────────────────
+const scopeFollowUps = [
+  fu({ id: 's-mine', title: 'Mine', assignedTo: 'U1' }),
+  fu({ id: 's-theirs', title: 'Theirs', assignedTo: 'u2' }),
+  fu({ id: 's-nobody', title: 'Nobody' }),
+  fu({ id: 's-case-theirs', title: 'Case theirs', caseId: 'c-assigned-u2' }),
+  fu({ id: 's-case-mine', title: 'Case mine', caseId: 'c-assigned-u1' }),
+  fu({ id: 's-override', title: 'Mine despite case', caseId: 'c-assigned-u2', assignedTo: 'u1' }),
+  fu({ id: 's-old-theirs', title: 'Old theirs', dueOn: '2026-07-20', assignedTo: 'u2' }),
+];
+const scopeSections = today.buildTodaySections(scopeFollowUps, due, NOW, contextFor);
+const scopeCaseAssignee = (caseId) => ({ 'c-assigned-u2': 'u2', 'c-assigned-u1': 'U1' })[caseId];
+eq('defaultTodayScope: Everyone solo, Mine with staff', [today.defaultTodayScope(1), today.defaultTodayScope(2), today.defaultTodayScope(0)], ['everyone', 'mine', 'everyone']);
+eq('cardAssignee: own assignee first, then the case assignee, lowercased', scopeSections.today.map((c) => today.cardAssignee(c, scopeCaseAssignee)), ['u1', 'u2', 'u1', 'u1', undefined, 'u2']);
+const everyone = today.filterTodaySections(scopeSections, 'everyone', 'u1', scopeCaseAssignee);
+check('Everyone is the unfiltered sections', everyone === scopeSections);
+const mine = today.filterTodaySections(scopeSections, 'mine', 'U1', scopeCaseAssignee);
+eq('Mine keeps my items and unowned ones, drops a teammate\'s and a case assigned to them', mine.today.map((c) => c.id), ['s-case-mine', 's-mine', 's-override', 's-nobody']);
+eq('Mine filters OVERDUE the same way', mine.overdue.map((c) => c.id), []);
+eq('partner cadence cards are nobody\'s and always show', mine.partnersDue.length, scopeSections.partnersDue.length);
+check('the original sections are untouched', scopeSections.today.length === 6);
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

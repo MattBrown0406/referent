@@ -23,6 +23,17 @@ const pagingOutput = ts.transpileModule(readFileSync(path.join(repoRoot, 'src/li
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021, esModuleInterop: true },
 }).outputText;
 writeFileSync(path.join(tmpDir, 'paging.js'), pagingOutput);
+// outcomes.ts is real code too (pure; it only imports types from ../data).
+const outcomesOutput = ts.transpileModule(readFileSync(path.join(repoRoot, 'src/lib/outcomes.ts'), 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021, esModuleInterop: true },
+}).outputText;
+writeFileSync(path.join(tmpDir, 'outcomes.js'), outcomesOutput);
+// insurance.ts is pure too (types from ../data only); business.ts takes the
+// VOB turnaround median from it.
+const insuranceOutput = ts.transpileModule(readFileSync(path.join(repoRoot, 'src/lib/insurance.ts'), 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021, esModuleInterop: true },
+}).outputText;
+writeFileSync(path.join(tmpDir, 'insurance.js'), insuranceOutput);
 writeFileSync(path.join(tmpDir, 'errors.js'), 'exports.StoreError = class StoreError extends Error {};');
 writeFileSync(path.join(tmpDir, 'auth-session.js'), 'exports.currentAuthSessionIdentity = async () => null;');
 writeFileSync(path.join(tmpDir, 'supabase.js'), 'exports.supabase = {};');

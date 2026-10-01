@@ -115,4 +115,18 @@ nativeState.responseListener({ notification: { request: { identifier: 'tap-1', c
 assert.deepEqual(targets, [['directory', 'b']], 'notification partner deep-link is delivered once');
 unsubscribe();
 
+// Server-sent pushes carry { kind, user_id, ...ids } and nothing else; a tap
+// is honored only for the account it was addressed to.
+const remote = [];
+const unsubscribeRemote = notifications.subscribeToNotificationResponses((target, partnerId, caseId) => remote.push([target, partnerId, caseId]));
+nativeState.responseListener({ notification: { request: { identifier: 'push-stale', content: { data: { kind: 'new_lead', user_id: 'user-a', case_id: 'c1' } } } } });
+nativeState.responseListener({ notification: { request: { identifier: 'push-1', content: { data: { kind: 'assigned_to_me', user_id: 'USER-B', case_id: 'c1', follow_up_id: 'f1' } } } } });
+nativeState.responseListener({ notification: { request: { identifier: 'push-1', content: { data: { kind: 'assigned_to_me', user_id: 'user-b', case_id: 'c1' } } } } });
+nativeState.responseListener({ notification: { request: { identifier: 'push-2', content: { data: { kind: 'directory_decision', user_id: 'user-b', global_partner_id: 'g1' } } } } });
+nativeState.responseListener({ notification: { request: { identifier: 'push-3', content: { data: { kind: 'overdue_mine', user_id: 'user-b' } } } } });
+nativeState.responseListener({ notification: { request: { identifier: 'push-4', content: { data: { kind: 'something_else', user_id: 'user-b' } } } } });
+assert.deepEqual(remote, [['case', undefined, 'c1'], ['workspace', undefined, undefined], ['home', undefined, undefined]], 'server-sent pushes deep-link once, only for the addressed account');
+assert.deepEqual(notifications.remotePushTarget({ kind: 'new_lead' }), { target: 'home' }, 'a lead push without a case id lands on Today');
+unsubscribeRemote();
+
 console.log('notification permission/scheduling/deep-link regression checks: ok');

@@ -1,5 +1,6 @@
 import { newUuid } from './cases';
 import { currentAuthSessionIdentity } from './auth-session';
+import { mapListingBeds, type BedGender, type ListingBeds, type ListingBedsRow } from './beds';
 import { StoreError } from './errors';
 import { supabase } from './supabase';
 import type { InsuranceNetworkPreference, Partner, PartnerType } from '../data';
@@ -35,6 +36,10 @@ export type GlobalPartner = {
   // own profile. Claimed listings are authoritative: the claimant's edits
   // keep them verified. Only the search RPC reports this.
   claimed?: boolean;
+  // Live bed counts (programs only; see src/lib/beds.ts). The search RPC
+  // reports beds_stale; rows read straight from the table fall back to the
+  // client mirror of the same seven-day window.
+  beds?: ListingBeds;
 };
 
 // Network-wide, aggregate-only usage for a listing. Fields are null when
@@ -45,6 +50,10 @@ export type GlobalPartnerStats = {
   referrals12m: number | null;
   admitRate: number | null;
   familyExperience: number | null;
+  // Outcomes loop (20261001160000): disclosed under the same five-workspace
+  // rule, plus at least five decided placements / dated admits.
+  completionRate: number | null; // 0-1
+  medianDaysToAdmit: number | null;
   lastReferralOn: string | null;
   disclosed: boolean;
 };
@@ -57,11 +66,14 @@ export type DirectorySearchParams = {
   populations?: string[];
   // PartnerType values; a listing matches when any of its types overlap.
   types?: string[];
+  // Keep only programs that may have a bed open for this gender: a confirmed
+  // 0 and a count older than seven days drop out; an unknown count stays.
+  bedFor?: BedGender;
   limit?: number;
   offset?: number;
 };
 
-type GlobalPartnerRow = {
+type GlobalPartnerRow = ListingBedsRow & {
   id: string;
   name: string;
   organization: string | null;
@@ -108,6 +120,7 @@ function mapListing(row: GlobalPartnerRow): GlobalPartner {
       ? row.verified_current
       : (row.verified_at ? Date.now() - Date.parse(row.verified_at) < 365 * 24 * 60 * 60 * 1000 : false),
     claimed: typeof row.claimed === 'boolean' ? row.claimed : undefined,
+    beds: mapListingBeds(row),
   };
 }
 
@@ -123,9 +136,64 @@ export async function searchGlobalDirectory(params: DirectorySearchParams = {}):
     p_types: params.types && params.types.length ? params.types : null,
     p_limit: params.limit ?? 50,
     p_offset: params.offset ?? 0,
+    p_bed_for: params.bedFor ?? null,
   });
   if (error) throw new StoreError(error.message || 'Could not search the directory.', false);
   return ((data || []) as GlobalPartnerRow[]).map(mapListing);
+}
+
+// ─── Bed availability ────────────────────────────────────────────────────────
+// Counts live on the listing only (never on the tenant copy). Match results
+// read them live for linked partners; the directory gets them from search.
+// Writes go through set_listing_beds, which admits only a claimant of the
+// listing or a platform admin and refuses individual professionals.
+
+export type ListingBedsStatus = ListingBeds & {
+  globalPartnerId: string;
+  // False for individual professionals: they never carry beds.
+  program: boolean;
+};
+
+type ListingBedsStatusRow = ListingBedsRow & { global_partner_id: string; program: boolean | null };
+
+export async function fetchListingBeds(ids: string[]): Promise<Map<string, ListingBedsStatus>> {
+  const result = new Map<string, ListingBedsStatus>();
+  if (ids.length === 0) return result;
+  const { data, error } = await supabase.rpc('fetch_listing_beds', { p_ids: ids });
+  if (error) throw new StoreError(error.message || 'Could not load bed availability.', false);
+  for (const row of (data || []) as ListingBedsStatusRow[]) {
+    result.set(row.global_partner_id, { ...mapListingBeds(row), globalPartnerId: row.global_partner_id, program: Boolean(row.program) });
+  }
+  return result;
+}
+
+export type SetListingBedsInput = {
+  bedsMale: number | null;
+  bedsFemale: number | null;
+  admissionsContactName: string;
+  admissionsContactPhone: string;
+};
+
+export async function setListingBeds(listingId: string, input: SetListingBedsInput): Promise<ListingBeds> {
+  const { data, error } = await supabase.rpc('set_listing_beds', {
+    p_global_id: listingId,
+    p_beds_male: input.bedsMale,
+    p_beds_female: input.bedsFemale,
+    p_contact_name: input.admissionsContactName.trim(),
+    p_contact_phone: input.admissionsContactPhone.trim(),
+  });
+  if (error) {
+    const message = error.code === '42501'
+      ? 'Only the program that claimed this listing, or ReferralFit, can update its beds.'
+      : error.message || 'Could not save bed availability.';
+    throw new StoreError(message, false);
+  }
+  const row = (Array.isArray(data) ? data[0] : data) as ListingBedsRow | undefined;
+  return {
+    ...mapListingBeds(row || {}),
+    admissionsContactName: input.admissionsContactName.trim(),
+    admissionsContactPhone: input.admissionsContactPhone.trim(),
+  };
 }
 
 // Distinct states with active listings, for filter pills. Cheap even at
@@ -146,6 +214,8 @@ type GlobalPartnerStatsRow = {
   referrals_12m: number | null;
   admit_rate: number | string | null;
   family_experience: number | string | null;
+  completion_rate?: number | string | null;
+  median_days_to_admit?: number | string | null;
   last_referral_on: string | null;
   disclosed: boolean;
 };
@@ -168,6 +238,8 @@ export async function fetchGlobalPartnerStats(ids: string[]): Promise<Map<string
       referrals12m: row.referrals_12m ?? null,
       admitRate: toNumber(row.admit_rate),
       familyExperience: toNumber(row.family_experience),
+      completionRate: toNumber(row.completion_rate ?? null),
+      medianDaysToAdmit: toNumber(row.median_days_to_admit ?? null),
       lastReferralOn: row.last_referral_on ?? null,
       disclosed: Boolean(row.disclosed),
     });

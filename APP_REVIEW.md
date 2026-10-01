@@ -123,8 +123,11 @@ never write it here.
 > They are not a way to pay ReferralFit, and the app never collects payment
 > details.
 >
-> Push notifications are local reminders (daily briefing, follow-up cadence)
-> and are optional.
+> Push notifications are optional. Local reminders (daily briefing,
+> follow-up cadence) are scheduled on the device; server-sent pushes (a new
+> lead, something assigned to you, your follow-ups past due, a directory
+> decision) are turned on by the user in Workspace > "Notify me about..."
+> and carry only a generic line with no names or case details.
 >
 > NEW LEAD / INTAKE LINK: "New lead" on Today is a quick form for a practice
 > to record an inbound call (name and phone are enough); the lead then shows

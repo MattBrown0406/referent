@@ -2,6 +2,8 @@ import type { Referral } from '../data';
 import type { CaseRecord, CaseStatus } from './cases';
 import { StoreError } from './errors';
 import { currentAuthSessionIdentity } from './auth-session';
+import { type OutcomeSummary, summarizeOutcomes } from './outcomes';
+import { type VobTiming, type VobTurnaroundMetric, summarizeVobTurnaround } from './insurance';
 import { fetchAllPages } from './paging';
 import { supabase } from './supabase';
 
@@ -50,6 +52,9 @@ export type CaseIntegration = {
 export type BusinessData = {
   stages: CaseStageHistory[];
   integrations: CaseIntegration[];
+  // Insurance workflow: when each VOB request was made and answered. Only
+  // the two timestamps leave the case file; no program, plan or person.
+  vobs?: VobTiming[];
 };
 
 export type LeadSourceMetric = {
@@ -144,6 +149,13 @@ export type BusinessDashboardMetrics = {
   pendingContractRevenue: number;
   openInvoices: number;
   overdueInvoices: number;
+  // Outcomes loop: outbound referrals in the period (by referral date),
+  // summarised the way partner_scorecard does it (src/lib/outcomes.ts).
+  outcomes: OutcomeSummary;
+  // Insurance workflow: VOB requests made in the period and the median days
+  // until the program answered (src/lib/insurance.ts). Mirrors
+  // vob_turnaround_stats() in the migration; keep the two in step.
+  vob: VobTurnaroundMetric;
 };
 
 export function parseOptionalPositiveUsdCents(input: string): number | null | undefined {
@@ -164,6 +176,8 @@ type StageRow = {
   entered_at: string;
   exited_at: string | null;
 };
+
+type VobTimingRow = { id: string; requested_at: string; answered_at: string | null };
 
 type IntegrationRow = {
   id: string;
@@ -234,10 +248,12 @@ export async function fetchBusinessData(): Promise<BusinessData> {
   const { orgId } = await currentAccount();
   let stageRows: StageRow[];
   let integrationRows: IntegrationRow[];
+  let vobRows: VobTimingRow[];
   try {
-    [stageRows, integrationRows] = await Promise.all([
+    [stageRows, integrationRows, vobRows] = await Promise.all([
       fetchAllPages<StageRow>((from, to) => supabase.from('case_stage_history').select('*').eq('org_id', orgId).order('entered_at', { ascending: true }).order('id').range(from, to)),
       fetchAllPages<IntegrationRow>((from, to) => supabase.from('case_integrations').select('*').eq('org_id', orgId).order('created_at', { ascending: false }).order('id').range(from, to)),
+      fetchAllPages<VobTimingRow>((from, to) => supabase.from('vob_requests').select('id, requested_at, answered_at').eq('org_id', orgId).order('requested_at', { ascending: false }).order('id').range(from, to)),
     ]);
   } catch (error) {
     if (error instanceof StoreError) throw error;
@@ -246,6 +262,7 @@ export async function fetchBusinessData(): Promise<BusinessData> {
   return {
     stages: stageRows.map(mapStage),
     integrations: integrationRows.sort((a, b) => b.updated_at.localeCompare(a.updated_at)).map(mapIntegration),
+    vobs: vobRows.map((row) => ({ requestedAt: row.requested_at, answeredAt: row.answered_at || undefined })),
   };
 }
 
@@ -456,5 +473,7 @@ export function computeBusinessDashboard(
     ),
     openInvoices: openInvoices.length,
     overdueInvoices: openInvoices.filter((item) => Boolean(item.dueOn && item.dueOn < today)).length,
+    outcomes: summarizeOutcomes(outboundReferrals),
+    vob: summarizeVobTurnaround(data.vobs || [], start),
   };
 }

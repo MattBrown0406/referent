@@ -30,7 +30,21 @@ assert.match(
 assert.doesNotMatch(source, /label="CASH MIN"|label="CASH MAX"/);
 assert.match(source, /accessibilityLabel=\{`\$\{plan\} \$\{status\}`\}/);
 assert.match(source, /insuranceNetworks: partnerForm\.insuranceNetworks/);
-assert.match(source, /isOutOfNetwork = networkCapabilities\.includes\('Out-of-network'\)/);
+// Payment fit lives in the pure ranker now (matching integrity); App.tsx
+// must not grow a second copy of it.
+const matchingSource = await readFile(new URL('../src/lib/matching.ts', import.meta.url), 'utf8');
+assert.match(matchingSource, /isOutOfNetwork = networkCapabilities\.includes\('Out-of-network'\)/);
+assert.doesNotMatch(source, /networkCapabilities\.includes\('Out-of-network'\)/, 'App.tsx must call the ranker, not re-derive payment fit');
+assert.match(source, /const matches = useMemo\(\s*\(\) => rankPrograms\(draftMatchProfile, partners, scorecards, bedOptions\)/, 'the match memo must rank through src/lib/matching.ts (with the bed filter as the only extra input)');
+assert.doesNotMatch(source, /reciprocity|inbound - partner\.outbound|to return|Tie-breaker/, 'no reciprocity or score-keeping language in App.tsx');
+assert.doesNotMatch(matchingSource, /\.(inbound|outbound)\b|['"](inbound|outbound)['"]/, 'the ranker never reads referral counts');
+assert.match(matchingSource, /disclosure: hasFinancialRelationship\(partner\),/, 'the disclosure is a flag on the result');
+assert.doesNotMatch(matchingSource.slice(matchingSource.indexOf('export function compareScored'), matchingSource.indexOf('export function rankPrograms')), /disclosure|financialRelationship/, 'ties never look at the disclosure');
+// A pick below the top needs a reason; a disclosed relationship needs one more tap, in both assignment flows.
+assert.match(source, /function addReferral\(disclosureConfirmed = false\)/);
+assert.match(source, /function finalizePacketSend\(disclosureConfirmed = false\)/);
+assert.ok((source.match(/confirmDisclosedRelationship\(/g) || []).length >= 3, 'both assignment flows must route through the disclosure confirmation');
+assert.ok((source.match(/await recordPlacementDecision\(decision, activeUserId\)/g) || []).length === 2, 'both assignment flows must write the placement record after the assignment');
 
 for (const label of [
   'The match', 'The match removal', 'The packet log', 'The case', 'The case status change',
@@ -94,10 +108,12 @@ assert.match(source, /withTimeout\(\s*rescheduleNotifications\(/, 'native notifi
 
 for (const operation of [
   'completeFollowUpWithNext', 'completeFollowUpWithCase',
-  'completeFollowUpWithOutcome', 'finalizeMatchPacket',
+  'recordPlacementOutcome', 'finalizeMatchPacket',
 ]) {
-  assert.match(source, new RegExp(`\\(\\) => ${operation}\\(`), `${operation} must be deferred until after the mutation/session fence`);
+  // Either `() => op(` or the awaited form `async () => { await op(` (used
+  // where the placement record follows the assignment inside the same fence).
+  assert.match(source, new RegExp(`(async )?\\(\\) => (\\{\\s*await )?${operation}\\(`), `${operation} must be deferred until after the mutation/session fence`);
 }
-assert.match(source, /\(\) => assignedMatch\s*\? assignMatchReferral\(/, 'assignMatchReferral must be deferred until after the mutation/session fence');
+assert.match(source, /async \(\) => \{\s*if \(assignedMatch\) \{\s*await assignMatchReferral\(/, 'assignMatchReferral must be deferred until after the mutation/session fence');
 
 console.log('optimistic mutation serialization/dependency invariants: ok');

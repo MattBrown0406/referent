@@ -77,10 +77,10 @@ to other intervention practices on recurring plans:
 - Placement matching across level of care, all 50 states plus DC, cash budget, insurance, therapeutic specialties, and men-only/women-only populations
 - State-aware insurance menus that list relevant regional plans before major national providers
 - State Medicaid program names and major Medicaid managed-care plans for every state and DC, informed by the CMS 2024 Managed Care Enrollment by Program and Plan dataset
-- Two-stage ranking: client fit first, referral reciprocity only as a tie-breaker
+- Three-step ranking (`docs/MATCHING.md`): hard requirements hide a program, a 0-100 fit score orders the rest, and ties go to lower family cost then a rotation seeded by the match. Referral counts and financial relationships never enter
 - Reusable client-match profiles with payment-aware budget fields
 - Referent assignment from a recommended match that automatically creates an outbound referral record
-- Inbound and outbound referral ledger with relationship-balance summaries
+- Inbound and outbound referral ledger with neutral per-partner activity (last referral date, received, sent)
 - Add partners, favorite relationships, log referrals and touches, with per-partner stay-in-touch cadences. Favorites are two-tier: `partners.favorite` is the workspace-wide team pin; `user_favorites` are personal to each signed-in user, work on directory listings before import, and carry over to the imported partner
 - Case files: one family, one place — contacts with one-tap call/text/email (auto-logged to the timeline), payment tracking, documents in a private bucket, and phone-number search across cases
 - Match packets that close the loop: share a de-identified placement recommendation, log the referral, set the check-in follow-up — all case-linked when the profile started from a case

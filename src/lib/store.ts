@@ -17,12 +17,17 @@ import { StoreError } from './errors';
 import { fetchAllPages } from './paging';
 import { supabase } from './supabase';
 import type {
+  ClientPopulation,
+  FinancialRelationship,
   InsuranceNetworkPreference,
+  LocationPreference,
   Partner,
   PartnerType,
+  PlacementReason,
   Referral,
   ReferralMatch,
 } from '../data';
+import type { PlacementCandidate } from './matching';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -40,7 +45,9 @@ export type FollowUpStatus = 'open' | 'done' | 'skipped';
 
 // v4 Today Command Center kinds (migration 20260724190000). 'touch' is a
 // partner-relationship touch (Done → Log touch); the rest are self-evident.
-export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch';
+// 'check_in' (migration 20261001160000) is a post-placement outcome check-in
+// created by the server 7, 30 and 90 days after admission.
+export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch' | 'check_in';
 
 export type FollowUp = {
   id: string;
@@ -56,6 +63,25 @@ export type FollowUp = {
   dueTime?: string; // HH:MM (24h, from the DB time column) — consults mostly
   waitingOn?: string; // who/what we're waiting on, when kind='waiting_on'
   snoozedUntil?: string; // YYYY-MM-DD — hides the item from Today until then
+  // Team basics. assignedTo: a workspace member's user id; null means
+  // "explicitly unassigned" (sent to the server), undefined means untouched
+  // (omitted from writes, so a build that predates the column still saves).
+  // A follow-up with no assignee belongs to whoever its case is assigned to.
+  assignedTo?: string | null;
+  completedBy?: string; // server-stamped; never written by the client
+  checkInDays?: number; // 7 | 30 | 90 when kind='check_in'; server-written
+};
+
+/**
+ * Network-wide figures for the listing behind a partner, from
+ * fetch_global_partner_stats. Present only when the directory discloses them
+ * (five distinct referring workspaces). Matching uses them as the prior for
+ * a partner this workspace has little history with.
+ */
+export type NetworkTrackRecord = {
+  admitRate: number | null; // 0-1
+  familyExperience: number | null; // 1-5
+  completionRate: number | null; // 0-1
 };
 
 export type PartnerScorecard = {
@@ -65,6 +91,14 @@ export type PartnerScorecard = {
   nonAdmits: number;
   avgFamilyExperience: number | null;
   lastReferralOn: string | null; // YYYY-MM-DD
+  // Outcomes loop (migration 20261001160000). Absent on cached cards from
+  // older builds; readers treat missing as zero / unknown.
+  completed?: number;
+  decidedPlacements?: number;
+  completionRate?: number | null; // completed / decided placements
+  medianDaysToAdmit?: number | null;
+  stillEnrolled?: number;
+  network?: NetworkTrackRecord;
 };
 
 // Patch for the v2 outcome-enrichment columns on referrals (admitted,
@@ -77,6 +111,11 @@ export type ReferralOutcomePatch = {
   familyExperience?: number | null; // 1-5
   outcomeNote?: string;
   outcome?: Referral['outcome'];
+  // Outcomes loop. checkIn stamps referrals.last_check_in_at on the server.
+  completed?: boolean | null;
+  completedOn?: string | null; // YYYY-MM-DD
+  stillEnrolled?: boolean | null;
+  checkIn?: boolean;
 };
 
 export type Snapshot = {
@@ -96,6 +135,25 @@ export type PacketCaseEvent = {
   referralId?: string;
   contactId?: string;
   occurredAt: string;
+};
+
+/**
+ * Why a program was chosen from a match: the shortlist the clinician saw,
+ * with scores, the pick and its rank, and the reason when it was not the top
+ * result. Written right after the assignment (placement_decisions).
+ */
+export type PlacementDecision = {
+  id: string;
+  matchProfileId: string;
+  caseId?: string;
+  referralId?: string;
+  chosenPartnerId: string;
+  chosenRank: number;
+  reason?: PlacementReason;
+  reasonNote?: string;
+  candidates: PlacementCandidate[];
+  weights: Record<string, number>;
+  decidedAt: string;
 };
 
 export type HydrateResult = {
@@ -207,7 +265,9 @@ type QueueOp =
   | { kind: 'referral.assign_match'; referral: Record<string, unknown>; match: Record<string, unknown> }
   | { kind: 'packet.finalize'; referral: Record<string, unknown>; match: Record<string, unknown> | null; touch: Record<string, unknown>; followUp: Record<string, unknown>; event: Record<string, unknown> | null }
   | { kind: 'contact.log_activity'; event: Record<string, unknown> | null; touch: Record<string, unknown> | null }
-  | { kind: 'referral.update'; id: string; patch: Record<string, unknown> };
+  | { kind: 'referral.update'; id: string; patch: Record<string, unknown> }
+  | { kind: 'placement.insert'; row: Record<string, unknown> }
+  | { kind: 'referral.record_outcome'; referralId: string; outcome: Record<string, unknown>; completed: Record<string, unknown> | null };
 
 type QueueEnvelope = { version: 2; userId: string; ops: QueueOp[] };
 let queueMutex: Promise<void> = Promise.resolve();
@@ -227,7 +287,7 @@ async function withQueueLock<T>(work: () => Promise<T>): Promise<T> {
 function isQueueOp(value: unknown): value is QueueOp {
   if (!value || typeof value !== 'object') return false;
   const op = value as { kind?: unknown; row?: unknown; id?: unknown; patch?: unknown; completed?: unknown; next?: unknown; event?: unknown; referralId?: unknown; outcome?: unknown; referral?: unknown; match?: unknown; caseId?: unknown; touch?: unknown; followUp?: unknown };
-  const insertKinds = ['partner.insert', 'referral.insert', 'match.insert', 'touch.insert', 'follow_up.insert'];
+  const insertKinds = ['partner.insert', 'referral.insert', 'match.insert', 'touch.insert', 'follow_up.insert', 'placement.insert'];
   const updateKinds = ['partner.update', 'match.update', 'follow_up.update', 'referral.update'];
   if (typeof op.kind !== 'string') return false;
   if (insertKinds.includes(op.kind)) return Boolean(op.row && typeof op.row === 'object');
@@ -238,6 +298,10 @@ function isQueueOp(value: unknown): value is QueueOp {
   }
   if (op.kind === 'follow_up.complete_outcome') {
     return Boolean(op.completed && typeof op.completed === 'object' && typeof op.referralId === 'string' && op.outcome && typeof op.outcome === 'object');
+  }
+  if (op.kind === 'referral.record_outcome') {
+    return typeof op.referralId === 'string' && Boolean(op.outcome && typeof op.outcome === 'object')
+      && (op.completed === null || Boolean(op.completed && typeof op.completed === 'object'));
   }
   if (op.kind === 'match.save_case') return Boolean(op.match && typeof op.match === 'object' && typeof op.caseId === 'string');
   if (op.kind === 'referral.assign_match') return Boolean(op.referral && typeof op.referral === 'object' && op.match && typeof op.match === 'object');
@@ -376,6 +440,14 @@ async function applyQueueOp(op: QueueOp, userId: string, orgId: string): Promise
       break;
     case 'referral.update':
       ({ error } = await supabase.from('referrals').update(op.patch).eq('id', op.id).eq('org_id', orgId));
+      break;
+    case 'placement.insert':
+      ({ error } = await supabase.from('placement_decisions').upsert({ ...op.row, owner_id: userId }, { onConflict: 'id', ignoreDuplicates: true }));
+      break;
+    case 'referral.record_outcome':
+      ({ error } = await supabase.rpc('record_placement_outcome', {
+        p_referral_id: op.referralId, p_outcome: op.outcome, p_completed: op.completed,
+      }));
       break;
   }
   if (error) throw error;
@@ -574,6 +646,10 @@ type PartnerRow = {
   global_listing_status?: string | null;
   directory_rejected_at?: string | null;
   directory_review_note?: string | null;
+  // Matching integrity (20261001130000). Private to the workspace; never
+  // part of any directory field list.
+  financial_relationship?: string | null;
+  financial_relationship_note?: string | null;
 };
 
 type ReferralRow = {
@@ -591,6 +667,11 @@ type ReferralRow = {
   packet_sent_at: string | null;
   match_profile_id: string | null;
   case_id: string | null; // v3 case-files linkage
+  // Outcomes loop (20261001160000); optional so older rows still map.
+  completed?: boolean | null;
+  completed_on?: string | null;
+  still_enrolled?: boolean | null;
+  last_check_in_at?: string | null;
 };
 
 type MatchRow = {
@@ -608,6 +689,10 @@ type MatchRow = {
   case_id: string | null; // v3 case-files linkage
   created_at: string;
   updated_at: string;
+  // Matching integrity (20261001130000)
+  must_have_therapies?: string[] | null;
+  population?: string | null;
+  location_preference?: string | null;
 };
 
 type TouchRow = {
@@ -638,6 +723,9 @@ type FollowUpRow = {
   due_time: string | null; // Postgres time serializes as "HH:MM:SS"
   waiting_on: string | null;
   snoozed_until: string | null;
+  assigned_to?: string | null;
+  completed_by?: string | null;
+  check_in_days?: number | null;
 };
 
 type ScorecardRow = {
@@ -647,6 +735,19 @@ type ScorecardRow = {
   non_admits: number | string | null;
   avg_family_experience: number | string | null;
   last_referral_on: string | null;
+  completed?: number | string | null;
+  decided_placements?: number | string | null;
+  completion_rate?: number | string | null;
+  median_days_to_admit?: number | string | null;
+  still_enrolled?: number | string | null;
+};
+
+type NetworkStatsRow = {
+  global_partner_id: string;
+  admit_rate: number | string | null;
+  family_experience: number | string | null;
+  completion_rate?: number | string | null;
+  disclosed: boolean;
 };
 
 function toNumber(value: number | string | null | undefined): number {
@@ -713,7 +814,24 @@ function mapPartnerRow(row: PartnerRow, balance: BalanceRow | undefined): Partne
       : undefined,
     directoryRejectedAt: row.directory_rejected_at ?? undefined,
     directoryReviewNote: row.directory_review_note || undefined,
+    financialRelationship: sanitizeFinancialRelationship(row.financial_relationship),
+    financialRelationshipNote: row.financial_relationship_note || undefined,
   };
+}
+
+const financialRelationships = new Set<FinancialRelationship>(['none', 'consulting_fee', 'marketing_agreement', 'speaking_fee', 'shared_ownership', 'other']);
+function sanitizeFinancialRelationship(value: unknown): FinancialRelationship {
+  return typeof value === 'string' && financialRelationships.has(value as FinancialRelationship) ? (value as FinancialRelationship) : 'none';
+}
+
+const clientPopulationValues = new Set<ClientPopulation>(['Any', 'Men', 'Women', 'Adolescent']);
+function sanitizePopulation(value: unknown): ClientPopulation {
+  return typeof value === 'string' && clientPopulationValues.has(value as ClientPopulation) ? (value as ClientPopulation) : 'Any';
+}
+
+const locationPreferenceValues = new Set<LocationPreference>(['No preference', 'Close to family', 'Away from home']);
+function sanitizeLocationPreference(value: unknown): LocationPreference {
+  return typeof value === 'string' && locationPreferenceValues.has(value as LocationPreference) ? (value as LocationPreference) : 'No preference';
 }
 
 function mapReferralRow(row: ReferralRow): Referral {
@@ -732,6 +850,10 @@ function mapReferralRow(row: ReferralRow): Referral {
     admittedOn: row.admitted_on || undefined,
     familyExperience: row.family_experience,
     outcomeNote: row.outcome_note || '',
+    completed: row.completed ?? null,
+    completedOn: row.completed_on || undefined,
+    stillEnrolled: row.still_enrolled ?? null,
+    lastCheckInAt: row.last_check_in_at || undefined,
   };
 }
 
@@ -745,6 +867,11 @@ function mapMatchRow(row: MatchRow): ReferralMatch {
     networkPreferences: (row.network_preferences || []) as InsuranceNetworkPreference[],
     maxBudget: row.max_budget ?? undefined,
     therapies: row.therapies || [],
+    // Rows from before 20261001130000 have no must-have list; leaving it
+    // undefined lets the matcher apply the defaults (MAT only).
+    mustHaveTherapies: Array.isArray(row.must_have_therapies) ? row.must_have_therapies : undefined,
+    population: sanitizePopulation(row.population),
+    locationPreference: sanitizeLocationPreference(row.location_preference),
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -780,6 +907,9 @@ function mapFollowUpRow(row: FollowUpRow): FollowUp {
     dueTime: row.due_time ? row.due_time.slice(0, 5) : undefined,
     waitingOn: row.waiting_on || undefined,
     snoozedUntil: row.snoozed_until || undefined,
+    assignedTo: row.assigned_to ? String(row.assigned_to).toLowerCase() : undefined,
+    completedBy: row.completed_by ? String(row.completed_by).toLowerCase() : undefined,
+    checkInDays: row.check_in_days ?? undefined,
   };
 }
 
@@ -797,7 +927,35 @@ function mapScorecardRow(row: ScorecardRow): PartnerScorecard {
     nonAdmits: toNumber(row.non_admits),
     avgFamilyExperience: toNullableNumber(row.avg_family_experience),
     lastReferralOn: row.last_referral_on,
+    completed: toNumber(row.completed),
+    decidedPlacements: toNumber(row.decided_placements),
+    completionRate: toNullableNumber(row.completion_rate),
+    medianDaysToAdmit: toNullableNumber(row.median_days_to_admit),
+    stillEnrolled: toNumber(row.still_enrolled),
   };
+}
+
+// Network priors for matching: the disclosed directory figures for every
+// listing this workspace's partners are linked to. Best effort — a workspace
+// without the directory entitlement, or offline, simply ranks on its own
+// history (the RPC error is swallowed, never surfaced).
+async function fetchNetworkTrackRecords(globalPartnerIds: string[]): Promise<Map<string, NetworkTrackRecord>> {
+  const result = new Map<string, NetworkTrackRecord>();
+  const ids = Array.from(new Set(globalPartnerIds.filter(Boolean)));
+  for (let index = 0; index < ids.length; index += 200) {
+    const chunk = ids.slice(index, index + 200);
+    const { data, error } = await supabase.rpc('fetch_global_partner_stats', { p_ids: chunk });
+    if (error) return result;
+    for (const row of (data || []) as NetworkStatsRow[]) {
+      if (!row.disclosed) continue;
+      result.set(row.global_partner_id, {
+        admitRate: toNullableNumber(row.admit_rate),
+        familyExperience: toNullableNumber(row.family_experience),
+        completionRate: toNullableNumber(row.completion_rate ?? null),
+      });
+    }
+  }
+  return result;
 }
 
 // App type → insert/update rows. `id` is included so optimistic local objects
@@ -828,6 +986,8 @@ function partnerToRow(partner: Partner): Record<string, unknown> {
     note: partner.note,
     favorite: Boolean(partner.favorite),
     touch_cadence_days: partner.touchCadenceDays ?? null,
+    financial_relationship: partner.financialRelationship || 'none',
+    financial_relationship_note: partner.financialRelationshipNote || '',
   };
 }
 
@@ -856,6 +1016,11 @@ function referralToRow(referral: Referral): Record<string, unknown> {
     admitted_on: referral.admittedOn ?? null,
     family_experience: referral.familyExperience ?? null,
     outcome_note: referral.outcomeNote ?? '',
+    // Outcomes loop columns are only sent when set, so a build that predates
+    // migration 20261001160000 on the server still inserts cleanly.
+    ...(referral.completed === undefined ? {} : { completed: referral.completed }),
+    ...(referral.completedOn === undefined ? {} : { completed_on: referral.completedOn || null }),
+    ...(referral.stillEnrolled === undefined ? {} : { still_enrolled: referral.stillEnrolled }),
   };
 }
 
@@ -869,10 +1034,29 @@ function matchToRow(match: ReferralMatch): Record<string, unknown> {
     network_preferences: match.networkPreferences || [],
     max_budget: match.maxBudget ?? null,
     therapies: match.therapies,
+    must_have_therapies: match.mustHaveTherapies ?? null,
+    population: match.population || 'Any',
+    location_preference: match.locationPreference || 'No preference',
     status: match.status,
     assigned_partner_id: safeId(match.assignedPartnerId),
     referral_id: safeId(match.referralId),
     case_id: safeId(match.caseId),
+  };
+}
+
+function placementToRow(decision: PlacementDecision): Record<string, unknown> {
+  return {
+    id: safeId(decision.id),
+    match_profile_id: safeId(decision.matchProfileId),
+    case_id: safeId(decision.caseId),
+    referral_id: safeId(decision.referralId),
+    chosen_partner_id: safeId(decision.chosenPartnerId),
+    chosen_rank: decision.chosenRank,
+    reason: decision.reason ?? null,
+    reason_note: decision.reasonNote ?? '',
+    candidates: decision.candidates.map((candidate) => ({ ...candidate, partnerId: safeId(candidate.partnerId) })),
+    weights: decision.weights,
+    decided_at: decision.decidedAt,
   };
 }
 
@@ -901,6 +1085,8 @@ function followUpToRow(followUp: FollowUp): Record<string, unknown> {
     due_time: followUp.dueTime ?? null,
     waiting_on: followUp.waitingOn ?? '',
     snoozed_until: followUp.snoozedUntil ?? null,
+    // completed_by is stamped server-side from the signed-in member.
+    ...(followUp.assignedTo === undefined ? {} : { assigned_to: followUp.assignedTo ? safeId(followUp.assignedTo) : null }),
   };
 }
 
@@ -918,6 +1104,10 @@ function referralOutcomePatchToRow(patch: ReferralOutcomePatch): Record<string, 
   if (patch.familyExperience !== undefined) row.family_experience = patch.familyExperience;
   if (patch.outcomeNote !== undefined) row.outcome_note = patch.outcomeNote;
   if (patch.outcome !== undefined) row.outcome = patch.outcome;
+  if (patch.completed !== undefined) row.completed = patch.completed;
+  if (patch.completedOn !== undefined) row.completed_on = patch.completedOn;
+  if (patch.stillEnrolled !== undefined) row.still_enrolled = patch.stillEnrolled;
+  if (patch.checkIn !== undefined) row.check_in = patch.checkIn;
   return row;
 }
 
@@ -1186,15 +1376,22 @@ async function fetchSnapshot(): Promise<Snapshot> {
     fetchAllPages<TouchRow>((from, to) => supabase.from('touches').select('*').order('occurred_at', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<BalanceRow>((from, to) => supabase.from('partner_balances').select('partner_id, inbound, outbound').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
     fetchAllPages<FollowUpRow>((from, to) => supabase.from('follow_ups').select('*').eq('status', 'open').order('created_at', { ascending: false }).order('id').range(from, to)),
-    fetchAllPages<ScorecardRow>((from, to) => supabase.from('partner_scorecard').select('partner_id, referrals_sent, admits, non_admits, avg_family_experience, last_referral_on').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
+    fetchAllPages<ScorecardRow>((from, to) => supabase.from('partner_scorecard').select('partner_id, referrals_sent, admits, non_admits, avg_family_experience, last_referral_on, completed, decided_placements, completion_rate, median_days_to_admit, still_enrolled').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
   ]);
 
   const balanceByPartner = new Map<string, BalanceRow>();
   for (const row of balanceRows) balanceByPartner.set(row.partner_id, row);
 
+  const networkByListing = await fetchNetworkTrackRecords(partnerRows.map((row) => row.global_partner_id as string).filter(Boolean));
+  const listingByPartner = new Map<string, string>();
+  for (const row of partnerRows) if (row.global_partner_id) listingByPartner.set(row.id, row.global_partner_id as string);
+
   const scorecards: Record<string, PartnerScorecard> = {};
   for (const row of scorecardRows) {
-    scorecards[row.partner_id] = mapScorecardRow(row);
+    const card = mapScorecardRow(row);
+    const listingId = listingByPartner.get(row.partner_id);
+    const network = listingId ? networkByListing.get(listingId) : undefined;
+    scorecards[row.partner_id] = network ? { ...card, network } : card;
   }
 
   return {
@@ -1349,6 +1546,17 @@ export async function assignMatchReferral(referral: Referral, match: ReferralMat
     supabase.rpc('assign_match_referral', { p_expected_owner_id: userId, p_referral: referralRow, p_match: matchRow }));
 }
 
+// The placement record follows the assignment write (never precedes it): if
+// the assignment is rejected the record is not attempted, and offline both
+// queue FIFO so the referral lands first.
+export async function recordPlacementDecision(decision: PlacementDecision, expectedUserId: string): Promise<void> {
+  const row = placementToRow(decision);
+  await runOrQueue(expectedUserId, { kind: 'placement.insert', row }, (userId) =>
+    // Append-only on the server (insert + select policies): a retried op
+    // that already landed is a no-op, never an update.
+    supabase.from('placement_decisions').upsert({ ...row, owner_id: userId }, { onConflict: 'id', ignoreDuplicates: true }));
+}
+
 export async function finalizeMatchPacket(
   referral: Referral,
   match: ReferralMatch | null,
@@ -1434,6 +1642,31 @@ export async function completeFollowUpWithOutcome(
       p_completed: completedRow,
       p_referral_id: safeReferralId,
       p_outcome: outcomeRow,
+    }),
+  );
+}
+
+// Outcomes loop: one server path (record_placement_outcome) for the admit
+// question and for every check-in. It updates the referral, optionally
+// completes the follow-up that prompted it, and creates the 7 / 30 / 90 day
+// check-ins once when the referral is an admission. Queued offline like any
+// other write; the check-ins themselves arrive on the next refresh.
+export async function recordPlacementOutcome(
+  referralId: string,
+  outcome: ReferralOutcomePatch,
+  completed: FollowUp | null,
+  expectedUserId: string,
+): Promise<void> {
+  const safeReferralId = safeId(referralId) as string;
+  const outcomeRow = referralOutcomePatchToRow(outcome);
+  const completedRow = completed ? followUpToRow(completed) : null;
+  await runOrQueue(
+    expectedUserId,
+    { kind: 'referral.record_outcome', referralId: safeReferralId, outcome: outcomeRow, completed: completedRow },
+    () => supabase.rpc('record_placement_outcome', {
+      p_referral_id: safeReferralId,
+      p_outcome: outcomeRow,
+      p_completed: completedRow,
     }),
   );
 }

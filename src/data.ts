@@ -9,6 +9,41 @@ export type PartnerType =
 export type ReferralDirection = 'Inbound' | 'Outbound';
 export type InsuranceNetworkPreference = 'In-network' | 'Out-of-network';
 
+/** Who the client is. A requirement for matching, never a preference. */
+export type ClientPopulation = 'Any' | 'Men' | 'Women' | 'Adolescent';
+export const clientPopulations: ClientPopulation[] = ['Any', 'Men', 'Women', 'Adolescent'];
+
+/** Where the family would like treatment to be, relative to home. */
+export type LocationPreference = 'No preference' | 'Close to family' | 'Away from home';
+export const locationPreferences: LocationPreference[] = ['No preference', 'Close to family', 'Away from home'];
+
+/**
+ * A financial relationship between the practice and a program. Disclosed on
+ * cards and in the family packet; it never enters the ranking.
+ */
+export type FinancialRelationship = 'none' | 'consulting_fee' | 'marketing_agreement' | 'speaking_fee' | 'shared_ownership' | 'other';
+export const financialRelationshipOptions: { value: FinancialRelationship; label: string }[] = [
+  { value: 'none', label: 'None' },
+  { value: 'consulting_fee', label: 'Consulting fee' },
+  { value: 'marketing_agreement', label: 'Marketing agreement' },
+  { value: 'speaking_fee', label: 'Speaking fee' },
+  { value: 'shared_ownership', label: 'Shared ownership' },
+  { value: 'other', label: 'Other' },
+];
+
+export function financialRelationshipLabel(value: FinancialRelationship | undefined): string {
+  return financialRelationshipOptions.find((option) => option.value === value)?.label || 'None';
+}
+
+/** Why a clinician chose a program other than the top-ranked one. */
+export type PlacementReason = 'family_preference' | 'bed_availability' | 'clinical_judgment' | 'other';
+export const placementReasonOptions: { value: PlacementReason; label: string }[] = [
+  { value: 'family_preference', label: 'Family preference' },
+  { value: 'bed_availability', label: 'Bed availability' },
+  { value: 'clinical_judgment', label: 'Clinical judgment' },
+  { value: 'other', label: 'Other' },
+];
+
 export type Partner = {
   id: string;
   name: string;
@@ -45,6 +80,9 @@ export type Partner = {
   directoryRejectedAt?: string;
   /** The reviewer's note that came with the decline, if any. */
   directoryReviewNote?: string;
+  /** Disclosed financial relationship with the practice. Never published to the directory; never affects ranking. */
+  financialRelationship?: FinancialRelationship;
+  financialRelationshipNote?: string;
 };
 
 export type Referral = {
@@ -63,6 +101,11 @@ export type Referral = {
   admittedOn?: string; // YYYY-MM-DD
   familyExperience?: number | null; // 1-5
   outcomeNote?: string;
+  // Outcomes loop (migration 20261001160000): what the check-ins record.
+  completed?: boolean | null; // finished the program? null = not yet known
+  completedOn?: string; // YYYY-MM-DD
+  stillEnrolled?: boolean | null;
+  lastCheckInAt?: string; // ISO timestamptz, server-stamped by record_placement_outcome
 };
 
 export type ReferralMatch = {
@@ -74,6 +117,11 @@ export type ReferralMatch = {
   networkPreferences?: InsuranceNetworkPreference[];
   maxBudget?: number;
   therapies: string[];
+  /** Needs the program must offer. Missing on profiles saved before matching integrity; see defaultMustHaveNeeds. */
+  mustHaveTherapies?: string[];
+  /** Missing on older profiles: derived from population needs in therapies, else 'Any'. */
+  population?: ClientPopulation;
+  locationPreference?: LocationPreference;
   status: 'Matching' | 'Referred';
   createdAt: string;
   updatedAt: string;

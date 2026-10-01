@@ -24,16 +24,25 @@ import {
 } from 'react-native';
 import type { Session } from '@supabase/supabase-js';
 import {
+  ClientPopulation,
+  clientPopulations,
+  FinancialRelationship,
+  financialRelationshipLabel,
+  financialRelationshipOptions,
   formatMoney,
   initialPartners,
   initialReferralMatches,
   initialReferrals,
   InsuranceNetworkPreference,
   insuranceProvidersForState,
+  LocationPreference,
+  locationPreferences,
   medicaidPlansByState,
   nationalInsuranceProviders,
   Partner,
   partnerTypes,
+  PlacementReason,
+  placementReasonOptions,
   Referral,
   ReferralDirection,
   ReferralMatch,
@@ -42,6 +51,24 @@ import {
   stateOptions,
   therapyOptions,
 } from './src/data';
+import {
+  BedOptions,
+  defaultMustHaveNeeds,
+  hasFinancialRelationship,
+  isPopulationNeed,
+  monthlyCostForPartner,
+  networkCapabilitiesForPartner,
+  placementCandidates,
+  PlacementCandidate,
+  ProgramScore,
+  rankOfPartner,
+  rankPrograms,
+  scoreProgram,
+  scoringWeights,
+  trackRecordPrior,
+  typesForPartner,
+} from './src/lib/matching';
+import { bedForFromPopulation, bedsCadenceLine, bedsLine, type BedFor } from './src/lib/beds';
 import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
@@ -49,10 +76,11 @@ import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
 import { isRecoveryRedirect, parseAuthRedirect } from './src/lib/auth-flows';
-import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, type LeadSettings } from './src/lib/org';
+import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, fetchWorkspaceMembers, memberDisplayName, type LeadSettings, type OrgMember } from './src/lib/org';
+import { refreshPushRegistration, unregisterThisDevice } from './src/lib/push';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
-import { fetchOrgDirectoryProfile, submitPartnerToDirectory, upsertOrgDirectoryProfile, type OrgDirectoryProfile } from './src/lib/directory';
+import { fetchListingBeds, fetchOrgDirectoryProfile, submitPartnerToDirectory, upsertOrgDirectoryProfile, type ListingBedsStatus, type OrgDirectoryProfile } from './src/lib/directory';
 import { directoryCostLabel, directoryMissingFields, directoryMissingFieldsMessage, isIndividualProfessional, PRIVATE_PAY_ONLY } from './src/lib/directory-submission';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
 import {
@@ -60,11 +88,32 @@ import {
   fetchBusinessData,
   LEAD_SOURCES,
 } from './src/lib/business';
+import { billsOutOfNetwork, checkInSchedule, formatDays, formatRate } from './src/lib/outcomes';
+import {
+  type CaseBenefits,
+  type PartnerPlanStatus,
+  type SubscriberRelationship,
+  type VobRequest,
+  type VobStatus,
+  VOB_STATUSES,
+  SUBSCRIBER_RELATIONSHIPS,
+  isVobAnswered,
+  memberIdLast4,
+  nextBusinessDay,
+  planLabel,
+  planNetworkStatusForPartner,
+  planStatusLine,
+  sortPlanStatuses,
+  subscriberRelationshipLabel,
+  vobChaseTitle,
+  vobStatusLabel,
+} from './src/lib/insurance';
 import {
   assignMatchReferral,
   completeFollowUpWithNext,
-  completeFollowUpWithOutcome,
   createFollowUp,
+  recordPlacementOutcome,
+  type ReferralOutcomePatch,
   createMatchProfile,
   deleteMatchProfile,
   createPartner,
@@ -85,7 +134,9 @@ import {
   persistCache,
   persistCaseFile,
   persistCaseList,
+  PlacementDecision,
   readBoundWorkspace,
+  recordPlacementDecision,
   refreshSnapshot,
   saveMatchWithCase,
   Snapshot,
@@ -106,6 +157,10 @@ import {
 } from './src/lib/notifications';
 import {
   buildTodaySections,
+  cardAssignee,
+  defaultTodayScope,
+  filterTodaySections,
+  type TodayScope,
   followUpToCard,
   formatWaiting,
   minutesWaiting,
@@ -123,6 +178,7 @@ import {
   labelLooksLikeFullName,
   PacketAudience,
   PacketFitInput,
+  packetFitInput,
 } from './src/lib/packet';
 import * as ImagePicker from 'expo-image-picker';
 import { MAX_CACHED_EVENTS_PER_FILE } from './src/lib/case-cache';
@@ -134,12 +190,17 @@ import {
   CaseRecord,
   CaseSearchResult,
   CaseStatus,
+  assignCase,
   completeFollowUpWithCase,
   createCaseBundle,
   createCaseFileSignedUrl,
   createLead,
+  fetchCaseBenefits,
+  fetchPartnersForPlan,
   leadCaseTitle,
   leadFollowUpTitle,
+  requestVob,
+  saveCaseBenefits,
   saveDocumentWithEvent,
   deleteContact,
   deleteDocumentRow,
@@ -158,6 +219,7 @@ import {
   updateCaseDetailsWithEvent,
   updateCasePaymentWithEvent,
   updateCaseWithEvent,
+  updateVobStatus,
   uploadCaseFile,
 } from './src/lib/cases';
 
@@ -281,6 +343,43 @@ type CasePaymentFormState = {
   note: string;
 };
 
+// Insurance workflow (migration 20261001170000). The plan editor keeps the
+// last four of the member id only: memberIdLast4() trims whatever is typed
+// before it is held in state, so the full id never sits in memory either.
+type CaseBenefitsFormState = {
+  carrier: string;
+  planName: string;
+  memberIdLast4: string;
+  subscriberRelationship: SubscriberRelationship;
+};
+
+type VobRequestFormState = {
+  caseId: string;
+  partnerId: string | null;
+  programName: string; // free text when no partner is chosen
+  note: string;
+};
+
+type VobAnswerFormState = {
+  requestId: string;
+  status: VobStatus;
+  answeredBy: string;
+  note: string;
+  quoted: string; // whole dollars as typed
+};
+
+// "2:14 PM" in the device's local time.
+function clockTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  let hour = date.getHours();
+  const minute = String(date.getMinutes()).padStart(2, '0');
+  const suffix = hour >= 12 ? 'PM' : 'AM';
+  hour = hour % 12;
+  if (hour === 0) hour = 12;
+  return `${hour}:${minute} ${suffix}`;
+}
+
 function relativeActivity(iso: string): string {
   const then = new Date(iso).getTime();
   if (Number.isNaN(then)) return '';
@@ -324,6 +423,7 @@ function todayKindIcon(card: TodayCard): IconName {
     case 'consult': return 'calendar';
     case 'waiting_on': return 'hourglass-outline';
     case 'touch': return 'hand-left-outline';
+    case 'check_in': return 'clipboard-outline';
     case 'cadence': return 'repeat';
     default: return 'return-up-back';
   }
@@ -346,6 +446,9 @@ type PartnerForm = {
   therapies: string[];
   note: string;
   touchCadence: string;
+  // Disclosed to families and shown on cards; never part of the ranking.
+  financialRelationship: FinancialRelationship;
+  financialRelationshipNote: string;
 };
 
 function localDateStamp() {
@@ -379,6 +482,8 @@ function makeEmptyPartnerForm(): PartnerForm {
   therapies: [],
   note: '',
   touchCadence: '',
+  financialRelationship: 'none',
+  financialRelationshipNote: '',
   };
 }
 
@@ -436,24 +541,21 @@ function orgProfileFormFromListing(profile: OrgDirectoryProfile): OrgProfileForm
   };
 }
 
-function typesForPartner(partner: Partner): Partner['type'][] {
-  if (partner.types?.length) return partner.types;
-  const legacyTypes = (partner.levels || []).filter((level): level is Partner['type'] => partnerTypes.includes(level as Partner['type']));
-  return legacyTypes.length ? legacyTypes : [partner.type];
-}
-
+// typesForPartner, monthlyCostForPartner and networkCapabilitiesForPartner
+// live in src/lib/matching.ts so the ranking and the UI read one definition.
 function partnerTypeLabel(partner: Partner) {
   return typesForPartner(partner).join(' · ');
 }
 
-function monthlyCostForPartner(partner: Partner): number {
-  return partner.monthlyCost ?? partner.cashMax ?? partner.cashMin ?? 0;
-}
-
-function networkCapabilitiesForPartner(partner: Partner, insurance: string): InsuranceNetworkPreference[] {
-  const explicit = partner.insuranceNetworks?.[insurance];
-  if (explicit?.length) return explicit;
-  return partner.insurance.includes(insurance) ? ['In-network'] : [];
+// Neutral activity line for partner cards and profiles: when, how many
+// received, how many sent. No tallies of who owes whom.
+function partnerActivityLine(partner: Partner, lastReferralOn?: string): string {
+  const parts = [
+    lastReferralOn ? `Last referral ${shortDate(lastReferralOn)}` : 'No referrals yet',
+    `${partner.inbound} received`,
+    `${partner.outbound} sent`,
+  ];
+  return parts.join(' · ');
 }
 
 function partnerShareMessage(partner: Partner) {
@@ -707,13 +809,14 @@ function PartnerCard({
   onPress,
   onShare,
   compact = false,
+  lastReferralOn,
 }: {
   partner: Partner;
   onPress: () => void;
   onShare?: () => void;
   compact?: boolean;
+  lastReferralOn?: string;
 }) {
-  const balance = partner.inbound - partner.outbound;
   const insurancePlanCount = partner.insurance.filter((plan) => plan !== 'Cash pay').length;
   return (
     <View style={[styles.partnerCard, compact && styles.partnerCardCompact]}>
@@ -739,10 +842,11 @@ function PartnerCard({
       </TouchableOpacity>
       {!compact ? (
         <View style={styles.partnerFooter}>
-            <Text style={styles.partnerFooterText}>{insurancePlanCount ? `${insurancePlanCount} insurance ${insurancePlanCount === 1 ? 'plan' : 'plans'}` : 'Cash pay only'}</Text>
-            <View style={[styles.balanceBadge, balance > 0 && styles.balanceBadgeWarm]}>
-              <AppIcon name={balance > 0 ? 'arrow-undo' : 'swap-horizontal'} size={13} color={balance > 0 ? COLORS.coral : COLORS.forest} />
-              <Text style={[styles.balanceText, balance > 0 && styles.balanceTextWarm]}>{balance > 0 ? `${balance} to return` : 'Balanced'}</Text>
+            <View style={{ flex: 1, flexShrink: 1 }}>
+              <Text style={styles.partnerFooterText}>{insurancePlanCount ? `${insurancePlanCount} insurance ${insurancePlanCount === 1 ? 'plan' : 'plans'}` : 'Cash pay only'} · {partnerActivityLine(partner, lastReferralOn)}</Text>
+              {hasFinancialRelationship(partner) ? (
+                <View style={[styles.disclosureBadge, { alignSelf: 'flex-start', marginTop: 6 }]}><AppIcon name="information-circle-outline" size={12} color={COLORS.coral} /><Text style={styles.disclosureBadgeText}>Disclosed relationship · {financialRelationshipLabel(partner.financialRelationship)}</Text></View>
+              ) : null}
             </View>
             {onShare ? (
               <TouchableOpacity accessibilityLabel={`Share ${partner.organization}`} accessibilityRole="button" onPress={onShare} style={styles.cardShareButton}>
@@ -840,6 +944,21 @@ export default function App() {
   }, []);
   const [caseEvents, setCaseEvents] = useState<CaseEvent[]>([]);
   const [caseDocuments, setCaseDocuments] = useState<CaseDocument[]>([]);
+  // Insurance workflow: the family's plan and the VOB requests, per case,
+  // read from the server when a case opens or a match links to one. Not
+  // part of the offline copy: a case file opened without a connection shows
+  // "needs a connection" on the Benefits card instead.
+  const [benefitsByCase, setBenefitsByCase] = useState<Record<string, CaseBenefits | null>>({});
+  const [vobsByCase, setVobsByCase] = useState<Record<string, VobRequest[]>>({});
+  const [benefitsLoadedFor, setBenefitsLoadedFor] = useState<Record<string, 'remote' | 'unavailable'>>({});
+  const [benefitsForm, setBenefitsForm] = useState<CaseBenefitsFormState | null>(null);
+  const [vobForm, setVobForm] = useState<VobRequestFormState | null>(null);
+  const [vobAnswerForm, setVobAnswerForm] = useState<VobAnswerFormState | null>(null);
+  const [vobSaving, setVobSaving] = useState(false);
+  // "Which of my partners take this plan?" from partners_for_plan, keyed by
+  // "<plan>|<state>". The Directory filter and the VOB suggestion list read it.
+  const [planStatuses, setPlanStatuses] = useState<Record<string, PartnerPlanStatus[]>>({});
+  const [directoryPlan, setDirectoryPlan] = useState('');
   const [caseListSource, setCaseListSource] = useState<CachedCopyState | null>(null);
   const [caseFileSource, setCaseFileSource] = useState<CachedCopyState | null>(null);
   // Pull-to-refresh on the Today, Cases, Directory and Referrals lists.
@@ -879,6 +998,9 @@ export default function App() {
   const [outcomeAdmittedOn, setOutcomeAdmittedOn] = useState('');
   const [outcomeStars, setOutcomeStars] = useState(0);
   const [outcomeNote, setOutcomeNote] = useState('');
+  // Post-placement check-ins (kind 'check_in') reuse the same sheet with one
+  // question: still enrolled, completed, or left before completing.
+  const [outcomeStatus, setOutcomeStatus] = useState<'enrolled' | 'completed' | 'left' | null>(null);
   const [notifPrePromptVisible, setNotifPrePromptVisible] = useState(false);
   const [welcomeVisible, setWelcomeVisible] = useState(false);
   const [profilePromptVisible, setProfilePromptVisible] = useState(false);
@@ -920,6 +1042,13 @@ export default function App() {
   // tick that keeps the NEW LEADS waiting clocks moving.
   const [showNewLead, setShowNewLead] = useState(false);
   const [leadSettings, setLeadSettings] = useState<LeadSettings>(DEFAULT_LEAD_SETTINGS);
+  // Team basics: who is in the workspace (names on timeline rows, the
+  // assignee pickers, "Take this lead") and the Today scope. A scope of null
+  // means "not chosen yet": the default follows the member count (Mine with
+  // staff, Everyone solo). A solo workspace never shows any of this.
+  const [members, setMembers] = useState<OrgMember[]>([]);
+  const [todayScopeChoice, setTodayScopeChoice] = useState<TodayScope | null>(null);
+  const [pendingNotificationCaseId, setPendingNotificationCaseId] = useState<string | null>(null);
   const [nowTick, setNowTick] = useState(() => new Date());
   const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
@@ -940,6 +1069,23 @@ export default function App() {
   const [matchState, setMatchState] = useState('ANY');
   const [matchBudget, setMatchBudget] = useState('');
   const [matchTherapies, setMatchTherapies] = useState<string[]>([]);
+  // Matching integrity: who the client is, where the family wants care, and
+  // which selected needs are must-haves (hide a program) versus preferred
+  // (score it). MAT is must-have by default when selected.
+  const [matchPopulation, setMatchPopulation] = useState<ClientPopulation>('Any');
+  const [matchLocationPreference, setMatchLocationPreference] = useState<LocationPreference>('No preference');
+  const [matchMustHave, setMatchMustHave] = useState<string[]>([]);
+  // "Has a bed for": off by default. When turned on, the client's population
+  // picks men / women; the clinician can change it. Live counts come from
+  // each linked directory listing (src/lib/beds.ts), never from the partner.
+  const [bedFilterOn, setBedFilterOn] = useState(false);
+  const [bedFor, setBedFor] = useState<BedFor>('any');
+  const [listingBeds, setListingBeds] = useState<Record<string, ListingBedsStatus>>({});
+  // The shortlist the clinician saw when they started an assignment, so the
+  // placement record can say what was shown and at what rank the pick sat.
+  const [pendingPlacement, setPendingPlacement] = useState<{ matchProfileId: string; rankedIds: string[]; candidates: PlacementCandidate[] } | null>(null);
+  const [placementReason, setPlacementReason] = useState<PlacementReason | null>(null);
+  const [placementReasonNote, setPlacementReasonNote] = useState('');
   const matchClientLabelRef = useRef<TextInput>(null);
   // Bind every mutation to the account from the render that initiated it. If
   // auth changes mid-flight, store.ts rejects the stale account ID.
@@ -1082,6 +1228,9 @@ export default function App() {
   }, []);
 
   const resetAccountState = useCallback(() => {
+    setMembers([]);
+    setTodayScopeChoice(null);
+    setPendingNotificationCaseId(null);
     caseLoadGenerationRef.current += 1;
     businessLoadGenerationRef.current += 1;
     activeOrgIdRef.current = '';
@@ -1092,6 +1241,14 @@ export default function App() {
     setAllCaseContacts([]);
     setCaseEvents([]);
     setCaseDocuments([]);
+    setBenefitsByCase({});
+    setVobsByCase({});
+    setBenefitsLoadedFor({});
+    setBenefitsForm(null);
+    setVobForm(null);
+    setVobAnswerForm(null);
+    setPlanStatuses({});
+    setDirectoryPlan('');
     setCaseListSource(null);
     setCaseFileSource(null);
     setPullRefreshing(false);
@@ -1283,6 +1440,16 @@ export default function App() {
         } catch {
           if (active && generation === authGenerationRef.current) setLeadSettings(DEFAULT_LEAD_SETTINGS);
         }
+        try {
+          const nextMembers = await fetchWorkspaceMembers();
+          if (!active || generation !== authGenerationRef.current) return;
+          setMembers(nextMembers);
+        } catch {
+          if (active && generation === authGenerationRef.current) setMembers([]);
+        }
+        // A member who turned push on gets this device re-registered quietly;
+        // this never prompts and never fails loudly.
+        void refreshPushRegistration(userId);
 
         const pending = await pendingWriteCount(userId);
         if (!active || generation !== authGenerationRef.current) return;
@@ -1424,6 +1591,15 @@ export default function App() {
         setCaseEvents(fileLoad.file.events);
         setCaseDocuments(fileLoad.file.documents);
         setCaseFileSource({ userId, source: fileLoad.source, savedAt: fileLoad.savedAt, truncated: fileLoad.truncated });
+        await loadCaseBenefits(activeCaseId);
+        if (!stillCurrent()) return 'ok';
+      }
+      try {
+        const nextMembers = await fetchWorkspaceMembers();
+        if (!stillCurrent()) return 'ok';
+        setMembers(nextMembers);
+      } catch {
+        // Keep the last known member list.
       }
       await syncDerived(refreshed, caseLoad.list.cases);
       if (stillCurrent()) setRefreshNotice('');
@@ -1505,11 +1681,30 @@ export default function App() {
   // opens the named partner once that account's directory has hydrated.
   useEffect(() => {
     if (!session?.user?.id) return undefined;
-    return subscribeToNotificationResponses((target, partnerId) => {
+    return subscribeToNotificationResponses((target, partnerId, caseId) => {
+      // Server-sent pushes carry only ids; the item opens once it has loaded.
+      if (target === 'case') {
+        setTab('home');
+        if (caseId) setPendingNotificationCaseId(caseId);
+        return;
+      }
+      if (target === 'workspace') {
+        setTab('home');
+        setShowWorkspace(true);
+        return;
+      }
       setTab(target);
       if (partnerId) setPendingNotificationPartnerId(partnerId);
     });
   }, [session?.user?.id]);
+
+  useEffect(() => {
+    if (!pendingNotificationCaseId) return;
+    if (!cases.some((item) => item.id === pendingNotificationCaseId)) return;
+    openCaseById(pendingNotificationCaseId);
+    setPendingNotificationCaseId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingNotificationCaseId, cases]);
 
   useEffect(() => {
     if (!pendingNotificationPartnerId) return;
@@ -1541,16 +1736,36 @@ export default function App() {
   const totals = useMemo(() => ({
     inbound: partners.reduce((sum, partner) => sum + partner.inbound, 0),
     outbound: partners.reduce((sum, partner) => sum + partner.outbound, 0),
-    reciprocal: partners.filter((partner) => partner.inbound > partner.outbound).length,
+    active: partners.filter((partner) => partner.inbound + partner.outbound > 0).length,
   }), [partners]);
+
+  // Most recent referral date per partner, either direction, for the neutral
+  // activity line on cards and profiles.
+  const lastReferralByPartner = useMemo(() => {
+    const latest: Record<string, string> = {};
+    for (const referral of referrals) {
+      if (!latest[referral.partnerId] || referral.date > latest[referral.partnerId]) latest[referral.partnerId] = referral.date;
+    }
+    return latest;
+  }, [referrals]);
+
+  // "Takes <plan>": partners_for_plan decides (the linked listing counts);
+  // until it answers, the partner's own data stands in with the same rule.
+  const directoryPlanStatuses = directoryPlan ? planStatuses[`${directoryPlan}|ANY`] : undefined;
+  useEffect(() => {
+    if (!directoryPlan || directoryPlanStatuses) return;
+    void loadPlanStatuses(directoryPlan, 'ANY');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [directoryPlan, directoryPlanStatuses]);
 
   const directoryPartners = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return partners
       .filter((partner) => directoryType === 'All' || typesForPartner(partner).includes(directoryType as Partner['type']))
       .filter((partner) => !needle || `${partner.name} ${partner.organization} ${partner.city} ${partner.state} ${partnerTypeLabel(partner)} ${partner.therapies.join(' ')}`.toLowerCase().includes(needle))
+      .filter((partner) => !directoryPlan || (directoryPlanStatuses?.find((item) => item.partnerId === partner.id)?.networkStatus || planNetworkStatusForPartner(partner, directoryPlan)) === 'in_network')
       .sort((a, b) => Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)) || a.organization.localeCompare(b.organization));
-  }, [partners, directoryType, search]);
+  }, [partners, directoryType, search, directoryPlan, directoryPlanStatuses]);
 
   const insuranceOptions = useMemo(() => insuranceProvidersForState(matchState), [matchState]);
 
@@ -1585,57 +1800,71 @@ export default function App() {
     return Array.from(new Set([...plansForState, ...orgProfileForm.insurance.filter((plan) => plan !== 'Cash pay')]));
   }, [orgProfileForm.state, orgProfileForm.insurance]);
 
-  const matches = useMemo(() => {
-    const budget = Number(matchBudget) || Infinity;
-    return partners
-      .map((partner) => {
-        const typeFit = matchType === 'Any type' || typesForPartner(partner).includes(matchType as Partner['type']);
-        const networkCapabilities = matchInsurance === 'Cash pay' ? [] : networkCapabilitiesForPartner(partner, matchInsurance);
-        const isInNetwork = networkCapabilities.includes('In-network');
-        const isOutOfNetwork = networkCapabilities.includes('Out-of-network');
-        const paymentFit = matchInsurance === 'Cash pay'
-          ? monthlyCostForPartner(partner) <= budget
-          : (matchNetworkPreferences.includes('In-network') && isInNetwork)
-            || (matchNetworkPreferences.includes('Out-of-network') && isOutOfNetwork);
-        const matchNetworkStatus: InsuranceNetworkPreference | null = matchInsurance === 'Cash pay'
-          ? null
-          : isInNetwork && matchNetworkPreferences.includes('In-network')
-            ? 'In-network'
-            : isOutOfNetwork ? 'Out-of-network' : null;
-        const regionFit = matchState === 'ANY' || partner.state === matchState || partner.regions.includes('Nationwide');
-        const matchesNeed = (need: string) => {
-          if (need === 'Men only') return partner.therapies.includes(need) || (partner.populations.includes('Men') && !partner.populations.includes('Women'));
-          if (need === 'Women only') return partner.therapies.includes(need) || (partner.populations.includes('Women') && !partner.populations.includes('Men'));
-          if (need === 'LGBTQ+') return partner.therapies.includes(need) || partner.populations.includes('LGBTQ+');
-          if (need === 'Adolescent') return partner.therapies.includes(need) || partner.populations.some((population) => ['Adolescent', 'Adolescents', 'Teens'].includes(population));
-          return partner.therapies.includes(need);
-        };
-        const matchedTherapies = matchTherapies.filter(matchesNeed);
-        const clinicalCoverage = matchTherapies.length ? matchedTherapies.length / matchTherapies.length : 1;
-        const eligible = typeFit && paymentFit && regionFit && (matchTherapies.length === 0 || matchedTherapies.length > 0);
-        const clinicalScore = Math.round(62 + clinicalCoverage * 30 + (paymentFit ? 4 : 0) + (regionFit ? 4 : 0));
-        const reciprocity = partner.inbound - partner.outbound;
-        // The exact fit signals the Match Packet's "why this fits" section is
-        // generated from — same dimensions this memo already computes.
-        const fitInput: PacketFitInput = { networkStatus: matchNetworkStatus, matchedTherapies, regionFit, paymentFit };
-        const scorecard = scorecards[partner.id];
-        const avgFamilyExperience = scorecard?.avgFamilyExperience ?? null;
-        const decided = (scorecard?.admits || 0) + (scorecard?.nonAdmits || 0);
-        const admitRate = decided > 0 ? (scorecard?.admits || 0) / decided : null;
-        return { partner, matchedTherapies, clinicalScore: Math.min(clinicalScore, 100), reciprocity, eligible, networkStatus: matchNetworkStatus, fitInput, avgFamilyExperience, admitRate };
-      })
-      .filter((match) => match.eligible)
-      // Tie-break order after fit score (v1 scorecard change): average family
-      // experience, then admit rate, then the pre-existing reciprocity
-      // tie-breaker. Reciprocity stays — it just now comes after outcomes.
-      // nulls sort last within each tier.
-      .sort((a, b) =>
-        b.clinicalScore - a.clinicalScore
-        || (b.avgFamilyExperience ?? -1) - (a.avgFamilyExperience ?? -1)
-        || (b.admitRate ?? -1) - (a.admitRate ?? -1)
-        || b.reciprocity - a.reciprocity
-        || monthlyCostForPartner(a.partner) - monthlyCostForPartner(b.partner));
-  }, [partners, matchType, matchInsurance, matchNetworkPreferences, matchState, matchBudget, matchTherapies, scorecards]);
+  // The criteria as they stand in the form, in the shape the ranker and the
+  // packet read. A profile that is not saved yet ranks under a fixed draft
+  // id, so its tie rotation is stable while the clinician edits.
+  const draftMatchProfile = useMemo((): ReferralMatch => ({
+    id: selectedMatchId || 'draft',
+    clientLabel: matchClientLabel,
+    levelOfCare: matchType as ReferralMatch['levelOfCare'],
+    state: matchState,
+    insurance: matchInsurance,
+    networkPreferences: matchNetworkPreferences,
+    maxBudget: matchInsurance === 'Cash pay' && matchBudget.trim() ? Number(matchBudget) || undefined : undefined,
+    therapies: matchTherapies,
+    mustHaveTherapies: matchMustHave,
+    population: matchPopulation,
+    locationPreference: matchLocationPreference,
+    status: 'Matching',
+    createdAt: '',
+    updatedAt: '',
+  }), [selectedMatchId, matchClientLabel, matchType, matchState, matchInsurance, matchNetworkPreferences, matchBudget, matchTherapies, matchMustHave, matchPopulation, matchLocationPreference]);
+
+  // The case behind the match profile on screen (a saved profile's case, or
+  // the case "Find placement" started from). Its VOB answers label the
+  // results; "Request VOB" lands there.
+  const matchCaseId = useMemo(() => {
+    const saved = selectedMatchId ? referralMatches.find((item) => item.id === selectedMatchId) : undefined;
+    return saved?.caseId || pendingCaseMatchId || null;
+  }, [selectedMatchId, referralMatches, pendingCaseMatchId]);
+  const matchCaseVobs = matchCaseId ? vobsByCase[matchCaseId] || [] : [];
+  useEffect(() => {
+    if (tab !== 'match' || !matchCaseId || benefitsLoadedFor[matchCaseId]) return;
+    void loadCaseBenefits(matchCaseId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, matchCaseId]);
+
+  // Live bed counts for partners linked to a directory listing, read from
+  // the listing itself (fetch_listing_beds). Refreshed when the set of linked
+  // partners changes or the clinician turns the bed filter on. Offline, or on
+  // a server without the migration, every count is simply unknown.
+  const linkedListingIds = useMemo(
+    () => Array.from(new Set(partners.map((partner) => partner.globalPartnerId).filter((id): id is string => Boolean(id)))).sort().join(','),
+    [partners],
+  );
+  useEffect(() => {
+    if (!session?.user?.id || !linkedListingIds) { setListingBeds({}); return undefined; }
+    let active = true;
+    fetchListingBeds(linkedListingIds.split(','))
+      .then((next) => { if (active) setListingBeds(Object.fromEntries(next)); })
+      .catch(() => { /* unknown counts never hide a program */ });
+    return () => { active = false; };
+  }, [session?.user?.id, linkedListingIds, bedFilterOn]);
+
+  const bedOptions = useMemo((): BedOptions => ({ bedFor: bedFilterOn ? bedFor : null, beds: listingBeds }), [bedFilterOn, bedFor, listingBeds]);
+
+  function bedLineForPartner(partner: Partner): string {
+    return partner.globalPartnerId ? bedsLine(listingBeds[partner.globalPartnerId]) : '';
+  }
+
+  // Hard requirements hide, the 0-100 score orders, cost then a seeded
+  // rotation breaks ties (src/lib/matching.ts). Referral counts are not an
+  // input: the ranker never reads inbound/outbound. With the bed filter on, a
+  // confirmed 0 hides; an unknown count sorts below a confirmed open bed.
+  const matches = useMemo(
+    () => rankPrograms(draftMatchProfile, partners, scorecards, bedOptions),
+    [draftMatchProfile, partners, scorecards, bedOptions],
+  );
 
   const sortedReferrals = referrals
     .slice()
@@ -1669,6 +1898,23 @@ export default function App() {
     setMatchNetworkPreferences(referralMatch.networkPreferences?.length ? referralMatch.networkPreferences : ['In-network']);
     setMatchBudget(referralMatch.maxBudget ? String(referralMatch.maxBudget) : '');
     setMatchTherapies(referralMatch.therapies);
+    setMatchMustHave(referralMatch.mustHaveTherapies ?? defaultMustHaveNeeds(referralMatch.therapies));
+    setMatchPopulation(referralMatch.population || 'Any');
+    setMatchLocationPreference(referralMatch.locationPreference || 'No preference');
+  }
+
+  // Needs and must-haves move together: a need that leaves the selection
+  // leaves the must-have list, and a newly selected MAT starts as must-have.
+  function updateMatchTherapies(next: string[]) {
+    setMatchMustHave((current) => [
+      ...current.filter((need) => next.includes(need)),
+      ...defaultMustHaveNeeds(next.filter((need) => !matchTherapies.includes(need) && !current.includes(need))),
+    ]);
+    setMatchTherapies(next);
+  }
+
+  function toggleMustHave(need: string) {
+    setMatchMustHave((current) => (current.includes(need) ? current.filter((item) => item !== need) : [...current, need]));
   }
 
   function toggleMatchNetworkPreference(preference: InsuranceNetworkPreference) {
@@ -1688,6 +1934,9 @@ export default function App() {
     setMatchNetworkPreferences(['In-network']);
     setMatchBudget('');
     setMatchTherapies([]);
+    setMatchMustHave([]);
+    setMatchPopulation('Any');
+    setMatchLocationPreference('No preference');
     requestAnimationFrame(() => matchClientLabelRef.current?.focus());
   }
 
@@ -1755,6 +2004,9 @@ export default function App() {
       networkPreferences: matchNetworkPreferences,
       maxBudget: matchInsurance === 'Cash pay' && matchBudget.trim() ? Number(matchBudget) || undefined : undefined,
       therapies: matchTherapies,
+      mustHaveTherapies: matchMustHave.filter((need) => matchTherapies.includes(need)),
+      population: matchPopulation,
+      locationPreference: matchLocationPreference,
       status: existing?.status || 'Matching',
       createdAt: existing?.createdAt || now,
       updatedAt: now,
@@ -1794,6 +2046,9 @@ export default function App() {
   async function openMatchedReferral(partnerId: string) {
     const referralMatch = await saveCurrentReferralMatch();
     if (!referralMatch) return;
+    setPendingPlacement({ matchProfileId: referralMatch.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
+    setPlacementReason(null);
+    setPlacementReasonNote('');
     setActiveReferralMatchId(referralMatch.id);
     setReferralForm({
       ...emptyReferral,
@@ -1826,39 +2081,40 @@ export default function App() {
     return saveCurrentReferralMatch();
   }
 
-  // Build the PacketFitInput the pure generator expects, using the same
-  // formulas as the matches memo (they share PacketFitInput field names).
+  // The packet's "why this fits" comes from the same scoring the ranker ran
+  // (src/lib/matching.ts scoreProgram), so the two can never disagree.
   function fitInputForMatch(matchProfile: ReferralMatch, partner: Partner): PacketFitInput {
-    const capabilities = matchProfile.insurance === 'Cash pay' ? [] : networkCapabilitiesForPartner(partner, matchProfile.insurance);
-    const isInNetwork = capabilities.includes('In-network');
-    const isOutOfNetwork = capabilities.includes('Out-of-network');
-    const preferences = matchProfile.networkPreferences?.length ? matchProfile.networkPreferences : (['In-network'] as InsuranceNetworkPreference[]);
-    const paymentFit = matchProfile.insurance === 'Cash pay'
-      ? monthlyCostForPartner(partner) <= (matchProfile.maxBudget ?? Infinity)
-      : (preferences.includes('In-network') && isInNetwork)
-        || (preferences.includes('Out-of-network') && isOutOfNetwork);
-    const networkStatus: InsuranceNetworkPreference | null = matchProfile.insurance === 'Cash pay'
-      ? null
-      : isInNetwork && preferences.includes('In-network')
-        ? 'In-network'
-        : isOutOfNetwork ? 'Out-of-network' : null;
-    const regionFit = !matchProfile.state || matchProfile.state === 'ANY' || partner.state === matchProfile.state || partner.regions.includes('Nationwide');
-    const matchesNeed = (need: string) => {
-      if (need === 'Men only') return partner.therapies.includes(need) || (partner.populations.includes('Men') && !partner.populations.includes('Women'));
-      if (need === 'Women only') return partner.therapies.includes(need) || (partner.populations.includes('Women') && !partner.populations.includes('Men'));
-      if (need === 'LGBTQ+') return partner.therapies.includes(need) || partner.populations.includes('LGBTQ+');
-      if (need === 'Adolescent') return partner.therapies.includes(need) || partner.populations.some((population) => ['Adolescent', 'Adolescents', 'Teens'].includes(population));
-      return partner.therapies.includes(need);
-    };
-    return { networkStatus, matchedTherapies: matchProfile.therapies.filter(matchesNeed), regionFit, paymentFit };
+    const score = scoreProgram(matchProfile, partner, scorecards[partner.id], trackRecordPrior(scorecards));
+    return packetFitInput(score, matchProfile);
+  }
+
+  // A program with a disclosed financial relationship needs one more tap
+  // before it is assigned, in either flow. The wording is plain on purpose.
+  function confirmDisclosedRelationship(partner: Partner, proceed: () => void) {
+    if (!hasFinancialRelationship(partner)) {
+      proceed();
+      return;
+    }
+    Alert.alert(
+      'Disclosed relationship',
+      `${partner.organization} has a disclosed financial relationship with your practice (${financialRelationshipLabel(partner.financialRelationship).toLowerCase()}). It did not affect the ranking, and the family packet will say so. Continue with this program?`,
+      [
+        { text: 'Go back', style: 'cancel' },
+        { text: 'Continue', onPress: proceed },
+      ],
+    );
   }
 
   // From a recommended match card: the profile only gets assigned (status →
-  // Referred) if the packet is actually sent.
-  async function openPacketComposer(partner: Partner, fitInput: PacketFitInput) {
+  // Referred) if the packet is actually sent. The shortlist is captured now,
+  // while the card order the clinician saw is still on screen.
+  async function openPacketComposer(partner: Partner, score: ProgramScore) {
     const matchProfile = await currentOrSavedMatch();
     if (!matchProfile) return;
-    const reasons = buildFitReasons(matchProfile, partner, fitInput);
+    setPendingPlacement({ matchProfileId: matchProfile.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
+    setPlacementReason(null);
+    setPlacementReasonNote('');
+    const reasons = buildFitReasons(matchProfile, partner, packetFitInput(score, matchProfile));
     setPacketTarget({ partner, match: matchProfile, assignOnSend: true });
     setPacketAudience('family');
     setPacketText(buildPacket(matchProfile, partner, reasons, 'family'));
@@ -1881,10 +2137,43 @@ export default function App() {
   function switchPacketAudience(audience: PacketAudience) {
     if (!packetTarget) return;
     setPacketAudience(audience);
-    const fitInput = packetTarget.match.status === 'Referred'
-      ? fitInputForMatch(packetTarget.match, packetTarget.partner)
-      : matches.find((item) => item.partner.id === packetTarget.partner.id)?.fitInput || fitInputForMatch(packetTarget.match, packetTarget.partner);
+    const fitInput = fitInputForMatch(packetTarget.match, packetTarget.partner);
     setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput), audience));
+  }
+
+  // The placement record for an assignment made from a match: what was
+  // shown, what was picked, at what rank, and why when it was not the top.
+  function buildPlacementDecision(matchProfile: ReferralMatch, partner: Partner, referralId: string, now: Date): PlacementDecision | null {
+    const placement = pendingPlacement && pendingPlacement.matchProfileId === matchProfile.id
+      ? pendingPlacement
+      : { matchProfileId: matchProfile.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) };
+    const rank = rankOfPartner(placement.rankedIds.map((id) => ({ partner: { id } })), partner.id);
+    if (rank > 1 && !placementReason) return null;
+    return {
+      id: makeId('pd'),
+      matchProfileId: matchProfile.id,
+      caseId: matchProfile.caseId,
+      referralId,
+      chosenPartnerId: partner.id,
+      chosenRank: rank,
+      reason: rank > 1 ? placementReason || undefined : undefined,
+      reasonNote: rank > 1 ? placementReasonNote.trim() : '',
+      candidates: placement.candidates,
+      weights: scoringWeights(),
+      decidedAt: now.toISOString(),
+    };
+  }
+
+  function placementRankFor(matchProfileId: string, partnerId: string): number {
+    const placement = pendingPlacement && pendingPlacement.matchProfileId === matchProfileId ? pendingPlacement : null;
+    const rankedIds = placement ? placement.rankedIds : matches.map((item) => item.partner.id);
+    return rankOfPartner(rankedIds.map((id) => ({ partner: { id } })), partnerId);
+  }
+
+  function clearPendingPlacement() {
+    setPendingPlacement(null);
+    setPlacementReason(null);
+    setPlacementReasonNote('');
   }
 
   async function sharePacketText() {
@@ -1911,6 +2200,7 @@ export default function App() {
     setPacketTarget(null);
     setPacketSendConfirm(false);
     setPacketAudience('family');
+    clearPendingPlacement();
   }
 
   // Post-send automation ("the loop"): referral + touch + follow-up, all
@@ -1918,12 +2208,25 @@ export default function App() {
   // If the profile wasn't assigned yet, this runs the SAME assignment code
   // path as the manual "Assign & refer" flow (assignMatchReferral: referral
   // insert first, then the match profile update) — not a duplicate of it.
-  function finalizePacketSend() {
+  function finalizePacketSend(disclosureConfirmed = false) {
     if (!packetTarget) return;
+    // Assigning from a packet: a pick below the top needs a reason, and a
+    // program with a disclosed relationship needs one more tap.
+    if (packetTarget.assignOnSend) {
+      if (placementRankFor(packetTarget.match.id, packetTarget.partner.id) > 1 && !placementReason) {
+        Alert.alert('One more thing', 'This program was not the top match. Choose the reason so the placement record is complete.');
+        return;
+      }
+      if (!disclosureConfirmed && hasFinancialRelationship(packetTarget.partner)) {
+        confirmDisclosedRelationship(packetTarget.partner, () => finalizePacketSend(true));
+        return;
+      }
+    }
     if (!mutationSlotAvailable('The packet log')) return;
     const previousMatchUi = {
       selectedMatchId, matchClientLabel, matchType, matchInsurance,
       matchNetworkPreferences, matchState, matchBudget, matchTherapies,
+      matchMustHave, matchPopulation, matchLocationPreference,
       tab, packetTarget, packetSendConfirm, packetAudience, packetText,
     };
     const { partner, match, assignOnSend } = packetTarget;
@@ -1997,8 +2300,9 @@ export default function App() {
     const nextReferrals = [referral, ...referrals.filter((item) => item.id !== referralId)];
     const nextTouches = [touch, ...touches];
     const nextFollowUps = [followUp, ...followUps];
-    // Balance + last-contact optimistic bumps mirror addReferral/saveTouch;
-    // the server (balances view, touches trigger) stays canonical.
+    // Activity-count + last-contact optimistic bumps mirror addReferral/saveTouch;
+    // the server (counts view, touches trigger) stays canonical. These counts
+    // are shown as activity only; the ranker never reads them.
     const nextPartners = partners.map((item) => item.id === partner.id
       ? {
           ...item,
@@ -2028,8 +2332,13 @@ export default function App() {
       applyCaseEvent(packetEvent);
     }
 
+    // The placement record is written after the assignment it describes.
+    const decision = assignOnSend && assignedMatch ? buildPlacementDecision(assignedMatch, partner, referralId, now) : null;
     void settleOptimisticWrite(
-      () => finalizeMatchPacket(referral, assignedMatch, touch, followUp, packetEvent, activeUserId),
+      async () => {
+        await finalizeMatchPacket(referral, assignedMatch, touch, followUp, packetEvent, activeUserId);
+        if (decision) await recordPlacementDecision(decision, activeUserId);
+      },
       snapshot,
       previousSnapshot,
       () => {
@@ -2044,6 +2353,9 @@ export default function App() {
         setMatchState(previousMatchUi.matchState);
         setMatchBudget(previousMatchUi.matchBudget);
         setMatchTherapies(previousMatchUi.matchTherapies);
+        setMatchMustHave(previousMatchUi.matchMustHave);
+        setMatchPopulation(previousMatchUi.matchPopulation);
+        setMatchLocationPreference(previousMatchUi.matchLocationPreference);
         setTab(previousMatchUi.tab);
         setPacketTarget(previousMatchUi.packetTarget);
         setPacketSendConfirm(previousMatchUi.packetSendConfirm);
@@ -2097,6 +2409,7 @@ export default function App() {
         setCaseDocuments([]);
         setCaseFileSource({ userId, source: 'unavailable', savedAt: '', truncated: false });
       });
+    void loadCaseBenefits(caseId);
   }
 
   function closeCase() {
@@ -2112,6 +2425,328 @@ export default function App() {
     setCaseNextStepCaseId(null);
     setQuickNoteContact(null);
     setDocView(null);
+    setBenefitsForm(null);
+    setVobForm(null);
+    setVobAnswerForm(null);
+  }
+
+  // ─── Insurance workflow: the Benefits card ──────────────────────────────
+  // The plan and the VOB requests for one case, straight from the server.
+  // Never cached: a case opened offline shows the card as unavailable.
+  async function loadCaseBenefits(caseId: string): Promise<void> {
+    const userId = activeUserId;
+    if (!userId) return;
+    try {
+      const file = await fetchCaseBenefits(caseId);
+      if (activeUserIdRef.current !== userId) return;
+      setBenefitsByCase((current) => ({ ...current, [caseId]: file.plan }));
+      setVobsByCase((current) => ({ ...current, [caseId]: file.requests }));
+      setBenefitsLoadedFor((current) => ({ ...current, [caseId]: 'remote' }));
+    } catch {
+      if (activeUserIdRef.current !== userId) return;
+      setBenefitsLoadedFor((current) => ({ ...current, [caseId]: 'unavailable' }));
+    }
+  }
+
+  // partners_for_plan for one plan (and optional state), cached by key for
+  // the session. Returns the cached answer at once when it is there.
+  async function loadPlanStatuses(plan: string, state: string): Promise<PartnerPlanStatus[] | null> {
+    const key = `${plan}|${state || 'ANY'}`;
+    if (planStatuses[key]) return planStatuses[key];
+    const userId = activeUserId;
+    if (!userId || !plan || plan === 'Cash pay') return null;
+    try {
+      const rows = await fetchPartnersForPlan(plan, state || 'ANY');
+      if (activeUserIdRef.current !== userId) return null;
+      setPlanStatuses((current) => ({ ...current, [key]: rows }));
+      return rows;
+    } catch {
+      return null;
+    }
+  }
+
+  // The client-side reading of a partner's own data, used while the server
+  // answer is loading or unreachable. Same rule as partners_for_plan minus
+  // the linked listing, which the server reads.
+  function planStatusFor(partner: Partner, plan: string, state: string): PartnerPlanStatus {
+    const key = `${plan}|${state || 'ANY'}`;
+    const fromServer = planStatuses[key]?.find((item) => item.partnerId === partner.id);
+    if (fromServer) return fromServer;
+    return {
+      partnerId: partner.id,
+      organization: partner.organization,
+      networkStatus: planNetworkStatusForPartner(partner, plan),
+      source: planNetworkStatusForPartner(partner, plan) === 'unknown' ? 'none' : 'partner',
+      sameState: !state || state === 'ANY' ? null : partner.state === state,
+    };
+  }
+
+  function openBenefitsEditor(record: CaseRecord) {
+    const plan = benefitsByCase[record.id];
+    setBenefitsForm({
+      carrier: plan?.carrier || '',
+      planName: plan?.planName || '',
+      memberIdLast4: plan?.memberIdLast4 || '',
+      subscriberRelationship: plan?.subscriberRelationship || '',
+    });
+  }
+
+  function saveBenefits(record: CaseRecord) {
+    const form = benefitsForm;
+    if (!form) return;
+    if (!mutationSlotAvailable('The insurance plan')) return;
+    const last4 = memberIdLast4(form.memberIdLast4);
+    if (form.memberIdLast4.trim() && last4.length !== 4) {
+      Alert.alert('Member id', 'Enter the last four characters of the member id, or leave it blank.');
+      return;
+    }
+    const previousPlan = benefitsByCase[record.id] ?? null;
+    const optimistic: CaseBenefits = {
+      caseId: record.id,
+      carrier: form.carrier.trim(),
+      planName: form.planName.trim(),
+      memberIdLast4: last4,
+      subscriberRelationship: form.subscriberRelationship,
+      updatedAt: new Date().toISOString(),
+    };
+    setBenefitsByCase((current) => ({ ...current, [record.id]: optimistic }));
+    setBenefitsForm(null);
+    const eventId = makeId('e');
+    let saved: Awaited<ReturnType<typeof saveCaseBenefits>> | null = null;
+    void settleOptimisticWrite(
+      async () => {
+        saved = await saveCaseBenefits(record.id, eventId, {
+          carrier: optimistic.carrier,
+          planName: optimistic.planName,
+          memberIdLast4: optimistic.memberIdLast4,
+          subscriberRelationship: optimistic.subscriberRelationship,
+        });
+      },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      () => setBenefitsByCase((current) => ({ ...current, [record.id]: previousPlan })),
+      'The insurance plan',
+    ).then((ok) => {
+      if (!ok || !saved) return;
+      const confirmed = saved as Awaited<ReturnType<typeof saveCaseBenefits>>;
+      setBenefitsByCase((current) => ({
+        ...current,
+        [record.id]: { ...optimistic, carrier: confirmed.carrier, planName: confirmed.planName, memberIdLast4: confirmed.memberIdLast4, subscriberRelationship: confirmed.subscriberRelationship, updatedAt: confirmed.occurredAt },
+      }));
+      if (confirmed.eventBody && activeCaseId === record.id) {
+        applyCaseEvent({ id: eventId, caseId: record.id, kind: 'system', body: confirmed.eventBody, occurredAt: confirmed.occurredAt, actorId: activeUserId.toLowerCase() });
+      }
+    });
+  }
+
+  // "Request VOB" from the Benefits card: opens the picker, pre-filled with
+  // the partners that take the plan (in-network first) when a plan is set.
+  function openVobRequest(record: CaseRecord, partnerId: string | null = null) {
+    const plan = benefitsByCase[record.id];
+    const linked = referralMatches.find((item) => item.id === record.matchProfileId) || referralMatches.find((item) => item.caseId === record.id);
+    if (plan?.carrier) void loadPlanStatuses(plan.carrier, linked?.state || 'ANY');
+    setVobForm({ caseId: record.id, partnerId, programName: '', note: '' });
+  }
+
+  // Creates the request (status requested), the chase follow-up due the
+  // next business day and assigned to whoever asked, and the timeline entry,
+  // in one server transaction. The optimistic rows match what lands.
+  function submitVobRequest(form: VobRequestFormState) {
+    const record = cases.find((item) => item.id === form.caseId);
+    if (!record) return;
+    const partner = form.partnerId ? partners.find((item) => item.id === form.partnerId) : undefined;
+    const programName = partner ? partner.organization : form.programName.trim();
+    if (!programName) {
+      Alert.alert('Which program?', 'Pick a partner or type the program name.');
+      return;
+    }
+    if (!mutationSlotAvailable('The VOB request')) return;
+    const now = new Date();
+    const id = makeId('v');
+    const followUpId = makeId('f');
+    const eventId = makeId('e');
+    const dueOn = nextBusinessDay(localDateStamp());
+    const optimistic: VobRequest = {
+      id,
+      caseId: record.id,
+      partnerId: partner?.id,
+      globalPartnerId: partner?.globalPartnerId,
+      programName,
+      status: 'requested',
+      requestedAt: now.toISOString(),
+      requestedBy: activeUserId.toLowerCase(),
+      answeredBy: '',
+      note: form.note.trim(),
+      quotedOutOfPocket: null,
+      followUpId,
+    };
+    const followUp: FollowUp = {
+      id: followUpId,
+      caseId: record.id,
+      partnerId: partner?.id,
+      kind: 'waiting_on',
+      waitingOn: programName,
+      title: vobChaseTitle(programName),
+      dueOn,
+      note: '',
+      status: 'open',
+      assignedTo: activeUserId.toLowerCase(),
+    };
+    const previousVobs = vobsByCase[record.id] || [];
+    const previousFollowUps = followUps;
+    const nextFollowUps = [followUp, ...previousFollowUps];
+    setVobsByCase((current) => ({ ...current, [record.id]: [optimistic, ...previousVobs] }));
+    setFollowUps(nextFollowUps);
+    setVobForm(null);
+    const eventBody = `VOB requested: ${programName}`;
+    if (activeCaseId === record.id) {
+      applyCaseEvent({ id: eventId, caseId: record.id, kind: 'system', body: eventBody, occurredAt: optimistic.requestedAt, actorId: activeUserId.toLowerCase() });
+    }
+    let saved: Awaited<ReturnType<typeof requestVob>> | null = null;
+    void settleOptimisticWrite(
+      async () => {
+        saved = await requestVob({
+          id, caseId: record.id, partnerId: partner?.id, programName, note: optimistic.note, dueOn, followUpId, eventId,
+        });
+      },
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps: previousFollowUps, scorecards },
+      () => {
+        setVobsByCase((current) => ({ ...current, [record.id]: previousVobs }));
+        setFollowUps(previousFollowUps);
+        setCaseEvents((current) => current.filter((item) => item.id !== eventId));
+      },
+      'The VOB request',
+    ).then((ok) => {
+      if (!ok || !saved) return;
+      const confirmed = saved as Awaited<ReturnType<typeof requestVob>>;
+      setVobsByCase((current) => ({
+        ...current,
+        [record.id]: (current[record.id] || []).map((item) => item.id === id
+          ? { ...item, programName: confirmed.programName, globalPartnerId: confirmed.globalPartnerId, requestedAt: confirmed.requestedAt, followUpId: confirmed.followUpId }
+          : item),
+      }));
+      if (confirmed.dueOn && confirmed.dueOn !== dueOn) {
+        setFollowUps((current) => current.map((item) => item.id === followUpId ? { ...item, dueOn: confirmed.dueOn as string } : item));
+      }
+    });
+  }
+
+  // One tap from a match result or a partner profile. The case comes from
+  // the match profile when it is linked to one; otherwise the user picks
+  // among the most recently active open cases.
+  function quickRequestVob(partner: Partner, caseId?: string) {
+    const submit = (targetCaseId: string) => {
+      const record = cases.find((item) => item.id === targetCaseId);
+      if (!record) return;
+      const already = (vobsByCase[targetCaseId] || []).find((item) => item.partnerId === partner.id && !isVobAnswered(item.status));
+      if (already) {
+        Alert.alert('Already asked', `A VOB request to ${partner.organization} is still open on ${record.title}.`);
+        return;
+      }
+      Alert.alert(
+        'Request VOB',
+        `Ask ${partner.organization} to verify benefits for ${record.title}? A reminder to check on it lands on your Today list the next business day.`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Request VOB', onPress: () => submitVobRequest({ caseId: targetCaseId, partnerId: partner.id, programName: '', note: '' }) },
+        ],
+      );
+    };
+    if (caseId && cases.some((item) => item.id === caseId)) {
+      submit(caseId);
+      return;
+    }
+    const candidates = cases.filter(isOpenCase).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 5);
+    if (!candidates.length) {
+      Alert.alert('No open case', 'Open a case file for the family first, then request the VOB from there.');
+      return;
+    }
+    Alert.alert('Which family?', 'The VOB request lands on the case file.', [
+      ...candidates.map((record): { text: string; onPress: () => void } => ({
+        text: record.title,
+        onPress: () => submit(record.id),
+      })),
+      { text: 'Cancel', style: 'cancel' },
+    ]);
+  }
+
+  function openVobAnswer(request: VobRequest) {
+    setVobAnswerForm({
+      requestId: request.id,
+      status: request.status,
+      answeredBy: request.answeredBy,
+      note: request.note,
+      quoted: request.quotedOutOfPocket == null ? '' : String(request.quotedOutOfPocket),
+    });
+  }
+
+  // Records what the program said. A status change is written to the
+  // timeline by the server with the member who recorded it; an answer also
+  // completes the chase follow-up.
+  function saveVobAnswer(record: CaseRecord) {
+    const form = vobAnswerForm;
+    if (!form || vobSaving) return;
+    const current = (vobsByCase[record.id] || []).find((item) => item.id === form.requestId);
+    if (!current) return;
+    const quotedRaw = form.quoted.replace(/[^\d]/g, '');
+    if (form.quoted.trim() && !quotedRaw) {
+      Alert.alert('Out of pocket', 'Enter whole dollars, or leave it blank.');
+      return;
+    }
+    if (!mutationSlotAvailable('The VOB update')) return;
+    const quoted = quotedRaw ? Number(quotedRaw) : null;
+    const nowIso = new Date().toISOString();
+    const statusChanged = form.status !== current.status;
+    const optimistic: VobRequest = {
+      ...current,
+      status: form.status,
+      answeredBy: form.answeredBy.trim(),
+      note: form.note.trim(),
+      quotedOutOfPocket: quoted,
+      answeredAt: isVobAnswered(form.status) ? (statusChanged || !current.answeredAt ? nowIso : current.answeredAt) : undefined,
+    };
+    const previousVobs = vobsByCase[record.id] || [];
+    const previousFollowUps = followUps;
+    const nextFollowUps = statusChanged && isVobAnswered(form.status) && current.followUpId
+      ? previousFollowUps.map((item) => item.id === current.followUpId && item.status === 'open' ? { ...item, status: 'done' as const, completedAt: nowIso } : item)
+      : previousFollowUps;
+    setVobsByCase((state) => ({ ...state, [record.id]: previousVobs.map((item) => item.id === current.id ? optimistic : item) }));
+    setFollowUps(nextFollowUps);
+    setVobAnswerForm(null);
+    setVobSaving(true);
+    const eventId = makeId('e');
+    let saved: Awaited<ReturnType<typeof updateVobStatus>> | null = null;
+    void settleOptimisticWrite(
+      async () => {
+        saved = await updateVobStatus(current.id, eventId, {
+          status: form.status,
+          answeredBy: optimistic.answeredBy,
+          note: optimistic.note,
+          quotedOutOfPocket: quoted,
+        });
+      },
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps: previousFollowUps, scorecards },
+      () => {
+        setVobsByCase((state) => ({ ...state, [record.id]: previousVobs }));
+        setFollowUps(previousFollowUps);
+      },
+      'The VOB update',
+    ).then((ok) => {
+      setVobSaving(false);
+      if (!ok || !saved) return;
+      const confirmed = saved as Awaited<ReturnType<typeof updateVobStatus>>;
+      setVobsByCase((state) => ({
+        ...state,
+        [record.id]: (state[record.id] || []).map((item) => item.id === current.id
+          ? { ...item, status: confirmed.status, answeredAt: confirmed.answeredAt, answeredBy: confirmed.answeredBy, note: confirmed.note, quotedOutOfPocket: confirmed.quotedOutOfPocket }
+          : item),
+      }));
+      if (confirmed.eventBody && activeCaseId === record.id) {
+        applyCaseEvent({ id: eventId, caseId: record.id, kind: 'system', body: confirmed.eventBody, occurredAt: confirmed.occurredAt, actorId: activeUserId.toLowerCase() });
+      }
+    });
   }
 
   // Insert or replace an event in the local timeline and reflect the
@@ -2856,12 +3491,92 @@ export default function App() {
     };
   }
 
-  const todaySections = useMemo(() => {
+  const allTodaySections = useMemo(() => {
     const now = new Date();
     const leads = newLeadCards(cases, allCaseContacts, followUps, leadSettings.leadResponseTargetMinutes, now);
     return buildTodaySections(followUps, partnersDueToday(partners, now, partnerSnoozes), now, followUpContext, leads);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings.leadResponseTargetMinutes]);
+
+  // Mine / Everyone. Only a workspace with staff has the choice; "Mine"
+  // keeps what is assigned to me and anything nobody has taken yet, so an
+  // unowned item never disappears from everyone's list at once.
+  const teamWorkspace = members.length > 1;
+  const todayScope: TodayScope = teamWorkspace ? (todayScopeChoice ?? defaultTodayScope(members.length)) : 'everyone';
+  const caseAssignee = (caseId: string) => cases.find((item) => item.id === caseId)?.assignedTo;
+  const todaySections = useMemo(
+    () => filterTodaySections(allTodaySections, todayScope, activeUserId, caseAssignee),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [allTodaySections, todayScope, activeUserId, cases],
+  );
+
+  function cardAssigneeLabel(card: TodayCard): string {
+    if (!card.followUp) return '';
+    const assignee = cardAssignee(card, caseAssignee);
+    if (!assignee) return 'Unassigned';
+    return assignee === activeUserId.toLowerCase() ? 'Yours' : `Assigned to ${memberDisplayName(members, assignee)}`;
+  }
+
+  // Assign a case, or take it. The server writes the timeline entry and
+  // returns its wording so the optimistic row matches; a failure rolls the
+  // case back and says so.
+  async function assignCaseTo(caseId: string, assignedTo: string | null) {
+    if (!cases.some((item) => item.id === caseId)) return;
+    const previousCases = cases;
+    setCases((current) => current.map((item) => (item.id === caseId ? { ...item, assignedTo: assignedTo || undefined } : item)));
+    const eventId = makeId('e');
+    try {
+      const saved = await assignCase(caseId, assignedTo, eventId);
+      if (activeCaseId === caseId) {
+        applyCaseEvent({ id: eventId, caseId, kind: 'system', body: saved.eventBody, occurredAt: saved.occurredAt, actorId: activeUserId.toLowerCase() });
+      }
+    } catch (error) {
+      setCases(previousCases);
+      Alert.alert('Assignment not saved', (error as Error).message);
+    }
+  }
+
+  function assigneeChoices(onPick: (userId: string | null) => void): { text: string; style?: 'cancel'; onPress?: () => void }[] {
+    return [
+      ...members.map((member) => ({
+        text: member.userId === activeUserId.toLowerCase() ? `${member.displayName} (you)` : member.displayName,
+        onPress: () => onPick(member.userId),
+      })),
+      { text: 'Unassigned', onPress: () => onPick(null) },
+      { text: 'Cancel', style: 'cancel' as const },
+    ];
+  }
+
+  function pickCaseAssignee(record: CaseRecord) {
+    Alert.alert('Assigned to', 'Who is handling this case? Its follow-ups follow unless one is assigned on its own.', assigneeChoices((userId) => { void assignCaseTo(record.id, userId); }));
+  }
+
+  function pickFollowUpAssignee(followUp: FollowUp) {
+    Alert.alert('Assigned to', 'Who is handling this follow-up?', assigneeChoices((userId) => {
+      const updated: FollowUp = { ...followUp, assignedTo: userId };
+      persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
+    }));
+  }
+
+  function followUpAssigneeLabel(followUp: FollowUp, record: CaseRecord): string {
+    if (followUp.assignedTo) return followUp.assignedTo === activeUserId.toLowerCase() ? 'You' : memberDisplayName(members, followUp.assignedTo);
+    if (record.assignedTo) return `${record.assignedTo === activeUserId.toLowerCase() ? 'You' : memberDisplayName(members, record.assignedTo)} (case)`;
+    return 'Assign';
+  }
+
+  // "note · Maria · by Mikayla · 2h ago"; a completed follow-up reads
+  // "Done by Mikayla, 2:14 PM". Names only: who did what, never how much.
+  function timelineMetaLine(event: CaseEvent, contactName?: string): string {
+    const actor = teamWorkspace && event.actorId ? memberDisplayName(members, event.actorId) : '';
+    if (actor && event.kind === 'system' && /^(Completed|Done)\b/.test(event.body)) {
+      return `Done by ${actor}, ${clockTime(event.occurredAt)}`;
+    }
+    const bits = [event.kind.replace('_', ' ')];
+    if (contactName) bits.push(contactName);
+    if (actor) bits.push(`by ${actor}`);
+    bits.push(relativeActivity(event.occurredAt));
+    return bits.join(' · ');
+  }
 
   // The NEW LEADS clocks tick every 30 seconds while a lead is waiting.
   useEffect(() => {
@@ -3115,6 +3830,23 @@ export default function App() {
     const card = doneCard;
     if (!card?.followUp || caseCloseLoopSaving) return;
     const followUp = card.followUp;
+    if (card.kind === 'check_in' && card.referralId) {
+      // A post-placement check-in: same sheet, one question, stars
+      // pre-filled with the current family experience.
+      const referral = referrals.find((item) => item.id === card.referralId);
+      setDoneCard(null);
+      requestAnimationFrame(() => {
+        setOutcomeFollowUp(followUp);
+        setOutcomeAnswer(null);
+        setOutcomeAdmittedOn(referral?.admittedOn || localDateStamp());
+        setOutcomeStars(referral?.familyExperience || 0);
+        setOutcomeNote('');
+        setOutcomeStatus(referral?.completed === true ? 'completed'
+          : referral?.completed === false ? 'left'
+            : referral?.stillEnrolled === true ? 'enrolled' : null);
+      });
+      return;
+    }
     if (card.referralId && card.context.referralAwaitingAnswer) {
       // Reuse the packet outcome sheet as-is (admitted? experience stars).
       setDoneCard(null);
@@ -3517,11 +4249,18 @@ export default function App() {
     setOutcomeAnswer(null);
     setOutcomeStars(0);
     setOutcomeNote('');
+    setOutcomeStatus(null);
   }
 
+  // The admit question and every later check-in go through one server path
+  // (record_placement_outcome): it updates the referral, completes the
+  // follow-up, and creates the 7 / 30 / 90 day check-ins once for an
+  // admission. Those check-ins are server-made, so a refresh follows.
   function saveOutcome() {
     const followUp = outcomeFollowUp;
-    if (!followUp || !outcomeAnswer) return;
+    if (!followUp) return;
+    const checkIn = followUp.kind === 'check_in';
+    if (checkIn ? !outcomeStatus : !outcomeAnswer) return;
     if (!mutationSlotAvailable('The outcome')) return;
     const now = new Date().toISOString();
     const completed: FollowUp = { ...followUp, status: 'done', completedAt: now };
@@ -3529,14 +4268,43 @@ export default function App() {
     setFollowUps(nextFollowUps);
     let nextReferrals = referrals;
     let write: () => Promise<void>;
+    let admission = false;
     if (followUp.referralId) {
+      const referralId = followUp.referralId;
+      const current = referrals.find((item) => item.id === referralId);
       const stars = outcomeStars > 0 ? outcomeStars : null;
-      const patch = outcomeAnswer === 'yes'
-        ? { admitted: true, admittedOn: outcomeAdmittedOn || localDateStamp(), outcome: 'Placed' as Referral['outcome'], familyExperience: stars, outcomeNote: outcomeNote.trim() }
-        : { admitted: false, outcomeNote: outcomeNote.trim() };
-      nextReferrals = referrals.map((item) => (item.id === followUp.referralId ? { ...item, ...patch } : item));
+      const note = outcomeNote.trim();
+      let patch: ReferralOutcomePatch;
+      if (checkIn) {
+        const completedProgram = outcomeStatus === 'completed' ? true : outcomeStatus === 'left' ? false : null;
+        patch = {
+          stillEnrolled: outcomeStatus === 'enrolled',
+          completed: completedProgram,
+          completedOn: completedProgram ? (current?.completedOn || localDateStamp()) : null,
+          familyExperience: stars,
+          checkIn: true,
+          ...(note ? { outcomeNote: current?.outcomeNote ? `${current.outcomeNote}\n${note}` : note } : {}),
+        };
+      } else if (outcomeAnswer === 'yes') {
+        admission = true;
+        patch = { admitted: true, admittedOn: outcomeAdmittedOn || localDateStamp(), outcome: 'Placed', familyExperience: stars, outcomeNote: note };
+      } else {
+        patch = { admitted: false, outcomeNote: note };
+      }
+      const local: Partial<Referral> = {
+        ...(patch.admitted !== undefined ? { admitted: patch.admitted } : {}),
+        ...(patch.admittedOn ? { admittedOn: patch.admittedOn } : {}),
+        ...(patch.outcome ? { outcome: patch.outcome } : {}),
+        ...(patch.familyExperience !== undefined ? { familyExperience: patch.familyExperience } : {}),
+        ...(patch.outcomeNote !== undefined ? { outcomeNote: patch.outcomeNote } : {}),
+        ...(patch.completed !== undefined ? { completed: patch.completed } : {}),
+        ...(patch.completedOn !== undefined ? { completedOn: patch.completedOn || undefined } : {}),
+        ...(patch.stillEnrolled !== undefined ? { stillEnrolled: patch.stillEnrolled } : {}),
+        ...(patch.checkIn ? { lastCheckInAt: now } : {}),
+      };
+      nextReferrals = referrals.map((item) => (item.id === referralId ? { ...item, ...local } : item));
       setReferrals(nextReferrals);
-      write = () => completeFollowUpWithOutcome(completed, followUp.referralId!, patch, activeUserId);
+      write = () => recordPlacementOutcome(referralId, patch, completed, activeUserId);
     } else {
       write = () => updateFollowUp(completed, activeUserId);
     }
@@ -3550,7 +4318,11 @@ export default function App() {
         setReferrals(referrals);
       },
       'The outcome',
-    );
+    ).then((saved) => {
+      // Pull the server-created check-ins onto Today (no-op when offline:
+      // they arrive with the next successful refresh after the queue flushes).
+      if (saved && admission) void refreshFromServer('pull');
+    });
   }
 
   function outcomeNotYet() {
@@ -3586,6 +4358,8 @@ export default function App() {
       therapies: partner.therapies,
       note: partner.note,
       touchCadence: partner.touchCadenceDays ? String(partner.touchCadenceDays) : '',
+      financialRelationship: partner.financialRelationship || 'none',
+      financialRelationshipNote: partner.financialRelationshipNote || '',
     });
     setSelectedPartner(null);
     setShowAddPartner(true);
@@ -3651,6 +4425,8 @@ export default function App() {
       lastContact: existing?.lastContact || localDateStamp(),
       favorite: existing?.favorite,
       touchCadenceDays: cadence && cadence > 0 ? cadence : undefined,
+      financialRelationship: partnerForm.financialRelationship,
+      financialRelationshipNote: partnerForm.financialRelationship === 'none' ? '' : partnerForm.financialRelationshipNote.trim(),
       createdAt: existing?.createdAt || new Date().toISOString(),
       // Directory linkage is server-owned; an edit never changes it.
       globalPartnerId: existing?.globalPartnerId,
@@ -3725,16 +4501,30 @@ export default function App() {
     }
   }
 
-  function addReferral() {
+  function addReferral(disclosureConfirmed = false) {
     if (!referralForm.partnerId || !referralForm.clientLabel.trim()) {
       Alert.alert('A little more detail', 'Choose a partner and add a client or family label.');
       return;
+    }
+    const chosenPartner = partners.find((item) => item.id === referralForm.partnerId);
+    if (activeReferralMatchId && chosenPartner) {
+      // Assigning from a match: a pick below the top needs a reason, and a
+      // program with a disclosed relationship needs one more tap.
+      if (placementRankFor(activeReferralMatchId, chosenPartner.id) > 1 && !placementReason) {
+        Alert.alert('One more thing', 'This program was not the top match. Choose the reason so the placement record is complete.');
+        return;
+      }
+      if (!disclosureConfirmed && hasFinancialRelationship(chosenPartner)) {
+        confirmDisclosedRelationship(chosenPartner, () => addReferral(true));
+        return;
+      }
     }
     if (!mutationSlotAvailable('The referral')) return;
     const previousReferralUi = {
       referralForm, showAddReferral, activeReferralMatchId, tab,
       selectedMatchId, matchClientLabel, matchType, matchInsurance,
       matchNetworkPreferences, matchState, matchBudget, matchTherapies,
+      matchMustHave, matchPopulation, matchLocationPreference,
     };
     const referral: Referral = {
       id: makeId('r'),
@@ -3780,11 +4570,19 @@ export default function App() {
     if (activeReferralMatchId) setTab('referrals');
     setActiveReferralMatchId(null);
     const snapshot: Snapshot = { partners: nextPartners, referrals: nextReferrals, referralMatches: nextMatches, touches, followUps, scorecards };
+    // The placement record is written after the assignment it describes.
+    const decision = assignedMatch && chosenPartner ? buildPlacementDecision(assignedMatch, chosenPartner, referral.id, new Date()) : null;
+    clearPendingPlacement();
     // Assignment flow: referral first, then the match profile update.
     void settleOptimisticWrite(
-      () => assignedMatch
-        ? assignMatchReferral(referral, { ...assignedMatch, clientLabel: referral.clientLabel, status: 'Referred', assignedPartnerId: referral.partnerId, referralId: referral.id, updatedAt: new Date().toISOString() }, activeUserId)
-        : createReferral(referral, activeUserId),
+      async () => {
+        if (assignedMatch) {
+          await assignMatchReferral(referral, { ...assignedMatch, clientLabel: referral.clientLabel, status: 'Referred', assignedPartnerId: referral.partnerId, referralId: referral.id, updatedAt: new Date().toISOString() }, activeUserId);
+          if (decision) await recordPlacementDecision(decision, activeUserId);
+        } else {
+          await createReferral(referral, activeUserId);
+        }
+      },
       snapshot,
       { partners, referrals, referralMatches, touches, followUps, scorecards },
       () => {
@@ -3801,6 +4599,9 @@ export default function App() {
         setMatchState(previousReferralUi.matchState);
         setMatchBudget(previousReferralUi.matchBudget);
         setMatchTherapies(previousReferralUi.matchTherapies);
+        setMatchMustHave(previousReferralUi.matchMustHave);
+        setMatchPopulation(previousReferralUi.matchPopulation);
+        setMatchLocationPreference(previousReferralUi.matchLocationPreference);
       },
       'The referral',
     );
@@ -3867,6 +4668,7 @@ export default function App() {
       { text: 'Cancel', style: 'cancel' },
       { text: 'Sign out', style: 'destructive', onPress: async () => {
         try {
+          await unregisterThisDevice();
           await cancelReferralFitNotifications();
           const { error } = await supabase.auth.signOut();
           if (error) throw error;
@@ -3987,7 +4789,13 @@ export default function App() {
             {card.subtitle ? <Text numberOfLines={1} style={styles.todayRowMeta}>{card.subtitle}</Text> : null}
             {overdue ? <Text style={styles.todayOverdueBadge}>{card.daysOverdue} {card.daysOverdue === 1 ? 'day' : 'days'} overdue</Text> : null}
             {card.lead ? renderLeadClock(card.lead) : null}
+            {teamWorkspace && cardAssigneeLabel(card) ? <Text style={styles.todayRowMeta}>{cardAssigneeLabel(card)}</Text> : null}
           </TouchableOpacity>
+          {teamWorkspace && card.lead && card.caseId && !caseAssignee(card.caseId) ? (
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Take this lead — ${card.title}`} onPress={() => { void assignCaseTo(card.caseId as string, activeUserId); }} style={[styles.todayDoneButton, styles.todayTakeButton]}>
+              <Text style={styles.todayDoneButtonText}>Take this lead</Text>
+            </TouchableOpacity>
+          ) : null}
           <View style={styles.todayActionRow}>
             <TouchableOpacity accessibilityLabel={`Call — ${card.title}`} onPress={() => cardContactAction(card, 'call')} style={styles.todayIconButton}>
               <AppIcon name="call" size={15} color={COLORS.forest} />
@@ -4013,9 +4821,11 @@ export default function App() {
     const loadLine = todayCounts.actions === 0
       ? 'Nothing on the list — enjoy the quiet, or add something below.'
       : `${todayCounts.actions} ${todayCounts.actions === 1 ? 'action' : 'actions'}${todayCounts.overdueCount > 0 ? ` · ${todayCounts.overdueCount} overdue` : ''}`;
-    const giveBack = partners
-      .filter((partner) => partner.inbound > partner.outbound)
-      .sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound))
+    // Recent partner activity, newest referral first. No tallies of who owes
+    // whom: placement follows fit, and relationships run on their cadence.
+    const recentPartners = partners
+      .filter((partner) => lastReferralByPartner[partner.id])
+      .sort((a, b) => lastReferralByPartner[b.id].localeCompare(lastReferralByPartner[a.id]))
       .slice(0, 3);
     const openCases = cases.filter(isOpenCase).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return (
@@ -4034,6 +4844,19 @@ export default function App() {
             </View>
             <Text style={styles.heroSubtitle}>{loadLine}</Text>
           </View>
+
+          {teamWorkspace ? (
+            <View style={styles.todayScopeBlock}>
+              <View style={styles.segmented}>
+                {(['mine', 'everyone'] as TodayScope[]).map((scope) => (
+                  <TouchableOpacity key={scope} accessibilityRole="button" accessibilityState={{ selected: todayScope === scope }} onPress={() => setTodayScopeChoice(scope)} style={[styles.segment, todayScope === scope && styles.segmentActive]}>
+                    <Text style={[styles.segmentText, todayScope === scope && styles.segmentTextActive]}>{scope === 'mine' ? 'Mine' : 'Everyone'}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              {todayScope === 'mine' ? <Text style={styles.todayRowMeta}>Mine shows what is assigned to you and anything nobody has taken yet.</Text> : null}
+            </View>
+          ) : null}
 
           {todaySections.newLeads.length ? (
             <View style={styles.todaySection}>
@@ -4065,6 +4888,8 @@ export default function App() {
 
           {todayCounts.actions === 0 ? (
             <EmptyState icon="checkmark-circle-outline" title="List is clear" body="No actions due and no partners past cadence. Log a touch, or capture the next thing with + below." />
+          ) : teamWorkspace && todayScope === 'mine' && !todaySections.newLeads.length && !todaySections.overdue.length && !todaySections.today.length && !todaySections.partnersDue.length ? (
+            <EmptyState icon="checkmark-circle-outline" title="Nothing of yours is due" body="Everything due today belongs to a teammate. Switch to Everyone to see the whole practice." />
           ) : null}
 
           {/* The old home content lives down here, collapsed. */}
@@ -4108,23 +4933,22 @@ export default function App() {
                 </>
               ) : null}
 
-              <SectionTitle title="Relationships to return" action="View all" onPress={() => setTab('referrals')} />
+              <SectionTitle title="Partner activity" action="View all" onPress={() => setTab('referrals')} />
               <View style={styles.returnCard}>
                 <View style={styles.returnIntro}>
-                  <View style={styles.returnIcon}><AppIcon name="heart-half" size={20} color={COLORS.coral} /></View>
+                  <View style={styles.returnIcon}><AppIcon name="people" size={20} color={COLORS.forest} /></View>
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.returnTitle}>{totals.reciprocal} partners have sent more than they’ve received</Text>
-                    <Text style={styles.returnBody}>Keep these relationships in mind only after client-fit factors are satisfied.</Text>
+                    <Text style={styles.returnTitle}>{totals.active} {totals.active === 1 ? 'partner has' : 'partners have'} referral activity</Text>
+                    <Text style={styles.returnBody}>Stay in touch on the cadence you set. Every placement follows the client's fit.</Text>
                   </View>
                 </View>
-                {giveBack.map((partner, index) => (
-                  <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={[styles.returnPartner, index === giveBack.length - 1 && { borderBottomWidth: 0 }]}>
+                {recentPartners.map((partner, index) => (
+                  <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={[styles.returnPartner, index === recentPartners.length - 1 && { borderBottomWidth: 0 }]}>
                     <Initials name={partner.organization} size={36} />
                     <View style={{ flex: 1 }}>
                       <Text style={styles.returnPartnerName}>{partner.organization}</Text>
-                      <Text numberOfLines={1} style={styles.returnPartnerType}>{partnerTypeLabel(partner)} · {partner.city}</Text>
+                      <Text numberOfLines={1} style={styles.returnPartnerType}>{partnerActivityLine(partner, lastReferralByPartner[partner.id])}</Text>
                     </View>
-                    <Text style={styles.returnCount}>+{partner.inbound - partner.outbound}</Text>
                     <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
                   </TouchableOpacity>
                 ))}
@@ -4295,13 +5119,64 @@ export default function App() {
             </View>
           ) : null}
 
+          <Text style={styles.fieldLabel}>CLIENT</Text>
+          <View style={styles.wrapPills}>
+            {clientPopulations.map((population) => <Pill key={population} label={population === 'Any' ? 'Any adult or teen' : population} active={matchPopulation === population} onPress={() => setMatchPopulation(population)} />)}
+          </View>
+          <Text style={styles.matchFieldHint}>A requirement, not a preference: a client marked Women never sees a men-only program, and an adolescent never sees an adult-only one.</Text>
+
+          <Text style={styles.fieldLabel}>HAS A BED FOR</Text>
+          <View style={styles.wrapPills}>
+            <Pill
+              label={bedFilterOn ? 'Required' : 'Not required'}
+              active={bedFilterOn}
+              icon={bedFilterOn ? 'checkmark-circle' : undefined}
+              onPress={() => {
+                if (!bedFilterOn) setBedFor(bedForFromPopulation(matchPopulation));
+                setBedFilterOn(!bedFilterOn);
+              }}
+            />
+            {bedFilterOn ? (['men', 'women', 'any'] as BedFor[]).map((option) => (
+              <Pill key={option} label={option === 'men' ? 'Men' : option === 'women' ? 'Women' : 'Anyone'} active={bedFor === option} onPress={() => setBedFor(option)} />
+            )) : null}
+          </View>
+          <Text style={styles.matchFieldHint}>{bedFilterOn
+            ? 'A program whose directory listing confirmed no bed today is hidden. A program that has not said stays, and sorts below confirmed openings among equal fit.'
+            : 'Turn on to hide programs that confirmed they are full today. The client above pre-selects men or women; counts come live from the directory.'}</Text>
+
+          <Text style={styles.fieldLabel}>LOCATION PREFERENCE</Text>
+          <View style={styles.wrapPills}>
+            {locationPreferences.map((preference) => <Pill key={preference} label={preference} active={matchLocationPreference === preference} onPress={() => setMatchLocationPreference(preference)} />)}
+          </View>
+          <Text style={styles.matchFieldHint}>{matchState === 'ANY' ? 'Choose a state above to score close-to-family or away-from-home.' : 'Close to family means in the same state; away from home means outside it.'}</Text>
+
           <MultiSelectDropdown
             label="THERAPEUTIC NEEDS"
             values={matchTherapies}
             options={therapyOptions}
-            onChange={setMatchTherapies}
+            onChange={updateMatchTherapies}
             icon="medkit-outline"
           />
+          {matchTherapies.length ? (
+            <View style={styles.mustHaveBlock}>
+              <Text style={styles.inputCaption}>Tap a need to make it a must-have. Must-haves hide programs that lack them; the rest shape the score.</Text>
+              <View style={[styles.wrapPills, { marginTop: 8 }]}>
+                {matchTherapies.map((need) => {
+                  const required = isPopulationNeed(need) || matchMustHave.includes(need);
+                  return (
+                    <Pill
+                      key={need}
+                      label={required ? `${need} · must have` : need}
+                      active={required}
+                      disabled={isPopulationNeed(need)}
+                      icon={required ? 'lock-closed' : undefined}
+                      onPress={() => toggleMustHave(need)}
+                    />
+                  );
+                })}
+              </View>
+            </View>
+          ) : null}
         </View>
 
         <View style={styles.resultsHeading}>
@@ -4322,11 +5197,15 @@ export default function App() {
                     <Text numberOfLines={2} style={styles.matchOrg}>{match.partner.organization}</Text>
                     <Text numberOfLines={1} style={styles.matchLocation}>{partnerTypeLabel(match.partner)} · {match.partner.city}, {match.partner.state}</Text>
                   </View>
-                  <View style={styles.scoreBlock}><Text style={styles.scoreNumber}>{match.clinicalScore}%</Text><Text style={styles.scoreLabel}>FIT</Text></View>
+                  <View style={styles.scoreBlock}><Text style={styles.scoreNumber}>{Math.round(match.total)}</Text><Text style={styles.scoreLabel}>FIT / 100</Text></View>
                 </View>
                 <View style={styles.matchReason}>
                   <AppIcon name="checkmark-circle" size={17} color={COLORS.forest} />
-                  <Text style={styles.matchReasonText}>{match.matchedTherapies.length ? `Matches ${match.matchedTherapies.join(', ')}` : 'Matches selected eligibility filters'}</Text>
+                  <Text style={styles.matchReasonText}>{[
+                    match.requiredNeeds.length ? `Required: ${match.requiredNeeds.join(', ')}` : '',
+                    match.matchedNeeds.length ? `Offers ${match.matchedNeeds.join(', ')}` : '',
+                    match.missingNeeds.length ? `Not listed: ${match.missingNeeds.join(', ')}` : '',
+                  ].filter(Boolean).join(' · ') || 'Meets every requirement'}</Text>
                 </View>
                 <View style={styles.matchDetails}>
                   <Text numberOfLines={1} style={[styles.matchDetailText, styles.matchInsuranceText]}>{matchInsurance === 'Cash pay'
@@ -4334,13 +5213,31 @@ export default function App() {
                     : `${match.networkStatus} · ${matchInsurance}`}</Text>
                   <Text numberOfLines={1} style={styles.matchPriceText}>{formatMoney(monthlyCostForPartner(match.partner))}/month</Text>
                 </View>
-                {match.reciprocity > 0 ? (
-                  <View style={styles.reciprocityNote}><AppIcon name="heart" size={13} color={COLORS.coral} /><Text style={styles.reciprocityNoteText}>Tie-breaker: sent you {match.reciprocity} more than received</Text></View>
+                {bedLineForPartner(match.partner) ? (
+                  <Text numberOfLines={1} style={bedLineForPartner(match.partner).endsWith('Unconfirmed') ? styles.bedLineUnconfirmed : styles.bedLineOpen}>{bedLineForPartner(match.partner)}</Text>
+                ) : null}
+                {matchInsurance !== 'Cash pay' ? (() => {
+                  // Honest label: the directory's network status is what the
+                  // program reports ("per program"); a VOB answer on the linked
+                  // case is what the carrier said, for that family only.
+                  const line = planStatusLine(planNetworkStatusForPartner(match.partner, matchInsurance), matchCaseVobs, match.partner.id);
+                  return <Text numberOfLines={1} style={line.confirmed ? styles.bedLineOpen : styles.bedLineUnconfirmed}>{line.text}</Text>;
+                })() : null}
+                {match.verifyBenefits || match.disclosure || matchInsurance !== 'Cash pay' ? (
+                  <View style={styles.matchFlags}>
+                    {match.verifyBenefits ? <View style={styles.verifyBadge}><AppIcon name="alert-circle-outline" size={12} color={COLORS.inkSoft} /><Text style={styles.verifyBadgeText}>Verify benefits</Text></View> : null}
+                    {matchInsurance !== 'Cash pay' ? (
+                      <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Request a verification of benefits from ${match.partner.organization}`} onPress={() => quickRequestVob(match.partner, matchCaseId || undefined)} style={styles.verifyBadge}>
+                        <AppIcon name="shield-checkmark-outline" size={12} color={COLORS.forest} /><Text style={[styles.verifyBadgeText, { color: COLORS.forest }]}>Request VOB</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                    {match.disclosure ? <View style={styles.disclosureBadge}><AppIcon name="information-circle-outline" size={12} color={COLORS.coral} /><Text style={styles.disclosureBadgeText}>Disclosed relationship · {financialRelationshipLabel(match.partner.financialRelationship)}</Text></View> : null}
+                  </View>
                 ) : null}
               </View>
             </TouchableOpacity>
             <View style={styles.matchActionRow}>
-              <TouchableOpacity style={styles.packetButton} onPress={() => openPacketComposer(match.partner, match.fitInput)}>
+              <TouchableOpacity style={styles.packetButton} onPress={() => openPacketComposer(match.partner, match)}>
                 <AppIcon name="document-text" size={16} color={COLORS.forest} />
                 <Text style={styles.packetButtonText}>Send packet</Text>
               </TouchableOpacity>
@@ -4524,9 +5421,24 @@ export default function App() {
             options={[{ label: 'All categories', value: 'All' }, ...partnerTypes.map((type) => ({ label: type, value: type }))]}
           />
         </View>
+        <View style={styles.directoryDropdown}>
+          <DropdownField
+            label="TAKES PLAN"
+            value={directoryPlan}
+            icon="shield-checkmark-outline"
+            onChange={setDirectoryPlan}
+            options={[{ label: 'Any plan', value: '' }, ...insuranceProvidersForState('ANY').filter((plan) => plan !== 'Cash pay').map((plan) => ({ label: plan, value: plan }))]}
+          />
+        </View>
+        {directoryPlan ? (
+          <View style={[styles.wrapPills, { marginBottom: 10 }]}>
+            <Pill label={`Takes ${directoryPlan} · per program`} active icon="close" onPress={() => setDirectoryPlan('')} />
+            <Text style={styles.inputCaption}>{directoryPlanStatuses ? 'In-network as each program reports it, from your partner records and linked directory listings. Confirm with a VOB before placement.' : 'Checking the directory…'}</Text>
+          </View>
+        ) : null}
         <View style={styles.directoryCountRow}><Text style={styles.directoryCount}>{directoryPartners.length} RESULTS</Text><AppIcon name="options-outline" size={18} color={COLORS.gray} /></View>
-        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
-        {!directoryPartners.length ? <EmptyState icon="people-outline" title="No partners found" body="Try another search or add a new relationship." /> : null}
+        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} lastReferralOn={lastReferralByPartner[partner.id]} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
+        {!directoryPartners.length ? <EmptyState icon="people-outline" title={directoryPlan ? `Nobody lists ${directoryPlan} in-network` : 'No partners found'} body={directoryPlan ? 'Programs report their own networks and lists are often incomplete. Clear the plan filter, or request a VOB from the case to find out for sure.' : 'Try another search or add a new relationship.'} /> : null}
       </ScrollView>
     );
   }
@@ -4537,7 +5449,7 @@ export default function App() {
         {renderHeader('Referral ledger')}
         {renderRefreshNotice()}
         <View style={styles.directoryTitleRow}>
-          <View><Text style={styles.screenTitle}>Give & receive</Text><Text style={styles.screenSubtitle}>Relationship history at a glance</Text></View>
+          <View><Text style={styles.screenTitle}>Referrals</Text><Text style={styles.screenSubtitle}>Referral history at a glance</Text></View>
           <TouchableOpacity accessibilityRole="button" accessibilityLabel="Add inbound referral" style={styles.roundAdd} onPress={() => openReferral('Inbound')}><AppIcon name="add" size={24} color={COLORS.white} /></TouchableOpacity>
         </View>
 
@@ -4553,8 +5465,8 @@ export default function App() {
           </View>
           <View style={styles.ledgerDivider} />
           <View style={styles.ledgerMetric}>
-            <View style={[styles.ledgerIcon, { backgroundColor: COLORS.coralPale }]}><AppIcon name="heart" size={18} color={COLORS.coral} /></View>
-            <Text style={styles.ledgerNumber}>{totals.reciprocal}</Text><Text style={styles.ledgerLabel}>To return</Text>
+            <View style={[styles.ledgerIcon, { backgroundColor: COLORS.coralPale }]}><AppIcon name="people" size={18} color={COLORS.coral} /></View>
+            <Text style={styles.ledgerNumber}>{totals.active}</Text><Text style={styles.ledgerLabel}>Active partners</Text>
           </View>
         </View>
 
@@ -4606,17 +5518,13 @@ export default function App() {
           })}
         </View> : <EmptyState icon="swap-horizontal-outline" title="No matching referrals" body={referrals.length ? 'Try another search or direction filter.' : 'Add a partner, then log your first inbound or outbound referral.'} />}
 
-        <SectionTitle title="Relationship balance" />
-        {partners.length ? partners.slice().sort((a, b) => (b.inbound - b.outbound) - (a.inbound - a.outbound)).slice(0, 5).map((partner) => {
-          const total = Math.max(partner.inbound + partner.outbound, 1);
-          const inboundWidth = `${Math.round((partner.inbound / total) * 100)}%` as `${number}%`;
-          return (
-            <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={styles.balanceRow}>
-              <View style={styles.balanceNameRow}><Text style={styles.balanceName} numberOfLines={1}>{partner.organization}</Text><Text style={styles.balanceNumbers}>{partner.inbound} in · {partner.outbound} out</Text></View>
-              <View style={styles.balanceTrack}><View style={[styles.balanceInbound, { width: inboundWidth }]} /></View>
-            </TouchableOpacity>
-          );
-        }) : <EmptyState icon="people-outline" title="No relationships yet" body="Your give-and-receive balance will appear after you add referral partners." />}
+        <SectionTitle title="Partner activity" />
+        {partners.length ? partners.slice().sort((a, b) => (lastReferralByPartner[b.id] || '').localeCompare(lastReferralByPartner[a.id] || '') || a.organization.localeCompare(b.organization)).slice(0, 5).map((partner) => (
+          <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={styles.balanceRow}>
+            <View style={styles.balanceNameRow}><Text style={styles.balanceName} numberOfLines={1}>{partner.organization}</Text></View>
+            <Text style={styles.balanceNumbers}>{partnerActivityLine(partner, lastReferralByPartner[partner.id])}</Text>
+          </TouchableOpacity>
+        )) : <EmptyState icon="people-outline" title="No partners yet" body="Referral activity will appear here after you add referral partners." />}
       </ScrollView>
     );
   }
@@ -4660,6 +5568,9 @@ export default function App() {
     if (caseContactForm) return CaseContactModal();
     if (quickNoteContact) return QuickNoteModal();
     if (docView) return DocViewModal();
+    if (benefitsForm) return CaseBenefitsModal(activeCase);
+    if (vobForm) return VobRequestModal(activeCase);
+    if (vobAnswerForm) return VobAnswerModal(activeCase);
     const record = activeCase;
     const colors = CASE_STATUS_COLORS[record.status];
     const linkedMatch = referralMatches.find((item) => item.id === record.matchProfileId)
@@ -4701,6 +5612,18 @@ export default function App() {
                     <Text style={[styles.caseChipText, styles.caseChipLargeText, { color: colors.fg }]}>{record.status}</Text>
                     <AppIcon name="chevron-down" size={12} color={colors.fg} />
                   </TouchableOpacity>
+                  {teamWorkspace ? (
+                    <TouchableOpacity
+                      accessibilityRole="button"
+                      accessibilityLabel={`Assigned to ${record.assignedTo ? memberDisplayName(members, record.assignedTo) : 'nobody'}. Tap to change.`}
+                      onPress={() => pickCaseAssignee(record)}
+                      style={[styles.caseChip, styles.caseChipLarge, { backgroundColor: COLORS.mintPale }]}
+                    >
+                      <AppIcon name="person-outline" size={12} color={COLORS.forest} />
+                      <Text style={[styles.caseChipText, styles.caseChipLargeText, { color: COLORS.forest }]}>{record.assignedTo ? (record.assignedTo === activeUserId.toLowerCase() ? 'Yours' : memberDisplayName(members, record.assignedTo)) : 'Unassigned'}</Text>
+                      <AppIcon name="chevron-down" size={12} color={COLORS.forest} />
+                    </TouchableOpacity>
+                  ) : null}
                 </View>
                 <Text style={styles.profileName}>Opened {shortDate(record.createdAt.slice(0, 10))} · active {relativeActivity(record.updatedAt)}</Text>
               </View>
@@ -4728,6 +5651,11 @@ export default function App() {
                       <Text style={styles.touchLogTitle}>{followUp.title}</Text>
                       <Text style={styles.touchLogNote}>Due {shortDate(followUp.dueOn)}{followUp.dueTime ? ` at ${followUp.dueTime}` : ''}{followUp.waitingOn ? ` · Waiting on ${followUp.waitingOn}` : ''}</Text>
                     </View>
+                    {teamWorkspace ? (
+                      <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Assigned to: ${followUpAssigneeLabel(followUp, record)}. Tap to change.`} onPress={() => pickFollowUpAssignee(followUp)} style={[styles.caseChip, { backgroundColor: COLORS.mintPale }]}>
+                        <Text style={[styles.caseChipText, { color: COLORS.forest }]}>{followUpAssigneeLabel(followUp, record)}</Text>
+                      </TouchableOpacity>
+                    ) : null}
                   </View>
                 )) : <Text style={styles.caseEmptyNote}>No next step scheduled. Add one so this case does not fall through the cracks.</Text>}
               </View>
@@ -4827,6 +5755,88 @@ export default function App() {
                 <Text style={styles.casePaymentHint}>Enter a quote to mark the case quoted automatically. Use “Record another payment” for each coaching session or installment. Every change lands on the timeline.</Text>
               </View>
 
+              {/* Benefits: the family's plan and the VOB requests */}
+              {(() => {
+                const plan = benefitsByCase[record.id] ?? null;
+                const requests = (vobsByCase[record.id] || []).slice().sort((a, b) => b.requestedAt.localeCompare(a.requestedAt));
+                const loaded = benefitsLoadedFor[record.id];
+                return (
+                  <View style={styles.infoCard}>
+                    <View style={styles.caseSectionHeader}>
+                      <View>
+                        <Text style={styles.infoTitle}>Benefits</Text>
+                        <Text style={styles.caseSectionHint}>Carrier, plan, and the last four of the member id. Nothing more is kept.</Text>
+                      </View>
+                      <TouchableOpacity
+                        accessibilityRole="button"
+                        accessibilityLabel={plan ? 'Edit the insurance plan' : 'Add the insurance plan'}
+                        onPress={() => openBenefitsEditor(record)}
+                        style={styles.caseSectionAction}
+                      >
+                        <AppIcon name={plan ? 'create-outline' : 'add'} size={14} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>{plan ? 'Edit' : 'Add plan'}</Text>
+                      </TouchableOpacity>
+                    </View>
+                    {loaded === 'unavailable' ? (
+                      <Text style={styles.caseEmptyNote}>Benefits need a connection. Pull to refresh once you are back online.</Text>
+                    ) : null}
+                    {plan && (plan.carrier || plan.planName || plan.memberIdLast4) ? (
+                      <View style={styles.businessDetailRow}>
+                        <View style={styles.businessDetailMetric}>
+                          <Text style={styles.infoLabel}>PLAN</Text>
+                          <Text style={styles.businessDetailValue}>{planLabel(plan) || 'Not set'}</Text>
+                        </View>
+                        <View style={styles.businessDetailMetric}>
+                          <Text style={styles.infoLabel}>MEMBER ID</Text>
+                          <Text style={styles.businessDetailValue}>{plan.memberIdLast4 ? `ending ${plan.memberIdLast4}` : '—'}</Text>
+                        </View>
+                        <View style={styles.businessDetailMetric}>
+                          <Text style={styles.infoLabel}>SUBSCRIBER</Text>
+                          <Text style={styles.businessDetailValue}>{subscriberRelationshipLabel(plan.subscriberRelationship)}</Text>
+                        </View>
+                      </View>
+                    ) : loaded === 'remote' ? (
+                      <Text style={styles.caseEmptyNote}>No plan on file yet. Add the carrier and plan so VOB requests go out with the right details.</Text>
+                    ) : null}
+                    <View style={[styles.caseSectionHeader, { marginTop: 12 }]}>
+                      <Text style={styles.infoLabel}>VOB REQUESTS</Text>
+                      <TouchableOpacity
+                        accessibilityRole="button"
+                        accessibilityLabel={`Request a verification of benefits for ${record.title}`}
+                        onPress={() => openVobRequest(record)}
+                        style={styles.caseSectionAction}
+                      >
+                        <AppIcon name="shield-checkmark-outline" size={14} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Request VOB</Text>
+                      </TouchableOpacity>
+                    </View>
+                    {requests.length ? requests.map((request) => {
+                      const tone = request.status === 'in_network' ? { bg: COLORS.mintPale, fg: COLORS.forest }
+                        : request.status === 'out_of_network' ? { bg: '#FFF3E8', fg: COLORS.coral }
+                          : request.status === 'not_accepted' ? { bg: '#F3F3EF', fg: COLORS.inkSoft }
+                            : { bg: '#EEF3FB', fg: COLORS.blue };
+                      const meta = [
+                        `asked ${shortDate(request.requestedAt.slice(0, 10))}`,
+                        request.answeredAt ? `answered ${shortDate(request.answeredAt.slice(0, 10))}${request.answeredBy ? ` by ${request.answeredBy}` : ''}` : '',
+                        request.quotedOutOfPocket != null ? `about ${formatMoney(request.quotedOutOfPocket)} out of pocket` : '',
+                      ].filter(Boolean).join(' · ');
+                      return (
+                        <TouchableOpacity key={request.id} accessibilityRole="button" accessibilityLabel={`${request.programName}: ${vobStatusLabel(request.status)}. Tap to record the answer.`} onPress={() => openVobAnswer(request)} style={styles.caseNextStepRow}>
+                          <View style={[styles.followUpIcon, { width: 30, height: 30 }]}><AppIcon name="shield-checkmark-outline" size={15} color={tone.fg} /></View>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.touchLogTitle}>{request.programName}</Text>
+                            <Text style={styles.touchLogNote}>{meta}</Text>
+                            {request.note ? <Text numberOfLines={2} style={styles.touchLogNote}>{request.note}</Text> : null}
+                          </View>
+                          <View style={[styles.caseChip, { backgroundColor: tone.bg }]}><Text style={[styles.caseChipText, { color: tone.fg }]}>{vobStatusLabel(request.status)}</Text></View>
+                        </TouchableOpacity>
+                      );
+                    }) : loaded === 'remote' ? (
+                      <Text style={styles.caseEmptyNote}>No VOB requested yet. One tap asks a program and puts a reminder on Today for the next business day.</Text>
+                    ) : null}
+                    <Text style={styles.casePaymentHint}>Network status on partners and match results is what each program reports about itself. An answer recorded here is what the carrier said for this family only; it never changes the partner's listing.</Text>
+                  </View>
+                );
+              })()}
+
               <CaseIntegrationPanel record={record} integrations={businessData.integrations} onChanged={refreshBusiness} />
 
               <View style={[styles.infoCard, { marginTop: 12 }]}>
@@ -4916,7 +5926,7 @@ export default function App() {
                         <View style={styles.touchLogIcon}><AppIcon name={caseEventIcon(event.kind)} size={14} color={COLORS.forest} /></View>
                         <View style={{ flex: 1 }}>
                           <Text style={styles.touchLogTitle}>{event.body || event.kind.replace('_', ' ')}</Text>
-                          <Text style={styles.touchLogNote}>{event.kind.replace('_', ' ')}{contact ? ` · ${contact.name}` : ''} · {relativeActivity(event.occurredAt)}</Text>
+                          <Text style={styles.touchLogNote}>{timelineMetaLine(event, contact?.name)}</Text>
                         </View>
                       </View>
                     );
@@ -5213,7 +6223,6 @@ export default function App() {
 
   function PartnerDetailModal() {
     if (!selectedPartner) return null;
-    const balance = selectedPartner.inbound - selectedPartner.outbound;
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setSelectedPartner(null)}>
         <SafeAreaView style={styles.modalPage}>
@@ -5241,10 +6250,44 @@ export default function App() {
             </View>
 
             <View style={styles.profileBalanceCard}>
-              <View><Text style={styles.fieldLabel}>RELATIONSHIP BALANCE</Text><Text style={styles.profileBalanceTitle}>{balance > 0 ? `They’ve sent ${balance} more` : balance < 0 ? `You’ve sent ${Math.abs(balance)} more` : 'Perfectly balanced'}</Text></View>
-              <View style={styles.profileCounts}><Text style={styles.profileCount}><Text style={{ color: COLORS.forest }}>{selectedPartner.inbound}</Text> in</Text><Text style={styles.profileCount}><Text style={{ color: COLORS.blue }}>{selectedPartner.outbound}</Text> out</Text></View>
+              <View><Text style={styles.fieldLabel}>REFERRAL ACTIVITY</Text><Text style={styles.profileBalanceTitle}>{lastReferralByPartner[selectedPartner.id] ? `Last referral ${shortDate(lastReferralByPartner[selectedPartner.id])}` : 'No referrals yet'}</Text></View>
+              <View style={styles.profileCounts}><Text style={styles.profileCount}><Text style={{ color: COLORS.forest }}>{selectedPartner.inbound}</Text> received</Text><Text style={styles.profileCount}><Text style={{ color: COLORS.blue }}>{selectedPartner.outbound}</Text> sent</Text></View>
             </View>
+            {hasFinancialRelationship(selectedPartner) ? (
+              <View style={[styles.infoCard, { marginBottom: 12 }]}>
+                <Text style={styles.infoTitle}>Disclosed relationship</Text>
+                <View style={[styles.infoLine, { borderBottomWidth: 0 }]}>
+                  <AppIcon name="information-circle-outline" size={18} color={COLORS.coral} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.infoValue}>{financialRelationshipLabel(selectedPartner.financialRelationship)}{selectedPartner.financialRelationshipNote ? ` · ${selectedPartner.financialRelationshipNote}` : ''}</Text>
+                    <Text style={styles.infoLabel}>Shown to families in every packet. Never part of the ranking.</Text>
+                  </View>
+                </View>
+              </View>
+            ) : null}
 
+            {(() => {
+              // Live from the linked directory listing; programs only.
+              const status = selectedPartner.globalPartnerId ? listingBeds[selectedPartner.globalPartnerId] : undefined;
+              if (!status?.program) return null;
+              const line = bedsLine(status);
+              const cadence = bedsCadenceLine(status);
+              const contact = [status.admissionsContactName, status.admissionsContactPhone].filter(Boolean).join(' · ');
+              return (
+                <View style={[styles.infoCard, { marginBottom: 12 }]}>
+                  <Text style={styles.infoTitle}>Beds today</Text>
+                  <View style={[styles.infoLine, { borderBottomWidth: 0 }]}>
+                    <AppIcon name="information-circle-outline" size={18} color={COLORS.gray} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.infoValue}>{line ? line.replace('Beds today: ', '') : 'Not confirmed yet'}</Text>
+                      {cadence ? <Text style={styles.infoLabel}>{cadence}</Text> : null}
+                      {contact ? <Text style={styles.infoLabel}>Admissions: {contact}</Text> : null}
+                      <Text style={styles.infoLabel}>Confirmed by the program in its directory listing. A count older than seven days reads as Unconfirmed.</Text>
+                    </View>
+                  </View>
+                </View>
+              );
+            })()}
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Staying in touch</Text>
               <View style={styles.infoLine}><AppIcon name="calendar-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Cadence</Text><Text style={styles.infoValue}>{selectedPartner.touchCadenceDays ? `Every ${selectedPartner.touchCadenceDays} days` : 'No cadence set'}</Text></View></View>
@@ -5255,6 +6298,16 @@ export default function App() {
               // the partner has actually received at least one referral.
               const scorecard = scorecards[selectedPartner.id];
               if (!scorecard || scorecard.referralsSent === 0) return null;
+              // Outcomes loop: what the check-ins have recorded for this
+              // program. Plain counts and rates for this workspace only —
+              // never a ranking, never per person.
+              const outOfNetwork = billsOutOfNetwork(selectedPartner);
+              const details = [
+                scorecard.decidedPlacements ? `${formatRate(scorecard.completionRate ?? null)} completed the program (${scorecard.completed ?? 0} of ${scorecard.decidedPlacements} decided)` : null,
+                scorecard.medianDaysToAdmit != null ? `Typically ${formatDays(scorecard.medianDaysToAdmit)} from referral to admission` : null,
+                scorecard.stillEnrolled ? `${scorecard.stillEnrolled} still enrolled` : null,
+                outOfNetwork ? 'Bills some carriers out-of-network (from the directory listing)' : null,
+              ].filter((line): line is string => Boolean(line));
               return (
                 <View style={[styles.infoCard, { marginTop: 12 }]}>
                   <Text style={styles.infoTitle}>Track record</Text>
@@ -5264,6 +6317,7 @@ export default function App() {
                       <Text style={styles.infoValue}>
                         {scorecard.referralsSent} sent · {scorecard.admits} admitted{scorecard.avgFamilyExperience != null ? ` · ${scorecard.avgFamilyExperience}★ family experience` : ''}
                       </Text>
+                      {details.map((line) => <Text key={line} style={styles.todayRowMeta}>{line}</Text>)}
                     </View>
                   </View>
                 </View>
@@ -5290,7 +6344,7 @@ export default function App() {
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Placement details</Text>
               <View style={styles.infoLine}><AppIcon name="wallet-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>{directoryCostLabel(typesForPartner(selectedPartner))}</Text><Text style={styles.infoValue}>{formatMoney(monthlyCostForPartner(selectedPartner))}</Text></View></View>
-              <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Insurance</Text><Text style={styles.infoValue}>{selectedPartner.insurance.filter((plan) => plan !== PRIVATE_PAY_ONLY).map((plan) => `${plan} (${networkCapabilitiesForPartner(selectedPartner, plan).map((status) => status === 'In-network' ? 'IN' : 'OON').join(' + ')})`).join(' · ') || (selectedPartner.insurance.includes(PRIVATE_PAY_ONLY) ? 'Private pay only' : 'Not recorded')}</Text></View></View>
+              <View style={styles.infoLine}><AppIcon name="shield-checkmark-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Insurance (per program)</Text><Text style={styles.infoValue}>{selectedPartner.insurance.filter((plan) => plan !== PRIVATE_PAY_ONLY).map((plan) => `${plan} (${networkCapabilitiesForPartner(selectedPartner, plan).map((status) => status === 'In-network' ? 'IN' : 'OON').join(' + ')})`).join(' · ') || (selectedPartner.insurance.includes(PRIVATE_PAY_ONLY) ? 'Private pay only' : 'Not recorded')}</Text><TouchableOpacity accessibilityRole="button" accessibilityLabel={`Request a verification of benefits from ${selectedPartner.organization}`} onPress={() => quickRequestVob(selectedPartner, activeCaseId || undefined)} style={[styles.caseSectionAction, { alignSelf: 'flex-start', marginTop: 6 }]}><AppIcon name="shield-checkmark-outline" size={14} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Request VOB</Text></TouchableOpacity></View></View>
               <View style={styles.infoLine}><AppIcon name="location-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Service area</Text><Text style={styles.infoValue}>{selectedPartner.regions.join(' · ')}</Text></View></View>
             </View>
 
@@ -5713,6 +6767,16 @@ export default function App() {
                 emptyLabel="Select therapeutic needs"
               />
               <FormField label="NOTES" value={partnerForm.note} onChangeText={(note) => setPartnerForm((current) => ({ ...current, note }))} placeholder="Relationship and program notes" multiline />
+              <Text style={styles.fieldLabel}>FINANCIAL RELATIONSHIP</Text>
+              <View style={[styles.wrapPills, { marginBottom: 8 }]}>
+                {financialRelationshipOptions.map((option) => (
+                  <Pill key={option.value} label={option.label} active={partnerForm.financialRelationship === option.value} onPress={() => setPartnerForm((current) => ({ ...current, financialRelationship: option.value }))} />
+                ))}
+              </View>
+              <Text style={styles.matchFieldHint}>Any money that moves between your practice and this program. It is disclosed on cards and in every family packet, stays private to your workspace, and never changes a match.</Text>
+              {partnerForm.financialRelationship !== 'none' ? (
+                <FormField label="DISCLOSURE NOTE (OPTIONAL)" value={partnerForm.financialRelationshipNote} onChangeText={(financialRelationshipNote) => setPartnerForm((current) => ({ ...current, financialRelationshipNote }))} placeholder="A few words families will see" />
+              ) : null}
               <Text style={styles.fieldLabel}>STAY IN TOUCH EVERY ___ DAYS</Text>
               <View style={styles.cadenceRow}>
                 {['7', '30', '60', '90'].map((preset) => (
@@ -5749,7 +6813,7 @@ export default function App() {
             <View style={styles.modalHeader}>
               <TouchableOpacity accessibilityLabel="Close referral form" onPress={closeReferralModal} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
               <Text style={styles.modalHeaderTitle}>{matchedReferral ? 'Assign referral' : 'Log a referral'}</Text>
-              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={addReferral}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => addReferral()}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               {matchedReferral ? (
@@ -5770,12 +6834,33 @@ export default function App() {
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.partnerPicker}>
                 {partners.slice().sort((a, b) => Number(b.id === referralForm.partnerId) - Number(a.id === referralForm.partnerId)).map((partner) => <TouchableOpacity key={partner.id} onPress={() => setReferralForm({ ...referralForm, partnerId: partner.id })} style={[styles.partnerPick, referralForm.partnerId === partner.id && styles.partnerPickActive]}><Initials name={partner.organization} size={34} /><Text numberOfLines={2} style={[styles.partnerPickText, referralForm.partnerId === partner.id && styles.partnerPickTextActive]}>{partner.organization}</Text></TouchableOpacity>)}
               </ScrollView>
+              {matchedReferral && referralForm.partnerId ? (() => {
+                const chosen = partners.find((item) => item.id === referralForm.partnerId);
+                const rank = placementRankFor(matchedReferral.id, referralForm.partnerId);
+                return (
+                  <>
+                    {chosen && hasFinancialRelationship(chosen) ? (
+                      <View style={[styles.disclosureBadge, { alignSelf: 'flex-start', marginBottom: 12 }]}><AppIcon name="information-circle-outline" size={12} color={COLORS.coral} /><Text style={styles.disclosureBadgeText}>Disclosed relationship · {financialRelationshipLabel(chosen.financialRelationship)} · one more confirmation on save</Text></View>
+                    ) : null}
+                    {rank > 1 ? (
+                      <View style={styles.placementReasonBlock}>
+                        <Text style={styles.fieldLabel}>WHY THIS PROGRAM?</Text>
+                        <Text style={styles.placementReasonHint}>{rank <= (pendingPlacement?.rankedIds.length ?? 0) ? `It ranked #${rank} on the match.` : 'It was not on the match list.'} The reason goes on the placement record, not to the family.</Text>
+                        <View style={styles.wrapPills}>{placementReasonOptions.map((option) => <Pill key={option.value} label={option.label} active={placementReason === option.value} onPress={() => setPlacementReason(option.value)} />)}</View>
+                        {placementReason === 'other' ? (
+                          <TextInput value={placementReasonNote} onChangeText={setPlacementReasonNote} placeholder="A few words" placeholderTextColor="#99A6A1" style={[styles.formInput, { marginTop: 10 }]} />
+                        ) : null}
+                      </View>
+                    ) : null}
+                  </>
+                );
+              })() : null}
               <FormField label="CLIENT / FAMILY LABEL *" value={referralForm.clientLabel} onChangeText={(clientLabel) => setReferralForm({ ...referralForm, clientLabel })} placeholder="Use initials or a private label" />
               <Text style={styles.privacyHint}><AppIcon name="lock-closed" size={13} color={COLORS.gray} /> Keep this de-identified; avoid clinical details or protected health information.</Text>
               <Text style={styles.fieldLabel}>OUTCOME</Text>
               <View style={styles.wrapPills}>{(['Introduced', 'Consulted', 'Placed', 'Pending'] as Referral['outcome'][]).map((outcome) => <Pill key={outcome} label={outcome} active={referralForm.outcome === outcome} onPress={() => setReferralForm({ ...referralForm, outcome })} />)}</View>
               <FormField label="NOTE" value={referralForm.note} onChangeText={(note) => setReferralForm({ ...referralForm, note })} placeholder="Optional relationship note" multiline />
-              <TouchableOpacity style={styles.primaryButton} onPress={addReferral}><Text style={styles.primaryButtonText}>{matchedReferral ? 'Save to referrals' : 'Save referral'}</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.primaryButton} onPress={() => addReferral()}><Text style={styles.primaryButtonText}>{matchedReferral ? 'Save to referrals' : 'Save referral'}</Text></TouchableOpacity>
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
@@ -5978,7 +7063,17 @@ export default function App() {
               <View style={styles.prePromptIcon}><AppIcon name="paper-plane" size={24} color={COLORS.forest} /></View>
               <Text style={styles.prePromptTitle}>Did you send it?</Text>
               <Text style={styles.prePromptText}>iOS can't always tell us whether the packet actually went out. Confirming logs the referral, records the touch, and sets the check-in follow-up.</Text>
-              <TouchableOpacity style={styles.primaryButton} onPress={finalizePacketSend}><Text style={styles.primaryButtonText}>Sent — log it</Text></TouchableOpacity>
+              {packetTarget.assignOnSend && placementRankFor(packetTarget.match.id, packetTarget.partner.id) > 1 ? (
+                <View style={styles.placementReasonBlock}>
+                  <Text style={styles.fieldLabel}>WHY THIS PROGRAM?</Text>
+                  <Text style={styles.placementReasonHint}>It was not the top match. The reason goes on the placement record, not to the family.</Text>
+                  <View style={styles.wrapPills}>{placementReasonOptions.map((option) => <Pill key={option.value} label={option.label} active={placementReason === option.value} onPress={() => setPlacementReason(option.value)} />)}</View>
+                  {placementReason === 'other' ? (
+                    <TextInput value={placementReasonNote} onChangeText={setPlacementReasonNote} placeholder="A few words" placeholderTextColor="#99A6A1" style={[styles.formInput, { marginTop: 10 }]} />
+                  ) : null}
+                </View>
+              ) : null}
+              <TouchableOpacity style={styles.primaryButton} onPress={() => finalizePacketSend()}><Text style={styles.primaryButtonText}>Sent — log it</Text></TouchableOpacity>
               <TouchableOpacity onPress={() => setPacketSendConfirm(false)} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Cancel — don't log</Text></TouchableOpacity>
             </ScrollView>
           </Pressable>
@@ -5990,6 +7085,57 @@ export default function App() {
   function OutcomeCaptureModal() {
     if (!outcomeFollowUp) return null;
     const referral = referrals.find((item) => item.id === outcomeFollowUp.referralId);
+    const checkIn = outcomeFollowUp.kind === 'check_in';
+    if (checkIn) {
+      const partnerName = partners.find((item) => item.id === (referral?.partnerId || outcomeFollowUp.partnerId))?.organization;
+      const intro = [referral?.clientLabel, partnerName ? `at ${partnerName}` : '', referral?.admittedOn ? `· admitted ${shortDate(referral.admittedOn)}` : '']
+        .filter(Boolean).join(' ');
+      const statusOptions: { value: 'enrolled' | 'completed' | 'left'; label: string }[] = [
+        { value: 'enrolled', label: 'Still enrolled' },
+        { value: 'completed', label: 'Completed the program' },
+        { value: 'left', label: 'Left before completing' },
+      ];
+      return (
+        <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={closeOutcomeSheet}>
+          <SafeAreaView style={styles.modalPage}>
+            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+              <View style={styles.modalHandle} />
+              <View style={styles.modalHeader}>
+                <TouchableOpacity accessibilityLabel="Close check-in" onPress={closeOutcomeSheet} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
+                <Text style={styles.modalHeaderTitle}>{outcomeFollowUp.checkInDays ? `${outcomeFollowUp.checkInDays}-day check-in` : 'Check-in'}</Text>
+                <View style={styles.closeButton} />
+              </View>
+              <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+                <Text style={styles.formIntro}>{intro || outcomeFollowUp.title}</Text>
+                <Text style={styles.fieldLabel}>HOW IS IT GOING?</Text>
+                <View style={styles.wrapPills}>
+                  {statusOptions.map((option) => (
+                    <Pill key={option.value} label={option.label} active={outcomeStatus === option.value} onPress={() => setOutcomeStatus(option.value)} />
+                  ))}
+                </View>
+                <TouchableOpacity onPress={outcomeNotYet} style={styles.outcomeNotYet}>
+                  <AppIcon name="time-outline" size={15} color={COLORS.blue} />
+                  <Text style={styles.outcomeNotYetText}>Haven't reached them — snooze this check-in 4 days</Text>
+                </TouchableOpacity>
+                <Text style={styles.fieldLabel}>HOW HAS THE FAMILY'S EXPERIENCE BEEN? (OPTIONAL)</Text>
+                <View style={styles.starRow}>
+                  {[1, 2, 3, 4, 5].map((star) => (
+                    <TouchableOpacity key={star} accessibilityLabel={`${star} star${star === 1 ? '' : 's'}`} onPress={() => setOutcomeStars(star === outcomeStars ? 0 : star)} style={styles.starButton}>
+                      <AppIcon name={star <= outcomeStars ? 'star' : 'star-outline'} size={30} color={star <= outcomeStars ? COLORS.gold : COLORS.gray} />
+                    </TouchableOpacity>
+                  ))}
+                </View>
+                <FormField label="NOTE (OPTIONAL)" value={outcomeNote} onChangeText={setOutcomeNote} placeholder="What the family told you, in a line" multiline />
+                <TouchableOpacity style={[styles.primaryButton, !outcomeStatus && { opacity: 0.45 }]} disabled={!outcomeStatus} onPress={saveOutcome}>
+                  <Text style={styles.primaryButtonText}>Save check-in</Text>
+                </TouchableOpacity>
+              </ScrollView>
+            </KeyboardAvoidingView>
+          </SafeAreaView>
+        </Modal>
+      );
+    }
+    const upcomingCheckIns = outcomeAnswer === 'yes' ? checkInSchedule(outcomeAdmittedOn || localDateStamp(), localDateStamp()) : [];
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={closeOutcomeSheet}>
         <SafeAreaView style={styles.modalPage}>
@@ -6032,6 +7178,11 @@ export default function App() {
                       return { label: index === 0 ? `Today (${shortDate(stamp)})` : shortDate(stamp), value: stamp };
                     })}
                   />
+                  {upcomingCheckIns.length ? (
+                    <Text style={styles.todayRowMeta}>
+                      Check-ins will land on Today {upcomingCheckIns.map((item) => `${shortDate(item.dueOn)} (${item.days} days)`).join(', ')}.
+                    </Text>
+                  ) : null}
                   <Text style={styles.fieldLabel}>HOW WAS THE FAMILY'S EXPERIENCE SO FAR? (OPTIONAL)</Text>
                   <View style={styles.starRow}>
                     {[1, 2, 3, 4, 5].map((star) => (
@@ -6134,6 +7285,148 @@ export default function App() {
     );
   }
 
+  // ─── Insurance workflow editors (swapped inside the case sheet) ──────────
+
+  function CaseBenefitsModal(record: CaseRecord) {
+    if (!benefitsForm) return null;
+    const close = () => setBenefitsForm(null);
+    const linked = referralMatches.find((item) => item.id === record.matchProfileId) || referralMatches.find((item) => item.caseId === record.id);
+    const carriers = insuranceProvidersForState(linked?.state || 'ANY').filter((plan) => plan !== 'Cash pay');
+    const carrierOptions = [
+      { label: 'Not set', value: '' },
+      ...(benefitsForm.carrier && !carriers.includes(benefitsForm.carrier) ? [{ label: benefitsForm.carrier, value: benefitsForm.carrier }] : []),
+      ...carriers.map((plan) => ({ label: plan, value: plan })),
+    ];
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Back to case file" onPress={close} style={styles.closeButton}><AppIcon name="arrow-back" size={21} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Insurance plan</Text>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => saveBenefits(record)}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>Just enough to ask a program for a VOB. Only the last four of the member id are kept; no date of birth, no SSN. Keep the card photo under Documents.</Text>
+              <DropdownField label="CARRIER" value={benefitsForm.carrier} icon="shield-checkmark-outline" onChange={(carrier) => setBenefitsForm((current) => (current ? { ...current, carrier } : current))} options={carrierOptions} />
+              <FormField label="PLAN NAME (OPTIONAL)" value={benefitsForm.planName} onChangeText={(planName) => setBenefitsForm((current) => (current ? { ...current, planName } : current))} placeholder="PPO Choice, HMO, Medicaid plan name" />
+              <FormField label="MEMBER ID, LAST FOUR ONLY" value={benefitsForm.memberIdLast4} onChangeText={(value) => setBenefitsForm((current) => (current ? { ...current, memberIdLast4: memberIdLast4(value) } : current))} placeholder="1234" />
+              <DropdownField label="SUBSCRIBER" value={benefitsForm.subscriberRelationship} icon="person-outline" onChange={(value) => setBenefitsForm((current) => (current ? { ...current, subscriberRelationship: value as SubscriberRelationship } : current))} options={SUBSCRIBER_RELATIONSHIPS.map((item) => ({ label: item.label, value: item.value }))} />
+              <TouchableOpacity accessibilityRole="button" style={styles.primaryButton} onPress={() => saveBenefits(record)}>
+                <Text style={styles.primaryButtonText}>Save plan</Text>
+              </TouchableOpacity>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function VobRequestModal(record: CaseRecord) {
+    if (!vobForm) return null;
+    const close = () => setVobForm(null);
+    const plan = benefitsByCase[record.id] ?? null;
+    const linked = referralMatches.find((item) => item.id === record.matchProfileId) || referralMatches.find((item) => item.caseId === record.id);
+    const state = linked?.state || 'ANY';
+    const requests = vobsByCase[record.id] || [];
+    const suggestions = plan?.carrier
+      ? sortPlanStatuses(partners.map((partner) => planStatusFor(partner, plan.carrier, state)))
+      : partners.slice().sort((a, b) => a.organization.localeCompare(b.organization)).map((partner): PartnerPlanStatus => ({ partnerId: partner.id, organization: partner.organization, networkStatus: 'unknown', source: 'none', sameState: null }));
+    const serverAnswered = Boolean(plan?.carrier && planStatuses[`${plan.carrier}|${state}`]);
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Back to case file" onPress={close} style={styles.closeButton}><AppIcon name="arrow-back" size={21} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>Request VOB</Text>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => submitVobRequest(vobForm)}><Text style={styles.saveText}>Request</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>
+                {plan?.carrier
+                  ? `Partners that report taking ${plan.carrier} are listed first. The label is what each program says about itself${serverAnswered ? '' : ' (checking the directory)'}; the VOB is how you find out for sure.`
+                  : 'Add the family’s plan on the Benefits card to see which partners report taking it. You can still ask any program now.'}
+              </Text>
+              <Text style={styles.fieldLabel}>WHICH PROGRAM</Text>
+              <View style={styles.followUpCard}>
+                {suggestions.map((item, index) => {
+                  const selected = vobForm.partnerId === item.partnerId;
+                  const partner = partners.find((candidate) => candidate.id === item.partnerId);
+                  const line = plan?.carrier ? planStatusLine(item.networkStatus, requests, item.partnerId) : null;
+                  const open = requests.find((request) => request.partnerId === item.partnerId && !isVobAnswered(request.status));
+                  return (
+                    <TouchableOpacity
+                      key={item.partnerId}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected }}
+                      onPress={() => setVobForm((current) => (current ? { ...current, partnerId: selected ? null : item.partnerId, programName: '' } : current))}
+                      style={[styles.caseNextStepRow, index === suggestions.length - 1 && { borderBottomWidth: 0 }]}
+                    >
+                      <View style={[styles.followUpIcon, { width: 30, height: 30 }]}><AppIcon name={selected ? 'radio-button-on' : 'radio-button-off'} size={17} color={selected ? COLORS.forest : COLORS.gray} /></View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.touchLogTitle}>{item.organization}</Text>
+                        <Text style={styles.touchLogNote}>
+                          {[partner ? `${partner.city}, ${partner.state}` : '', line ? line.text : '', open ? 'VOB already open' : ''].filter(Boolean).join(' · ')}
+                        </Text>
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
+                {!suggestions.length ? <Text style={styles.caseEmptyNote}>No partners in your network yet. Type the program below.</Text> : null}
+              </View>
+              <FormField label="OR A PROGRAM BY NAME" value={vobForm.programName} onChangeText={(programName) => setVobForm((current) => (current ? { ...current, programName, partnerId: programName.trim() ? null : current.partnerId } : current))} placeholder="A program outside your network" />
+              <FormField label="NOTE (OPTIONAL)" value={vobForm.note} onChangeText={(note) => setVobForm((current) => (current ? { ...current, note } : current))} placeholder="Who you spoke with, fax or portal used, what they need from you" multiline />
+              <TouchableOpacity accessibilityRole="button" style={styles.primaryButton} onPress={() => submitVobRequest(vobForm)}>
+                <Text style={styles.primaryButtonText}>Request VOB</Text>
+              </TouchableOpacity>
+              <Text style={styles.casePaymentHint}>A reminder to check on it lands on your Today list the next business day. The request is logged on the timeline.</Text>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  function VobAnswerModal(record: CaseRecord) {
+    if (!vobAnswerForm) return null;
+    const close = () => setVobAnswerForm(null);
+    const request = (vobsByCase[record.id] || []).find((item) => item.id === vobAnswerForm.requestId);
+    if (!request) return null;
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
+        <SafeAreaView style={styles.modalPage}>
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+            <View style={styles.modalHandle} />
+            <View style={styles.modalHeader}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Back to case file" onPress={close} style={styles.closeButton}><AppIcon name="arrow-back" size={21} /></TouchableOpacity>
+              <Text style={styles.modalHeaderTitle}>VOB answer</Text>
+              <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => saveVobAnswer(record)} disabled={vobSaving}><Text style={[styles.saveText, vobSaving && { opacity: 0.45 }]}>Save</Text></TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+              <Text style={styles.formIntro}>{request.programName}, asked {shortDate(request.requestedAt.slice(0, 10))}. What did they say?</Text>
+              <Text style={styles.fieldLabel}>STATUS</Text>
+              <View style={[styles.wrapPills, { marginBottom: 14 }]}>
+                {VOB_STATUSES.map((status) => (
+                  <Pill key={status} label={vobStatusLabel(status)} active={vobAnswerForm.status === status} onPress={() => setVobAnswerForm((current) => (current ? { ...current, status } : current))} />
+                ))}
+              </View>
+              <FormField label="WHO ANSWERED (OPTIONAL)" value={vobAnswerForm.answeredBy} onChangeText={(answeredBy) => setVobAnswerForm((current) => (current ? { ...current, answeredBy } : current))} placeholder="Maria in admissions" />
+              <FormField label="QUOTED OUT OF POCKET, DOLLARS (OPTIONAL)" value={vobAnswerForm.quoted} onChangeText={(quoted) => setVobAnswerForm((current) => (current ? { ...current, quoted } : current))} placeholder="500" keyboardType="number-pad" />
+              <FormField label="NOTES" value={vobAnswerForm.note} onChangeText={(note) => setVobAnswerForm((current) => (current ? { ...current, note } : current))} placeholder="Deductible, coinsurance, authorization needed, what the family was told" multiline />
+              <TouchableOpacity accessibilityRole="button" style={[styles.primaryButton, vobSaving && { opacity: 0.45 }]} onPress={() => saveVobAnswer(record)} disabled={vobSaving}>
+                <Text style={styles.primaryButtonText}>{vobSaving ? 'Saving…' : 'Save answer'}</Text>
+              </TouchableOpacity>
+              <Text style={styles.casePaymentHint}>A status change is written to the timeline with your name. An answer also closes the reminder to check on it. This applies to this family only and never changes the partner's own network listing.</Text>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
+    );
+  }
+
   function CaseNextStepModal(record: CaseRecord) {
     const close = () => setCaseNextStepCaseId(null);
     return (
@@ -6217,7 +7510,7 @@ export default function App() {
                 <Text style={styles.primaryButtonText}>Next step…</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.sheetSecondaryButton} onPress={confirmDoneCloseLoop}>
-                <Text style={styles.sheetSecondaryButtonText}>{referralAwaiting ? 'Close the loop — record the outcome' : doneCard.caseId ? 'Close the loop — complete & set case status' : 'Close the loop — just complete'}</Text>
+                <Text style={styles.sheetSecondaryButtonText}>{doneCard.kind === 'check_in' && doneCard.referralId ? 'Close the loop — record the check-in' : referralAwaiting ? 'Close the loop — record the outcome' : doneCard.caseId ? 'Close the loop — complete & set case status' : 'Close the loop — just complete'}</Text>
               </TouchableOpacity>
               <TouchableOpacity onPress={close} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Not yet</Text></TouchableOpacity>
                 </>
@@ -6274,6 +7567,11 @@ export default function App() {
                 <Pill label="+2 days" onPress={() => confirmSnooze('plus2')} />
                 <Pill label="Next week" onPress={() => confirmSnooze('nextweek')} />
               </View>
+              {teamWorkspace && snoozeCard.followUp ? (
+                <TouchableOpacity style={styles.sheetSecondaryButton} onPress={() => { const followUp = snoozeCard.followUp as FollowUp; setSnoozeCard(null); pickFollowUpAssignee(followUp); }}>
+                  <Text style={styles.sheetSecondaryButtonText}>Assign to…</Text>
+                </TouchableOpacity>
+              ) : null}
               <TouchableOpacity style={styles.sheetSecondaryButton} onPress={() => { const card = snoozeCard; setSnoozeCard(null); openNextStepSheet(card); }}>
                 <Text style={styles.sheetSecondaryButtonText}>Set next step…</Text>
               </TouchableOpacity>
@@ -6609,7 +7907,6 @@ const styles = StyleSheet.create({
   returnPartner: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   returnPartnerName: { color: COLORS.ink, fontSize: 13, fontWeight: '700' },
   returnPartnerType: { color: COLORS.gray, fontSize: 11, marginTop: 2 },
-  returnCount: { color: COLORS.coral, fontSize: 13, fontWeight: '800' },
   activityCard: { backgroundColor: COLORS.white, borderRadius: 22, paddingHorizontal: 16, borderWidth: 1, borderColor: '#E5E8E3' },
   activityRow: { flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
   directionIcon: { width: 34, height: 34, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
@@ -6713,8 +8010,17 @@ const styles = StyleSheet.create({
   matchDetailText: { color: COLORS.gray, fontSize: 10, fontWeight: '600' },
   matchInsuranceText: { flex: 1, flexShrink: 1, marginRight: 8 },
   matchPriceText: { flexShrink: 0, color: COLORS.gray, fontSize: 10, fontWeight: '600', textAlign: 'right' },
-  reciprocityNote: { flexDirection: 'row', gap: 5, alignItems: 'center', marginTop: 9 },
-  reciprocityNoteText: { flex: 1, flexShrink: 1, color: COLORS.coral, fontSize: 10, lineHeight: 14, fontWeight: '700' },
+  matchFlags: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 9 },
+  bedLineOpen: { color: COLORS.forest, fontSize: 11, fontWeight: '700', marginTop: 7 },
+  bedLineUnconfirmed: { color: COLORS.gray, fontSize: 11, fontWeight: '700', marginTop: 7 },
+  verifyBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#F3F3EF', borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5 },
+  verifyBadgeText: { color: COLORS.inkSoft, fontSize: 9, fontWeight: '800' },
+  disclosureBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.coralPale, borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5, flexShrink: 1 },
+  disclosureBadgeText: { color: COLORS.coral, fontSize: 9, fontWeight: '800', flexShrink: 1 },
+  matchFieldHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: 8, marginBottom: 14, paddingHorizontal: 2 },
+  mustHaveBlock: { marginTop: -4, marginBottom: 12 },
+  placementReasonBlock: { marginTop: 4, marginBottom: 16 },
+  placementReasonHint: { color: COLORS.gray, fontSize: 11, lineHeight: 16, marginTop: -4, marginBottom: 10 },
   assignReferralButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: COLORS.forest, borderRadius: 13, marginTop: 13 },
   assignReferralButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
   directoryTitleRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 18 },
@@ -6754,10 +8060,6 @@ const styles = StyleSheet.create({
   moreTags: { color: COLORS.gray, fontSize: 10, alignSelf: 'center', fontWeight: '700' },
   partnerFooter: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#EFF1EF' },
   partnerFooterText: { flex: 1, flexShrink: 1, color: COLORS.gray, fontSize: 10, fontWeight: '600' },
-  balanceBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5 },
-  balanceBadgeWarm: { backgroundColor: COLORS.coralPale },
-  balanceText: { color: COLORS.forest, fontSize: 9, fontWeight: '800' },
-  balanceTextWarm: { color: COLORS.coral },
   cardShareButton: { width: 44, height: 44, borderRadius: 11, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.mint },
   emptyState: { alignItems: 'center', paddingVertical: 36, paddingHorizontal: 28 },
   emptyIcon: { width: 52, height: 52, borderRadius: 18, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
@@ -6791,8 +8093,6 @@ const styles = StyleSheet.create({
   balanceNameRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 12, marginBottom: 7 },
   balanceName: { flex: 1, color: COLORS.ink, fontSize: 12, fontWeight: '700' },
   balanceNumbers: { color: COLORS.gray, fontSize: 10 },
-  balanceTrack: { height: 7, borderRadius: 4, backgroundColor: '#DCE7EA', overflow: 'hidden' },
-  balanceInbound: { height: '100%', borderRadius: 4, backgroundColor: COLORS.sage },
   bottomNav: { flexDirection: 'row', paddingTop: 8, paddingBottom: Platform.OS === 'ios' ? 7 : 10, backgroundColor: COLORS.white, borderTopWidth: 1, borderTopColor: COLORS.line, shadowColor: COLORS.ink, shadowOpacity: 0.06, shadowRadius: 10, shadowOffset: { width: 0, height: -4 } },
   navItem: { flex: 1, minHeight: 48, alignItems: 'center', justifyContent: 'center', gap: 3 },
   navIconWrap: { width: 40, height: 32, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
@@ -6987,6 +8287,7 @@ const styles = StyleSheet.create({
   docViewImage: { flex: 1, marginBottom: 30 },
   // Today Command Center
   todaySection: { marginBottom: 16 },
+  todayScopeBlock: { marginBottom: 10 },
   todaySectionHeader: { color: COLORS.gray, fontSize: 11, fontWeight: '800', letterSpacing: 1.1, marginBottom: 7, marginTop: 2 },
   todaySectionHeaderOverdue: { color: COLORS.coral },
   todayRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, backgroundColor: COLORS.white, borderRadius: 15, padding: 11, marginBottom: 7, borderWidth: 1, borderColor: '#E5E8E3' },
@@ -7006,6 +8307,7 @@ const styles = StyleSheet.create({
   heroTitleGrow: { flex: 1 },
   todayActionRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 },
   todayIconButton: { width: 44, height: 44, borderRadius: 12, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, alignItems: 'center', justifyContent: 'center' },
+  todayTakeButton: { marginTop: 8, flex: 0 },
   todayDoneButton: { flex: 1, minHeight: 44, borderRadius: 12, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
   todayDoneButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
   fab: { position: 'absolute', right: 18, bottom: 18, width: 54, height: 54, borderRadius: 19, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', shadowColor: COLORS.ink, shadowOpacity: 0.25, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 8 },

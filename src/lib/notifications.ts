@@ -342,17 +342,57 @@ export function cancelReferralFitNotifications(): Promise<void> {
 
 // ─── Tap handling ───────────────────────────────────────────────────────────
 
-export type NotificationTarget = 'home' | 'directory';
+// Local reminders carry { target, partnerId, ownerId }. Server-sent pushes
+// (see docs/NOTIFICATIONS.md) carry { kind, user_id, case_id, ... } and
+// nothing private: the app resolves the item after sign-in. Either way a tap
+// is honored only for the account the notification was addressed to.
+export type NotificationTarget = 'home' | 'directory' | 'case' | 'workspace';
+
+export type RemotePushData = {
+  kind?: string;
+  user_id?: string;
+  case_id?: string;
+  follow_up_id?: string;
+  global_partner_id?: string;
+};
+
+export function remotePushTarget(data: RemotePushData): { target: NotificationTarget; caseId?: string } | null {
+  switch (data.kind) {
+    case 'new_lead':
+    case 'assigned_to_me':
+      return typeof data.case_id === 'string' && data.case_id ? { target: 'case', caseId: data.case_id } : { target: 'home' };
+    case 'overdue_mine':
+      return { target: 'home' };
+    case 'directory_decision':
+    case 'directory_submission':
+      return { target: 'workspace' };
+    case 'bed_opened':
+      // The listing id is in data; the app opens the Directory, where the
+      // live count shows. Nothing about the program is in the push itself.
+      return { target: 'directory' };
+    default:
+      return null;
+  }
+}
 
 export function subscribeToNotificationResponses(
-  onTarget: (target: NotificationTarget, partnerId?: string) => void,
+  onTarget: (target: NotificationTarget, partnerId?: string, caseId?: string) => void,
 ): () => void {
   const extract = (response: Notifications.NotificationResponse | null) => {
     const requestId = response?.notification?.request?.identifier;
     if (!requestId || handledResponseIds.has(requestId)) return;
-    const data = response.notification.request.content.data as { target?: string; partnerId?: string; ownerId?: string } | undefined;
-    if (!scheduleOwnerId || data?.ownerId !== scheduleOwnerId) return;
-    if (data?.target !== 'home' && data?.target !== 'directory') return;
+    const data = response.notification.request.content.data as ({ target?: string; partnerId?: string; ownerId?: string } & RemotePushData) | undefined;
+    if (!scheduleOwnerId || !data) return;
+    if (typeof data.kind === 'string') {
+      if (typeof data.user_id !== 'string' || data.user_id.toLowerCase() !== scheduleOwnerId.toLowerCase()) return;
+      const remote = remotePushTarget(data);
+      if (!remote) return;
+      handledResponseIds.add(requestId);
+      onTarget(remote.target, undefined, remote.caseId);
+      return;
+    }
+    if (data.ownerId !== scheduleOwnerId) return;
+    if (data.target !== 'home' && data.target !== 'directory') return;
     handledResponseIds.add(requestId);
     onTarget(data.target, typeof data.partnerId === 'string' ? data.partnerId : undefined);
   };
