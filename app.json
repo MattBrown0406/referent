@@ -2,14 +2,14 @@
   "expo": {
     "name": "ReferralFit",
     "slug": "referralfit",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "orientation": "portrait",
     "icon": "./assets/icon-referent-symbiosis.png",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.mattbrown.referralfit",
-      "buildNumber": "9",
+      "buildNumber": "1",
       "entitlements": {
         "aps-environment": "production"
       },
