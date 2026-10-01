@@ -100,5 +100,41 @@ equal('source ordering', result.sources.map((item) => [item.source, item.cases, 
 ]);
 equal('average days to engaged', result.averageDaysToEngaged, 2.5);
 
+// ─── Speed to lead ──────────────────────────────────────────────────────────
+// A lead is a case with leadCapturedAt; its clock stops at firstTouchAt. The
+// fixture mirrors supabase/tests/lead_capture_test.sql section 7.
+const lead = (overrides) => ({
+  ...makeCase({ id: overrides.id, leadSource: overrides.leadSource, createdAt: overrides.leadCapturedAt }),
+  leadCapturedAt: overrides.leadCapturedAt,
+  firstTouchAt: overrides.firstTouchAt,
+});
+const leadCases = [
+  lead({ id: 'l1', leadSource: 'Website', leadCapturedAt: '2026-08-01T10:00:00Z', firstTouchAt: '2026-08-01T10:05:00Z' }), // 5 min
+  lead({ id: 'l2', leadSource: 'Website', leadCapturedAt: '2026-08-01T10:00:00Z', firstTouchAt: '2026-08-01T10:10:00Z' }), // 10 min
+  lead({ id: 'l3', leadSource: 'Inbound call', leadCapturedAt: '2026-08-01T10:00:00Z', firstTouchAt: '2026-08-01T10:30:00Z' }), // 30 min
+  lead({ id: 'l4', leadSource: 'Inbound call', leadCapturedAt: '2026-08-01T10:00:00Z' }), // never answered
+  lead({ id: 'l5', leadSource: 'Website', leadCapturedAt: '2025-01-01T10:00:00Z', firstTouchAt: '2025-01-01T10:01:00Z' }), // 1 min, outside 90 days
+  makeCase({ id: 'n1', leadSource: 'Website', createdAt: '2026-08-02T10:00:00Z' }), // a case, not a lead
+];
+const leadNow = new Date(2026, 7, 6, 12);
+equal('median helper', [business.median([]), business.median([3, 1, 2]), business.median([1, 2, 3, 4])], [null, 2, 2.5]);
+equal('speed to lead, 90 days, 15-minute target', business.computeSpeedToLead(leadCases, 90, 15, leadNow), {
+  leads: 4, answered: 3, medianMinutes: 10, withinTarget: 2, withinTargetRate: 0.5, targetMinutes: 15,
+});
+equal('speed to lead, all time', business.computeSpeedToLead(leadCases, 'all', 15, leadNow), {
+  leads: 5, answered: 4, medianMinutes: 7.5, withinTarget: 3, withinTargetRate: 0.6, targetMinutes: 15,
+});
+equal('a tighter target counts fewer leads as answered in time', business.computeSpeedToLead(leadCases, 90, 5, leadNow).withinTarget, 1);
+equal('no leads means no rate and no median', business.computeSpeedToLead([leadCases[5]], 90, 15, leadNow), {
+  leads: 0, answered: 0, medianMinutes: null, withinTarget: 0, withinTargetRate: null, targetMinutes: 15,
+});
+const leadResult = business.computeBusinessDashboard(leadCases, [], { stages: [], integrations: [] }, 90, leadNow, 15);
+equal('dashboard carries speed to lead', leadResult.speedToLead, business.computeSpeedToLead(leadCases, 90, 15, leadNow));
+equal('per-source lead counts', leadResult.sources.map((item) => [item.source, item.cases, item.leads, item.leadsWithinTarget]), [
+  ['Website', 3, 2, 2],
+  ['Inbound call', 2, 2, 0],
+]);
+equal('the dashboard target defaults to 15 minutes', business.computeBusinessDashboard(leadCases, [], { stages: [], integrations: [] }, 90, leadNow).speedToLead.targetMinutes, 15);
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

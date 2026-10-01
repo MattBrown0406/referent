@@ -50,9 +50,18 @@ export type CaseRecord = {
   quotedAmount: number | null;
   paidAmount: number;
   matchProfileId?: string;
+  // Lead capture (server-set, never written by the client). lead_captured_at
+  // marks a case that arrived as a lead (New lead quick-add or the intake
+  // link); first_touch_at is stamped by a trigger on the first logged call,
+  // text, email, or meeting and never moves. Both feed speed-to-lead.
+  firstTouchAt?: string; // ISO timestamptz
+  leadCapturedAt?: string; // ISO timestamptz
+  leadUrgency?: LeadUrgency;
   createdAt: string; // ISO timestamptz
   updatedAt: string; // ISO timestamptz
 };
+
+export type LeadUrgency = 'none' | 'immediate_danger';
 
 export type CaseContact = {
   id: string;
@@ -111,6 +120,9 @@ type CaseRow = {
   quoted_amount: number | null;
   paid_amount: number | null;
   match_profile_id: string | null;
+  first_touch_at?: string | null;
+  lead_captured_at?: string | null;
+  lead_urgency?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -161,6 +173,9 @@ function mapCaseRow(row: CaseRow): CaseRecord {
     quotedAmount: row.quoted_amount,
     paidAmount: row.paid_amount ?? 0,
     matchProfileId: row.match_profile_id || undefined,
+    firstTouchAt: row.first_touch_at || undefined,
+    leadCapturedAt: row.lead_captured_at || undefined,
+    leadUrgency: row.lead_urgency === 'immediate_danger' ? 'immediate_danger' : undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -455,6 +470,59 @@ export async function createCaseBundle(
     p_case: caseToRow(record),
     p_contact: primaryContact ? contactToRow(primaryContact) : null,
     p_follow_up: followUpRow,
+  }));
+}
+
+// ─── Lead capture: the in-app "New lead" quick-add ──────────────────────────
+// The server builds the case, primary contact, first-call follow-up, and
+// timeline entry in one transaction (create_lead). The client supplies the
+// ids so its optimistic rows match what lands, plus the device-local due day
+// and the first-call target time (the server's clock is UTC).
+
+export type NewLeadInput = {
+  caseId: string;
+  contactId: string;
+  followUpId: string;
+  callerName: string;
+  phone: string;
+  email: string;
+  aboutRelationship: string;
+  aboutFirstName: string;
+  leadSource: string;
+  urgency: LeadUrgency;
+  dueOn: string; // YYYY-MM-DD, device-local
+  dueTime: string | null; // HH:MM 24h, device-local
+};
+
+// Mirrors lead_case_title() in the migration so the optimistic case card
+// reads exactly like the saved one.
+export function leadCaseTitle(input: Pick<NewLeadInput, 'callerName' | 'aboutRelationship' | 'aboutFirstName'>): string {
+  const caller = input.callerName.trim();
+  const about = `${input.aboutRelationship.trim()} ${input.aboutFirstName.trim()}`.trim();
+  return about ? `${caller} — ${about}` : caller;
+}
+
+export function leadFollowUpTitle(caseTitle: string): string {
+  return `First call — ${caseTitle}`;
+}
+
+export async function createLead(input: NewLeadInput, expectedUserId: string): Promise<void> {
+  await runOrThrow(() => supabase.rpc('create_lead', {
+    p_expected_owner_id: expectedUserId,
+    p_lead: {
+      id: input.caseId,
+      contact_id: input.contactId,
+      follow_up_id: input.followUpId,
+      caller_name: input.callerName,
+      phone: input.phone,
+      email: input.email,
+      about_relationship: input.aboutRelationship,
+      about_first_name: input.aboutFirstName,
+      lead_source: input.leadSource,
+      urgency: input.urgency,
+      due_on: input.dueOn,
+      due_time: input.dueTime ?? '',
+    },
   }));
 }
 

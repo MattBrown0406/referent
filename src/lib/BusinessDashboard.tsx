@@ -28,6 +28,8 @@ type Props = {
   loading: boolean;
   error?: string;
   benchmarksEntitled: boolean;
+  // The workspace's first-call target (orgs.lead_response_target_minutes).
+  leadResponseTargetMinutes: number;
   onClose: () => void;
   onRefresh: () => void;
   onOpenCase: (caseId: string) => void;
@@ -42,6 +44,14 @@ const periods: { label: string; value: BusinessPeriod }[] = [
 
 function percent(value: number): string {
   return `${Math.round(value * 100)}%`;
+}
+
+export function formatResponseMinutes(minutes: number | null): string {
+  if (minutes == null) return '—';
+  if (minutes < 1) return '< 1 min';
+  if (minutes < 60) return `${Math.round(minutes)} min`;
+  if (minutes < 1440) return `${(minutes / 60).toFixed(1)} h`;
+  return `${(minutes / 1440).toFixed(1)} d`;
 }
 
 function localDateStamp(date: Date): string {
@@ -74,15 +84,17 @@ export default function BusinessDashboard({
   loading,
   error,
   benchmarksEntitled,
+  leadResponseTargetMinutes,
   onClose,
   onRefresh,
   onOpenCase,
 }: Props) {
   const [period, setPeriod] = useState<BusinessPeriod>(90);
   const metrics = useMemo(
-    () => computeBusinessDashboard(cases, referrals, data, period),
-    [cases, referrals, data, period],
+    () => computeBusinessDashboard(cases, referrals, data, period, new Date(), leadResponseTargetMinutes),
+    [cases, referrals, data, period, leadResponseTargetMinutes],
   );
+  const speed = metrics.speedToLead;
   const today = localDateStamp(new Date());
   const attention = data.integrations.filter((record) => needsAttention(record, today));
 
@@ -156,6 +168,26 @@ export default function BusinessDashboard({
             </View>
           </View>
 
+          <Text style={styles.sectionTitle}>Speed to lead</Text>
+          <Text style={styles.sectionNote}>Leads from New lead and the intake link, by arrival date. The clock runs from arrival to the first logged call, text, email, or meeting. Target: {speed.targetMinutes} minutes (Workspace).</Text>
+          <View style={styles.metricGrid}>
+            <View style={styles.metricCard}>
+              <Text style={styles.metricLabel}>MEDIAN RESPONSE</Text>
+              <Text style={styles.metricValue}>{formatResponseMinutes(speed.medianMinutes)}</Text>
+              <Text style={styles.metricDetail}>{speed.answered} of {speed.leads} {speed.leads === 1 ? 'lead' : 'leads'} answered</Text>
+            </View>
+            <View style={styles.metricCard}>
+              <Text style={styles.metricLabel}>WITHIN {speed.targetMinutes} MIN</Text>
+              <Text style={[styles.metricValue, speed.withinTargetRate != null && speed.withinTargetRate < 0.5 && styles.overdueValue]}>
+                {speed.withinTargetRate == null ? '—' : percent(speed.withinTargetRate)}
+              </Text>
+              <Text style={styles.metricDetail}>{speed.withinTarget} answered inside the target</Text>
+            </View>
+          </View>
+          {speed.leads === 0 ? (
+            <Text style={styles.emptyFootnote}>Add leads with New lead on Today, or share your intake link from Workspace, and this fills in.</Text>
+          ) : null}
+
           <Text style={styles.sectionTitle}>Case funnel</Text>
           <View style={styles.card}>
             {metrics.funnel.map((step, index) => (
@@ -184,7 +216,10 @@ export default function BusinessDashboard({
               <View key={source.source} style={[styles.sourceRow, index === metrics.sources.length - 1 && styles.lastRow]}>
                 <View style={styles.sourceCopy}>
                   <Text style={styles.rowTitle}>{source.source}</Text>
-                  <Text style={styles.rowDetail}>{source.cases} cases · {source.placed} placed</Text>
+                  <Text style={styles.rowDetail}>
+                    {source.cases} cases · {source.placed} placed
+                    {source.leads ? ` · ${source.leads} ${source.leads === 1 ? 'lead' : 'leads'}, ${source.leadsWithinTarget} within target` : ''}
+                  </Text>
                 </View>
                 <View style={styles.sourceMoney}>
                   <Text style={styles.sourceCollected}>{formatMoney(source.collected)}</Text>

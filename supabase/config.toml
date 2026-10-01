@@ -396,6 +396,9 @@ verify_jwt = false
 [functions.revenuecat-webhook]
 verify_jwt = false
 
+[functions.intake]
+verify_jwt = false
+
 [analytics]
 enabled = true
 port = 55427

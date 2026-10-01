@@ -58,7 +58,64 @@ export type LeadSourceMetric = {
   placed: number;
   quoted: number;
   collected: number;
+  // Speed to lead, per source: leads captured (quick-add or intake link),
+  // how many were answered within the first-call target.
+  leads: number;
+  leadsWithinTarget: number;
 };
+
+export const DEFAULT_LEAD_RESPONSE_TARGET_MINUTES = 15;
+
+// Speed to lead for a period. A lead is a case with leadCapturedAt (the
+// New lead quick-add or the intake link); its clock runs from capture to
+// firstTouchAt, the server-stamped first logged call/text/email/meeting.
+// withinTargetRate counts every lead in the period, answered or not, so an
+// unanswered lead pulls the rate down rather than disappearing from it.
+// Mirrors lead_capture_metrics() in the migration; keep the two in step.
+export type SpeedToLeadMetric = {
+  leads: number;
+  answered: number;
+  medianMinutes: number | null;
+  withinTarget: number;
+  withinTargetRate: number | null;
+  targetMinutes: number;
+};
+
+type LeadTiming = Pick<CaseRecord, 'leadCapturedAt' | 'firstTouchAt' | 'leadSource'>;
+
+function leadResponseMinutes(record: LeadTiming): number | null {
+  if (!record.leadCapturedAt || !record.firstTouchAt) return null;
+  const minutes = (new Date(record.firstTouchAt).getTime() - new Date(record.leadCapturedAt).getTime()) / 60000;
+  return Number.isFinite(minutes) && minutes >= 0 ? minutes : null;
+}
+
+export function median(values: number[]): number | null {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+export function computeSpeedToLead(
+  cases: LeadTiming[],
+  period: BusinessPeriod,
+  targetMinutes = DEFAULT_LEAD_RESPONSE_TARGET_MINUTES,
+  now = new Date(),
+): SpeedToLeadMetric {
+  const start = periodStart(period, now);
+  const leads = cases.filter((record) => record.leadCapturedAt && new Date(record.leadCapturedAt).getTime() >= start);
+  const responses = leads.map(leadResponseMinutes).filter((value): value is number => value != null);
+  const withinTarget = responses.filter((minutes) => minutes <= targetMinutes).length;
+  const medianValue = median(responses);
+  return {
+    leads: leads.length,
+    answered: responses.length,
+    medianMinutes: medianValue == null ? null : Math.round(medianValue * 10) / 10,
+    withinTarget,
+    withinTargetRate: leads.length ? withinTarget / leads.length : null,
+    targetMinutes,
+  };
+}
 
 export type FunnelMetric = {
   key: 'inquiry' | 'consult' | 'engaged' | 'placed';
@@ -82,6 +139,7 @@ export type BusinessDashboardMetrics = {
   averageDaysToEngaged: number | null;
   funnel: FunnelMetric[];
   sources: LeadSourceMetric[];
+  speedToLead: SpeedToLeadMetric;
   pendingContracts: number;
   pendingContractRevenue: number;
   openInvoices: number;
@@ -310,6 +368,7 @@ export function computeBusinessDashboard(
   data: BusinessData,
   period: BusinessPeriod,
   now = new Date(),
+  leadResponseTargetMinutes = DEFAULT_LEAD_RESPONSE_TARGET_MINUTES,
 ): BusinessDashboardMetrics {
   const start = periodStart(period, now);
   const scopedCases = cases.filter((record) => new Date(record.createdAt).getTime() >= start);
@@ -325,12 +384,17 @@ export function computeBusinessDashboard(
   const sourceMap = new Map<string, LeadSourceMetric>();
   for (const record of scopedCases) {
     const source = record.leadSource?.trim() || 'Unspecified';
-    const metric = sourceMap.get(source) || { source, cases: 0, placed: 0, quoted: 0, collected: 0 };
+    const metric = sourceMap.get(source) || { source, cases: 0, placed: 0, quoted: 0, collected: 0, leads: 0, leadsWithinTarget: 0 };
     const revenue = revenueByCase.get(record.id) || { quoted: 0, collected: 0, outstanding: 0 };
     metric.cases += 1;
     metric.quoted += revenue.quoted;
     metric.collected += revenue.collected;
     if (hasReached(record, scopedStages, 'placed')) metric.placed += 1;
+    if (record.leadCapturedAt) {
+      metric.leads += 1;
+      const minutes = leadResponseMinutes(record);
+      if (minutes != null && minutes <= leadResponseTargetMinutes) metric.leadsWithinTarget += 1;
+    }
     sourceMap.set(source, metric);
   }
 
@@ -384,6 +448,7 @@ export function computeBusinessDashboard(
       { key: 'placed', label: 'Placed', value: placed, rate: placed / base },
     ],
     sources: [...sourceMap.values()].sort((a, b) => b.cases - a.cases || b.collected - a.collected),
+    speedToLead: computeSpeedToLead(scopedCases, period, leadResponseTargetMinutes, now),
     pendingContracts: pendingContractRecords.length,
     pendingContractRevenue: pendingContractRecords.reduce(
       (sum, contract) => sum + (contract.amountCents == null ? 0 : contract.amountCents / 100),

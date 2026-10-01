@@ -28,7 +28,30 @@ export type Workspace = {
   myRole: OrgRole;
   members: OrgMember[];
   openInvites: OrgInvite[];
+  leadSettings: LeadSettings;
 };
+
+// Lead capture settings on the workspace row. The intake token is generated
+// and rotated server-side only; the target is the owner's to edit.
+export type LeadSettings = {
+  intakeToken: string;
+  leadResponseTargetMinutes: number;
+};
+
+export const DEFAULT_LEAD_RESPONSE_TARGET_MINUTES = 15;
+
+export const DEFAULT_LEAD_SETTINGS: LeadSettings = {
+  intakeToken: '',
+  leadResponseTargetMinutes: DEFAULT_LEAD_RESPONSE_TARGET_MINUTES,
+};
+
+function mapLeadSettings(row: { intake_token?: unknown; lead_response_target_minutes?: unknown } | null): LeadSettings {
+  const target = Number(row?.lead_response_target_minutes);
+  return {
+    intakeToken: typeof row?.intake_token === 'string' ? row.intake_token : '',
+    leadResponseTargetMinutes: Number.isInteger(target) && target >= 1 && target <= 1440 ? target : DEFAULT_LEAD_RESPONSE_TARGET_MINUTES,
+  };
+}
 
 function fail(error: { message?: string } | null, fallback: string): never {
   throw new StoreError(error?.message || fallback, false);
@@ -42,11 +65,16 @@ export async function fetchCurrentOrgId(): Promise<string> {
 }
 
 export async function fetchWorkspace(userId: string): Promise<Workspace | null> {
-  const [orgResult, membersResult, invitesResult] = await Promise.all([
-    supabase.from('orgs').select('id, name').maybeSingle(),
+  let [orgResult, membersResult, invitesResult] = await Promise.all([
+    supabase.from('orgs').select('id, name, intake_token, lead_response_target_minutes').maybeSingle(),
     supabase.from('org_members').select('user_id, role, display_name, created_at').order('created_at'),
     supabase.from('org_invites').select('id, code, expires_at, accepted_at, created_at').order('created_at', { ascending: false }),
   ]);
+  // Until the lead-capture migration is applied the two columns do not exist
+  // (42703); the workspace screen still works, just without the intake card.
+  if (orgResult.error?.code === '42703') {
+    orgResult = await supabase.from('orgs').select('id, name').maybeSingle();
+  }
   if (orgResult.error) fail(orgResult.error, 'Could not load the workspace.');
   if (!orgResult.data) return null;
   if (membersResult.error) fail(membersResult.error, 'Could not load workspace members.');
@@ -76,7 +104,32 @@ export async function fetchWorkspace(userId: string): Promise<Workspace | null> 
     myRole: me?.role ?? 'member',
     members,
     openInvites,
+    leadSettings: mapLeadSettings(orgResult.data),
   };
+}
+
+// Lightweight read for the app shell (Today clock, quick-add, dashboard
+// target). Any failure falls back to the defaults; nothing else depends on it.
+export async function fetchLeadSettings(): Promise<LeadSettings> {
+  const { data, error } = await supabase.from('orgs').select('intake_token, lead_response_target_minutes').maybeSingle();
+  if (error) fail(error, 'Could not load lead settings.');
+  return mapLeadSettings(data);
+}
+
+export async function updateLeadResponseTarget(orgId: string, minutes: number): Promise<void> {
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
+    throw new StoreError('Enter a target between 1 and 1440 minutes.', false);
+  }
+  const { error } = await supabase.from('orgs').update({ lead_response_target_minutes: minutes }).eq('id', orgId);
+  if (error) fail(error, 'Could not save the first-call target.');
+}
+
+// "Make a new link": the old token stops working the moment this returns.
+export async function rotateIntakeToken(): Promise<string> {
+  const { data, error } = await supabase.rpc('rotate_intake_token');
+  if (error) fail(error, 'Could not make a new intake link.');
+  if (typeof data !== 'string' || !data) throw new StoreError('The new intake link was not returned.', false);
+  return data;
 }
 
 export async function renameWorkspace(orgId: string, name: string): Promise<void> {

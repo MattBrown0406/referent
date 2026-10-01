@@ -45,10 +45,11 @@ import {
 import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
+import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
 import { isRecoveryRedirect, parseAuthRedirect } from './src/lib/auth-flows';
-import { fetchCurrentOrgId } from './src/lib/org';
+import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, type LeadSettings } from './src/lib/org';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
 import { fetchOrgDirectoryProfile, submitPartnerToDirectory, upsertOrgDirectoryProfile, type OrgDirectoryProfile } from './src/lib/directory';
@@ -106,6 +107,9 @@ import {
 import {
   buildTodaySections,
   followUpToCard,
+  formatWaiting,
+  minutesWaiting,
+  newLeadCards,
   nextStepDate,
   partnersDueToday,
   prunePartnerSnoozes,
@@ -133,6 +137,9 @@ import {
   completeFollowUpWithCase,
   createCaseBundle,
   createCaseFileSignedUrl,
+  createLead,
+  leadCaseTitle,
+  leadFollowUpTitle,
   saveDocumentWithEvent,
   deleteContact,
   deleteDocumentRow,
@@ -908,6 +915,12 @@ export default function App() {
   const [referralDirectionFilter, setReferralDirectionFilter] = useState<'All' | ReferralDirection>('All');
   const [showBusinessDashboard, setShowBusinessDashboard] = useState(false);
   const [showWorkspace, setShowWorkspace] = useState(false);
+  // Lead capture: the "New lead" quick-add sheet, the workspace's first-call
+  // target and intake token (advisory; defaults when offline), and a slow
+  // tick that keeps the NEW LEADS waiting clocks moving.
+  const [showNewLead, setShowNewLead] = useState(false);
+  const [leadSettings, setLeadSettings] = useState<LeadSettings>(DEFAULT_LEAD_SETTINGS);
+  const [nowTick, setNowTick] = useState(() => new Date());
   const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
   const [directorySubmitBusy, setDirectorySubmitBusy] = useState(false);
@@ -1074,6 +1087,7 @@ export default function App() {
     activeOrgIdRef.current = '';
     applySnapshot({ partners: [], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} });
     setEntitlements(NO_ENTITLEMENTS);
+    setLeadSettings(DEFAULT_LEAD_SETTINGS);
     setCases([]);
     setAllCaseContacts([]);
     setCaseEvents([]);
@@ -1260,6 +1274,16 @@ export default function App() {
           if (active && generation === authGenerationRef.current) setEntitlements(NO_ENTITLEMENTS);
         }
 
+        // Lead settings (first-call target, intake link) are advisory UI
+        // context too; the defaults are fine offline.
+        try {
+          const nextLeadSettings = await fetchLeadSettings();
+          if (!active || generation !== authGenerationRef.current) return;
+          setLeadSettings(nextLeadSettings);
+        } catch {
+          if (active && generation === authGenerationRef.current) setLeadSettings(DEFAULT_LEAD_SETTINGS);
+        }
+
         const pending = await pendingWriteCount(userId);
         if (!active || generation !== authGenerationRef.current) return;
         setQueuedWrites(pending);
@@ -1386,6 +1410,13 @@ export default function App() {
       } catch {
         // Preserve the last known entitlement state during a transient
         // foreground refresh failure; server-side gates remain authoritative.
+      }
+      try {
+        const nextLeadSettings = await fetchLeadSettings();
+        if (!stillCurrent()) return 'ok';
+        setLeadSettings(nextLeadSettings);
+      } catch {
+        // Keep the last known target and intake link on a transient failure.
       }
       if (activeCaseId) {
         const fileLoad = await loadCaseFile(userId, activeCaseId);
@@ -2087,7 +2118,14 @@ export default function App() {
   // activity on the case's updated_at ordering.
   function applyCaseEvent(event: CaseEvent) {
     setCaseEvents((current) => [event, ...current.filter((item) => item.id !== event.id)]);
-    setCases((current) => current.map((item) => item.id === event.caseId ? { ...item, updatedAt: event.occurredAt } : item));
+    // Mirror the server's first-touch trigger: the first logged call, text,
+    // email, or meeting stamps first_touch_at once, which is what takes a
+    // lead off NEW LEADS and feeds speed to lead. The next refresh re-reads
+    // the authoritative value either way.
+    const isTouch = event.kind === 'call' || event.kind === 'text' || event.kind === 'email' || event.kind === 'meeting';
+    setCases((current) => current.map((item) => item.id === event.caseId
+      ? { ...item, updatedAt: event.occurredAt, firstTouchAt: isTouch && !item.firstTouchAt ? event.occurredAt : item.firstTouchAt }
+      : item));
   }
 
   function failCaseChange(message: string, rollback: () => void) {
@@ -2820,9 +2858,112 @@ export default function App() {
 
   const todaySections = useMemo(() => {
     const now = new Date();
-    return buildTodaySections(followUps, partnersDueToday(partners, now, partnerSnoozes), now, followUpContext);
+    const leads = newLeadCards(cases, allCaseContacts, followUps, leadSettings.leadResponseTargetMinutes, now);
+    return buildTodaySections(followUps, partnersDueToday(partners, now, partnerSnoozes), now, followUpContext, leads);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [followUps, partners, cases, referrals, partnerSnoozes]);
+  }, [followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings.leadResponseTargetMinutes]);
+
+  // The NEW LEADS clocks tick every 30 seconds while a lead is waiting.
+  useEffect(() => {
+    if (!todaySections.newLeads.length) return undefined;
+    setNowTick(new Date());
+    const timer = setInterval(() => setNowTick(new Date()), 30000);
+    return () => clearInterval(timer);
+  }, [todaySections.newLeads.length]);
+
+  async function reloadLeadSettings() {
+    try {
+      setLeadSettings(await fetchLeadSettings());
+    } catch {
+      // Keep what we have; the Workspace screen already reported the failure.
+    }
+  }
+
+  // "New lead": the case, its primary contact, and the first-call follow-up
+  // land together (create_lead). The first call is due today at now + target
+  // when that stays inside today; past midnight it is simply due today.
+  function saveNewLead(draft: NewLeadDraft) {
+    if (!mutationSlotAvailable('The lead')) return;
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const title = leadCaseTitle(draft);
+    const record: CaseRecord = {
+      id: makeId('c'),
+      title,
+      status: 'inquiry',
+      summary: draft.urgency === 'immediate_danger' ? 'Caller reported immediate danger when this lead arrived.' : '',
+      leadSource: draft.leadSource,
+      leadSourceDetail: '',
+      lostReason: '',
+      stageChangedAt: nowIso,
+      paymentStatus: 'none',
+      quotedAmount: null,
+      paidAmount: 0,
+      leadCapturedAt: nowIso,
+      leadUrgency: draft.urgency,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    const contact: CaseContact = {
+      id: makeId('cc'),
+      caseId: record.id,
+      name: draft.callerName,
+      relationship: draft.aboutRelationship,
+      phone: draft.phone,
+      email: draft.email,
+      isPrimary: true,
+      note: '',
+    };
+    const due = new Date(now.getTime() + leadSettings.leadResponseTargetMinutes * 60000);
+    const dueOn = localDateStamp();
+    const dueTime = due.getDate() === now.getDate()
+      ? `${String(due.getHours()).padStart(2, '0')}:${String(due.getMinutes()).padStart(2, '0')}`
+      : null;
+    const firstCall: FollowUp = {
+      id: makeId('f'),
+      caseId: record.id,
+      kind: 'first_call',
+      title: leadFollowUpTitle(title),
+      dueOn,
+      dueTime: dueTime ?? undefined,
+      status: 'open',
+      note: '',
+    };
+    const previousCases = cases;
+    const previousContacts = allCaseContacts;
+    const previousFollowUps = followUps;
+    const nextFollowUps = [firstCall, ...followUps];
+    setCases([record, ...cases]);
+    setAllCaseContacts([contact, ...allCaseContacts]);
+    setFollowUps(nextFollowUps);
+    setShowNewLead(false);
+    void settleOptimisticWrite(
+      () => createLead({
+        caseId: record.id,
+        contactId: contact.id,
+        followUpId: firstCall.id,
+        callerName: draft.callerName,
+        phone: draft.phone,
+        email: draft.email,
+        aboutRelationship: draft.aboutRelationship,
+        aboutFirstName: draft.aboutFirstName,
+        leadSource: draft.leadSource,
+        urgency: draft.urgency,
+        dueOn,
+        dueTime,
+      }, activeUserId),
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps: previousFollowUps, scorecards },
+      () => {
+        setCases(previousCases);
+        setAllCaseContacts(previousContacts);
+        setFollowUps(previousFollowUps);
+      },
+      'The lead',
+      [record, ...previousCases],
+      previousCases,
+    );
+  }
 
   const todayCounts = useMemo(() => todayLoad(followUps, partners), [followUps, partners]);
 
@@ -3808,6 +3949,22 @@ export default function App() {
     );
   }
 
+  // The visible speed-to-lead clock on a NEW LEADS card: time since the lead
+  // arrived against the workspace target, plus the danger flag when the
+  // caller reported someone in danger right now.
+  function renderLeadClock(lead: NonNullable<TodayCard['lead']>) {
+    const waited = minutesWaiting(lead.arrivedAt, nowTick);
+    const late = waited > lead.targetMinutes;
+    return (
+      <View style={styles.todayLeadBadgeRow}>
+        {lead.immediateDanger ? <Text style={styles.todayLeadDanger}>⚠️ Caller reported immediate danger</Text> : null}
+        <Text style={[styles.todayLeadClock, late && styles.todayLeadClockLate]} accessibilityLabel={`Waiting ${formatWaiting(waited)}`}>
+          ⏱ {formatWaiting(waited)} waiting{late ? ` · past the ${lead.targetMinutes} min target` : ` · target ${lead.targetMinutes} min`}
+        </Text>
+      </View>
+    );
+  }
+
   // Compact action row for the Today list. Primary row: Call / Text / Done;
   // the ⋯ overflow opens one sheet with Snooze + Set Next Step — all five
   // actions reachable in one tap + one sheet.
@@ -3829,6 +3986,7 @@ export default function App() {
             <Text numberOfLines={2} style={styles.todayRowTitle}>{card.title}</Text>
             {card.subtitle ? <Text numberOfLines={1} style={styles.todayRowMeta}>{card.subtitle}</Text> : null}
             {overdue ? <Text style={styles.todayOverdueBadge}>{card.daysOverdue} {card.daysOverdue === 1 ? 'day' : 'days'} overdue</Text> : null}
+            {card.lead ? renderLeadClock(card.lead) : null}
           </TouchableOpacity>
           <View style={styles.todayActionRow}>
             <TouchableOpacity accessibilityLabel={`Call — ${card.title}`} onPress={() => cardContactAction(card, 'call')} style={styles.todayIconButton}>
@@ -3867,9 +4025,22 @@ export default function App() {
           {renderRefreshNotice()}
           <View style={styles.welcomeRow}>
             <Text style={styles.eyebrow}>{currentDateLabel()}</Text>
-            <Text style={styles.heroTitle}>Today</Text>
+            <View style={styles.heroRow}>
+              <Text style={[styles.heroTitle, styles.heroTitleGrow]}>Today</Text>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="New lead" style={styles.addButton} onPress={() => setShowNewLead(true)}>
+                <AppIcon name="call" size={18} color={COLORS.white} />
+                <Text style={styles.addButtonText}>New lead</Text>
+              </TouchableOpacity>
+            </View>
             <Text style={styles.heroSubtitle}>{loadLine}</Text>
           </View>
+
+          {todaySections.newLeads.length ? (
+            <View style={styles.todaySection}>
+              <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderLead]}>⚡ NEW LEADS</Text>
+              {todaySections.newLeads.map((card) => <TodayCardRow key={card.id} card={card} />)}
+            </View>
+          ) : null}
 
           {todaySections.overdue.length ? (
             <View style={styles.todaySection}>
@@ -6317,6 +6488,12 @@ export default function App() {
       {OutcomeCaptureModal()}
       {CaseDetailModal()}
       {NewCaseModal()}
+      <NewLeadSheet
+        visible={showNewLead}
+        targetMinutes={leadSettings.leadResponseTargetMinutes}
+        onClose={() => setShowNewLead(false)}
+        onSave={saveNewLead}
+      />
       <BusinessDashboard
         visible={showBusinessDashboard}
         cases={cases}
@@ -6325,6 +6502,7 @@ export default function App() {
         loading={businessLoading}
         error={businessError}
         benchmarksEntitled={entitlements.entitlements.benchmarks}
+        leadResponseTargetMinutes={leadSettings.leadResponseTargetMinutes}
         onClose={() => setShowBusinessDashboard(false)}
         onRefresh={() => { void refreshBusiness(); }}
         onOpenCase={(caseId) => {
@@ -6362,6 +6540,7 @@ export default function App() {
           setWorkspaceEpoch((epoch) => epoch + 1);
         }}
         onEditDirectoryProfile={() => { void openOrgProfileForm(true); }}
+        onLeadSettingsChanged={() => { void reloadLeadSettings(); }}
         onAccountDeleted={() => {
           setShowWorkspace(false);
           cancelReferralFitNotifications().catch(() => undefined);
@@ -6818,6 +6997,13 @@ const styles = StyleSheet.create({
   todayRowTitle: { color: COLORS.ink, fontSize: 13, fontWeight: '700', lineHeight: 17 },
   todayRowMeta: { color: COLORS.gray, fontSize: 10, marginTop: 2 },
   todayOverdueBadge: { color: COLORS.coral, fontSize: 10, fontWeight: '800', marginTop: 3 },
+  todayLeadBadgeRow: { marginTop: 4, gap: 2 },
+  todayLeadClock: { color: COLORS.forest, fontSize: 11, fontWeight: '800' },
+  todayLeadClockLate: { color: COLORS.coral },
+  todayLeadDanger: { color: COLORS.coral, fontSize: 11, fontWeight: '800' },
+  todaySectionHeaderLead: { color: COLORS.forest },
+  heroRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
+  heroTitleGrow: { flex: 1 },
   todayActionRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 },
   todayIconButton: { width: 44, height: 44, borderRadius: 12, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, alignItems: 'center', justifyContent: 'center' },
   todayDoneButton: { flex: 1, minHeight: 44, borderRadius: 12, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
