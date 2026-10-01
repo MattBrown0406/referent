@@ -2,7 +2,7 @@
 -- Run after a local migration reset with: supabase test db
 
 BEGIN;
-SELECT plan(51);
+SELECT plan(54);
 
 -- Two practices (personal workspaces via handle_new_user) and one colleague
 -- who is re-homed into practice A as a plain member.
@@ -195,9 +195,28 @@ SELECT throws_ok(
   'rate-limit buckets are not readable by signed-in users'
 );
 
+SELECT throws_ok(
+  $$ SELECT public.intake_practice_name(current_setting('test.token_a')) $$,
+  '42501',
+  NULL,
+  'a signed-in user cannot use the token lookup'
+);
+
 RESET ROLE;
 SELECT set_config('request.jwt.claim.sub', '', true);
 SET LOCAL ROLE service_role;
+
+SELECT is(
+  public.intake_practice_name(current_setting('test.token_a')),
+  'My Practice',
+  'the service role can resolve a token to the practice name for the form'
+);
+
+SELECT is(
+  public.intake_practice_name('0000000000000000000000000000000000000000'),
+  NULL,
+  'an unknown token resolves to no practice'
+);
 
 SELECT lives_ok(
   $$ SELECT set_config('test.intake_case', public.create_lead_from_intake(current_setting('test.token_a'), jsonb_build_object(
@@ -205,6 +224,10 @@ SELECT lives_ok(
        'lead_source', 'Website', 'lead_source_detail', 'Intake link', 'urgency', 'none'))::text, true) $$,
   'the intake link creates a lead with the service role'
 );
+
+-- The service role holds no table grants on Supabase (only the RPCs above);
+-- read the result back as the superuser.
+RESET ROLE;
 
 SELECT is(
   (SELECT (org_id::text, owner_id::text, lead_channel, status, lead_source)::text FROM public.cases WHERE id = current_setting('test.intake_case')::uuid),
@@ -222,6 +245,9 @@ SELECT ok(
   (SELECT due_on = CURRENT_DATE FROM public.follow_ups WHERE case_id = current_setting('test.intake_case')::uuid),
   'without a device date the first call is due today'
 );
+
+SELECT set_config('request.jwt.claim.sub', '', true);
+SET LOCAL ROLE service_role;
 
 SELECT throws_ok(
   $$ SELECT public.create_lead_from_intake('0000000000000000000000000000000000000000', jsonb_build_object('caller_name', 'Nobody', 'phone', '5415550100')) $$,

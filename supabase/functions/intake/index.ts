@@ -47,10 +47,12 @@ function serviceClient() {
   });
 }
 
+// The service role holds no table grants here; every read and write goes
+// through a service-role-only RPC.
 async function practiceName(supabase: ReturnType<typeof serviceClient>, token: string): Promise<string | null> {
-  const { data, error } = await supabase.from('orgs').select('name').eq('intake_token', token).maybeSingle();
+  const { data, error } = await supabase.rpc('intake_practice_name', { p_token: token });
   if (error) throw error;
-  return data?.name ? String(data.name) : null;
+  return typeof data === 'string' && data ? data : null;
 }
 
 async function rateLimitHit(

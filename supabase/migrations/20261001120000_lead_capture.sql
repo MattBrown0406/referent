@@ -348,6 +348,22 @@ $$;
 REVOKE ALL ON FUNCTION public.create_lead_from_intake(text, jsonb) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.create_lead_from_intake(text, jsonb) TO service_role;
 
+-- The practice name for the hosted form (GET), or NULL for an unknown or
+-- rotated token. The service role reads nothing else about the workspace;
+-- it has no table grants on orgs and does not need any.
+CREATE OR REPLACE FUNCTION public.intake_practice_name(p_token text)
+RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT o.name
+    FROM public.orgs AS o
+   WHERE coalesce(p_token, '') ~ '^[0-9a-f]{32,64}$'
+     AND o.intake_token = p_token
+$$;
+REVOKE ALL ON FUNCTION public.intake_practice_name(text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.intake_practice_name(text) TO service_role;
+
 -- ===========================================================================
 -- 5. intake rate limiting
 -- ===========================================================================

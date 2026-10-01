@@ -122,14 +122,17 @@ SELECT p.oid::regprocedure AS fn,
   FROM pg_proc p
  WHERE p.pronamespace = 'public'::regnamespace
    AND p.proname IN ('create_lead', 'create_lead_from_intake', 'rotate_intake_token',
-                     'lead_capture_metrics', 'intake_rate_limit_hit', 'create_lead_internal')
+                     'lead_capture_metrics', 'intake_rate_limit_hit', 'intake_practice_name',
+                     'create_lead_internal')
  ORDER BY 1;
 ```
 
 Expected for query 3: `anon_can_run` false everywhere; `create_lead`,
 `rotate_intake_token`, `lead_capture_metrics` true for authenticated;
-`create_lead_from_intake` and `intake_rate_limit_hit` true only for
-service_role; `create_lead_internal` false for all three.
+`create_lead_from_intake`, `intake_practice_name`, and
+`intake_rate_limit_hit` true only for service_role; `create_lead_internal`
+false for all three. The edge function needs no table grants: it only calls
+those three service-role RPCs.
 
 ## Deploy the edge function
 
@@ -181,7 +184,7 @@ deno test  --node-modules-dir=none supabase/functions/intake/
 
 ## Tests
 
-- `supabase/tests/lead_capture_test.sql` (pgTAP, 51 assertions): lead
+- `supabase/tests/lead_capture_test.sql` (pgTAP, 54 assertions): lead
   creation through both RPCs; validation; `first_touch_at` set once and only
   once; RLS between workspaces; token rotation invalidating the old link;
   the rate limiter; `lead_capture_metrics()` medians and target shares on a
