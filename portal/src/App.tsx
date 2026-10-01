@@ -20,6 +20,7 @@ type Listing = {
   id: string;
   name: string;
   organization: string;
+  types: string[];
   city: string;
   state: string;
   phone: string;
@@ -76,6 +77,76 @@ function csv(value: string): string[] {
   return value.split(',').map((item) => item.trim()).filter(Boolean);
 }
 
+// ─── Beds available today ────────────────────────────────────────────────────
+// Mirrors public.fetch_listing_beds / public.set_listing_beds
+// (20261001150000_bed_availability.sql). Only treatment programs carry beds;
+// the server decides staleness (beds_stale) so the portal never computes it.
+
+const BED_PROGRAM_TYPES = ['Inpatient', 'IOP / PHP', 'Sober Living', 'Detox'];
+const MAX_BEDS = 999;
+
+type BedsStatus = {
+  beds_male: number | null;
+  beds_female: number | null;
+  beds_updated_at: string | null;
+  beds_stale: boolean;
+  beds_cadence_days: number | null;
+  admissions_contact_name: string;
+  admissions_contact_phone: string;
+};
+
+type BedsForm = {
+  bedsMale: number | null;
+  bedsFemale: number | null;
+  contactName: string;
+  contactPhone: string;
+};
+
+type BedHistoryRow = {
+  id: string;
+  updated_at: string;
+  beds_male: number | null;
+  beds_female: number | null;
+};
+
+function carriesBeds(types: string[]): boolean {
+  return types.some((type) => BED_PROGRAM_TYPES.includes(type));
+}
+
+function toBedsForm(status: BedsStatus | null): BedsForm {
+  return {
+    bedsMale: status?.beds_male ?? null,
+    bedsFemale: status?.beds_female ?? null,
+    contactName: status?.admissions_contact_name || '',
+    contactPhone: status?.admissions_contact_phone || '',
+  };
+}
+
+// "just now", "35m ago", "2h ago", "3d ago"
+function relativeTime(iso: string, now = new Date()): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return '';
+  const minutes = Math.max(0, Math.round((now.getTime() - then) / 60000));
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+function countWord(count: number | null, gender: 'men' | 'women'): string {
+  if (count === null) return gender === 'men' ? 'men: not set' : 'women: not set';
+  if (gender === 'men') return count === 1 ? '1 man' : `${count} men`;
+  return count === 1 ? '1 woman' : `${count} women`;
+}
+
+function bedsSummary(status: BedsStatus): string {
+  if (!status.beds_updated_at) return 'Not set yet. Interventionists see nothing about beds until you confirm a count.';
+  if (status.beds_stale) return 'Unconfirmed. Your last count is more than seven days old, so the directory shows Unconfirmed instead of a number.';
+  if (status.beds_male === 0 && status.beds_female === 0) return `Full, confirmed ${relativeTime(status.beds_updated_at)}.`;
+  return `${[countWord(status.beds_male, 'men'), countWord(status.beds_female, 'women')].join(', ')}, confirmed ${relativeTime(status.beds_updated_at)}.`;
+}
+
 // Carriers as typed, trimmed and deduplicated, so each gets exactly one
 // network-status row and exactly one key in the saved payload.
 function carriersOf(value: string): string[] {
@@ -107,6 +178,10 @@ export default function App() {
   const [listing, setListing] = useState<Listing | null | 'none'>(null);
   const [form, setForm] = useState<ListingForm | null>(null);
   const [importCount, setImportCount] = useState<number | null>(null);
+  const [beds, setBeds] = useState<BedsStatus | null>(null);
+  const [bedsForm, setBedsForm] = useState<BedsForm>(toBedsForm(null));
+  const [bedHistory, setBedHistory] = useState<BedHistoryRow[]>([]);
+  const [bedsBusy, setBedsBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -133,7 +208,7 @@ export default function App() {
     if (!membership) { setListing('none'); return; }
     const { data, error: listingError } = await supabase
       .from('global_partners')
-      .select('id, name, organization, city, state, phone, email, website, monthly_cost, insurance, insurance_networks, therapies, populations, levels, description, status, verified_at')
+      .select('id, name, organization, types, city, state, phone, email, website, monthly_cost, insurance, insurance_networks, therapies, populations, levels, description, status, verified_at')
       .eq('id', membership.global_partner_id)
       .maybeSingle();
     if (listingError) { setError(listingError.message); return; }
@@ -141,6 +216,7 @@ export default function App() {
     const next: Listing = {
       ...data,
       organization: data.organization || '',
+      types: data.types || [],
       website: data.website || '',
       insurance: data.insurance || [],
       insurance_networks: (data.insurance_networks as InsuranceNetworks | null) || {},
@@ -153,11 +229,40 @@ export default function App() {
     setForm(toForm(next));
     const { data: count } = await supabase.rpc('center_listing_import_count');
     setImportCount(typeof count === 'number' ? count : null);
+    await loadBeds(next);
   }, []);
+
+  // Bed status and the last five confirmations. Both degrade to "not
+  // available yet" when the server does not have the migration.
+  async function loadBeds(current: Listing) {
+    if (!carriesBeds(current.types)) { setBeds(null); setBedHistory([]); return; }
+    const { data: status } = await supabase.rpc('fetch_listing_beds', { p_ids: [current.id] });
+    const row = Array.isArray(status) ? (status[0] as BedsStatus | undefined) : undefined;
+    const nextStatus: BedsStatus | null = row
+      ? {
+        beds_male: typeof row.beds_male === 'number' ? row.beds_male : null,
+        beds_female: typeof row.beds_female === 'number' ? row.beds_female : null,
+        beds_updated_at: row.beds_updated_at || null,
+        beds_stale: Boolean(row.beds_stale),
+        beds_cadence_days: typeof row.beds_cadence_days === 'number' ? row.beds_cadence_days : null,
+        admissions_contact_name: row.admissions_contact_name || '',
+        admissions_contact_phone: row.admissions_contact_phone || '',
+      }
+      : null;
+    setBeds(nextStatus);
+    setBedsForm(toBedsForm(nextStatus));
+    const { data: history } = await supabase
+      .from('listing_bed_updates')
+      .select('id, updated_at, beds_male, beds_female')
+      .eq('global_partner_id', current.id)
+      .order('updated_at', { ascending: false })
+      .limit(5);
+    setBedHistory((history as BedHistoryRow[] | null) || []);
+  }
 
   useEffect(() => {
     if (session) void loadListing();
-    else { setListing(null); setForm(null); setImportCount(null); }
+    else { setListing(null); setForm(null); setImportCount(null); setBeds(null); setBedHistory([]); }
   }, [session, loadListing]);
 
   async function submitAuth(event: React.FormEvent) {
@@ -242,6 +347,39 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  // Confirming beds re-stamps the count even when the numbers did not change;
+  // that is the point: a confirmed count stays current for seven days.
+  async function saveBeds(event: React.FormEvent) {
+    event.preventDefault();
+    if (!listing || listing === 'none') return;
+    setBedsBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const { error: bedsError } = await supabase.rpc('set_listing_beds', {
+        p_global_id: listing.id,
+        p_beds_male: bedsForm.bedsMale,
+        p_beds_female: bedsForm.bedsFemale,
+        p_contact_name: bedsForm.contactName.trim(),
+        p_contact_phone: bedsForm.contactPhone.trim(),
+      });
+      if (bedsError) throw bedsError;
+      setNotice('Beds confirmed. Interventionists see this count for the next seven days.');
+      await loadBeds(listing);
+    } catch (saveError) {
+      setError((saveError as Error).message);
+    } finally {
+      setBedsBusy(false);
+    }
+  }
+
+  function stepBeds(key: 'bedsMale' | 'bedsFemale', delta: number) {
+    setBedsForm((current) => {
+      const next = Math.min(MAX_BEDS, Math.max(0, (current[key] ?? 0) + delta));
+      return { ...current, [key]: next };
+    });
   }
 
   function toggleNetworkStatus(carrier: string, status: NetworkStatus) {
@@ -342,6 +480,61 @@ export default function App() {
               controlled by ReferralFit.
             </p>
           </div>
+          {carriesBeds(listing.types) ? (
+            <form className="card beds" onSubmit={saveBeds}>
+              <h2>Beds available today</h2>
+              <p className="help">
+                Tell interventionists what is open right now, for men and for women. A count
+                shows in the directory and in match results for seven days, then reads as
+                Unconfirmed until you confirm it again. Confirming the same numbers is enough.
+              </p>
+              <div className={`beds-status${beds?.beds_stale && beds.beds_updated_at ? ' stale' : ''}`}>
+                {beds ? bedsSummary(beds) : 'Bed availability is not available on the server yet.'}
+                {beds?.beds_cadence_days ? <span className="stat"> Usually updates beds within <b>{beds.beds_cadence_days === 1 ? '1 day' : `${beds.beds_cadence_days} days`}</b>.</span> : null}
+              </div>
+              {(['bedsMale', 'bedsFemale'] as const).map((key) => {
+                const value = bedsForm[key];
+                const label = key === 'bedsMale' ? 'Beds for men' : 'Beds for women';
+                return (
+                  <div key={key} className="stepper">
+                    <div className="stepper-label">
+                      <span>{label}</span>
+                      <small>{value === null ? 'Not set' : value === 0 ? 'Full' : `${value} open`}</small>
+                    </div>
+                    <div className="stepper-controls">
+                      <button type="button" className="step" aria-label={`Fewer ${label.toLowerCase()}`} disabled={bedsBusy || value === null || value <= 0} onClick={() => stepBeds(key, -1)}>−</button>
+                      <output aria-label={label}>{value === null ? '–' : value}</output>
+                      <button type="button" className="step" aria-label={`More ${label.toLowerCase()}`} disabled={bedsBusy || (value ?? 0) >= MAX_BEDS} onClick={() => stepBeds(key, 1)}>+</button>
+                      <button type="button" className="ghost small" disabled={bedsBusy || value === null} onClick={() => setBedsForm({ ...bedsForm, [key]: null })}>Not set</button>
+                    </div>
+                  </div>
+                );
+              })}
+              <div className="actions">
+                <button type="button" className="ghost" disabled={bedsBusy} onClick={() => setBedsForm({ ...bedsForm, bedsMale: 0, bedsFemale: 0 })}>We are full today</button>
+              </div>
+              <label>On-call admissions contact (optional)</label>
+              <input value={bedsForm.contactName} placeholder="Name" maxLength={120} onChange={(e) => setBedsForm({ ...bedsForm, contactName: e.target.value })} />
+              <input value={bedsForm.contactPhone} placeholder="Phone" maxLength={40} inputMode="tel" onChange={(e) => setBedsForm({ ...bedsForm, contactPhone: e.target.value })} />
+              <div className="actions">
+                <button type="submit" disabled={bedsBusy || !beds}>{bedsBusy ? 'Saving' : 'Confirm beds'}</button>
+                {beds?.beds_updated_at ? <span className="stat">Last updated <b>{relativeTime(beds.beds_updated_at)}</b></span> : null}
+              </div>
+              {bedHistory.length ? (
+                <div className="history">
+                  <label>Recent confirmations</label>
+                  <ul>
+                    {bedHistory.map((row) => (
+                      <li key={row.id}>
+                        <span>{row.updated_at.slice(0, 16).replace('T', ' ')}</span>
+                        <span>{row.beds_male === 0 && row.beds_female === 0 ? 'Full' : `${countWord(row.beds_male, 'men')}, ${countWord(row.beds_female, 'women')}`}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </form>
+          ) : null}
           <form className="card" onSubmit={saveListing}>
             <h2>Listing details</h2>
             <label>Organization</label>

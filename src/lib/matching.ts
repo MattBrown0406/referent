@@ -6,6 +6,7 @@ import type {
   Partner,
   ReferralMatch,
 } from '../data';
+import { bedAvailable, type BedFor, type ListingBeds } from './beds';
 
 // ─── Matching ───────────────────────────────────────────────────────────────
 // Pure ranking logic: no React, no Supabase, no side effects, so it runs in
@@ -18,6 +19,12 @@ import type {
 //   2. A 0-100 fit score from four weighted parts (constants below).
 //   3. Ties: lower family cost first, then a rotation seeded by the match
 //      profile id (stable for that family, different for the next).
+//
+// Bed availability (src/lib/beds.ts) joins as an optional hard requirement:
+// when the clinician asks for "a bed for men / women / anyone", a program
+// whose linked listing confirms 0 is hidden. A program whose count is
+// unknown or unconfirmed is NOT hidden; among equal fit it sorts below a
+// confirmed open bed (a tie-break only; the score never moves).
 //
 // Referral counts (inbound / outbound) and any financial relationship with a
 // program are NOT inputs. The functions here never read them.
@@ -290,12 +297,24 @@ export type ScoreComponents = {
   trackRecord: number;
 };
 
-export type Requirement = 'level' | 'population' | 'payment' | 'location' | 'mustHave';
+export type Requirement = 'level' | 'population' | 'payment' | 'location' | 'mustHave' | 'bed';
+
+/**
+ * The bed filter as the ranker sees it: which bed must be open, and the live
+ * status of each linked listing keyed by globalPartnerId. Partners with no
+ * linked listing, or no row in `beds`, count as unknown.
+ */
+export type BedOptions = {
+  bedFor: BedFor | null;
+  beds: Record<string, ListingBeds | undefined>;
+};
 
 export type ProgramScore = {
   partner: Partner;
   eligible: boolean;
   failedRequirements: Requirement[];
+  /** With a bed filter on: true = confirmed open, false = confirmed none (hidden), null = unknown or unconfirmed. Null when the filter is off. */
+  bedAvailability: boolean | null;
   /** 0-100, the four components summed and rounded to one decimal. */
   total: number;
   components: ScoreComponents;
@@ -322,11 +341,18 @@ function round1(value: number): number {
   return Math.round(value * 10) / 10;
 }
 
+/** A linked listing's confirmed answer to the bed filter; null when the filter is off or nothing is known. */
+export function bedAvailabilityForPartner(partner: Pick<Partner, 'globalPartnerId'>, options: BedOptions | undefined): boolean | null {
+  if (!options?.bedFor || !partner.globalPartnerId) return null;
+  return bedAvailable(options.beds[partner.globalPartnerId], options.bedFor);
+}
+
 export function scoreProgram(
   profile: MatchProfileInput,
   partner: Partner,
   card: TrackRecord | undefined,
   prior: TrackRecordPrior,
+  bedOptions?: BedOptions,
 ): ProgramScore {
   const failed: Requirement[] = [];
   if (profile.levelOfCare !== 'Any type' && !typesForPartner(partner).includes(profile.levelOfCare)) failed.push('level');
@@ -338,6 +364,9 @@ export function scoreProgram(
   const required = mustHaveNeedsForProfile(profile);
   const requiredNeeds = required.filter((need) => partnerOffersNeed(partner, need));
   if (requiredNeeds.length !== required.length) failed.push('mustHave');
+  // A confirmed 0 hides; unknown / unconfirmed never does (it only sorts lower).
+  const bedAvailability = bedAvailabilityForPartner(partner, bedOptions);
+  if (bedAvailability === false) failed.push('bed');
 
   const preferred = preferredNeedsForProfile(profile);
   const matchedNeeds = preferred.filter((need) => partnerOffersNeed(partner, need));
@@ -355,6 +384,7 @@ export function scoreProgram(
     partner,
     eligible: failed.length === 0,
     failedRequirements: failed,
+    bedAvailability,
     total: round1(components.clinical + components.cost + components.location + components.trackRecord),
     components,
     requiredNeeds,
@@ -383,8 +413,19 @@ export function rotationKey(matchProfileId: string, partnerId: string): number {
   return hash;
 }
 
+/**
+ * Bed tie-break: with the filter on, a confirmed open bed (true) sorts
+ * before an unknown or unconfirmed count (null). Confirmed 0 is already
+ * hidden. 0 when the filter is off, so nothing else changes.
+ */
+export function compareBedAvailability(a: ProgramScore, b: ProgramScore): number {
+  const rank = (value: boolean | null) => (value === true ? 0 : 1);
+  return rank(a.bedAvailability) - rank(b.bedAvailability);
+}
+
 export function compareScored(profileId: string, a: ProgramScore, b: ProgramScore): number {
   return b.total - a.total
+    || compareBedAvailability(a, b)
     || a.familyCost - b.familyCost
     || rotationKey(profileId, a.partner.id) - rotationKey(profileId, b.partner.id)
     || a.partner.id.localeCompare(b.partner.id);
@@ -395,10 +436,11 @@ export function rankPrograms(
   profile: MatchProfileInput,
   partners: Partner[],
   scorecards: Record<string, TrackRecord | undefined>,
+  bedOptions?: BedOptions,
 ): ProgramScore[] {
   const prior = trackRecordPrior(scorecards);
   return partners
-    .map((partner) => scoreProgram(profile, partner, scorecards[partner.id], prior))
+    .map((partner) => scoreProgram(profile, partner, scorecards[partner.id], prior, bedOptions))
     .filter((score) => score.eligible)
     .sort((a, b) => compareScored(profile.id, a, b));
 }

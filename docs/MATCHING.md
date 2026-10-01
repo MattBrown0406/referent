@@ -26,6 +26,7 @@ A program that fails any one of these is not shown. It is never shown lower.
 | A way to pay | Cash pay: monthly cost within the budget (no budget = any cost). Insurance: in-network, or out-of-network when the clinician allowed it, using the existing `insurance_networks` logic. |
 | Location | The profile has no state, or the partner is in that state, or the partner serves `Nationwide`. Unchanged. |
 | Must-have needs | Every need the clinician marked must-have is offered. `MAT` is must-have by default when selected (`MUST_HAVE_BY_DEFAULT`). The three population needs (`Men only`, `Women only`, `Adolescent`) are always requirements. |
+| A bed (optional) | Only when the clinician turns on "Has a bed for" (Men / Women / Anyone; the client's population pre-selects it). A partner whose linked directory listing confirms 0 for that requirement within the last seven days is hidden. A partner with no linked listing, a count never set, or a count older than seven days is NOT hidden: it stays, and among equal fit it sorts below a confirmed open bed (a tie-break between the score and family cost; the score itself never moves). See `BED_AVAILABILITY.md`. |
 
 What `src/data.ts` has: `therapyOptions` carries `Men only`, `Women only`,
 `Adolescent` and `MAT`. There is no separate "Medication-assisted" entry, so

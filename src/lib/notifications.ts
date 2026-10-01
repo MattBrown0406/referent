@@ -366,6 +366,10 @@ export function remotePushTarget(data: RemotePushData): { target: NotificationTa
     case 'directory_decision':
     case 'directory_submission':
       return { target: 'workspace' };
+    case 'bed_opened':
+      // The listing id is in data; the app opens the Directory, where the
+      // live count shows. Nothing about the program is in the push itself.
+      return { target: 'directory' };
     default:
       return null;
   }

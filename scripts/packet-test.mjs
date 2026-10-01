@@ -31,6 +31,7 @@ execFileSync('mkdir', ['-p', tmpDir]);
 // self-contained, so we can load the real thing. packet.ts imports '../data'
 // — mirror that relative layout inside the temp dir (lib/packet.js → data.js).
 transpileTo('src/data.ts', 'data.js');
+transpileTo('src/lib/beds.ts', 'lib/beds.js');
 transpileTo('src/lib/matching.ts', 'lib/matching.js');
 transpileTo('src/lib/packet.ts', 'lib/packet.js');
 

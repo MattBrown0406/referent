@@ -32,6 +32,7 @@ function transpileTo(relSrc, outName) {
 
 mkdirSync(tmpDir, { recursive: true });
 transpileTo('src/data.ts', 'data.js');
+transpileTo('src/lib/beds.ts', 'lib/beds.js');
 transpileTo('src/lib/matching.ts', 'lib/matching.js');
 
 const m = require(path.join(tmpDir, 'lib', 'matching.js'));

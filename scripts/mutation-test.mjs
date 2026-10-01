@@ -35,7 +35,7 @@ assert.match(source, /insuranceNetworks: partnerForm\.insuranceNetworks/);
 const matchingSource = await readFile(new URL('../src/lib/matching.ts', import.meta.url), 'utf8');
 assert.match(matchingSource, /isOutOfNetwork = networkCapabilities\.includes\('Out-of-network'\)/);
 assert.doesNotMatch(source, /networkCapabilities\.includes\('Out-of-network'\)/, 'App.tsx must call the ranker, not re-derive payment fit');
-assert.match(source, /const matches = useMemo\(\s*\(\) => rankPrograms\(draftMatchProfile, partners, scorecards\)/, 'the match memo must rank through src/lib/matching.ts');
+assert.match(source, /const matches = useMemo\(\s*\(\) => rankPrograms\(draftMatchProfile, partners, scorecards, bedOptions\)/, 'the match memo must rank through src/lib/matching.ts (with the bed filter as the only extra input)');
 assert.doesNotMatch(source, /reciprocity|inbound - partner\.outbound|to return|Tie-breaker/, 'no reciprocity or score-keeping language in App.tsx');
 assert.doesNotMatch(matchingSource, /\.(inbound|outbound)\b|['"](inbound|outbound)['"]/, 'the ranker never reads referral counts');
 assert.match(matchingSource, /disclosure: hasFinancialRelationship\(partner\),/, 'the disclosure is a flag on the result');

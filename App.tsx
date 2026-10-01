@@ -52,6 +52,7 @@ import {
   therapyOptions,
 } from './src/data';
 import {
+  BedOptions,
   defaultMustHaveNeeds,
   hasFinancialRelationship,
   isPopulationNeed,
@@ -67,6 +68,7 @@ import {
   trackRecordPrior,
   typesForPartner,
 } from './src/lib/matching';
+import { bedForFromPopulation, bedsCadenceLine, bedsLine, type BedFor } from './src/lib/beds';
 import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
@@ -78,7 +80,7 @@ import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, fetchWorks
 import { refreshPushRegistration, unregisterThisDevice } from './src/lib/push';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
-import { fetchOrgDirectoryProfile, submitPartnerToDirectory, upsertOrgDirectoryProfile, type OrgDirectoryProfile } from './src/lib/directory';
+import { fetchListingBeds, fetchOrgDirectoryProfile, submitPartnerToDirectory, upsertOrgDirectoryProfile, type ListingBedsStatus, type OrgDirectoryProfile } from './src/lib/directory';
 import { directoryCostLabel, directoryMissingFields, directoryMissingFieldsMessage, isIndividualProfessional, PRIVATE_PAY_ONLY } from './src/lib/directory-submission';
 import CaseIntegrationPanel from './src/lib/CaseIntegrationPanel';
 import {
@@ -1003,6 +1005,12 @@ export default function App() {
   const [matchPopulation, setMatchPopulation] = useState<ClientPopulation>('Any');
   const [matchLocationPreference, setMatchLocationPreference] = useState<LocationPreference>('No preference');
   const [matchMustHave, setMatchMustHave] = useState<string[]>([]);
+  // "Has a bed for": off by default. When turned on, the client's population
+  // picks men / women; the clinician can change it. Live counts come from
+  // each linked directory listing (src/lib/beds.ts), never from the partner.
+  const [bedFilterOn, setBedFilterOn] = useState(false);
+  const [bedFor, setBedFor] = useState<BedFor>('any');
+  const [listingBeds, setListingBeds] = useState<Record<string, ListingBedsStatus>>({});
   // The shortlist the clinician saw when they started an assignment, so the
   // placement record can say what was shown and at what rank the pick sat.
   const [pendingPlacement, setPendingPlacement] = useState<{ matchProfileId: string; rankedIds: string[]; candidates: PlacementCandidate[] } | null>(null);
@@ -1722,12 +1730,36 @@ export default function App() {
     updatedAt: '',
   }), [selectedMatchId, matchClientLabel, matchType, matchState, matchInsurance, matchNetworkPreferences, matchBudget, matchTherapies, matchMustHave, matchPopulation, matchLocationPreference]);
 
+  // Live bed counts for partners linked to a directory listing, read from
+  // the listing itself (fetch_listing_beds). Refreshed when the set of linked
+  // partners changes or the clinician turns the bed filter on. Offline, or on
+  // a server without the migration, every count is simply unknown.
+  const linkedListingIds = useMemo(
+    () => Array.from(new Set(partners.map((partner) => partner.globalPartnerId).filter((id): id is string => Boolean(id)))).sort().join(','),
+    [partners],
+  );
+  useEffect(() => {
+    if (!session?.user?.id || !linkedListingIds) { setListingBeds({}); return undefined; }
+    let active = true;
+    fetchListingBeds(linkedListingIds.split(','))
+      .then((next) => { if (active) setListingBeds(Object.fromEntries(next)); })
+      .catch(() => { /* unknown counts never hide a program */ });
+    return () => { active = false; };
+  }, [session?.user?.id, linkedListingIds, bedFilterOn]);
+
+  const bedOptions = useMemo((): BedOptions => ({ bedFor: bedFilterOn ? bedFor : null, beds: listingBeds }), [bedFilterOn, bedFor, listingBeds]);
+
+  function bedLineForPartner(partner: Partner): string {
+    return partner.globalPartnerId ? bedsLine(listingBeds[partner.globalPartnerId]) : '';
+  }
+
   // Hard requirements hide, the 0-100 score orders, cost then a seeded
   // rotation breaks ties (src/lib/matching.ts). Referral counts are not an
-  // input: the ranker never reads inbound/outbound.
+  // input: the ranker never reads inbound/outbound. With the bed filter on, a
+  // confirmed 0 hides; an unknown count sorts below a confirmed open bed.
   const matches = useMemo(
-    () => rankPrograms(draftMatchProfile, partners, scorecards),
-    [draftMatchProfile, partners, scorecards],
+    () => rankPrograms(draftMatchProfile, partners, scorecards, bedOptions),
+    [draftMatchProfile, partners, scorecards, bedOptions],
   );
 
   const sortedReferrals = referrals
@@ -4609,6 +4641,25 @@ export default function App() {
           </View>
           <Text style={styles.matchFieldHint}>A requirement, not a preference: a client marked Women never sees a men-only program, and an adolescent never sees an adult-only one.</Text>
 
+          <Text style={styles.fieldLabel}>HAS A BED FOR</Text>
+          <View style={styles.wrapPills}>
+            <Pill
+              label={bedFilterOn ? 'Required' : 'Not required'}
+              active={bedFilterOn}
+              icon={bedFilterOn ? 'checkmark-circle' : undefined}
+              onPress={() => {
+                if (!bedFilterOn) setBedFor(bedForFromPopulation(matchPopulation));
+                setBedFilterOn(!bedFilterOn);
+              }}
+            />
+            {bedFilterOn ? (['men', 'women', 'any'] as BedFor[]).map((option) => (
+              <Pill key={option} label={option === 'men' ? 'Men' : option === 'women' ? 'Women' : 'Anyone'} active={bedFor === option} onPress={() => setBedFor(option)} />
+            )) : null}
+          </View>
+          <Text style={styles.matchFieldHint}>{bedFilterOn
+            ? 'A program whose directory listing confirmed no bed today is hidden. A program that has not said stays, and sorts below confirmed openings among equal fit.'
+            : 'Turn on to hide programs that confirmed they are full today. The client above pre-selects men or women; counts come live from the directory.'}</Text>
+
           <Text style={styles.fieldLabel}>LOCATION PREFERENCE</Text>
           <View style={styles.wrapPills}>
             {locationPreferences.map((preference) => <Pill key={preference} label={preference} active={matchLocationPreference === preference} onPress={() => setMatchLocationPreference(preference)} />)}
@@ -4678,6 +4729,9 @@ export default function App() {
                     : `${match.networkStatus} · ${matchInsurance}`}</Text>
                   <Text numberOfLines={1} style={styles.matchPriceText}>{formatMoney(monthlyCostForPartner(match.partner))}/month</Text>
                 </View>
+                {bedLineForPartner(match.partner) ? (
+                  <Text numberOfLines={1} style={bedLineForPartner(match.partner).endsWith('Unconfirmed') ? styles.bedLineUnconfirmed : styles.bedLineOpen}>{bedLineForPartner(match.partner)}</Text>
+                ) : null}
                 {match.verifyBenefits || match.disclosure ? (
                   <View style={styles.matchFlags}>
                     {match.verifyBenefits ? <View style={styles.verifyBadge}><AppIcon name="alert-circle-outline" size={12} color={COLORS.inkSoft} /><Text style={styles.verifyBadgeText}>Verify benefits</Text></View> : null}
@@ -5616,6 +5670,28 @@ export default function App() {
               </View>
             ) : null}
 
+            {(() => {
+              // Live from the linked directory listing; programs only.
+              const status = selectedPartner.globalPartnerId ? listingBeds[selectedPartner.globalPartnerId] : undefined;
+              if (!status?.program) return null;
+              const line = bedsLine(status);
+              const cadence = bedsCadenceLine(status);
+              const contact = [status.admissionsContactName, status.admissionsContactPhone].filter(Boolean).join(' · ');
+              return (
+                <View style={[styles.infoCard, { marginBottom: 12 }]}>
+                  <Text style={styles.infoTitle}>Beds today</Text>
+                  <View style={[styles.infoLine, { borderBottomWidth: 0 }]}>
+                    <AppIcon name="information-circle-outline" size={18} color={COLORS.gray} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.infoValue}>{line ? line.replace('Beds today: ', '') : 'Not confirmed yet'}</Text>
+                      {cadence ? <Text style={styles.infoLabel}>{cadence}</Text> : null}
+                      {contact ? <Text style={styles.infoLabel}>Admissions: {contact}</Text> : null}
+                      <Text style={styles.infoLabel}>Confirmed by the program in its directory listing. A count older than seven days reads as Unconfirmed.</Text>
+                    </View>
+                  </View>
+                </View>
+              );
+            })()}
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Staying in touch</Text>
               <View style={styles.infoLine}><AppIcon name="calendar-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Cadence</Text><Text style={styles.infoValue}>{selectedPartner.touchCadenceDays ? `Every ${selectedPartner.touchCadenceDays} days` : 'No cadence set'}</Text></View></View>
@@ -7130,6 +7206,8 @@ const styles = StyleSheet.create({
   matchInsuranceText: { flex: 1, flexShrink: 1, marginRight: 8 },
   matchPriceText: { flexShrink: 0, color: COLORS.gray, fontSize: 10, fontWeight: '600', textAlign: 'right' },
   matchFlags: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 9 },
+  bedLineOpen: { color: COLORS.forest, fontSize: 11, fontWeight: '700', marginTop: 7 },
+  bedLineUnconfirmed: { color: COLORS.gray, fontSize: 11, fontWeight: '700', marginTop: 7 },
   verifyBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#F3F3EF', borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5 },
   verifyBadgeText: { color: COLORS.inkSoft, fontSize: 9, fontWeight: '800' },
   disclosureBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.coralPale, borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5, flexShrink: 1 },

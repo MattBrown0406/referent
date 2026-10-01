@@ -29,6 +29,7 @@ name into one. Every kind has a fixed, generic title and body, written in
 | `overdue_mine` | Follow-ups past due | Some of your follow-ups are past due. Open ReferralFit to catch up. |
 | `directory_decision` | Directory decision | There is a directory decision on one of your submissions. |
 | `directory_submission` | New directory submission | A practice submitted a listing for review. |
+| `bed_opened` | A bed opened | A program you follow has a bed open today. |
 
 The `data` payload carries only ids (`case_id`, `follow_up_id`,
 `global_partner_id`), the `kind`, and the recipient's `user_id`. The app
@@ -77,6 +78,7 @@ trigger / hourly job  ->  notification_outbox  ->  push-dispatch (edge fn)  ->  
 | `global_partners` inserted with status `pending` and a submitting workspace | every platform admin except the submitter | `directory_submission` |
 | `global_partners` moves from `pending` to `active` or `archived` | every member of the submitting workspace except the reviewer | `directory_decision` |
 | hourly job finds open follow-ups past their day that are mine (own assignee, or the case's assignee when the follow-up has none) | the member, once a day at 9 AM in their timezone | `overdue_mine` |
+| `set_listing_beds` moves a gender's count from 0 or unknown to open (`BED_AVAILABILITY.md`) | every member of a workspace that favorited or imported the listing, except the person who set it; opt-in, default off | `bed_opened` |
 
 Timezone: the app reports the device offset on every registration and
 preference save (`tz_offset_minutes`, minutes east of UTC). Until a device
