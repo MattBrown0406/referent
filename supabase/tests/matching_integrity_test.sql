@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(28);
+SELECT plan(30);
 
 -- Actors
 --   a1  owner of practice A                       workspace A
@@ -148,14 +148,25 @@ SELECT throws_ok(
   'the reason is limited to the listed choices'
 );
 
-UPDATE public.placement_decisions SET reason = 'other' WHERE id = 'a1800000-0000-0000-0000-0000000000d1';
-DELETE FROM public.placement_decisions WHERE id = 'a1700000-0000-0000-0000-0000000000d1';
+SELECT throws_ok(
+  $$ UPDATE public.placement_decisions SET reason = 'other' WHERE id = 'a1800000-0000-0000-0000-0000000000d1' $$,
+  '42501',
+  NULL,
+  'the record is append-only: the author cannot update it'
+);
+
+SELECT throws_ok(
+  $$ DELETE FROM public.placement_decisions WHERE id = 'a1700000-0000-0000-0000-0000000000d1' $$,
+  '42501',
+  NULL,
+  'the record is append-only: the author cannot delete it'
+);
 
 SELECT is(
   (SELECT count(*)::integer || '|' || (SELECT reason FROM public.placement_decisions WHERE id = 'a1800000-0000-0000-0000-0000000000d1')
      FROM public.placement_decisions),
   '2|bed_availability',
-  'the record is append-only: the author can neither update nor delete it'
+  'both records are still there, unchanged'
 );
 
 RESET ROLE;

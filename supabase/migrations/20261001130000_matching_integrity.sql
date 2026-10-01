@@ -129,7 +129,7 @@ DROP POLICY IF EXISTS "placement_decisions: org insert" ON public.placement_deci
 CREATE POLICY "placement_decisions: org insert" ON public.placement_decisions
   FOR INSERT WITH CHECK (org_id = public.current_org_id());
 
-REVOKE ALL ON TABLE public.placement_decisions FROM PUBLIC, anon;
+REVOKE ALL ON TABLE public.placement_decisions FROM PUBLIC, anon, authenticated;
 GRANT SELECT, INSERT ON TABLE public.placement_decisions TO authenticated;
 GRANT ALL ON TABLE public.placement_decisions TO service_role;
 
