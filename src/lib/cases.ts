@@ -57,6 +57,9 @@ export type CaseRecord = {
   firstTouchAt?: string; // ISO timestamptz
   leadCapturedAt?: string; // ISO timestamptz
   leadUrgency?: LeadUrgency;
+  // Team basics: the workspace member this case is assigned to (optional).
+  // Changed only through assignCase so the timeline records it.
+  assignedTo?: string;
   createdAt: string; // ISO timestamptz
   updatedAt: string; // ISO timestamptz
 };
@@ -84,6 +87,9 @@ export type CaseEvent = {
   referralId?: string;
   documentId?: string;
   occurredAt: string; // ISO timestamptz
+  // The member who did it. Stamped server-side from the signed-in user;
+  // empty for automated entries (the intake link) and never sent by the app.
+  actorId?: string;
 };
 
 export type CaseDocument = {
@@ -123,6 +129,7 @@ type CaseRow = {
   first_touch_at?: string | null;
   lead_captured_at?: string | null;
   lead_urgency?: string | null;
+  assigned_to?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -147,6 +154,7 @@ type CaseEventRow = {
   referral_id: string | null;
   document_id: string | null;
   occurred_at: string;
+  actor_id?: string | null;
 };
 
 type CaseDocumentRow = {
@@ -176,6 +184,7 @@ function mapCaseRow(row: CaseRow): CaseRecord {
     firstTouchAt: row.first_touch_at || undefined,
     leadCapturedAt: row.lead_captured_at || undefined,
     leadUrgency: row.lead_urgency === 'immediate_danger' ? 'immediate_danger' : undefined,
+    assignedTo: row.assigned_to ? String(row.assigned_to).toLowerCase() : undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -204,6 +213,7 @@ function mapEventRow(row: CaseEventRow): CaseEvent {
     referralId: row.referral_id || undefined,
     documentId: row.document_id || undefined,
     occurredAt: row.occurred_at,
+    actorId: row.actor_id ? String(row.actor_id).toLowerCase() : undefined,
   };
 }
 
@@ -698,6 +708,27 @@ export async function updateCaseBusinessDetailsWithEvent(
       occurredAt: row.occurred_at,
       eventBody: row.event_body,
     };
+  });
+}
+
+// Assign (or unassign with null) a case. The server checks membership,
+// writes the timeline entry, and returns its wording so the optimistic row
+// matches. "Take this lead" is this call with the caller's own id.
+export type CaseAssignment = { eventBody: string; occurredAt: string };
+
+export async function assignCase(caseId: string, assignedTo: string | null, eventId: string): Promise<CaseAssignment> {
+  return withStableCaseAccount(async () => {
+    const { data, error } = await supabase.rpc('assign_case', {
+      p_case_id: caseId,
+      p_assigned_to: assignedTo,
+      p_event_id: eventId,
+    });
+    if (error) throw new StoreError(error.message, false);
+    const row = (Array.isArray(data) ? data[0] : data) as { event_body?: unknown; occurred_at?: unknown } | null;
+    if (!row || typeof row.event_body !== 'string' || typeof row.occurred_at !== 'string') {
+      throw new StoreError('The assignment was saved but could not be read back. Refresh the case.', false);
+    }
+    return { eventBody: row.event_body, occurredAt: row.occurred_at };
   });
 }
 

@@ -74,7 +74,8 @@ import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
 import { isRecoveryRedirect, parseAuthRedirect } from './src/lib/auth-flows';
-import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, type LeadSettings } from './src/lib/org';
+import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, fetchWorkspaceMembers, memberDisplayName, type LeadSettings, type OrgMember } from './src/lib/org';
+import { refreshPushRegistration, unregisterThisDevice } from './src/lib/push';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
 import GlobalDirectoryScreen from './src/lib/GlobalDirectoryScreen';
 import { fetchOrgDirectoryProfile, submitPartnerToDirectory, upsertOrgDirectoryProfile, type OrgDirectoryProfile } from './src/lib/directory';
@@ -133,6 +134,10 @@ import {
 } from './src/lib/notifications';
 import {
   buildTodaySections,
+  cardAssignee,
+  defaultTodayScope,
+  filterTodaySections,
+  type TodayScope,
   followUpToCard,
   formatWaiting,
   minutesWaiting,
@@ -162,6 +167,7 @@ import {
   CaseRecord,
   CaseSearchResult,
   CaseStatus,
+  assignCase,
   completeFollowUpWithCase,
   createCaseBundle,
   createCaseFileSignedUrl,
@@ -308,6 +314,18 @@ type CasePaymentFormState = {
   amount: string;
   note: string;
 };
+
+// "2:14 PM" in the device's local time.
+function clockTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  let hour = date.getHours();
+  const minute = String(date.getMinutes()).padStart(2, '0');
+  const suffix = hour >= 12 ? 'PM' : 'AM';
+  hour = hour % 12;
+  if (hour === 0) hour = 12;
+  return `${hour}:${minute} ${suffix}`;
+}
 
 function relativeActivity(iso: string): string {
   const then = new Date(iso).getTime();
@@ -952,6 +970,13 @@ export default function App() {
   // tick that keeps the NEW LEADS waiting clocks moving.
   const [showNewLead, setShowNewLead] = useState(false);
   const [leadSettings, setLeadSettings] = useState<LeadSettings>(DEFAULT_LEAD_SETTINGS);
+  // Team basics: who is in the workspace (names on timeline rows, the
+  // assignee pickers, "Take this lead") and the Today scope. A scope of null
+  // means "not chosen yet": the default follows the member count (Mine with
+  // staff, Everyone solo). A solo workspace never shows any of this.
+  const [members, setMembers] = useState<OrgMember[]>([]);
+  const [todayScopeChoice, setTodayScopeChoice] = useState<TodayScope | null>(null);
+  const [pendingNotificationCaseId, setPendingNotificationCaseId] = useState<string | null>(null);
   const [nowTick, setNowTick] = useState(() => new Date());
   const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
@@ -1125,6 +1150,9 @@ export default function App() {
   }, []);
 
   const resetAccountState = useCallback(() => {
+    setMembers([]);
+    setTodayScopeChoice(null);
+    setPendingNotificationCaseId(null);
     caseLoadGenerationRef.current += 1;
     businessLoadGenerationRef.current += 1;
     activeOrgIdRef.current = '';
@@ -1326,6 +1354,16 @@ export default function App() {
         } catch {
           if (active && generation === authGenerationRef.current) setLeadSettings(DEFAULT_LEAD_SETTINGS);
         }
+        try {
+          const nextMembers = await fetchWorkspaceMembers();
+          if (!active || generation !== authGenerationRef.current) return;
+          setMembers(nextMembers);
+        } catch {
+          if (active && generation === authGenerationRef.current) setMembers([]);
+        }
+        // A member who turned push on gets this device re-registered quietly;
+        // this never prompts and never fails loudly.
+        void refreshPushRegistration(userId);
 
         const pending = await pendingWriteCount(userId);
         if (!active || generation !== authGenerationRef.current) return;
@@ -1468,6 +1506,13 @@ export default function App() {
         setCaseDocuments(fileLoad.file.documents);
         setCaseFileSource({ userId, source: fileLoad.source, savedAt: fileLoad.savedAt, truncated: fileLoad.truncated });
       }
+      try {
+        const nextMembers = await fetchWorkspaceMembers();
+        if (!stillCurrent()) return 'ok';
+        setMembers(nextMembers);
+      } catch {
+        // Keep the last known member list.
+      }
       await syncDerived(refreshed, caseLoad.list.cases);
       if (stillCurrent()) setRefreshNotice('');
       return 'ok';
@@ -1548,11 +1593,30 @@ export default function App() {
   // opens the named partner once that account's directory has hydrated.
   useEffect(() => {
     if (!session?.user?.id) return undefined;
-    return subscribeToNotificationResponses((target, partnerId) => {
+    return subscribeToNotificationResponses((target, partnerId, caseId) => {
+      // Server-sent pushes carry only ids; the item opens once it has loaded.
+      if (target === 'case') {
+        setTab('home');
+        if (caseId) setPendingNotificationCaseId(caseId);
+        return;
+      }
+      if (target === 'workspace') {
+        setTab('home');
+        setShowWorkspace(true);
+        return;
+      }
       setTab(target);
       if (partnerId) setPendingNotificationPartnerId(partnerId);
     });
   }, [session?.user?.id]);
+
+  useEffect(() => {
+    if (!pendingNotificationCaseId) return;
+    if (!cases.some((item) => item.id === pendingNotificationCaseId)) return;
+    openCaseById(pendingNotificationCaseId);
+    setPendingNotificationCaseId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingNotificationCaseId, cases]);
 
   useEffect(() => {
     if (!pendingNotificationPartnerId) return;
@@ -2968,12 +3032,92 @@ export default function App() {
     };
   }
 
-  const todaySections = useMemo(() => {
+  const allTodaySections = useMemo(() => {
     const now = new Date();
     const leads = newLeadCards(cases, allCaseContacts, followUps, leadSettings.leadResponseTargetMinutes, now);
     return buildTodaySections(followUps, partnersDueToday(partners, now, partnerSnoozes), now, followUpContext, leads);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings.leadResponseTargetMinutes]);
+
+  // Mine / Everyone. Only a workspace with staff has the choice; "Mine"
+  // keeps what is assigned to me and anything nobody has taken yet, so an
+  // unowned item never disappears from everyone's list at once.
+  const teamWorkspace = members.length > 1;
+  const todayScope: TodayScope = teamWorkspace ? (todayScopeChoice ?? defaultTodayScope(members.length)) : 'everyone';
+  const caseAssignee = (caseId: string) => cases.find((item) => item.id === caseId)?.assignedTo;
+  const todaySections = useMemo(
+    () => filterTodaySections(allTodaySections, todayScope, activeUserId, caseAssignee),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [allTodaySections, todayScope, activeUserId, cases],
+  );
+
+  function cardAssigneeLabel(card: TodayCard): string {
+    if (!card.followUp) return '';
+    const assignee = cardAssignee(card, caseAssignee);
+    if (!assignee) return 'Unassigned';
+    return assignee === activeUserId.toLowerCase() ? 'Yours' : `Assigned to ${memberDisplayName(members, assignee)}`;
+  }
+
+  // Assign a case, or take it. The server writes the timeline entry and
+  // returns its wording so the optimistic row matches; a failure rolls the
+  // case back and says so.
+  async function assignCaseTo(caseId: string, assignedTo: string | null) {
+    if (!cases.some((item) => item.id === caseId)) return;
+    const previousCases = cases;
+    setCases((current) => current.map((item) => (item.id === caseId ? { ...item, assignedTo: assignedTo || undefined } : item)));
+    const eventId = makeId('e');
+    try {
+      const saved = await assignCase(caseId, assignedTo, eventId);
+      if (activeCaseId === caseId) {
+        applyCaseEvent({ id: eventId, caseId, kind: 'system', body: saved.eventBody, occurredAt: saved.occurredAt, actorId: activeUserId.toLowerCase() });
+      }
+    } catch (error) {
+      setCases(previousCases);
+      Alert.alert('Assignment not saved', (error as Error).message);
+    }
+  }
+
+  function assigneeChoices(onPick: (userId: string | null) => void): { text: string; style?: 'cancel'; onPress?: () => void }[] {
+    return [
+      ...members.map((member) => ({
+        text: member.userId === activeUserId.toLowerCase() ? `${member.displayName} (you)` : member.displayName,
+        onPress: () => onPick(member.userId),
+      })),
+      { text: 'Unassigned', onPress: () => onPick(null) },
+      { text: 'Cancel', style: 'cancel' as const },
+    ];
+  }
+
+  function pickCaseAssignee(record: CaseRecord) {
+    Alert.alert('Assigned to', 'Who is handling this case? Its follow-ups follow unless one is assigned on its own.', assigneeChoices((userId) => { void assignCaseTo(record.id, userId); }));
+  }
+
+  function pickFollowUpAssignee(followUp: FollowUp) {
+    Alert.alert('Assigned to', 'Who is handling this follow-up?', assigneeChoices((userId) => {
+      const updated: FollowUp = { ...followUp, assignedTo: userId };
+      persistFollowUpChange(updated, followUps.map((item) => (item.id === followUp.id ? updated : item)));
+    }));
+  }
+
+  function followUpAssigneeLabel(followUp: FollowUp, record: CaseRecord): string {
+    if (followUp.assignedTo) return followUp.assignedTo === activeUserId.toLowerCase() ? 'You' : memberDisplayName(members, followUp.assignedTo);
+    if (record.assignedTo) return `${record.assignedTo === activeUserId.toLowerCase() ? 'You' : memberDisplayName(members, record.assignedTo)} (case)`;
+    return 'Assign';
+  }
+
+  // "note · Maria · by Mikayla · 2h ago"; a completed follow-up reads
+  // "Done by Mikayla, 2:14 PM". Names only: who did what, never how much.
+  function timelineMetaLine(event: CaseEvent, contactName?: string): string {
+    const actor = teamWorkspace && event.actorId ? memberDisplayName(members, event.actorId) : '';
+    if (actor && event.kind === 'system' && /^(Completed|Done)\b/.test(event.body)) {
+      return `Done by ${actor}, ${clockTime(event.occurredAt)}`;
+    }
+    const bits = [event.kind.replace('_', ' ')];
+    if (contactName) bits.push(contactName);
+    if (actor) bits.push(`by ${actor}`);
+    bits.push(relativeActivity(event.occurredAt));
+    return bits.join(' · ');
+  }
 
   // The NEW LEADS clocks tick every 30 seconds while a lead is waiting.
   useEffect(() => {
@@ -4008,6 +4152,7 @@ export default function App() {
       { text: 'Cancel', style: 'cancel' },
       { text: 'Sign out', style: 'destructive', onPress: async () => {
         try {
+          await unregisterThisDevice();
           await cancelReferralFitNotifications();
           const { error } = await supabase.auth.signOut();
           if (error) throw error;
@@ -4128,7 +4273,13 @@ export default function App() {
             {card.subtitle ? <Text numberOfLines={1} style={styles.todayRowMeta}>{card.subtitle}</Text> : null}
             {overdue ? <Text style={styles.todayOverdueBadge}>{card.daysOverdue} {card.daysOverdue === 1 ? 'day' : 'days'} overdue</Text> : null}
             {card.lead ? renderLeadClock(card.lead) : null}
+            {teamWorkspace && cardAssigneeLabel(card) ? <Text style={styles.todayRowMeta}>{cardAssigneeLabel(card)}</Text> : null}
           </TouchableOpacity>
+          {teamWorkspace && card.lead && card.caseId && !caseAssignee(card.caseId) ? (
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Take this lead — ${card.title}`} onPress={() => { void assignCaseTo(card.caseId as string, activeUserId); }} style={[styles.todayDoneButton, styles.todayTakeButton]}>
+              <Text style={styles.todayDoneButtonText}>Take this lead</Text>
+            </TouchableOpacity>
+          ) : null}
           <View style={styles.todayActionRow}>
             <TouchableOpacity accessibilityLabel={`Call — ${card.title}`} onPress={() => cardContactAction(card, 'call')} style={styles.todayIconButton}>
               <AppIcon name="call" size={15} color={COLORS.forest} />
@@ -4178,6 +4329,19 @@ export default function App() {
             <Text style={styles.heroSubtitle}>{loadLine}</Text>
           </View>
 
+          {teamWorkspace ? (
+            <View style={styles.todayScopeBlock}>
+              <View style={styles.segmented}>
+                {(['mine', 'everyone'] as TodayScope[]).map((scope) => (
+                  <TouchableOpacity key={scope} accessibilityRole="button" accessibilityState={{ selected: todayScope === scope }} onPress={() => setTodayScopeChoice(scope)} style={[styles.segment, todayScope === scope && styles.segmentActive]}>
+                    <Text style={[styles.segmentText, todayScope === scope && styles.segmentTextActive]}>{scope === 'mine' ? 'Mine' : 'Everyone'}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              {todayScope === 'mine' ? <Text style={styles.todayRowMeta}>Mine shows what is assigned to you and anything nobody has taken yet.</Text> : null}
+            </View>
+          ) : null}
+
           {todaySections.newLeads.length ? (
             <View style={styles.todaySection}>
               <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderLead]}>⚡ NEW LEADS</Text>
@@ -4208,6 +4372,8 @@ export default function App() {
 
           {todayCounts.actions === 0 ? (
             <EmptyState icon="checkmark-circle-outline" title="List is clear" body="No actions due and no partners past cadence. Log a touch, or capture the next thing with + below." />
+          ) : teamWorkspace && todayScope === 'mine' && !todaySections.newLeads.length && !todaySections.overdue.length && !todaySections.today.length && !todaySections.partnersDue.length ? (
+            <EmptyState icon="checkmark-circle-outline" title="Nothing of yours is due" body="Everything due today belongs to a teammate. Switch to Everyone to see the whole practice." />
           ) : null}
 
           {/* The old home content lives down here, collapsed. */}
@@ -4878,6 +5044,18 @@ export default function App() {
                     <Text style={[styles.caseChipText, styles.caseChipLargeText, { color: colors.fg }]}>{record.status}</Text>
                     <AppIcon name="chevron-down" size={12} color={colors.fg} />
                   </TouchableOpacity>
+                  {teamWorkspace ? (
+                    <TouchableOpacity
+                      accessibilityRole="button"
+                      accessibilityLabel={`Assigned to ${record.assignedTo ? memberDisplayName(members, record.assignedTo) : 'nobody'}. Tap to change.`}
+                      onPress={() => pickCaseAssignee(record)}
+                      style={[styles.caseChip, styles.caseChipLarge, { backgroundColor: COLORS.mintPale }]}
+                    >
+                      <AppIcon name="person-outline" size={12} color={COLORS.forest} />
+                      <Text style={[styles.caseChipText, styles.caseChipLargeText, { color: COLORS.forest }]}>{record.assignedTo ? (record.assignedTo === activeUserId.toLowerCase() ? 'Yours' : memberDisplayName(members, record.assignedTo)) : 'Unassigned'}</Text>
+                      <AppIcon name="chevron-down" size={12} color={COLORS.forest} />
+                    </TouchableOpacity>
+                  ) : null}
                 </View>
                 <Text style={styles.profileName}>Opened {shortDate(record.createdAt.slice(0, 10))} · active {relativeActivity(record.updatedAt)}</Text>
               </View>
@@ -4905,6 +5083,11 @@ export default function App() {
                       <Text style={styles.touchLogTitle}>{followUp.title}</Text>
                       <Text style={styles.touchLogNote}>Due {shortDate(followUp.dueOn)}{followUp.dueTime ? ` at ${followUp.dueTime}` : ''}{followUp.waitingOn ? ` · Waiting on ${followUp.waitingOn}` : ''}</Text>
                     </View>
+                    {teamWorkspace ? (
+                      <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Assigned to: ${followUpAssigneeLabel(followUp, record)}. Tap to change.`} onPress={() => pickFollowUpAssignee(followUp)} style={[styles.caseChip, { backgroundColor: COLORS.mintPale }]}>
+                        <Text style={[styles.caseChipText, { color: COLORS.forest }]}>{followUpAssigneeLabel(followUp, record)}</Text>
+                      </TouchableOpacity>
+                    ) : null}
                   </View>
                 )) : <Text style={styles.caseEmptyNote}>No next step scheduled. Add one so this case does not fall through the cracks.</Text>}
               </View>
@@ -5093,7 +5276,7 @@ export default function App() {
                         <View style={styles.touchLogIcon}><AppIcon name={caseEventIcon(event.kind)} size={14} color={COLORS.forest} /></View>
                         <View style={{ flex: 1 }}>
                           <Text style={styles.touchLogTitle}>{event.body || event.kind.replace('_', ' ')}</Text>
-                          <Text style={styles.touchLogNote}>{event.kind.replace('_', ' ')}{contact ? ` · ${contact.name}` : ''} · {relativeActivity(event.occurredAt)}</Text>
+                          <Text style={styles.touchLogNote}>{timelineMetaLine(event, contact?.name)}</Text>
                         </View>
                       </View>
                     );
@@ -6503,6 +6686,11 @@ export default function App() {
                 <Pill label="+2 days" onPress={() => confirmSnooze('plus2')} />
                 <Pill label="Next week" onPress={() => confirmSnooze('nextweek')} />
               </View>
+              {teamWorkspace && snoozeCard.followUp ? (
+                <TouchableOpacity style={styles.sheetSecondaryButton} onPress={() => { const followUp = snoozeCard.followUp as FollowUp; setSnoozeCard(null); pickFollowUpAssignee(followUp); }}>
+                  <Text style={styles.sheetSecondaryButtonText}>Assign to…</Text>
+                </TouchableOpacity>
+              ) : null}
               <TouchableOpacity style={styles.sheetSecondaryButton} onPress={() => { const card = snoozeCard; setSnoozeCard(null); openNextStepSheet(card); }}>
                 <Text style={styles.sheetSecondaryButtonText}>Set next step…</Text>
               </TouchableOpacity>
@@ -7216,6 +7404,7 @@ const styles = StyleSheet.create({
   docViewImage: { flex: 1, marginBottom: 30 },
   // Today Command Center
   todaySection: { marginBottom: 16 },
+  todayScopeBlock: { marginBottom: 10 },
   todaySectionHeader: { color: COLORS.gray, fontSize: 11, fontWeight: '800', letterSpacing: 1.1, marginBottom: 7, marginTop: 2 },
   todaySectionHeaderOverdue: { color: COLORS.coral },
   todayRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, backgroundColor: COLORS.white, borderRadius: 15, padding: 11, marginBottom: 7, borderWidth: 1, borderColor: '#E5E8E3' },
@@ -7235,6 +7424,7 @@ const styles = StyleSheet.create({
   heroTitleGrow: { flex: 1 },
   todayActionRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 },
   todayIconButton: { width: 44, height: 44, borderRadius: 12, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, alignItems: 'center', justifyContent: 'center' },
+  todayTakeButton: { marginTop: 8, flex: 0 },
   todayDoneButton: { flex: 1, minHeight: 44, borderRadius: 12, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
   todayDoneButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
   fab: { position: 'absolute', right: 18, bottom: 18, width: 54, height: 54, borderRadius: 19, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', shadowColor: COLORS.ink, shadowOpacity: 0.25, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 8 },

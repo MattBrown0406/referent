@@ -108,6 +108,27 @@ export async function fetchWorkspace(userId: string): Promise<Workspace | null> 
   };
 }
 
+// Who is in the workspace, for the assignee pickers, the Today filter, and
+// the names on timeline rows. RLS limits this to the caller's own org.
+export async function fetchWorkspaceMembers(): Promise<OrgMember[]> {
+  const { data, error } = await supabase.from('org_members').select('user_id, role, display_name, created_at').order('created_at');
+  if (error) fail(error, 'Could not load workspace members.');
+  return (data || []).map((row) => ({
+    userId: String(row.user_id).toLowerCase(),
+    role: row.role === 'owner' ? 'owner' : 'member',
+    displayName: row.display_name || 'Member',
+    joinedAt: row.created_at,
+  }));
+}
+
+// Display name for a member id; a member who has left reads as "a former
+// teammate" rather than vanishing from the record.
+export function memberDisplayName(members: OrgMember[], userId: string | undefined | null): string {
+  if (!userId) return '';
+  const member = members.find((item) => item.userId === userId.toLowerCase());
+  return member ? member.displayName : 'a former teammate';
+}
+
 // Lightweight read for the app shell (Today clock, quick-add, dashboard
 // target). Any failure falls back to the defaults; nothing else depends on it.
 export async function fetchLeadSettings(): Promise<LeadSettings> {
