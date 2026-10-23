@@ -5,7 +5,9 @@ import {
   chunk,
   collectReceiptResults,
   collectSendResults,
+  ExpoHttpError,
   isAuthorized,
+  isTransientSendFailure,
   secretMatches,
   type OutboxRow,
 } from './push.ts';
@@ -51,15 +53,51 @@ Deno.test('collectSendResults marks a row sent when any device accepted and prun
     { status: 'error', message: 'rate', details: { error: 'MessageRateExceeded' } },
   ]);
   assertEquals(results, [
-    { id: 'r1', tickets: [{ token: 'ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]', id: 't1' }], error: '' },
-    { id: 'r2', tickets: [], error: 'MessageRateExceeded' },
+    { id: 'r1', tickets: [{ token: 'ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]', id: 't1' }], error: '', retry: false },
+    { id: 'r2', tickets: [], error: 'MessageRateExceeded', retry: true },
   ]);
   assertEquals(deadTokens, ['ExponentPushToken[bbbbbbbbbbbbbbbbbbbbbb]']);
 });
 
 Deno.test('collectSendResults treats a missing ticket as a failed attempt', () => {
   const { results } = collectSendResults([{ rowId: 'r1', token: 'ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]' }], []);
-  assertEquals(results, [{ id: 'r1', tickets: [], error: 'no_ticket' }]);
+  assertEquals(results, [{ id: 'r1', tickets: [], error: 'no_ticket', retry: true }]);
+});
+
+Deno.test('a failed send request is retryable for network errors and Expo 5xx / 429, final for other 4xx', () => {
+  assert(isTransientSendFailure(new TypeError('error sending request: connection reset')));
+  assert(isTransientSendFailure(new ExpoHttpError(503)));
+  assert(isTransientSendFailure(new ExpoHttpError(429)));
+  assert(!isTransientSendFailure(new ExpoHttpError(400)));
+  assert(!isTransientSendFailure(new ExpoHttpError(401)));
+  assertEquals(new ExpoHttpError(502).message, 'Expo push API answered 502');
+});
+
+Deno.test('collectSendResults keeps a row retryable when the whole request failed transiently', () => {
+  const sent = [
+    { rowId: 'r1', token: 'ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]' },
+    { rowId: 'r2', token: 'ExponentPushToken[bbbbbbbbbbbbbbbbbbbbbb]' },
+  ];
+  const { results } = collectSendResults(sent, [
+    { status: 'error', message: 'Expo push API answered 503', transient: true },
+    { status: 'error', message: 'Expo push API answered 400', transient: false },
+  ]);
+  assertEquals(results, [
+    { id: 'r1', tickets: [], error: 'Expo push API answered 503', retry: true },
+    { id: 'r2', tickets: [], error: 'Expo push API answered 400', retry: false },
+  ]);
+});
+
+Deno.test('collectSendResults treats permanent ticket errors as final', () => {
+  const { results, deadTokens } = collectSendResults(
+    [{ rowId: 'r1', token: 'ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]' }, { rowId: 'r2', token: 'ExponentPushToken[bbbbbbbbbbbbbbbbbbbbbb]' }],
+    [
+      { status: 'error', message: 'gone', details: { error: 'DeviceNotRegistered' } },
+      { status: 'error', message: 'big', details: { error: 'MessageTooBig' } },
+    ],
+  );
+  assertEquals(results.map((result) => [result.id, result.retry]), [['r1', false], ['r2', false]]);
+  assertEquals(deadTokens, ['ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]']);
 });
 
 Deno.test('collectReceiptResults reads receipts by ticket id', () => {

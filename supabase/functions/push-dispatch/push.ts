@@ -32,16 +32,44 @@ export type ExpoMessage = {
   channelId?: string;
 };
 
+// `transient` is set by the dispatcher (never by Expo) on the placeholder
+// tickets it records when the whole send request failed.
 export type Ticket =
   | { status: 'ok'; id: string }
-  | { status: 'error'; message?: string; details?: { error?: string } };
+  | { status: 'error'; message?: string; details?: { error?: string }; transient?: boolean };
 
 export type Receipt =
   | { status: 'ok' }
   | { status: 'error'; message?: string; details?: { error?: string } };
 
-export type OutboxResult = { id: string; tickets: { token: string; id: string }[]; error: string };
+// retry: nothing was delivered, but the failure is worth another attempt;
+// push_outbox_record leaves the row queued (claim retries it, five
+// attempts at most). Otherwise a row with no ticket is final.
+export type OutboxResult = { id: string; tickets: { token: string; id: string }[]; error: string; retry: boolean };
 export type ReceiptResult = { id: string; error: string };
+
+// A non-2xx answer from the Expo push API.
+export class ExpoHttpError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super(`Expo push API answered ${status}`);
+    this.name = 'ExpoHttpError';
+    this.status = status;
+  }
+}
+
+// Whole-request failures: Expo 5xx and 429 are transient, other 4xx
+// answers are not; anything thrown before an answer (network error,
+// timeout, unreadable body) is transient.
+export function isTransientSendFailure(error: unknown): boolean {
+  if (error instanceof ExpoHttpError) return error.status >= 500 || error.status === 429;
+  return true;
+}
+
+// Per-message ticket errors worth retrying. Everything else Expo reports
+// (DeviceNotRegistered, MessageTooBig, InvalidCredentials, ...) is final.
+// no_ticket: Expo answered without a ticket for this message.
+export const TRANSIENT_TICKET_ERRORS = new Set(['MessageRateExceeded', 'no_ticket']);
 
 export function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = [];
@@ -87,7 +115,7 @@ export function collectSendResults(
   const deadTokens = new Set<string>();
   sent.forEach((entry, index) => {
     const ticket = tickets[index];
-    const result = byRow.get(entry.rowId) || { id: entry.rowId, tickets: [], error: '' };
+    const result = byRow.get(entry.rowId) || { id: entry.rowId, tickets: [], error: '', retry: false };
     if (ticket && ticket.status === 'ok' && typeof ticket.id === 'string') {
       result.tickets.push({ token: entry.token, id: ticket.id });
     } else {
@@ -96,10 +124,14 @@ export function collectSendResults(
         : 'no_ticket';
       if (ticket && isDeviceNotRegistered(ticket)) deadTokens.add(entry.token);
       if (!result.error) result.error = reason;
+      const transient = (ticket && ticket.status === 'error' && ticket.transient === true) || TRANSIENT_TICKET_ERRORS.has(reason);
+      if (transient) result.retry = true;
     }
     byRow.set(entry.rowId, result);
   });
-  const results = [...byRow.values()].map((result) => ({ ...result, error: result.tickets.length ? '' : result.error }));
+  const results = [...byRow.values()].map((result) => result.tickets.length
+    ? { ...result, error: '', retry: false }
+    : result);
   return { results, deadTokens: [...deadTokens] };
 }
 

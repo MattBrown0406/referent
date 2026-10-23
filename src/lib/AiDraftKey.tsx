@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, Linking, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
 import { looksLikeAnthropicKey, maskAnthropicKey, normalizeAnthropicKey } from './outreach';
 import {
@@ -16,8 +16,6 @@ import {
 // it is checked with Anthropic, and it stays in this phone's keychain. The
 // screen says what is shared with Anthropic before anything is (App Review
 // 5.1.2(i)); saving the key is the user's agreement to that.
-
-const CONSOLE_KEYS_URL = 'https://console.anthropic.com/settings/keys';
 
 const COLORS = {
   ink: '#16352E',
@@ -41,7 +39,7 @@ export function AiKeyDisclosure() {
   return (
     <View>
       <Text style={styles.body}>
-        ReferralFit is free, so AI drafts run on your own Anthropic account using your API key. Anthropic bills you directly, usually a few cents per draft.
+        AI drafts are written by Claude from Anthropic, using your own Anthropic account and API key. ReferralFit does not sell, charge for, or receive anything from this feature.
       </Text>
       <Text style={styles.body}>For each draft, ReferralFit sends Anthropic only:</Text>
       {SHARED_WITH_ANTHROPIC.map((line) => <Text key={line} style={styles.bullet}>•  {line}</Text>)}
@@ -67,38 +65,54 @@ export function AiKeySetup({ userId, saveLabel, onSaved, onCancel, cancelLabel }
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState('');
+  // Cancel (or closing the sheet) while the key is being checked means no:
+  // the key is not saved and nothing is drafted.
+  const abandonedRef = useRef(false);
+  const savingRef = useRef(false);
+  useEffect(() => () => { abandonedRef.current = true; }, []);
 
   if (!aiKeysSupported) {
     return <Text style={styles.body}>AI drafts use your phone’s keychain, so they are set up in the iPhone app.</Text>;
   }
 
   async function save() {
-    if (busy) return;
+    if (savingRef.current) return;
     const apiKey = normalizeAnthropicKey(value);
     if (!looksLikeAnthropicKey(apiKey)) {
       setProblem('That does not look like an Anthropic API key. It starts with sk-ant-.');
       return;
     }
+    savingRef.current = true;
+    abandonedRef.current = false;
     setBusy(true);
     setProblem('');
     try {
       await verifyAnthropicKey(apiKey);
+      if (abandonedRef.current) return;
       await saveAnthropicKey(userId, apiKey);
+      if (abandonedRef.current) {
+        await removeAnthropicKey(userId); // cancelled while the keychain write was in flight
+        return;
+      }
       setValue('');
       onSaved(apiKey);
     } catch (error) {
-      setProblem(error instanceof DraftUnavailableError ? error.message : 'The key could not be saved on this phone. Try again.');
+      if (!abandonedRef.current) setProblem(error instanceof DraftUnavailableError ? error.message : 'The key could not be saved on this phone. Try again.');
     } finally {
-      setBusy(false);
+      savingRef.current = false;
+      if (!abandonedRef.current) setBusy(false);
     }
+  }
+
+  function cancel() {
+    abandonedRef.current = true;
+    onCancel?.();
   }
 
   return (
     <View>
       <AiKeyDisclosure />
-      <TouchableOpacity accessibilityRole="link" onPress={() => { Linking.openURL(CONSOLE_KEYS_URL).catch(() => undefined); }} style={styles.linkButton}>
-        <Text style={styles.linkText}>Create a key in the Anthropic Console ↗</Text>
-      </TouchableOpacity>
+      <Text style={styles.body}>To get a key, sign in at console.anthropic.com and create one under API keys, then paste it here.</Text>
       <Text style={styles.label}>YOUR ANTHROPIC API KEY</Text>
       <TextInput
         style={styles.input}
@@ -119,7 +133,7 @@ export function AiKeySetup({ userId, saveLabel, onSaved, onCancel, cancelLabel }
         {busy ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.primaryButtonText}>{saveLabel}</Text>}
       </TouchableOpacity>
       {onCancel ? (
-        <TouchableOpacity accessibilityRole="button" onPress={onCancel} style={styles.textButton}>
+        <TouchableOpacity accessibilityRole="button" onPress={cancel} style={styles.textButton}>
           <Text style={styles.textButtonText}>{cancelLabel || 'Not now'}</Text>
         </TouchableOpacity>
       ) : null}
@@ -208,8 +222,6 @@ const styles = StyleSheet.create({
   label: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, color: COLORS.gray, marginTop: 16, marginBottom: 6 },
   input: { minHeight: 48, borderWidth: 1, borderColor: COLORS.line, borderRadius: 12, backgroundColor: COLORS.white, paddingHorizontal: 12, paddingVertical: 10, fontSize: 16, color: COLORS.ink },
   problem: { fontSize: 13, lineHeight: 18, color: COLORS.coralInk, marginTop: 8 },
-  linkButton: { minHeight: 44, justifyContent: 'center', marginTop: 8 },
-  linkText: { fontSize: 15, fontWeight: '700', color: COLORS.forest },
   primaryButton: { minHeight: 50, borderRadius: 14, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', marginTop: 16 },
   primaryButtonText: { color: COLORS.white, fontSize: 16, fontWeight: '800' },
   busy: { opacity: 0.7 },

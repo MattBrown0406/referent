@@ -320,6 +320,22 @@ export function suggestedChannel(
 
 // ─── Draft request (what leaves the device) ─────────────────────────────────
 
+// Sign-up placeholders never sign a message.
+export function senderOrBlank(name: string): string {
+  const trimmed = name.trim();
+  return /^member$/i.test(trimmed) ? '' : trimmed;
+}
+
+export function practiceOrBlank(name: string): string {
+  const trimmed = name.trim();
+  return /^my practice$/i.test(trimmed) ? '' : trimmed;
+}
+
+function partnerOrganization(target: Extract<OutreachTarget, { kind: 'partner' }>): string {
+  const org = target.organization.trim();
+  return org && org !== '—' ? org : '';
+}
+
 const CASE_STAGES: CaseStatus[] = ['inquiry', 'consult', 'deciding', 'engaged', 'intervention', 'placed', 'aftercare', 'closed', 'lost'];
 
 export type DraftRequestBody = {
@@ -362,9 +378,11 @@ export function buildDraftRequest(params: {
     recipient: {
       firstName: firstName(recipient.name),
       relationship: target.kind === 'case' ? recipient.relationship.slice(0, 40) : '',
-      organization: target.kind === 'partner' ? targetAnchor(target).slice(0, 80) : '',
+      // The organization only; a partner with none is not stood in for by the
+      // contact's full name.
+      organization: target.kind === 'partner' ? partnerOrganization(target).slice(0, 80) : '',
     },
-    sender: { firstName: firstName(params.senderName), practiceName: params.practiceName.trim().slice(0, 80) },
+    sender: { firstName: firstName(senderOrBlank(params.senderName)), practiceName: practiceOrBlank(params.practiceName).slice(0, 80) },
     situation: {
       stage: target.kind === 'case' && CASE_STAGES.includes(target.status) ? target.status : '',
       partnerTypes: target.kind === 'partner' ? target.types.slice(0, 6) : [],
@@ -389,48 +407,51 @@ export function templateDraft(params: {
 }): OutreachDraft {
   const to = firstName(params.recipient.name);
   const hi = to ? `Hi ${to}` : 'Hi';
-  const me = firstName(params.senderName) || 'me';
-  const practice = params.practiceName.trim();
+  const name = firstName(senderOrBlank(params.senderName));
+  const practice = practiceOrBlank(params.practiceName);
+  const itsMe = name ? `it's ${name}` : 'just me';
+  const thisIs = name ? `this is ${name}${practice ? ` with ${practice}` : ''}` : practice ? `this is ${practice}` : 'checking in';
+  const signOff = name ? `${name}${practice ? `\n${practice}` : ''}` : practice;
   const later = params.history.count > 0;
   if (params.target.kind === 'partner') {
     const org = targetAnchor(params.target);
     if (params.channel === 'text') {
-      return { channel: 'text', body: `${hi}, this is ${me}${practice ? ` with ${practice}` : ''}. ${later ? 'Checking back in' : 'Good to connect'} — I'd like to stay in touch and learn more about ${org}. Talk soon.` };
+      return { channel: 'text', body: `${hi}, ${thisIs}. ${later ? 'Checking back in' : 'Good to connect'} — I'd like to stay in touch and learn more about ${org}. Talk soon.` };
     }
     if (params.channel === 'email') {
       return {
         channel: 'email',
         subject: later ? 'Checking back in' : 'Good to connect',
-        body: `${hi},\n\n${later ? 'Following up on my last note.' : 'Thanks for connecting.'} I'd like to learn more about ${org} and stay in touch, and I'm glad to be a resource for you as well.\n\nWould a short call in the next week or two work?\n\n${me}${practice ? `\n${practice}` : ''}`,
+        body: `${hi},\n\n${later ? 'Following up on my last note.' : 'Thanks for connecting.'} I'd like to learn more about ${org} and stay in touch, and I'm glad to be a resource for you as well.\n\nWould a short call in the next week or two work?${signOff ? `\n\n${signOff}` : ''}`,
       };
     }
     return {
       channel: 'call',
-      opener: `${hi}, this is ${me}${practice ? ` with ${practice}` : ''}. Do you have a couple of minutes?`,
+      opener: `${hi}, ${thisIs}. Do you have a couple of minutes?`,
       talkingPoints: [`Ask what is new at ${org}`, 'Ask who is best to reach for admissions questions', 'Offer to be a resource for their team'],
-      voicemail: `${hi}, it's ${me}${practice ? ` with ${practice}` : ''}. Just checking in and would love to connect. Give me a call back when you have a minute.`,
+      voicemail: `${hi}, ${thisIs}. Just checking in and would love to connect. Give me a call back when you have a minute.`,
     };
   }
   if (params.channel === 'text') {
     return {
       channel: 'text',
       body: later
-        ? `${hi}, it's ${me} again. Just checking in, no pressure at all. I'm here whenever you're ready to talk.`
-        : `${hi}, it's ${me}, following up on our conversation. I'm here whenever you'd like to talk. — ${me}`,
+        ? `${hi}, ${itsMe} again. Just checking in, no pressure at all. I'm here whenever you're ready to talk.`
+        : `${hi}, ${itsMe}, following up on our conversation. I'm here whenever you'd like to talk.`,
     };
   }
   if (params.channel === 'email') {
     return {
       channel: 'email',
       subject: later ? 'Checking in' : 'Following up',
-      body: `${hi},\n\n${later ? 'I wanted to check in again.' : 'Thank you for reaching out.'} I know this can be a lot to carry, and there is no pressure to decide anything right now. When you're ready, I'm glad to talk through what you're seeing and what options look like.\n\nYou can reply here or call me any time.\n\n${me}${practice ? `\n${practice}` : ''}`,
+      body: `${hi},\n\n${later ? 'I wanted to check in again.' : 'Thank you for reaching out.'} I know this can be a lot to carry, and there is no pressure to decide anything right now. When you're ready, I'm glad to talk through what you're seeing and what options look like.\n\nYou can reply here or call me any time.${signOff ? `\n\n${signOff}` : ''}`,
     };
   }
   return {
     channel: 'call',
-    opener: `${hi}, it's ${me}. Is now an okay time to talk for a few minutes?`,
+    opener: `${hi}, ${itsMe}. Is now an okay time to talk for a few minutes?`,
     talkingPoints: ['Ask how things have been since you last spoke', 'Listen first; ask what feels most urgent to them', 'Offer a clear next step and a time to talk again'],
-    voicemail: `${hi}, it's ${me}. Just checking in. Call me back whenever it works for you.`,
+    voicemail: `${hi}, ${itsMe}. Just checking in. Call me back whenever it works for you.`,
   };
 }
 

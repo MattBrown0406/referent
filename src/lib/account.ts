@@ -1,6 +1,7 @@
-import { StoreError } from './errors';
+import { RejectedWritesError, StoreError, describeError } from './errors';
 import { fetchCurrentOrgId } from './org';
-import { prepareForWorkspaceChange } from './store';
+import { fetchAllPages } from './paging';
+import { prepareForWorkspaceChange, rejectedWriteCount } from './store';
 import { supabase } from './supabase';
 
 // Self-serve account deletion (App Store guideline 5.1.1(v)).
@@ -28,19 +29,28 @@ export type DeleteOwnAccountOptions = {
   removeWorkspaceFiles: boolean;
 };
 
+// Every document path in the workspace, paged: PostgREST stops at max_rows
+// (1,000) without an error, and a truncated list would leave case documents
+// (PHI) behind in storage after the account is gone.
+async function listWorkspaceDocumentPaths(orgId: string): Promise<string[]> {
+  let rows: { id: string; storage_path: unknown }[];
+  try {
+    rows = await fetchAllPages<{ id: string; storage_path: unknown }>((from, to) => supabase.from('case_documents').select('id, storage_path').eq('org_id', orgId).order('id').range(from, to));
+  } catch (error) {
+    if (error instanceof StoreError) throw error;
+    throw new StoreError(`Could not list workspace documents: ${describeError(error)}`, false);
+  }
+  return Array.from(new Set(rows
+    .map((row) => (typeof row.storage_path === 'string' ? row.storage_path : ''))
+    .filter(Boolean)));
+}
+
 async function removeWorkspaceCaseFiles(): Promise<void> {
   const orgId = await fetchCurrentOrgId();
-  const { data, error } = await supabase
-    .from('case_documents')
-    .select('storage_path')
-    .eq('org_id', orgId);
-  if (error) throw new StoreError(error.message || 'Could not list workspace documents.', false);
-  const paths = (data || [])
-    .map((row) => (typeof row.storage_path === 'string' ? row.storage_path : ''))
-    .filter(Boolean);
+  const paths = await listWorkspaceDocumentPaths(orgId);
   for (let index = 0; index < paths.length; index += 100) {
     const { error: removeError } = await supabase.storage.from(CASE_DOCUMENTS_BUCKET).remove(paths.slice(index, index + 100));
-    if (removeError) throw new StoreError(removeError.message || 'Could not remove workspace documents.', false);
+    if (removeError) throw new StoreError(`Could not remove workspace documents: ${describeError(removeError)}`, false);
   }
 }
 
@@ -49,10 +59,18 @@ export async function deleteOwnAccount({ userId, removeWorkspaceFiles }: DeleteO
   // caches first, so a member's last edits reach the practice and nothing
   // stale survives the deletion. Refuses while offline.
   try {
-    await prepareForWorkspaceChange(userId);
+    try {
+      await prepareForWorkspaceChange(userId);
+    } catch (error) {
+      // Changes the server already refused (set aside on this device) are
+      // moot once the account is gone; anything else still blocks deletion.
+      const refused = error instanceof RejectedWritesError || await rejectedWriteCount(userId).catch(() => 0) > 0;
+      if (!refused) throw error;
+      await prepareForWorkspaceChange(userId, { discardRejected: true });
+    }
   } catch (error) {
     throw new StoreError(
-      `Could not sync this device's pending changes. Connect to the internet, wait for sync to finish, then try again. (${(error as Error).message})`,
+      `Could not sync this device's pending changes. Connect to the internet, wait for sync to finish, then try again. (${describeError(error)})`,
       true,
     );
   }
@@ -60,6 +78,6 @@ export async function deleteOwnAccount({ userId, removeWorkspaceFiles }: DeleteO
     await removeWorkspaceCaseFiles();
   }
   const { error } = await supabase.rpc('delete_own_account');
-  if (error) throw new StoreError(error.message || 'Could not delete the account.', false);
+  if (error) throw new StoreError(describeError(error, 'Could not delete the account.'), false);
   await supabase.auth.signOut({ scope: 'local' });
 }

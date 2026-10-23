@@ -149,7 +149,7 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
               <TouchableOpacity
                 accessibilityRole="button"
                 disabled={!item.externalUrl}
-                onPress={() => item.externalUrl && Linking.openURL(item.externalUrl)}
+                onPress={() => { if (item.externalUrl) Linking.openURL(item.externalUrl).catch(() => undefined); }}
                 style={styles.rowBody}
               >
                 <View style={[styles.providerBadge, item.provider === 'square' ? styles.squareBadge : styles.pandaBadge]}>

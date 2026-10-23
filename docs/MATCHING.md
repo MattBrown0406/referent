@@ -23,8 +23,8 @@ A program that fails any one of these is not shown. It is never shown lower.
 | --- | --- |
 | Level of care | The profile's level of care is `Any type` or one of the partner's types. |
 | Population | `Men`: never a women-only or adolescent-only program. `Women`: never men-only or adolescent-only. `Adolescent`: only programs that serve adolescents. `Any`: no filter. Men-only / women-only come from the partner's `Men only` / `Women only` need or a single-gender `populations` list; adolescent from the `Adolescent` need or `Adolescent` / `Adolescents` / `Teens` in `populations`. A partner with no populations recorded is read as adults, unless it lists `Adolescent` as a need (then adolescent-only, the safer reading for an adult client). Older profiles that carry `Men only`, `Women only`, or `Adolescent` as a selected need are read the same way. |
-| A way to pay | Cash pay: monthly cost within the budget (no budget = any cost). Insurance: in-network, or out-of-network when the clinician allowed it, using the existing `insurance_networks` logic. |
-| Location | The profile has no state, or the partner is in that state, or the partner serves `Nationwide`. Unchanged. |
+| A way to pay | Cash pay: monthly cost within the budget (no budget = any cost). A monthly cost of 0 (or blank, with no legacy range) is a cost never entered: unknown, not free, so it is not hidden (the budget cannot be checked either way); it scores neutral and sorts after known costs (step 2, step 3). Insurance: in-network, or out-of-network when the clinician allowed it, using the existing `insurance_networks` logic. |
+| Location | Depends on the location preference (`stateIsSearchArea`). `No preference` and `Close to family`: the GEOGRAPHY state is the search area, so the profile has no state, or the partner is in that state, or the partner serves `Nationwide`. `Away from home`: the GEOGRAPHY state is the family's home state, not a filter; nothing is hidden for where it is, and the location score (step 2) puts out-of-state programs first. Before this, the state still filtered under `Away from home`, which hid every out-of-state program except nationwide ones and left the home-state programs it scores 0. |
 | Must-have needs | Every need the clinician marked must-have is offered. `MAT` is must-have by default when selected (`MUST_HAVE_BY_DEFAULT`). The three population needs (`Men only`, `Women only`, `Adolescent`) are always requirements. |
 | A bed (optional) | Only when the clinician turns on "Has a bed for" (Men / Women / Anyone; the client's population pre-selects it). A partner whose linked directory listing confirms 0 for that requirement within the last seven days is hidden. A partner with no linked listing, a count never set, or a count older than seven days is NOT hidden: it stays, and among equal fit it sorts below a confirmed open bed (a tie-break between the score and family cost; the score itself never moves). See `BED_AVAILABILITY.md`. |
 
@@ -39,9 +39,9 @@ Four parts, each a named constant in `src/lib/matching.ts`:
 | Part | Weight | Constant | How it is scored |
 | --- | --- | --- | --- |
 | Clinical fit | 50 | `WEIGHT_CLINICAL_FIT` | Share of the client's preferred (non-must-have) needs the program offers. No preferred needs = full points. Must-haves are requirements and are not re-counted here. |
-| Cost to the family | 25 | `WEIGHT_FAMILY_COST` | In-network: full. Out-of-network: `OUT_OF_NETWORK_COST_SHARE` (0.5) of the points plus a "Verify benefits" flag on the card. Cash pay with a budget: `CASH_AT_BUDGET_COST_SHARE` (0.5) at exactly the budget, rising toward full the further under budget. Cash pay without a budget: `CASH_NO_BUDGET_COST_SHARE` (0.5); cost still breaks ties. |
-| Location preference | 10 | `WEIGHT_LOCATION` | New per-client field: `No preference` (full), `Close to family` (full when the program is in the client's state, else none), `Away from home` (the reverse). The only location data on both sides is the state, so same state versus different state is the distance proxy. With no client state the score is half. |
-| Track record | 15 | `WEIGHT_TRACK_RECORD` | From `partner_scorecard`: family-experience average, completion rate (outcomes loop) and admit rate, each blended toward the prior with `TRACK_RECORD_PRIOR_CASES` (5) prior cases, then combined per `TRACK_RECORD_BLEND`: 60% family experience, 25% completion, 15% admit rate. A program with no decided cases scores exactly half (7.5). |
+| Cost to the family | 25 | `WEIGHT_FAMILY_COST` | In-network: full. Out-of-network: `OUT_OF_NETWORK_COST_SHARE` (0.5) of the points plus a "Verify benefits" flag on the card. Cash pay with a budget: `CASH_AT_BUDGET_COST_SHARE` (0.5) at exactly the budget, rising toward full the further under budget. Cash pay without a budget: `CASH_NO_BUDGET_COST_SHARE` (0.5); cost still breaks ties. Cash pay with no cost on file (`knownMonthlyCostForPartner` is null: 0 is how a blank cost is stored): `CASH_UNKNOWN_COST_SHARE` (0.5), no more than a program priced at exactly the budget, and the packet says the cost is not on file instead of "$0 — within budget". |
+| Location preference | 10 | `WEIGHT_LOCATION` | New per-client field: `No preference` (full), `Close to family` (full when the program is in the client's state, else none; out-of-state programs reach this list only by serving `Nationwide`), `Away from home` (the reverse, over programs in every state: home-state programs stay on the list with none). The only location data on both sides is the state, so same state versus different state is the distance proxy. With no client state the score is half. |
+| Track record | 15 | `WEIGHT_TRACK_RECORD` | From `partner_scorecard`: family-experience average, completion rate (outcomes loop) and admit rate, each blended toward the prior with `TRACK_RECORD_PRIOR_CASES` (5) prior cases, then combined per `TRACK_RECORD_BLEND`: 60% family experience, 25% completion, 15% admit rate. A program with no decided cases scores exactly its prior (`priorTrackRecordScore`): the listing's network figures when disclosed, else the workspace average; half (7.5) only when nobody has data. It used to score a flat 7.5, so in a workspace with a good record a program whose only referral was a 1-star non-admit (9.3) outranked a never-used one. |
 
 The parts sum to the total; the maximum is `MAX_SCORE` (100). Components are
 rounded to one decimal.
@@ -62,21 +62,29 @@ The outcomes loop (`docs/OUTCOMES.md`) adds two things here:
   admissions but no completion answers yet sits exactly on the prior. The
   weights live in `TRACK_RECORD_BLEND` (experience 0.6, completion 0.25,
   admit rate 0.15); they sum to one, so the component can never exceed 15.
-- **The network as the prior for thin history.** When this workspace has
-  fewer than `TRACK_RECORD_PRIOR_CASES` decided cases with a program and the
-  directory discloses network figures for its listing (five distinct
-  referring workspaces; see `fetch_global_partner_stats`), those figures
-  replace the workspace averages as that program's prior, signal by signal
-  (`priorForCard`). A figure the directory withheld falls back to the
-  workspace average. With five or more local cases the network figure is not
-  consulted. The figures ride along on `PartnerScorecard.network`, loaded
-  best-effort with the snapshot; without the directory plan, or offline,
-  ranking simply uses local history.
+- **The network as the prior.** When the directory discloses network
+  figures for a program's listing (five distinct referring workspaces; see
+  `fetch_global_partner_stats`), those figures replace the workspace
+  averages as that program's prior, signal by signal (`priorForCard`). A
+  figure the directory withheld falls back to the workspace average. The
+  prior counts as `TRACK_RECORD_PRIOR_CASES` cases, so it is the whole score
+  at 0 local cases, half at 5 and a fifth at 20: the network stands in while
+  local history is thin and fades as it grows. (It used to switch off at
+  five local cases. Switching priors broke monotonicity: with a weak network
+  record in a strong workspace, five 1-star non-admits scored above no
+  history at all.) The figures ride along on `PartnerScorecard.network`,
+  loaded best-effort with the snapshot; without the directory plan, or
+  offline, ranking simply uses local history.
+- **Evidence moves the score one way.** No history scores the prior; a
+  record worse than the prior on every signal scores below it, and a better
+  one above. `scripts/matching-test.mjs` checks this over random priors and
+  records.
 
 ### Step 3: ties
 
 1. Lower cost to the family wins: for cash pay the monthly cost, for insurance
-   in-network before out-of-network.
+   in-network before out-of-network. A cash cost not on file sorts after every
+   known cost (`compareFamilyCost`), however high.
 2. Remaining ties rotate in an order seeded by the match profile id
    (`rotationKey`, FNV-1a over profile id + partner id). The same family
    always sees the same order; the next family sees a different one.

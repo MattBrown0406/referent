@@ -34,6 +34,17 @@ SELECT set_config('test.org_n4', org_id::text, true) FROM public.org_members WHE
 UPDATE public.org_members SET org_id = current_setting('test.org_p')::uuid, role = 'member'
  WHERE user_id = 'a2000000-0000-0000-0000-00000000c100';
 
+-- Network stats count only established workspaces (20261024120000): make
+-- P and n1..n4 60 days old with three cases each.
+UPDATE public.orgs SET created_at = now() - interval '60 days'
+ WHERE id IN (current_setting('test.org_p')::uuid, current_setting('test.org_n1')::uuid, current_setting('test.org_n2')::uuid,
+              current_setting('test.org_n3')::uuid, current_setting('test.org_n4')::uuid);
+INSERT INTO public.cases (owner_id, title)
+SELECT u.id, 'Established fixture ' || g
+  FROM unnest(ARRAY['a1000000-0000-0000-0000-00000000c100', 'c1000000-0000-0000-0000-00000000c100', 'c2000000-0000-0000-0000-00000000c100',
+                    'c3000000-0000-0000-0000-00000000c100', 'c4000000-0000-0000-0000-00000000c100']::uuid[]) AS u(id),
+       generate_series(1, 3) AS g;
+
 -- One shared listing G1, linked from P and from n1..n4.
 INSERT INTO public.global_partners (id, name, organization, types, city, state, phone, status, verified_at)
 VALUES ('d1000000-0000-0000-0000-00000000c100', 'Admissions', 'Juniper Ridge Recovery', ARRAY['Inpatient'], 'Bend', 'OR', '(541) 555-0400', 'active', now());

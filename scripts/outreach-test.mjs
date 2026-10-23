@@ -280,6 +280,28 @@ check('the timeline lists recent outreach, oldest first, then the open steps', (
   assert.deepEqual(entries.map((entry) => entry.id), ['e1', 'e3', 'n0', 'n1']);
 });
 
+check('sign-up placeholders never sign a draft, and a partner without an organization sends none', () => {
+  assert.equal(outreach.senderOrBlank('Member'), '');
+  assert.equal(outreach.practiceOrBlank('My Practice'), '');
+  assert.equal(outreach.practiceOrBlank('Freedom Interventions'), 'Freedom Interventions');
+  const body = outreach.buildDraftRequest({
+    channel: 'text',
+    target: outreach.partnerTarget({ ...PARTNER, organization: '—' }),
+    recipient: outreach.partnerRecipient(PARTNER),
+    senderName: 'Member',
+    practiceName: 'My Practice',
+    history: { count: 0, lastChannel: '', lastAt: '' },
+    instructions: '',
+    now: new Date(),
+  });
+  assert.deepEqual(body.sender, { firstName: '', practiceName: '' });
+  assert.equal(body.recipient.organization, '', 'the contact\'s full name never stands in for the organization');
+  const text = outreach.templateDraft({ channel: 'text', target: caseTarget, recipient: ana, senderName: 'Member', practiceName: 'My Practice', history: { count: 0, lastChannel: '', lastAt: '' } });
+  assert.equal(/Member|My Practice|it's me|— me/.test(text.body), false);
+  const signed = outreach.templateDraft({ channel: 'text', target: caseTarget, recipient: ana, senderName: 'Matt', practiceName: '', history: { count: 0, lastChannel: '', lastAt: '' } });
+  assert.equal((signed.body.match(/Matt/g) || []).length, 1, 'signed once, not twice');
+});
+
 check('a pasted Anthropic key is cleaned, recognized, and masked', () => {
   const key = `sk-ant-api03-${'Ab9_-'.repeat(18)}xY7z`;
   assert.equal(outreach.normalizeAnthropicKey(`  "${key}"\n`), key);

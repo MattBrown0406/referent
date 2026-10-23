@@ -367,7 +367,8 @@ SELECT is(
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- F. Duplicate on first create: automatic takeover on email-domain match
+-- F. Duplicate on first create: an email-domain match is NOT proof
+--    (20261024120000). It files a claim request; nothing is taken over.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 INSERT INTO public.global_partners (id, name, organization, types, phone, website, status)
@@ -382,22 +383,22 @@ SELECT set_config('test.profile_result', public.upsert_org_directory_profile(
 
 SELECT is(
   (current_setting('test.profile_result')::jsonb ->> 'status') || '|' || (current_setting('test.profile_result')::jsonb ->> 'listing_id'),
-  'claimed|e2000000-0000-0000-0000-0000000000c1',
-  'a matching unclaimed listing is taken over when the email domain matches its website'
+  'claim_requested|e2000000-0000-0000-0000-0000000000c1',
+  'a matching email domain no longer takes the listing over; it files a claim request'
 );
 
+-- The listing is not the caller's, so it is read back as the superuser.
+RESET ROLE;
 SELECT ok(
-  (SELECT owner_org_id = current_setting('test.org_other')::uuid
-      AND status = 'active' AND verified_at IS NOT NULL
-      AND name = 'Dr. Casey Cascade'
+  (SELECT owner_org_id IS NULL AND status = 'pending' AND name = 'Front desk'
      FROM public.global_partners WHERE id = 'e2000000-0000-0000-0000-0000000000c1'),
-  'the taken-over listing is owned, live, verified, and carries the new content'
+  'the matching listing is untouched until a platform admin approves'
 );
 
 SELECT is(
   (SELECT count(*)::integer FROM public.global_partners WHERE phone_digits = '5415550500'),
   1,
-  'no duplicate listing was created by the takeover'
+  'no duplicate listing was created by the claim request'
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -490,7 +491,7 @@ SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-0000000000c1
 
 SELECT is(
   (SELECT count(*)::integer FROM public.center_claim_requests WHERE status = 'pending'),
-  2,
+  3,
   'the platform admin sees every pending request'
 );
 

@@ -140,7 +140,7 @@ eq('tomorrow', today.nextStepDate('tomorrow', NOW), '2026-07-25');
 eq('in 3 days', today.nextStepDate('in3days', NOW), '2026-07-27');
 eq('next week (+7)', today.nextStepDate('nextweek', NOW), '2026-07-31');
 eq('custom', today.nextStepDate('custom', NOW, '2026-08-14'), '2026-08-14');
-eq('custom without a date falls back to today', today.nextStepDate('custom', NOW), '2026-07-24');
+eq('custom without a date falls back to the first date offered (tomorrow)', today.nextStepDate('custom', NOW), '2026-07-25');
 eq('snooze +1', today.snoozeDate('plus1', NOW), '2026-07-25');
 eq('snooze +2', today.snoozeDate('plus2', NOW), '2026-07-26');
 eq('snooze next week', today.snoozeDate('nextweek', NOW), '2026-07-31');

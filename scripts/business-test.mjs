@@ -111,6 +111,52 @@ equal('source ordering', result.sources.map((item) => [item.source, item.cases, 
 ]);
 equal('average days to engaged', result.averageDaysToEngaged, 2.5);
 
+// ─── The same external record linked by two teammates ──────────────────────
+// case_integrations is unique per owner, so a teammate can link the same
+// Square invoice or PandaDoc document to the same case. Webhooks sync only
+// the connecting owner's row; the teammate's copy goes stale. Each record
+// counts once per case, and the synced copy speaks for it.
+const syncedIntegrations = integrations.map((item) => (item.id === 'i1' ? { ...item, lastSyncedAt: '2026-08-01T00:00:00Z' } : item));
+const teammateCopies = [
+  // Same invoice, same case, linked later by a teammate and never synced.
+  { id: 'i1-teammate', caseId: 'c1', provider: 'square', recordType: 'invoice', externalId: ' inv1 ', status: 'unpaid', amountCents: 100000, paidAmountCents: 0, currency: 'USD', dueOn: '2026-08-01', externalUrl: '', metadata: {}, updatedAt: '2026-08-03T00:00:00Z' },
+  // Same paid invoice on c2, linked twice.
+  { id: 'i3-teammate', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv2', status: 'paid', amountCents: 200000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-07-30T00:00:00Z' },
+  // Same open proposal on c1, linked twice.
+  { id: 'i2-teammate', caseId: 'c1', provider: 'pandadoc', recordType: 'document', externalId: 'doc1', status: 'document.sent', amountCents: 350000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-07-30T00:00:00Z' },
+  // A contract on c2 the provider says is completed; the teammate's stale
+  // copy still reads "sent" (and was edited more recently) and must not
+  // count as pending.
+  { id: 'i4', caseId: 'c2', provider: 'pandadoc', recordType: 'document', externalId: 'doc9', status: 'document.completed', amountCents: 500000, currency: 'USD', externalUrl: '', metadata: {}, lastSyncedAt: '2026-08-02T00:00:00Z', updatedAt: '2026-08-02T00:00:00Z' },
+  { id: 'i4-teammate', caseId: 'c2', provider: 'pandadoc', recordType: 'document', externalId: 'doc9', status: 'document.sent', amountCents: 500000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-04T00:00:00Z' },
+];
+const duplicated = business.computeBusinessDashboard(cases, referrals, { stages, integrations: [...syncedIntegrations, ...teammateCopies] }, 90, new Date(2026, 7, 6, 12));
+equal('a record linked twice counts once: revenue', {
+  quoted: duplicated.quotedRevenue,
+  collected: duplicated.collectedRevenue,
+  outstanding: duplicated.outstandingRevenue,
+}, { quoted: 3000, collected: 2500, outstanding: 500 });
+equal('a record linked twice counts once: invoices and contracts', [duplicated.pendingContracts, duplicated.pendingContractRevenue, duplicated.openInvoices, duplicated.overdueInvoices], [1, 3500, 1, 1]);
+equal('a record linked twice counts once: per source', duplicated.sources.map((item) => [item.source, item.quoted, item.collected]), [
+  ['Website', 1000, 500],
+  ['Professional referral', 2000, 2000],
+]);
+const pick = (rows) => business.uniqueIntegrations(rows).map((item) => item.id);
+const row = (overrides) => ({ caseId: 'c1', provider: 'square', recordType: 'invoice', externalId: 'inv1', status: 'unpaid', amountCents: null, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z', ...overrides });
+equal('the synced copy wins over a more recently edited one', pick([row({ id: 'b', updatedAt: '2026-08-09T00:00:00Z', amountCents: 100 }), row({ id: 'a', lastSyncedAt: '2026-08-01T00:00:00Z' })]), ['a']);
+equal('then a copy with an amount', pick([row({ id: 'a', updatedAt: '2026-08-09T00:00:00Z' }), row({ id: 'b', amountCents: 100 })]), ['b']);
+equal('then the most recent edit, then the lower id', [
+  pick([row({ id: 'a' }), row({ id: 'b', updatedAt: '2026-08-02T00:00:00Z' })]),
+  pick([row({ id: 'b' }), row({ id: 'a' })]),
+], [['b'], ['a']]);
+equal('distinct records, cases, record types and providers all stay', pick([
+  row({ id: '1' }),
+  row({ id: '2', externalId: 'inv2' }),
+  row({ id: '3', caseId: 'c2' }),
+  row({ id: '4', recordType: 'payment' }),
+  row({ id: '5', provider: 'pandadoc', recordType: 'document' }),
+]), ['1', '2', '3', '4', '5']);
+
 // ─── Speed to lead ──────────────────────────────────────────────────────────
 // A lead is a case with leadCapturedAt; its clock stops at firstTouchAt. The
 // fixture mirrors supabase/tests/lead_capture_test.sql section 7.
@@ -146,6 +192,17 @@ equal('per-source lead counts', leadResult.sources.map((item) => [item.source, i
   ['Inbound call', 2, 2, 0],
 ]);
 equal('the dashboard target defaults to 15 minutes', business.computeBusinessDashboard(leadCases, [], { stages: [], integrations: [] }, 90, leadNow).speedToLead.targetMinutes, 15);
+
+equal('whole-dollar fields read what people type, and refuse what they would misread', [
+  business.parseWholeDollars(''),
+  business.parseWholeDollars('1500'),
+  business.parseWholeDollars('$1,500'),
+  business.parseWholeDollars('1,500.00'),
+  business.parseWholeDollars('0'),
+  business.parseWholeDollars('1500.50'),
+  business.parseWholeDollars('4,50'),
+  business.parseWholeDollars('abc'),
+], [null, 1500, 1500, 1500, 0, undefined, undefined, undefined]);
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

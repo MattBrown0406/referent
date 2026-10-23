@@ -4,8 +4,18 @@
 export const INTAKE_TOKEN_PATTERN = /^[0-9a-f]{32,64}$/;
 
 // Rate limits (fixed windows, enforced server-side in intake_rate_limit_hit).
+// TOKEN_LIMIT and IP_LIMIT are charged only for a submission that would
+// create a lead, so junk posts cannot lock a practice's link.
+// IP_POST_LIMIT is charged for every POST from one address (honeypot,
+// invalid, or real) and is looser, so a family fixing a typo is never
+// locked out while one address still cannot hammer the endpoint.
 export const TOKEN_LIMIT = { perWindow: 30, windowSeconds: 3600 };
 export const IP_LIMIT = { perWindow: 6, windowSeconds: 3600 };
+export const IP_POST_LIMIT = { perWindow: 20, windowSeconds: 3600 };
+
+export type RateLimit = { perWindow: number; windowSeconds: number };
+// Resolves true while the bucket is within its limit (and counts this hit).
+export type RateLimitHit = (bucket: string, limit: RateLimit) => Promise<boolean>;
 
 export const URGENCY_CHOICES = ['none', 'immediate_danger'] as const;
 export type Urgency = (typeof URGENCY_CHOICES)[number];
@@ -108,6 +118,40 @@ export function clientAddress(headers: Headers): string {
 
 export function bucketNames(token: string, addressHash: string): { token: string; ip: string | null } {
   return { token: `token:${token}`, ip: addressHash ? `ip:${addressHash}` : null };
+}
+
+export function postBucketName(addressHash: string): string | null {
+  return addressHash ? `ip-post:${addressHash}` : null;
+}
+
+export type PostDecision =
+  | { kind: 'limited' }
+  | { kind: 'bad_content_type' }
+  | { kind: 'honeypot' }
+  | { kind: 'invalid'; reason: string }
+  | { kind: 'lead'; lead: IntakeLead };
+
+// The POST pipeline, in order: the per-address all-posts bucket; read the
+// form (null = not a form post); honeypot and validation; and only then the
+// per-address lead bucket followed by the per-token bucket. A post that will
+// not create a lead never touches the practice's token bucket, and a lead
+// refused by the address bucket does not spend the token bucket either.
+export async function admitPost(
+  token: string,
+  addressHash: string,
+  readForm: () => Promise<URLSearchParams | null>,
+  hit: RateLimitHit,
+): Promise<PostDecision> {
+  const postBucket = postBucketName(addressHash);
+  if (postBucket && !(await hit(postBucket, IP_POST_LIMIT))) return { kind: 'limited' };
+  const form = await readForm();
+  if (!form) return { kind: 'bad_content_type' };
+  const parsed = parseSubmission(form);
+  if (parsed.kind !== 'lead') return parsed;
+  const buckets = bucketNames(token, addressHash);
+  if (buckets.ip && !(await hit(buckets.ip, IP_LIMIT))) return { kind: 'limited' };
+  if (!(await hit(buckets.token, TOKEN_LIMIT))) return { kind: 'limited' };
+  return parsed;
 }
 
 // ─── Pages ──────────────────────────────────────────────────────────────────

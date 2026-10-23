@@ -23,6 +23,16 @@ SELECT org_id, 'directory', true, 'manual'
   FROM public.org_members
  WHERE user_id IN ('a2000000-0000-0000-0000-00000000000a', 'a3000000-0000-0000-0000-00000000000a');
 
+-- Network stats count only established workspaces (20261024120000): both
+-- practices are 60 days old with three cases each.
+UPDATE public.orgs SET created_at = now() - interval '60 days'
+ WHERE id IN (SELECT org_id FROM public.org_members
+               WHERE user_id IN ('a2000000-0000-0000-0000-00000000000a', 'a3000000-0000-0000-0000-00000000000a'));
+INSERT INTO public.cases (owner_id, title)
+SELECT u.id, 'Established fixture ' || g
+  FROM unnest(ARRAY['a2000000-0000-0000-0000-00000000000a', 'a3000000-0000-0000-0000-00000000000a']::uuid[]) AS u(id),
+       generate_series(1, 3) AS g;
+
 -- ─── Curator seeds listings ─────────────────────────────────────────────────
 
 SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-00000000000a', true);

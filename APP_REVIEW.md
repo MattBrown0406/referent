@@ -70,7 +70,11 @@ Suggested reply — paste into the App Store Connect message thread:
 > content or feature has ever been sold for this app.
 >
 > **4. What paid content is unlocked without In-App Purchase?** None. All
-> functionality is free for every account.
+> functionality is free for every account. One optional feature, AI-drafted
+> follow-up messages, can use the practitioner's own API key from a
+> third-party AI provider (Anthropic), which they obtain and manage with that
+> provider directly. ReferralFit does not sell, resell, or receive payment for
+> it, and the app links to no purchase.
 >
 > **5. Are the enterprise services sold to single users, consumers, or for
 > family use?** No enterprise services are sold. ReferralFit is a free
@@ -127,9 +131,10 @@ never write it here.
 > partner) gives a ready draft to edit and send from the iPhone's own Messages
 > or Mail; it works without any setup. "Draft with AI" is optional and uses
 > the practice's own Anthropic API key, which the user adds in the app and
-> which is billed by Anthropic to their own Anthropic account. ReferralFit
-> sells nothing and receives no payment for it. Before a key is added, the
-> app explains exactly what is sent to Anthropic.
+> under their own Anthropic account. ReferralFit sells nothing and receives no
+> payment for it. Before a key is added, the app explains exactly what is
+> sent to Anthropic. Trying "Draft with AI" needs your own Anthropic key;
+> every other part of Follow up works without one.
 >
 > Push notifications are optional. Local reminders (daily briefing,
 > follow-up cadence) are scheduled on the device; server-sent pushes (a new

@@ -45,12 +45,13 @@ async function functionErrorBody(error: unknown): Promise<FunctionErrorBody> {
 const OFFLINE_MESSAGE = 'No connection. Write this one yourself, or try again when you are back online.';
 const KEY_CODES = ['key_required', 'key_invalid', 'key_forbidden'];
 
-// The user's own Anthropic key rides along in a header on every call; the
-// function uses it for that one request and never stores it.
-async function invokeDraftFunction(body: unknown, apiKey: string): Promise<unknown> {
+// The user's own Anthropic key rides along in the request body on every call
+// (never a header: platform request logs can record headers); the function
+// uses it for that one request and never stores it.
+async function invokeDraftFunction(body: Record<string, unknown>, apiKey: string): Promise<unknown> {
   let result: Awaited<ReturnType<typeof supabase.functions.invoke>>;
   try {
-    result = await supabase.functions.invoke('draft-follow-up', { body: body as Record<string, unknown>, headers: { 'x-anthropic-key': apiKey } });
+    result = await supabase.functions.invoke('draft-follow-up', { body: { ...body, anthropicKey: apiKey } });
   } catch {
     throw new DraftUnavailableError(OFFLINE_MESSAGE, 'offline');
   }
@@ -81,7 +82,7 @@ function isDraft(value: unknown): value is OutreachDraft {
 }
 
 export async function requestOutreachDraft(body: DraftRequestBody, apiKey: string): Promise<{ draft: OutreachDraft; remaining: number | null }> {
-  const data = await invokeDraftFunction(body, apiKey) as { draft?: unknown; remaining?: unknown } | null;
+  const data = await invokeDraftFunction(body as unknown as Record<string, unknown>, apiKey) as { draft?: unknown; remaining?: unknown } | null;
   if (!data || !isDraft(data.draft)) {
     throw new DraftUnavailableError('The draft came back unreadable. Try again.', 'unavailable');
   }

@@ -37,8 +37,8 @@ The sheet:
 3. **Anything to mention?** (optional) and **✦ Draft with AI**. With no key
    on the phone yet, **Turn on AI drafts** explains that drafts run on the
    user's own Anthropic account, says exactly what is sent and to whom (App
-   Review guideline 5.1.2(i)), links to the Anthropic Console to create a
-   key, and takes the pasted key. The key is checked with Anthropic (a free
+   Review guideline 5.1.2(i)), says where to create a key (as text, not a
+   link, and with no prices: App Review 3.1), and takes the pasted key. The key is checked with Anthropic (a free
    model-list call) before it is saved; saving it is the user's agreement.
    **Workspace → AI drafts** shows the saved key masked (`sk-ant-…a1B2`)
    with Replace and Remove.
@@ -83,9 +83,11 @@ follow-up, and a step deleted in the meantime does not block the log.
   iCloud Keychain or backups, never written to ReferralFit's database).
   Another account signed in on the same phone cannot use it. Deleting the
   account removes it; signing out keeps it for that account's next sign-in.
-- Sent with each draft request in the `x-anthropic-key` header over TLS. The
+- Sent with each draft request in the JSON body (`anthropicKey`) over TLS —
+  never a header, because platform request logs can record headers. The
   function checks its shape (`sk-ant-…`), uses it for that one Anthropic call,
-  and never stores, logs, or returns it.
+  and never stores, logs, or returns it. Cancelling setup while the key is
+  being checked saves nothing and drafts nothing.
 - Anthropic's answers are passed back in plain words: a key Anthropic does
   not accept (or without permission) sends the user back to **Update your
   Anthropic key**; no credit or billing, or the account's rate limit, says so.
@@ -126,9 +128,11 @@ screen says so.
 
 ## Deploy
 
-The function needs the migration. The app works before either (Draft with AI
-says drafting is unavailable; the starting draft and sending still work).
-There is no Anthropic secret to set on the server.
+Both are live in production as of 2026-10-23 (migration applied and
+recorded; function deployed). The order matters for any future environment:
+the migration first, because a build with this feature records every send
+with `record_outreach_sent`. There is no Anthropic secret to set on the
+server.
 
 ### 1. Apply the migration
 
@@ -179,16 +183,17 @@ confirmation shows a follow-up two days out, the case timeline shows the
 text, and Today shows the new step on that date.
 
 Without a device, with a signed-in user's access token in `$TOKEN`, a case
-id from that user's workspace in `$CASE`, and an Anthropic key in `$KEY`:
+id from that user's workspace in `$CASE`, and an Anthropic key in `$KEY`
+(the key goes in the body, as the app sends it):
 
 ```sh
 curl -s -X POST "https://ovfafffvcpaahktvlsdm.supabase.co/functions/v1/draft-follow-up" \
-  -H "Authorization: Bearer $TOKEN" -H "x-anthropic-key: $KEY" -H 'content-type: application/json' \
-  -d '{"channel":"text","target":{"kind":"case","caseId":"'"$CASE"'"},"recipient":{"firstName":"Ana","relationship":"mother"},"sender":{"firstName":"Matt","practiceName":"Freedom Interventions"},"situation":{"stage":"inquiry","attempt":2,"lastChannel":"call","daysSinceLastContact":2,"purpose":"follow_up"}}'
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"anthropicKey":"'"$KEY"'","channel":"text","target":{"kind":"case","caseId":"'"$CASE"'"},"recipient":{"firstName":"Ana","relationship":"mother"},"sender":{"firstName":"Matt","practiceName":"Freedom Interventions"},"situation":{"stage":"inquiry","attempt":2,"lastChannel":"call","daysSinceLastContact":2,"purpose":"follow_up"}}'
 ```
 
 Expect `{"draft":{"channel":"text","body":"…"},"remaining":199}`. The same
-call with the body `{"action":"verify"}` checks the key and returns
+call with the body `{"anthropicKey":"…","action":"verify"}` checks the key and returns
 `{"ok":true}`.
 
 ### 4. Ship a native build
@@ -212,9 +217,9 @@ the user's own Anthropic account, so nothing is sold.
 | Request | Response |
 | --- | --- |
 | No or bad `Authorization` | 401 `unauthorized` |
-| No `x-anthropic-key`, or not shaped like `sk-ant-…` | 400 `key_required` |
-| Anthropic does not accept the key / key lacks permission | 401 `key_invalid` / 403 `key_forbidden` |
-| Anthropic rejects the request (no credit or billing) | 400 `key_rejected` |
+| No `anthropicKey` in the body, or not shaped like `sk-ant-…` | 400 `key_required` |
+| Anthropic does not accept the key / key lacks permission or the model | 401 `key_invalid` / 403 `key_forbidden` |
+| Anthropic rejects the request (usually the account; logged by status and type) | 400 `key_rejected` |
 | The user's Anthropic account is rate-limited | 429 `key_rate_limited` |
 | `{"action":"verify"}` with a working key | 200 `{ ok: true }` (no draft, no cap) |
 | Unreadable body, unknown channel, bad id, no recipient name | 400 `bad_request` |

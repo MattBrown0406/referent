@@ -169,6 +169,21 @@ export function parseOptionalPositiveUsdCents(input: string): number | null | un
   return Math.round(dollars * 100);
 }
 
+// Whole-dollar money fields (quotes, payments, costs, budgets): "$1,500",
+// "1500", or "1,500.00" → 1500; blank → null; "0" → 0. Anything else
+// (decimal commas, cents, words) → undefined so the caller can say so,
+// instead of "1500.00" silently becoming 150000 or "4,500" becoming 0.
+export function parseWholeDollars(input: string): number | null | undefined {
+  const value = input.trim();
+  if (!value) return null;
+  if (/^\$?0+(?:\.0{1,2})?$/.test(value)) return 0;
+  const cents = parseOptionalPositiveUsdCents(value);
+  if (typeof cents !== 'number' || cents % 100 !== 0) return undefined;
+  return cents / 100;
+}
+
+export const WHOLE_DOLLARS_HINT = 'Enter whole dollars, like 1500 or $1,500.';
+
 type StageRow = {
   id: string;
   case_id: string;
@@ -330,6 +345,46 @@ const terminalInvoiceStatuses = new Set(['paid', 'canceled', 'cancelled', 'refun
 
 type CaseRevenue = { quoted: number; collected: number; outstanding: number };
 
+// case_integrations is unique on (owner_id, provider, record_type,
+// external_id), so two teammates can each link the same Square invoice or
+// PandaDoc document to one case. Counted twice, that doubles quoted,
+// collected and outstanding revenue and the open-invoice, overdue and
+// pending-contract figures. The dashboard counts one row per (case,
+// provider, record type, external id); the rows themselves stay as they are
+// so each teammate can still see and remove their own link.
+export function integrationRecordKey(item: Pick<CaseIntegration, 'caseId' | 'provider' | 'recordType' | 'externalId'>): string {
+  return JSON.stringify([item.caseId, item.provider, item.recordType, item.externalId.trim()]);
+}
+
+function timestamp(value: string | undefined): number {
+  const time = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(time) ? time : Number.NEGATIVE_INFINITY;
+}
+
+// Which copy speaks for the record: the one the provider synced most
+// recently (webhooks update only the connecting owner's row, so a teammate's
+// copy goes stale), then one that carries an amount, then the most recently
+// edited, then the lower id so the choice is stable.
+function preferredIntegration(a: CaseIntegration, b: CaseIntegration): CaseIntegration {
+  const synced = timestamp(a.lastSyncedAt) - timestamp(b.lastSyncedAt);
+  if (synced) return synced > 0 ? a : b;
+  const amount = Number(a.amountCents != null) - Number(b.amountCents != null);
+  if (amount) return amount > 0 ? a : b;
+  const updated = timestamp(a.updatedAt) - timestamp(b.updatedAt);
+  if (updated) return updated > 0 ? a : b;
+  return a.id <= b.id ? a : b;
+}
+
+export function uniqueIntegrations(integrations: CaseIntegration[]): CaseIntegration[] {
+  const kept = new Map<string, CaseIntegration>();
+  for (const item of integrations) {
+    const key = integrationRecordKey(item);
+    const current = kept.get(key);
+    kept.set(key, current ? preferredIntegration(current, item) : item);
+  }
+  return [...kept.values()];
+}
+
 function revenueForCase(record: CaseRecord, integrations: CaseIntegration[]): CaseRevenue {
   const squareInvoices = integrations.filter((item) => item.caseId === record.id
     && item.provider === 'square' && item.recordType === 'invoice' && item.amountCents != null);
@@ -395,7 +450,8 @@ export function computeBusinessDashboard(
   const engaged = scopedCases.filter((record) => hasReached(record, scopedStages, 'engaged')).length;
   const placed = scopedCases.filter((record) => hasReached(record, scopedStages, 'placed')).length;
   const base = scopedCases.length || 1;
-  const scopedIntegrations = data.integrations.filter((item) => scopedIds.has(item.caseId));
+  // One row per linked record per case, whoever linked it (uniqueIntegrations).
+  const scopedIntegrations = uniqueIntegrations(data.integrations.filter((item) => scopedIds.has(item.caseId)));
   const revenueByCase = new Map(scopedCases.map((record) => [record.id, revenueForCase(record, scopedIntegrations)]));
 
   const sourceMap = new Map<string, LeadSourceMetric>();

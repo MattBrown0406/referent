@@ -162,6 +162,30 @@ console.log('PACKET 3 — audience: FAMILY (cash pay + budget fixture)');
 console.log('═'.repeat(64));
 console.log(buildPacket(profileCash, partnerB, reasonsB, 'family'));
 
+// ─── 4. A cash cost not on file is never "within budget" ───────────────────
+// 0 is how a cost that was never entered is stored. It used to read
+// "Monthly cash cost is $0 — within the $2,500 budget".
+const partnerNoCost = { ...partnerB, monthlyCost: 0, cashMin: 0, cashMax: 0 };
+const reasonsNoCost = buildFitReasons(profileCash, partnerNoCost, fitB);
+assert(reasonsNoCost.includes('Monthly cash cost not on file — confirm it with the program'));
+assert(!reasonsNoCost.some((reason) => reason.includes('$0') || reason.includes('within')), 'an unknown cost never claims to fit the budget');
+assert(!buildPacket(profileCash, partnerNoCost, reasonsNoCost, 'family').includes('$0'));
+// The legacy range stands in for a blank monthly cost, as it does on load.
+assert(buildFitReasons(profileCash, { ...partnerB, monthlyCost: 0, cashMin: 1200, cashMax: 2400 }, fitB).includes('Monthly cash cost is $2,400 — within the $2,500 budget'));
+// A budget of 0 is no budget (as in the ranking), so nothing is "within" it.
+assert(buildFitReasons({ ...profileCash, maxBudget: 0 }, partnerB, fitB).includes('Monthly cash cost: $2,400'));
+
+// ─── 5. Away from home: the state is home, not where to look ───────────────
+const awayProfile = { ...profileInsurance, locationPreference: 'Away from home' };
+const awayFit = { ...fitA, locationPreference: 'Away from home' };
+assert(buildFitReasons(awayProfile, { ...partnerA, state: 'CA' }, { ...awayFit, sameState: false }).includes('Outside Oregon, away from home'));
+const awayInState = buildFitReasons(awayProfile, partnerA, { ...awayFit, sameState: true });
+assert(!awayInState.some((reason) => reason.includes('Oregon')), 'a home-state program gets no location bullet when the family wants distance');
+const awayPacket = buildPacket(awayProfile, partnerA, reasonsA, 'partner');
+assert(awayPacket.includes('- Home state: Oregon') && awayPacket.includes('- Location preference: Away from home'));
+assert(!awayPacket.includes('- Location: Oregon'));
+assert(buildPacket(profileInsurance, partnerA, reasonsA, 'partner').includes('- Location: Oregon'), 'other preferences keep the Location line');
+
 // ─── De-identification heuristic spot checks ───────────────────────────────
 
 console.log('\n' + '─'.repeat(64));

@@ -20,6 +20,7 @@ import {
   type BusinessPeriod,
   computeBusinessDashboard,
   type CaseIntegration,
+  uniqueIntegrations,
 } from './business';
 
 type Props = {
@@ -98,7 +99,8 @@ export default function BusinessDashboard({
   );
   const speed = metrics.speedToLead;
   const today = localDateStamp(new Date());
-  const attention = data.integrations.filter((record) => needsAttention(record, today));
+  // One row per linked invoice or contract, even when two teammates linked it.
+  const attention = uniqueIntegrations(data.integrations).filter((record) => needsAttention(record, today));
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
@@ -329,7 +331,7 @@ export default function BusinessDashboard({
                 return (
                   <TouchableOpacity
                     key={record.id}
-                    onPress={() => record.externalUrl ? Linking.openURL(record.externalUrl) : onOpenCase(record.caseId)}
+                    onPress={() => (record.externalUrl ? Linking.openURL(record.externalUrl).catch(() => onOpenCase(record.caseId)) : onOpenCase(record.caseId))}
                     style={[styles.attentionRow, index === attention.length - 1 && styles.lastRow]}
                   >
                     <View style={styles.attentionBadge}><Text style={styles.attentionBadgeText}>{record.provider === 'square' ? 'S' : 'P'}</Text></View>

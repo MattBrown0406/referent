@@ -91,9 +91,20 @@ function daysBetween(a: Date, b: Date): number {
   return Math.round((bDay - aDay) / 86400000);
 }
 
+// lastContact is a YYYY-MM-DD stamp: a LOCAL calendar day. new Date('2026-10-20')
+// would be UTC midnight — the evening before in US time zones — and every
+// cadence would count one day too many (mirrors partnerDaysSinceContact in
+// today.ts, so reminders and Today agree).
+function parseContactBasis(basis: string): Date {
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(basis);
+  return dateOnly
+    ? new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]))
+    : new Date(basis);
+}
+
 function daysSinceContact(partner: Partner, now = new Date()): number {
   const basis = partner.lastContact || partner.createdAt || '';
-  const parsed = new Date(basis);
+  const parsed = parseContactBasis(basis);
   const basisDay = Number.isNaN(parsed.getTime()) ? startOfToday(now) : startOfToday(parsed);
   return Math.max(0, daysBetween(basisDay, now));
 }
@@ -134,7 +145,41 @@ export type NotificationInput = {
   referrals: Referral[];
   followUps?: FollowUp[];
   cases?: CaseRecord[];
+  // Whose reminders these are. Defaults to the schedule owner (the ownerId
+  // passed to rescheduleNotifications, which App.tsx sets to the user id).
+  userId?: string;
+  // Who a case is assigned to; defaults to a lookup in `cases`.
+  caseAssignee?: (caseId: string) => string | undefined;
+  // 'mine' (default): follow-up reminders and consult alerts only for what is
+  // assigned to this user, or to nobody (Today's Mine rule). 'everyone'
+  // schedules every open follow-up in the workspace.
+  scope?: 'mine' | 'everyone';
 };
+
+// Today's Mine rule (filterTodaySections / cardAssignee in today.ts): a
+// follow-up is mine when it is assigned to me, or to nobody and its case is
+// assigned to me or to nobody. Teammates' work never buzzes this phone.
+export function followUpIsMine(
+  followUp: FollowUp,
+  userId: string,
+  caseAssignee: (caseId: string) => string | undefined,
+): boolean {
+  const me = userId.toLowerCase();
+  const assignee = followUp.assignedTo
+    ? followUp.assignedTo.toLowerCase()
+    : followUp.caseId ? caseAssignee(followUp.caseId)?.toLowerCase() : undefined;
+  return !assignee || assignee === me;
+}
+
+// The follow-ups this device should remind about, per the input's scope.
+export function reminderFollowUps(input: NotificationInput, ownerId: string): FollowUp[] {
+  const followUps = (input.followUps || []).filter((followUp) => followUp.status === 'open');
+  if (input.scope === 'everyone') return followUps;
+  const userId = input.userId || ownerId;
+  const assigneeByCase = new Map((input.cases || []).map((record) => [record.id, record.assignedTo]));
+  const caseAssignee = input.caseAssignee ?? ((caseId: string) => assigneeByCase.get(caseId));
+  return followUps.filter((followUp) => followUpIsMine(followUp, userId, caseAssignee));
+}
 
 function dateStamp(date: Date): string {
   const year = date.getFullYear();
@@ -194,7 +239,11 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   await Notifications.cancelAllScheduledNotificationsAsync();
   if (!isScheduleCurrent(generation, ownerId)) return;
 
-  const { partners, followUps = [] } = input;
+  const { partners } = input;
+  // The user's own follow-ups and consult alerts come before partner cadence
+  // nags: with many partners past cadence the nags alone would use up the
+  // MAX_SCHEDULED slots and the user's own reminders would never be set.
+  const followUps = reminderFollowUps(input, ownerId);
   let remaining = MAX_SCHEDULED;
   const now = new Date();
 
@@ -228,6 +277,34 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
       content: {
         title: 'Consult in 30 minutes',
         body: `${followUp.title} · ${followUp.dueTime}`,
+        data: { target: 'home', ownerId },
+        ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+      },
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DATE,
+        date: when,
+        ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+      },
+    })) remaining -= 1;
+  }
+
+  const openFollowUps = followUps
+    .filter((followUp) => followUp.status === 'open' && !(followUp.kind === 'consult' && followUp.dueTime))
+    .sort((a, b) => (a.snoozedUntil || a.dueOn).localeCompare(b.snoozedUntil || b.dueOn));
+  const partnerById = new Map(partners.map((partner) => [partner.id, partner]));
+  for (const followUp of openFollowUps) {
+    if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;
+    const effectiveDue = followUp.snoozedUntil || followUp.dueOn;
+    const parsed = new Date(`${effectiveDue}T12:00:00`);
+    if (Number.isNaN(parsed.getTime())) continue;
+    const dueDay = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+    let when = atTime(dueDay, 9, 0);
+    if (when.getTime() <= now.getTime()) when = nextTime(9, 0, now);
+    const partnerName = followUp.partnerId ? partnerById.get(followUp.partnerId)?.name : undefined;
+    if (await scheduleIfCurrent(generation, ownerId, {
+      content: {
+        title: 'Follow-up due',
+        body: partnerName ? `${followUp.title} — ${partnerName}` : followUp.title,
         data: { target: 'home', ownerId },
         ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
       },
@@ -283,34 +360,6 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
         },
       })) remaining -= 1;
     }
-  }
-
-  const openFollowUps = followUps
-    .filter((followUp) => followUp.status === 'open' && !(followUp.kind === 'consult' && followUp.dueTime))
-    .sort((a, b) => (a.snoozedUntil || a.dueOn).localeCompare(b.snoozedUntil || b.dueOn));
-  const partnerById = new Map(partners.map((partner) => [partner.id, partner]));
-  for (const followUp of openFollowUps) {
-    if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;
-    const effectiveDue = followUp.snoozedUntil || followUp.dueOn;
-    const parsed = new Date(`${effectiveDue}T12:00:00`);
-    if (Number.isNaN(parsed.getTime())) continue;
-    const dueDay = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
-    let when = atTime(dueDay, 9, 0);
-    if (when.getTime() <= now.getTime()) when = nextTime(9, 0, now);
-    const partnerName = followUp.partnerId ? partnerById.get(followUp.partnerId)?.name : undefined;
-    if (await scheduleIfCurrent(generation, ownerId, {
-      content: {
-        title: 'Follow-up due',
-        body: partnerName ? `${followUp.title} — ${partnerName}` : followUp.title,
-        data: { target: 'home', ownerId },
-        ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
-      },
-      trigger: {
-        type: Notifications.SchedulableTriggerInputTypes.DATE,
-        date: when,
-        ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
-      },
-    })) remaining -= 1;
   }
 }
 

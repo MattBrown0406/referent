@@ -131,6 +131,9 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
   const [keyProblem, setKeyProblem] = useState(false); // Anthropic refused the saved key
   const openGeneration = useRef(0);
   const sendingRef = useRef(false); // a second tap before re-render must not open Messages twice
+  const draftingRef = useRef(false); // …or request (and bill) two drafts
+  const stageRef = useRef<Stage>('compose');
+  stageRef.current = stage;
   const recordingRef = useRef(false); // …or log the same send twice
   const sentAtRef = useRef<Date | null>(null);
 
@@ -210,17 +213,19 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
   // AI drafts run on the user's own Anthropic key (the app is free). No key on
   // this phone yet → the setup screen, which explains what is shared first.
   async function draftWithAi(savedKey?: string) {
-    if (!request || !recipient || drafting) return;
+    if (!request || !recipient || draftingRef.current) return;
     if (!aiKeysSupported) {
       setDraftNotice('AI drafts are set up in the iPhone app. The starting draft below is yours to edit.');
       return;
     }
+    draftingRef.current = true;
+    const generation = openGeneration.current;
     const apiKey = savedKey || await getAnthropicKey(userId);
     if (!apiKey) {
-      setStage('setup');
+      draftingRef.current = false;
+      if (openGeneration.current === generation) setStage('setup');
       return;
     }
-    const generation = openGeneration.current;
     const forChannel = channel;
     setDrafting(true);
     setDraftNotice('');
@@ -245,11 +250,13 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
       setKeyProblem(error instanceof DraftUnavailableError && error.reason === 'key');
       setDraftNotice(error instanceof DraftUnavailableError ? error.message : 'Drafting is unavailable right now. The starting draft below is yours to edit.');
     } finally {
+      draftingRef.current = false;
       if (openGeneration.current === generation) setDrafting(false);
     }
   }
 
   function keySaved(apiKey: string) {
+    if (stageRef.current !== 'setup') return; // the user moved on; nothing is drafted
     setKeyProblem(false);
     setDraftNotice('');
     setStage('compose');

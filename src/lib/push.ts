@@ -1,6 +1,8 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 
+import { currentAuthSessionIdentity } from './auth-session';
 import { StoreError } from './errors';
 import { getNotificationPermissionState, requestNotificationPermission } from './notifications';
 import { supabase } from './supabase';
@@ -145,7 +147,71 @@ export async function saveNotificationPreferences(userId: string, preferences: N
 
 // ─── Device registration ────────────────────────────────────────────────────
 
+// The Expo push token this device registered, per account, on disk: an
+// in-memory copy alone is gone after an app restart, and an offline launch
+// never re-registers, so sign-out could not tell the server to stop pushing to
+// this device. `pendingUnregister` marks a sign-out (or push turned off) whose
+// unregister call could not reach the server; it is retried the next time
+// this account signs in on this device.
+const PUSH_REGISTRATION_KEY_PREFIX = 'referralfit-push-registration-v1:';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+type StoredPushRegistration = { version: 1; userId: string; token: string; pendingUnregister?: boolean };
+
 let registeredToken: string | null = null;
+let registeredUserId: string | null = null;
+
+function pushRegistrationKey(userId: string): string | null {
+  return UUID_RE.test(userId) ? `${PUSH_REGISTRATION_KEY_PREFIX}${userId.toLowerCase()}` : null;
+}
+
+async function readStoredRegistration(userId: string): Promise<StoredPushRegistration | null> {
+  const key = pushRegistrationKey(userId);
+  if (!key) return null;
+  try {
+    const raw = await AsyncStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredPushRegistration>;
+    if (parsed.version !== 1 || typeof parsed.token !== 'string' || !parsed.token
+        || typeof parsed.userId !== 'string' || parsed.userId.toLowerCase() !== userId.toLowerCase()) return null;
+    return { version: 1, userId: parsed.userId.toLowerCase(), token: parsed.token, ...(parsed.pendingUnregister ? { pendingUnregister: true } : {}) };
+  } catch {
+    return null;
+  }
+}
+
+// Best effort: a device that cannot save the record behaves as before.
+async function writeStoredRegistration(userId: string, token: string, pendingUnregister = false): Promise<void> {
+  const key = pushRegistrationKey(userId);
+  if (!key) return;
+  const record: StoredPushRegistration = { version: 1, userId: userId.toLowerCase(), token, ...(pendingUnregister ? { pendingUnregister: true } : {}) };
+  try {
+    await AsyncStorage.setItem(key, JSON.stringify(record));
+  } catch {
+    // ignore
+  }
+}
+
+async function clearStoredRegistration(userId: string): Promise<void> {
+  const key = pushRegistrationKey(userId);
+  if (!key) return;
+  try {
+    await AsyncStorage.removeItem(key);
+  } catch {
+    // ignore
+  }
+}
+
+// The account a registration belongs to: the caller's, else the session on
+// this device (read offline-tolerantly; it is only a storage key here).
+async function registrationOwner(userId?: string): Promise<string | null> {
+  if (userId) return userId.toLowerCase();
+  try {
+    return (await currentAuthSessionIdentity({ allowOffline: true }))?.userId ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export type PushRegistration = { ok: true; token: string } | { ok: false; reason: string };
 
@@ -172,8 +238,9 @@ async function expoPushToken(): Promise<string> {
 }
 
 // Register this device for the signed-in account. Never prompts: the OS
-// permission must already be granted.
-export async function registerThisDevice(): Promise<PushRegistration> {
+// permission must already be granted. `userId` (optional) names the account;
+// without it the signed-in session's user is used.
+export async function registerThisDevice(userId?: string): Promise<PushRegistration> {
   if (Platform.OS === 'web') return { ok: false, reason: 'Push notifications are not available on the web.' };
   if (await getNotificationPermissionState() !== 'authorized') {
     return { ok: false, reason: 'Notifications are off for ReferralFit in your phone’s Settings.' };
@@ -195,38 +262,86 @@ export async function registerThisDevice(): Promise<PushRegistration> {
     return { ok: false, reason: error.message || 'The device could not be registered.' };
   }
   registeredToken = token;
+  const owner = await registrationOwner(userId);
+  registeredUserId = owner;
+  if (owner) await writeStoredRegistration(owner, token);
   return { ok: true, token };
 }
 
 // The user-initiated path from Workspace settings: ask the OS (once), then
 // register. Returns the reason when it cannot be turned on.
-export async function enablePush(): Promise<PushRegistration> {
+export async function enablePush(userId?: string): Promise<PushRegistration> {
   if (Platform.OS === 'web') return { ok: false, reason: 'Push notifications are not available on the web.' };
   const granted = await requestNotificationPermission();
   if (!granted) return { ok: false, reason: 'Notifications are off for ReferralFit in your phone’s Settings. Turn them on there, then try again.' };
-  return registerThisDevice();
+  return registerThisDevice(userId);
 }
 
-// Sign-in: keep the registration fresh for members who turned push on.
+// Sign-in: keep the registration fresh for members who turned push on, and
+// finish an unregister that could not reach the server at the last sign-out.
 // Silent by design; any failure is simply "no push on this device".
 export async function refreshPushRegistration(userId: string): Promise<void> {
   try {
+    const stored = await readStoredRegistration(userId);
+    if (stored) {
+      registeredToken = stored.token;
+      registeredUserId = stored.userId;
+    }
     const { preferences, available } = await fetchNotificationPreferences(userId);
-    if (!available || !preferences.pushEnabled) return;
-    await registerThisDevice();
+    if (!available) return;
+    if (preferences.pushEnabled) {
+      await registerThisDevice(userId);
+      return;
+    }
+    if (stored?.pendingUnregister) await unregisterThisDevice(userId);
   } catch {
     // Offline, or the server does not have push yet.
   }
 }
 
-// Sign-out on this device: stop every push for this token.
-export async function unregisterThisDevice(): Promise<void> {
-  const token = registeredToken;
+// Sign-out (or push turned off) on this device: stop every push for this
+// token. Works after an app restart or an offline launch because the token is
+// read back from disk; if the server cannot be reached the unregister is
+// remembered and retried at this account's next sign-in. `userId` (optional)
+// names the account; without it the signed-in session's user is used.
+export async function unregisterThisDevice(userId?: string): Promise<void> {
+  const owner = await registrationOwner(userId ?? registeredUserId ?? undefined);
+  const stored = owner ? await readStoredRegistration(owner) : null;
+  const memoryToken = registeredToken && (!owner || !registeredUserId || registeredUserId === owner) ? registeredToken : null;
+  const token = memoryToken ?? stored?.token ?? null;
   registeredToken = null;
+  registeredUserId = null;
   if (!token) return;
+  let reached = false;
+  let offline = false;
   try {
-    await supabase.rpc('unregister_push_token', { p_token: token });
+    // An expired session with no connection would make the call below wait
+    // out supabase-js's refresh retries first; skip straight to "retry later".
+    offline = Boolean((await currentAuthSessionIdentity({ allowOffline: true }))?.offline);
   } catch {
-    // Best effort; the dispatcher prunes a dead token on its own.
+    offline = false;
   }
+  if (!offline) {
+    try {
+      const { error } = await supabase.rpc('unregister_push_token', { p_token: token });
+      // Any answer from the server (even "no such function") means retrying
+      // later would not help; only a lost connection is retried.
+      reached = !error || !isLostConnection(error);
+    } catch (error) {
+      reached = !isLostConnection(error);
+    }
+  }
+  if (!owner) return;
+  if (reached) await clearStoredRegistration(owner);
+  else await writeStoredRegistration(owner, token, true);
+}
+
+function isLostConnection(error: unknown): boolean {
+  const value = error as { name?: unknown; message?: unknown; code?: unknown; status?: unknown } | null;
+  if (!value) return false;
+  if (value.name === 'AuthRetryableFetchError') return true;
+  if (typeof value.status === 'number' || (typeof value.code === 'string' && /^[0-9A-Z]{5}$/.test(value.code))) return false;
+  const message = String(value.message ?? '').toLowerCase();
+  return message.includes('network request failed') || message.includes('failed to fetch') || message.includes('fetch failed')
+    || message.includes('timeout') || message.includes('offline') || message.includes('internet');
 }

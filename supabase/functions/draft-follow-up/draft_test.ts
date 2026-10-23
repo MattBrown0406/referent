@@ -7,7 +7,7 @@ import {
   DraftRequestError,
   LIMITS,
   outputSchema,
-  parseApiKeyHeader,
+  parseApiKey,
   parseDraftOutput,
   parseDraftRequest,
   SYSTEM_PROMPT,
@@ -166,14 +166,22 @@ Deno.test('clean collapses whitespace and control characters', () => {
   assertEquals(clean(42, 10), '');
 });
 
-Deno.test('parseApiKeyHeader accepts an Anthropic key and nothing else', () => {
+Deno.test('parseApiKey accepts an Anthropic key and nothing else', () => {
   const key = `sk-ant-api03-${'a'.repeat(80)}_-Z9`;
-  assertEquals(parseApiKeyHeader(key), key);
-  assertEquals(parseApiKeyHeader(`  ${key}\n`), key, 'surrounding whitespace is trimmed');
-  assertEquals(parseApiKeyHeader(null), null);
-  assertEquals(parseApiKeyHeader(''), null);
-  assertEquals(parseApiKeyHeader('sk-ant-short'), null);
-  assertEquals(parseApiKeyHeader(`sk-proj-${'a'.repeat(40)}`), null, 'another provider\'s key');
-  assertEquals(parseApiKeyHeader(`sk-ant-${'a'.repeat(30)} DROP`), null, 'no spaces inside');
-  assertEquals(parseApiKeyHeader(`sk-ant-${'a'.repeat(300)}`), null, 'absurd length');
+  assertEquals(parseApiKey(key), key);
+  assertEquals(parseApiKey(`  ${key}\n`), key, 'surrounding whitespace is trimmed');
+  assertEquals(parseApiKey(null), null);
+  assertEquals(parseApiKey(42), null);
+  assertEquals(parseApiKey(''), null);
+  assertEquals(parseApiKey('sk-ant-short'), null);
+  assertEquals(parseApiKey(`sk-proj-${'a'.repeat(40)}`), null, 'another provider\'s key');
+  assertEquals(parseApiKey(`sk-ant-${'a'.repeat(30)} DROP`), null, 'no spaces inside');
+  assertEquals(parseApiKey(`sk-ant-${'a'.repeat(300)}`), null, 'absurd length');
+});
+
+Deno.test('the key in the body never reaches the parsed draft request or the prompt', () => {
+  const key = `sk-ant-api03-${'k'.repeat(60)}`;
+  const parsed = parseDraftRequest({ ...caseRequest(), anthropicKey: key });
+  assert(!JSON.stringify(parsed).includes(key));
+  assert(!buildUserPrompt(parsed).includes(key));
 });

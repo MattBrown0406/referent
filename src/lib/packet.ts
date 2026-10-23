@@ -1,6 +1,6 @@
 import { financialRelationshipLabel, formatMoney, stateOptions } from '../data';
 import type { InsuranceNetworkPreference, Partner, ReferralMatch } from '../data';
-import { hasFinancialRelationship, type ProgramScore } from './matching';
+import { hasFinancialRelationship, knownMonthlyCostForPartner, type ProgramScore } from './matching';
 
 // ─── Match Packet generator ─────────────────────────────────────────────────
 // Pure text builder — no React, no Supabase, no side effects — so it can be
@@ -64,13 +64,13 @@ export function buildFitReasons(matchProfile: ReferralMatch, partner: Partner, f
     reasons.push(`Provides ${matchProfile.levelOfCare} level of care`);
   }
   if (matchProfile.insurance === 'Cash pay') {
-    const monthlyCost = partner.monthlyCost ?? partner.cashMax ?? partner.cashMin;
-    const withinBudget = matchProfile.maxBudget != null && monthlyCost <= matchProfile.maxBudget;
-    reasons.push(
-      withinBudget
-        ? `Monthly cash cost is ${formatMoney(monthlyCost)} — within the ${formatMoney(matchProfile.maxBudget as number)} budget`
-        : `Monthly cash cost: ${formatMoney(monthlyCost)}`,
-    );
+    // 0 is how a cost that was never entered is stored: say so, never "$0 —
+    // within budget". A budget of 0 is no budget, as in the ranking.
+    const monthlyCost = knownMonthlyCostForPartner(partner);
+    const budget = matchProfile.maxBudget && matchProfile.maxBudget > 0 ? matchProfile.maxBudget : null;
+    if (monthlyCost == null) reasons.push('Monthly cash cost not on file — confirm it with the program');
+    else if (budget != null && monthlyCost <= budget) reasons.push(`Monthly cash cost is ${formatMoney(monthlyCost)} — within the ${formatMoney(budget)} budget`);
+    else reasons.push(`Monthly cash cost: ${formatMoney(monthlyCost)}`);
   } else if (fit.networkStatus === 'In-network') {
     reasons.push(`In-network with ${matchProfile.insurance}`);
   } else if (fit.networkStatus === 'Out-of-network') {
@@ -80,7 +80,9 @@ export function buildFitReasons(matchProfile: ReferralMatch, partner: Partner, f
     const preference = fit.locationPreference;
     if (preference === 'Close to family' && fit.sameState) reasons.push(`In ${stateName(matchProfile.state)}, close to family`);
     else if (preference === 'Away from home' && fit.sameState === false) reasons.push(`Outside ${stateName(matchProfile.state)}, away from home`);
-    else reasons.push(`Serves ${stateName(matchProfile.state)}`);
+    // Away from home: the state is home, not the search area, so a program
+    // there gets no location bullet (it does not fit the preference).
+    else if (preference !== 'Away from home') reasons.push(`Serves ${stateName(matchProfile.state)}`);
   }
   if (fit.requiredNeeds.length) {
     reasons.push(`Provides ${fit.requiredNeeds.join(', ')} (required)`);
@@ -100,7 +102,10 @@ export function buildPacket(matchProfile: ReferralMatch, partner: Partner, fitRe
   const criteriaLines = [
     'CLIENT CRITERIA',
     `- Level of care: ${matchProfile.levelOfCare === 'Any type' ? 'Any level of care' : matchProfile.levelOfCare}`,
-    `- Location: ${stateName(matchProfile.state)}`,
+    // Under "Away from home" the state is where the family lives, not where to look.
+    matchProfile.locationPreference === 'Away from home' && matchProfile.state && matchProfile.state !== 'ANY'
+      ? `- Home state: ${stateName(matchProfile.state)}`
+      : `- Location: ${stateName(matchProfile.state)}`,
     `- Payment: ${matchProfile.insurance}`,
     matchProfile.insurance === 'Cash pay' && matchProfile.maxBudget != null
       ? `- Budget: up to ${formatMoney(matchProfile.maxBudget)}`

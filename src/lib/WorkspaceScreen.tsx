@@ -61,6 +61,7 @@ type Props = {
   // The account and its local session are already gone when this fires; the
   // caller resets in-memory state and lets the auth listener show sign-in.
   onAccountDeleted: () => void;
+  onSignOut: () => void;
   // Lead settings (intake token, first-call target) changed; the caller
   // refreshes what Today and the Business dashboard use.
   onLeadSettingsChanged?: () => void;
@@ -103,7 +104,7 @@ function profileStatusLabel(profile: NonNullable<OrgDirectoryProfileState['profi
   return profile.verifiedAt ? `Live · Verified ${profile.verifiedAt.slice(0, 10)}` : 'Live in the directory';
 }
 
-export default function WorkspaceScreen({ visible, userId, entitlements, onClose, onWorkspaceChanged, onEditDirectoryProfile, onAccountDeleted, onLeadSettingsChanged }: Props) {
+export default function WorkspaceScreen({ visible, userId, entitlements, onClose, onWorkspaceChanged, onEditDirectoryProfile, onAccountDeleted, onLeadSettingsChanged, onSignOut }: Props) {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [editingTarget, setEditingTarget] = useState<string | null>(null);
   const [linkCopied, setLinkCopied] = useState(false);
@@ -258,9 +259,11 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
 
   function saveTarget() {
     if (!workspace || editingTarget === null) return;
-    const minutes = Number(editingTarget.trim());
+    const text = editingTarget.trim();
+    const minutes = Number(text);
     setEditingTarget(null);
-    if (!Number.isInteger(minutes) || minutes === workspace.leadSettings.leadResponseTargetMinutes) return;
+    // A cleared field keeps the current target; a target is at least a minute.
+    if (!text || !Number.isInteger(minutes) || minutes < 1 || minutes === workspace.leadSettings.leadResponseTargetMinutes) return;
     void run(async () => {
       await updateLeadResponseTarget(workspace.orgId, minutes);
       await load();
@@ -698,6 +701,14 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 </View>
               </View>
             ) : null}
+
+            <View style={styles.card}>
+              <Text style={styles.cardLabel}>Sign out</Text>
+              <Text style={styles.helpText}>Signs this phone out of ReferralFit. Your workspace stays as it is, and you can sign back in any time.</Text>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Sign out" disabled={busy} onPress={onSignOut} style={[styles.smallButton, styles.helpTextSpaced, { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center' }]}>
+                <Text style={styles.smallButtonText}>Sign out</Text>
+              </TouchableOpacity>
+            </View>
 
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Delete account</Text>

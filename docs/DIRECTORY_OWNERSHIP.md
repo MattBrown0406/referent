@@ -1,7 +1,10 @@
 # Directory ownership: claimed listings and workspace profiles
 
-Migration: `supabase/migrations/20260928170000_claimed_listings_authoritative.sql`.
-Tests: `supabase/tests/claimed_listings_authoritative_test.sql`.
+Migration: `supabase/migrations/20260928170000_claimed_listings_authoritative.sql`,
+amended by `supabase/migrations/20261024120000_directory_membership_hardening.sql`
+(no automatic takeovers; every duplicate goes to admin review).
+Tests: `supabase/tests/claimed_listings_authoritative_test.sql`,
+`supabase/tests/directory_membership_hardening_test.sql`.
 
 Product rule (Matt, 2026-09-28): *once a listing has been claimed by a
 professional, that becomes authoritative, regardless of who created it*, and
@@ -22,7 +25,7 @@ Every directory listing (`global_partners`) is in exactly one ownership state.
 | --- | --- | --- | --- |
 | **Platform** | Hand-curated, or auto-published from the seed workspace (`docs/DIRECTORY_SEED_ROLLOUT.md`). | Platform admins; the seed workspace's edits push up. | Admin-controlled. Any other non-admin edit clears `verified_at` for review. |
 | **Center** | A program claims it in the center portal with an admin-issued claim code (`center_members` row). | The center account, in the portal. | Claiming stamps `verified_at` if it was empty. Every center edit re-stamps it `now()`. |
-| **Org** | A ReferralFit workspace built it as its own profile, took over a duplicate, or was granted a claim request (`owner_org_id`). One per workspace. | The workspace **owner**, in the app (Workspace → Your directory profile). | Created live + verified. Every owner edit re-stamps `verified_at`. |
+| **Org** | A ReferralFit workspace built it as its own profile (no duplicate existed), or a platform admin granted the workspace's claim request (`owner_org_id`). One per workspace. | The workspace **owner**, in the app (Workspace → Your directory profile). | Created live + verified. Every owner edit re-stamps `verified_at`. |
 
 "Claimed" = center **or** org (`public.global_listing_is_claimed(id)`).
 `public.global_listing_claimed_by_caller(id)` answers whether the signed-in
@@ -50,7 +53,7 @@ user is that listing's center member or a member of the owning workspace.
    and `cleanup_unlinked_global_partners` skip any listing with a center
    member, an owner workspace, or an open claim request.
 5. **Status stays admin-controlled.** Claiming does not activate a `pending`
-   listing; the org-profile paths (create, takeover, approval) do set
+   listing; the org-profile paths (create, approval) do set
    `status = 'active'` because the owner is attesting their own practice.
 
 ## Workspace profiles (self-serve)
@@ -76,20 +79,28 @@ Return value: `{"status": ..., "listing_id": ..., "request_id"?: ...}`.
 | --- | --- |
 | `created` | No duplicate; a new active, verified listing owned by the workspace. |
 | `updated` | The workspace already owned a listing; it was updated and re-verified. Status untouched (an admin-archived profile stays archived). |
-| `claimed` | An **unclaimed** duplicate (same phone digits or website domain, like `suggest_global_listing`) was taken over automatically, updated with the payload, set active + verified, and owned. |
-| `claim_requested` | A duplicate exists that the workspace may not take over automatically. A `center_claim_requests` row was recorded (or the existing open one returned). **Nothing on the listing changed.** |
+| `claim_requested` | A duplicate exists (same phone digits or website domain). A `center_claim_requests` row was recorded (or the existing open one returned). **Nothing on the listing changed**; a platform admin decides. |
+
+`claimed` (automatic takeover) was removed on 2026-10-24. Older app builds
+that still know the word simply never receive it.
 
 ### Anti-hijack rule
 
-Automatic takeover of an unclaimed duplicate happens **only** when one of:
+There is **no automatic takeover**. Whenever a duplicate exists — claimed
+or not, whoever created or submitted it — the profile save files a claim
+request and changes nothing on the listing until a platform admin approves
+it with `approve_center_claim_request`.
 
-- the lowercased domain of the caller's auth email equals the listing's
-  `website_domain` (and that domain is non-empty);
-- the listing's `created_by` is the caller;
-- the listing's `suggested_by_org_id` is the caller's workspace.
+Until 2026-10-24 three signals handed an unclaimed duplicate over on the
+spot: the caller's workspace had submitted it (`suggested_by_org_id`), the
+caller had created it (`created_by`), or the domain of the caller's sign-in
+email matched its website. None of them proves the caller *is* that
+program: practices submit listings for third-party programs they refer to,
+and sign-in emails are not confirmed. They are now only **hints** written
+into the request's `note` for the reviewer, for example
+`[submitted by this workspace; created by this user]` or
+`[sign-in email domain matches the website (unverified)]`.
 
-Any other match — and **always** when the duplicate is already claimed by a
-center or owned by another workspace — goes to the claim-request path.
 Re-submitting returns the same open request (one pending request per
 workspace per listing). A workspace never has more than one profile
 (`global_partners_owner_org_unique`).
@@ -128,8 +139,10 @@ SELECT r.id, r.created_at, r.note, o.name AS workspace, u.email AS requested_by,
  ORDER BY r.created_at;
 ```
 
-`r.payload` holds what the workspace tried to publish, for context. Approval
-does **not** apply it; the workspace edits the listing afterwards.
+`r.payload` holds what the workspace tried to publish, for context, and
+`r.note` carries the reviewer hints described under *Anti-hijack rule*
+(none of them is proof). Approval does **not** apply the payload; the
+workspace edits the listing afterwards.
 
 Approve (hands the listing to the workspace, sets it active + verified):
 
@@ -190,7 +203,7 @@ only backfills `verified_at` on listings that already have a center claim.
 - The app's profile form has no pickers for `levels` or `populations`; it
   sends `levels = types` and keeps existing `populations` (default `Adults`),
   exactly like the partner form.
-- Email-domain takeover compares against the listing's website domain only.
-  A workspace whose owner signs in with a public mailbox (gmail etc.) always
-  goes through the claim-request path when a duplicate exists.
+- Every duplicate needs an admin decision, including a listing the
+  practice itself submitted earlier through the partner flow. Expect more
+  claim requests in the queue than before 2026-10-24.
 - Approving a claim request does not apply the submitted payload.

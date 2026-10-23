@@ -67,6 +67,13 @@ trigger / hourly job  ->  notification_outbox  ->  push-dispatch (edge fn)  ->  
    as `DeviceNotRegistered` (in a ticket or a receipt) is deleted so it is
    never tried again. The service role has no table grants; it only runs
    those four RPCs.
+   A **transient** send failure (network error or timeout, Expo 5xx or 429,
+   `MessageRateExceeded`, a missing ticket) is recorded with `retry: true`:
+   `error` stays empty, the reason goes to `last_error`, and the claim picks
+   the row up again five minutes later, up to five attempts in all (then
+   `too_many_attempts`). Any other failure (`DeviceNotRegistered`,
+   `MessageTooBig`, other 4xx, no device) is final at once. Before
+   2026-10-24 every failure was final, so the retry never happened.
 
 ### What enqueues what
 
@@ -196,8 +203,9 @@ this device or build yet" until it is.
 SELECT count(*) AS devices, count(DISTINCT user_id) AS members FROM public.push_tokens;
 SELECT count(*) FILTER (WHERE push_enabled) AS push_on, count(*) AS rows FROM public.notification_preferences;
 
--- 2. Outbox health: waiting, sent in the last day, failed.
+-- 2. Outbox health: waiting (retrying = waiting after a transient failure), sent in the last day, failed.
 SELECT count(*) FILTER (WHERE sent_at IS NULL AND error IS NULL) AS waiting,
+       count(*) FILTER (WHERE sent_at IS NULL AND error IS NULL AND last_error IS NOT NULL) AS retrying,
        count(*) FILTER (WHERE sent_at > now() - interval '1 day') AS sent_today,
        count(*) FILTER (WHERE error IS NOT NULL) AS failed,
        max(sent_at) AS last_sent

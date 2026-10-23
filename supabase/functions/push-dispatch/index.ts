@@ -22,7 +22,9 @@ import {
   collectSendResults,
   EXPO_RECEIPTS_URL,
   EXPO_SEND_URL,
+  ExpoHttpError,
   isAuthorized,
+  isTransientSendFailure,
   type OutboxRow,
   RECEIPT_CHUNK,
   type Receipt,
@@ -52,7 +54,7 @@ function expoHeaders(): Record<string, string> {
 
 async function expoPost<T>(url: string, body: unknown): Promise<T> {
   const response = await fetch(url, { method: 'POST', headers: expoHeaders(), body: JSON.stringify(body) });
-  if (!response.ok) throw new Error(`Expo push API answered ${response.status}`);
+  if (!response.ok) throw new ExpoHttpError(response.status);
   return await response.json() as T;
 }
 
@@ -68,15 +70,18 @@ async function sendBatch(supabase: ReturnType<typeof serviceClient>, rows: Outbo
         tickets.push(got[index] || { status: 'error', message: 'no_ticket' });
       }
     } catch (error) {
+      // A network error or an Expo 5xx / 429 leaves these rows retryable;
+      // push_outbox_claim offers them again after five minutes.
+      const transient = isTransientSendFailure(error);
       for (let index = 0; index < part.length; index += 1) {
-        tickets.push({ status: 'error', message: (error as Error).message || 'send_failed' });
+        tickets.push({ status: 'error', message: (error as Error).message || 'send_failed', transient });
       }
     }
   }
   const { results, deadTokens } = collectSendResults(entries, tickets);
   // Rows that had no device at all (claim returned them with an empty list).
   for (const row of rows) {
-    if (!results.some((result) => result.id === row.id)) results.push({ id: row.id, tickets: [], error: 'no_device' });
+    if (!results.some((result) => result.id === row.id)) results.push({ id: row.id, tickets: [], error: 'no_device', retry: false });
   }
   const { error } = await supabase.rpc('push_outbox_record', { p_results: results, p_dead_tokens: deadTokens });
   if (error) throw error;

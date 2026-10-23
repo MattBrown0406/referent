@@ -92,7 +92,8 @@ export function nextStepDate(choice: WhenChoice, today: Date, customStamp?: stri
     case 'in3days': return dateStamp(addDays(today, 3));
     // Next-week snooze/scheduling convention in this app: +7 days.
     case 'nextweek': return dateStamp(addDays(today, 7));
-    case 'custom': return customStamp || dateStamp(today);
+    // The date picker opens on tomorrow; an untouched picker means tomorrow.
+    case 'custom': return customStamp || dateStamp(addDays(today, 1));
   }
 }
 

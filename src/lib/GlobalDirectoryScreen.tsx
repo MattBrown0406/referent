@@ -121,6 +121,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
   const [stats, setStats] = useState<Map<string, GlobalPartnerStats>>(new Map());
   const [favoriteIds, setFavoriteIds] = useState<Set<string>>(new Set());
   const [loadError, setLoadError] = useState('');
+  const [retryNonce, setRetryNonce] = useState(0);
   const [search, setSearch] = useState('');
   const [stateFilter, setStateFilter] = useState('');
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
@@ -173,7 +174,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     }, listings === null ? 0 : SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, entitled, userId, search, stateFilter, typeFilter, bedFilter]);
+  }, [visible, entitled, userId, search, stateFilter, typeFilter, bedFilter, retryNonce]);
 
   useEffect(() => {
     operationGenerationRef.current += 1;
@@ -266,7 +267,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
 
         {!entitlementKnown ? (
           <View style={styles.centered}>
-            <Text accessibilityRole="alert" style={styles.errorText}>Subscription status is unavailable. Reopen the screen when the app is online.</Text>
+            <Text accessibilityRole="alert" style={styles.errorText}>The directory needs a connection. Reopen this screen when the app is online.</Text>
           </View>
         ) : !entitled ? (
           <View style={styles.centered}>
@@ -283,6 +284,9 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
         ) : loadError ? (
           <View style={styles.centered}>
             <Text accessibilityRole="alert" style={styles.errorText}>{loadError}</Text>
+            <TouchableOpacity accessibilityRole="button" onPress={() => { setLoadError(''); setRetryNonce((value) => value + 1); }} style={{ minHeight: 44, justifyContent: 'center', marginTop: 12 }}>
+              <Text style={styles.closeText}>Try again</Text>
+            </TouchableOpacity>
           </View>
         ) : listings === null ? (
           <View style={styles.centered}><ActivityIndicator color={COLORS.blue} /></View>

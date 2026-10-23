@@ -6,7 +6,10 @@
 //   * the token is validated by shape before any lookup and resolved on
 //     every request, so a rotated link stops working at once;
 //   * per-token and per-address fixed-window rate limits live in the
-//     database (intake_rate_limit_hit); the address is only ever HMAC-hashed;
+//     database (intake_rate_limit_hit); the address is only ever HMAC-hashed.
+//     Every POST is charged to a loose per-address bucket; the per-token
+//     bucket is charged only for a submission that would create a lead, so
+//     junk posts cannot lock a practice's link (admitPost in intake.ts);
 //   * a filled honeypot field is answered with the thank-you page and
 //     creates nothing;
 //   * no submitted value is ever rendered back, logged, or returned;
@@ -16,13 +19,11 @@ import { createClient } from 'npm:@supabase/supabase-js@2.110.8';
 
 import { bytesToHex, hmacSha256, requiredEnv } from '../_shared/webhooks.ts';
 import {
-  bucketNames,
+  admitPost,
   clientAddress,
   formPage,
-  IP_LIMIT,
-  parseSubmission,
+  type RateLimit,
   thankYouPage,
-  TOKEN_LIMIT,
   tokenFromPath,
   tooManyPage,
   unavailablePage,
@@ -58,7 +59,7 @@ async function practiceName(supabase: ReturnType<typeof serviceClient>, token: s
 async function rateLimitHit(
   supabase: ReturnType<typeof serviceClient>,
   bucket: string,
-  limit: { perWindow: number; windowSeconds: number },
+  limit: RateLimit,
 ): Promise<boolean> {
   const { data, error } = await supabase.rpc('intake_rate_limit_hit', {
     p_bucket: bucket,
@@ -69,15 +70,24 @@ async function rateLimitHit(
   return data === true;
 }
 
-async function withinLimits(supabase: ReturnType<typeof serviceClient>, token: string, headers: Headers): Promise<boolean> {
+async function addressHashOf(headers: Headers): Promise<string> {
   const address = clientAddress(headers);
   // Keyed with the service key so the stored bucket cannot be reversed to an
   // address without it; no extra secret to provision.
-  const addressHash = address ? bytesToHex(await hmacSha256(requiredEnv('SUPABASE_SERVICE_ROLE_KEY'), address)).slice(0, 32) : '';
-  const buckets = bucketNames(token, addressHash);
-  const checks = [rateLimitHit(supabase, buckets.token, TOKEN_LIMIT)];
-  if (buckets.ip) checks.push(rateLimitHit(supabase, buckets.ip, IP_LIMIT));
-  return (await Promise.all(checks)).every(Boolean);
+  return address ? bytesToHex(await hmacSha256(requiredEnv('SUPABASE_SERVICE_ROLE_KEY'), address)).slice(0, 32) : '';
+}
+
+async function readForm(request: Request): Promise<URLSearchParams | null> {
+  const contentType = request.headers.get('content-type') || '';
+  if (!contentType.startsWith('application/x-www-form-urlencoded') && !contentType.startsWith('multipart/form-data')) {
+    return null;
+  }
+  const body = await request.formData();
+  const form = new URLSearchParams();
+  for (const [key, value] of body.entries()) {
+    if (typeof value === 'string') form.set(key, value);
+  }
+  return form;
 }
 
 Deno.serve(async (request) => {
@@ -96,18 +106,14 @@ Deno.serve(async (request) => {
 
     if (request.method === 'GET') return html(formPage(name, actionUrl));
 
-    if (!(await withinLimits(supabase, token, request.headers))) return html(tooManyPage(), 429);
-
-    const contentType = request.headers.get('content-type') || '';
-    if (!contentType.startsWith('application/x-www-form-urlencoded') && !contentType.startsWith('multipart/form-data')) {
-      return html(formPage(name, actionUrl, 'Please use the form on this page.'), 400);
-    }
-    const body = await request.formData();
-    const form = new URLSearchParams();
-    for (const [key, value] of body.entries()) {
-      if (typeof value === 'string') form.set(key, value);
-    }
-    const parsed = parseSubmission(form);
+    const parsed = await admitPost(
+      token,
+      await addressHashOf(request.headers),
+      () => readForm(request),
+      (bucket, limit) => rateLimitHit(supabase, bucket, limit),
+    );
+    if (parsed.kind === 'limited') return html(tooManyPage(), 429);
+    if (parsed.kind === 'bad_content_type') return html(formPage(name, actionUrl, 'Please use the form on this page.'), 400);
     if (parsed.kind === 'honeypot') return html(thankYouPage(name));
     if (parsed.kind === 'invalid') return html(formPage(name, actionUrl, parsed.reason), 400);
 

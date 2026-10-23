@@ -106,14 +106,44 @@ dated admits (for the median). Platform admins see the raw figures. The
 directory card line gains "67% completed" and "typically 5 days to admit"
 when disclosed.
 
+### Established workspaces (since 2026-10-24)
+
+Only **established** workspaces count toward the network figures and their
+disclosure floors, so a handful of free throwaway workspaces can neither
+unlock a listing's numbers (and read another practice's outcomes by
+subtraction) nor skew them. Definition, in
+`public.org_is_established(org uuid)`
+(`20261024120000_directory_membership_hardening.sql`):
+
+- the workspace was created **at least 30 days ago** (`orgs.created_at`,
+  which no client can change; the owner can still rename the workspace), and
+- it has **at least 3 cases or at least 5 referrals**, all-time, in any
+  status or direction.
+
+Where it applies:
+
+- `global_partner_stats` (and so `fetch_global_partner_stats`): only
+  partners and referrals of established workspaces are aggregated, and
+  `importing_orgs` / `referring_orgs` (the five-workspace floors) count
+  established workspaces only. Platform admins see the same restricted
+  figures.
+- `fetch_benchmarks`: the comparison cohort is paid benchmark workspaces
+  that are also established (`benchmark_cohort_orgs()`), still excluding the
+  caller. The caller's own workspace column is unaffected.
+
+A brand-new practice therefore contributes to the network about a month
+after it signs up and starts recording work; its own screens are unchanged.
+
 ## Matching
 
 See `docs/MATCHING.md`, "Track record". In short: family experience stays
 the primary signal; completion joins the blend at 25% (experience 60%, admit
 rate 15%); each signal is shrunk toward the prior with
-`TRACK_RECORD_PRIOR_CASES` (5) prior cases; and when this workspace has
-fewer than five decided cases with a program, the disclosed network figures
-for its listing are the prior instead of the workspace average.
+`TRACK_RECORD_PRIOR_CASES` (5) prior cases. The prior is the listing's
+disclosed network figures when there are any (otherwise the workspace
+average), and its weight fades as this workspace's own cases build up (half
+at 5 cases, a fifth at 20). A program with no decided cases scores exactly
+its prior, so a poor record never outranks no record.
 
 ## Applying to production
 

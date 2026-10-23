@@ -5,7 +5,8 @@
 //
 // Bring your own key: ReferralFit is free, so each practitioner adds their
 // own Anthropic API key in the app. It lives in their phone's keychain and
-// arrives here in the x-anthropic-key header on each request.
+// arrives here in the request body (`anthropicKey`) on each request — not a
+// header, so no request log can record it.
 //
 // Safety properties:
 //   * every request must carry a signed-in user's access token; it is checked
@@ -33,7 +34,7 @@ import {
   DraftOutputError,
   DraftRequestError,
   outputSchema,
-  parseApiKeyHeader,
+  parseApiKey,
   parseDraftOutput,
   parseDraftRequest,
   SYSTEM_PROMPT,
@@ -43,7 +44,7 @@ const MODEL = 'claude-opus-5-5';
 
 const CORS_HEADERS = {
   'access-control-allow-origin': '*',
-  'access-control-allow-headers': 'authorization, x-client-info, apikey, content-type, x-anthropic-key',
+  'access-control-allow-headers': 'authorization, x-client-info, apikey, content-type',
   'access-control-allow-methods': 'POST, OPTIONS',
 };
 
@@ -77,14 +78,17 @@ function anthropicFailure(error: unknown): Response {
   if (error instanceof Anthropic.AuthenticationError) {
     return failure(401, 'key_invalid', 'Anthropic did not accept this API key. Check it, or create a new key in the Anthropic Console.');
   }
-  if (error instanceof Anthropic.PermissionDeniedError) {
-    return failure(403, 'key_forbidden', 'This API key is not allowed to use Claude. Check the key’s workspace in the Anthropic Console.');
+  if (error instanceof Anthropic.PermissionDeniedError || error instanceof Anthropic.NotFoundError) {
+    return failure(403, 'key_forbidden', 'This API key cannot use the Claude model ReferralFit drafts with. Check the key’s workspace in the Anthropic Console.');
   }
   if (error instanceof Anthropic.RateLimitError) {
     return failure(429, 'key_rate_limited', 'Your Anthropic account is at its rate limit. Try again in a minute.');
   }
   if (error instanceof Anthropic.BadRequestError) {
-    return failure(400, 'key_rejected', 'Anthropic turned the request down. Check that your Anthropic account has credit or billing set up.');
+    // Usually the account (no credit), but a request-shape problem looks the
+    // same from here, so it is logged — status and error type only.
+    console.error('Anthropic rejected the request', error.status, (error.error as { error?: { type?: string } } | undefined)?.error?.type ?? '');
+    return failure(400, 'key_rejected', 'Anthropic turned the request down. Check your account in the Anthropic Console, then try again.');
   }
   if (error instanceof Anthropic.APIConnectionTimeoutError) {
     return failure(504, 'timeout', 'The draft took too long. Try again.');
@@ -115,16 +119,16 @@ Deno.serve(async (request) => {
   const userId = userData?.user?.id;
   if (userError || !userId) return failure(401, 'unauthorized', 'Your session has expired. Sign in again.');
 
-  const apiKey = parseApiKeyHeader(request.headers.get('x-anthropic-key'));
-  if (!apiKey) {
-    return failure(400, 'key_required', 'Add your Anthropic API key to use AI drafts. It starts with sk-ant-.');
-  }
-
   let body: unknown;
   try {
     body = await request.json();
   } catch {
     return failure(400, 'bad_request', 'The draft request was not readable.');
+  }
+
+  const apiKey = parseApiKey(body && typeof body === 'object' ? (body as { anthropicKey?: unknown }).anthropicKey : null);
+  if (!apiKey) {
+    return failure(400, 'key_required', 'Add your Anthropic API key to use AI drafts. It starts with sk-ant-.');
   }
 
   const anthropic = new Anthropic({ apiKey, timeout: 45_000, maxRetries: 1 });

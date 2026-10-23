@@ -1,12 +1,18 @@
 import { assert, assertEquals, assertStringIncludes } from 'jsr:@std/assert@1';
 
 import {
+  admitPost,
   bucketNames,
   clientAddress,
   escapeHtml,
   formPage,
+  IP_LIMIT,
+  IP_POST_LIMIT,
   parseSubmission,
+  postBucketName,
+  type RateLimit,
   thankYouPage,
+  TOKEN_LIMIT,
   tokenFromPath,
 } from './intake.ts';
 
@@ -116,4 +122,79 @@ Deno.test('clientAddress prefers the first forwarded address', () => {
 Deno.test('bucketNames keys the token and the hashed address, skipping an unknown address', () => {
   assertEquals(bucketNames(TOKEN, 'abc'), { token: `token:${TOKEN}`, ip: 'ip:abc' });
   assertEquals(bucketNames(TOKEN, ''), { token: `token:${TOKEN}`, ip: null });
+});
+
+// Records every bucket charged, in order; buckets listed in `full` refuse.
+function recorder(full: string[] = []) {
+  const hits: string[] = [];
+  const hit = (bucket: string, _limit: RateLimit) => {
+    hits.push(bucket);
+    return Promise.resolve(!full.includes(bucket));
+  };
+  return { hits, hit };
+}
+
+const VALID = new URLSearchParams({ caller_name: 'Dan', phone: '5415550177' });
+
+Deno.test('admitPost: junk posts never touch the practice token bucket', async () => {
+  for (const form of [
+    new URLSearchParams({ company: 'Acme', caller_name: 'Bot', phone: '5415550177' }),
+    new URLSearchParams({ caller_name: '', phone: '' }),
+  ]) {
+    const { hits, hit } = recorder();
+    const decision = await admitPost(TOKEN, 'abc', () => Promise.resolve(form), hit);
+    assert(decision.kind === 'honeypot' || decision.kind === 'invalid');
+    assertEquals(hits, ['ip-post:abc'], 'only the loose per-address bucket is charged');
+  }
+});
+
+Deno.test('admitPost: a non-form post is charged to the address only', async () => {
+  const { hits, hit } = recorder();
+  const decision = await admitPost(TOKEN, 'abc', () => Promise.resolve(null), hit);
+  assertEquals(decision.kind, 'bad_content_type');
+  assertEquals(hits, ['ip-post:abc']);
+});
+
+Deno.test('admitPost: a real lead is charged address-post, address-lead, then token, in that order', async () => {
+  const { hits, hit } = recorder();
+  const decision = await admitPost(TOKEN, 'abc', () => Promise.resolve(VALID), hit);
+  assertEquals(decision.kind, 'lead');
+  assertEquals(hits, ['ip-post:abc', 'ip:abc', `token:${TOKEN}`]);
+});
+
+Deno.test('admitPost: a full address bucket stops before the form is read', async () => {
+  const { hits, hit } = recorder(['ip-post:abc']);
+  let read = false;
+  const decision = await admitPost(TOKEN, 'abc', () => { read = true; return Promise.resolve(VALID); }, hit);
+  assertEquals(decision.kind, 'limited');
+  assertEquals(read, false);
+  assertEquals(hits, ['ip-post:abc']);
+});
+
+Deno.test('admitPost: an address over its lead limit does not spend the token bucket', async () => {
+  const { hits, hit } = recorder(['ip:abc']);
+  const decision = await admitPost(TOKEN, 'abc', () => Promise.resolve(VALID), hit);
+  assertEquals(decision.kind, 'limited');
+  assertEquals(hits, ['ip-post:abc', 'ip:abc']);
+});
+
+Deno.test('admitPost: a full token bucket refuses the lead', async () => {
+  const { hit } = recorder([`token:${TOKEN}`]);
+  assertEquals((await admitPost(TOKEN, 'abc', () => Promise.resolve(VALID), hit)).kind, 'limited');
+});
+
+Deno.test('admitPost: without a client address only the token bucket applies, and only to leads', async () => {
+  const junk = recorder();
+  await admitPost(TOKEN, '', () => Promise.resolve(new URLSearchParams({ company: 'x' })), junk.hit);
+  assertEquals(junk.hits, []);
+  const lead = recorder();
+  await admitPost(TOKEN, '', () => Promise.resolve(VALID), lead.hit);
+  assertEquals(lead.hits, [`token:${TOKEN}`]);
+});
+
+Deno.test('the per-address all-posts limit is looser than the per-address lead limit', () => {
+  assertEquals(postBucketName('abc'), 'ip-post:abc');
+  assertEquals(postBucketName(''), null);
+  assert(IP_POST_LIMIT.perWindow > IP_LIMIT.perWindow);
+  assertEquals(TOKEN_LIMIT, { perWindow: 30, windowSeconds: 3600 });
 });

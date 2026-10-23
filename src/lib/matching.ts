@@ -15,10 +15,13 @@ import { bedAvailable, type BedFor, type ListingBeds } from './beds';
 //
 // The rule, in order:
 //   1. Hard requirements hide a program; they never demote it. Level of care,
-//      population, a way to pay, location, and every must-have need.
+//      population, a way to pay, location (the GEOGRAPHY state as a search
+//      area, except under "Away from home", where it is only the home state
+//      the score measures from), and every must-have need.
 //   2. A 0-100 fit score from four weighted parts (constants below).
-//   3. Ties: lower family cost first, then a rotation seeded by the match
-//      profile id (stable for that family, different for the next).
+//   3. Ties: lower family cost first (an unknown cash cost after every known
+//      one), then a rotation seeded by the match profile id (stable for that
+//      family, different for the next).
 //
 // Bed availability (src/lib/beds.ts) joins as an optional hard requirement:
 // when the clinician asks for "a bed for men / women / anyone", a program
@@ -47,6 +50,13 @@ export const OUT_OF_NETWORK_COST_SHARE = 0.5;
 export const CASH_AT_BUDGET_COST_SHARE = 0.5;
 /** Cash pay with no budget set earns this share (cost still breaks ties). */
 export const CASH_NO_BUDGET_COST_SHARE = 0.5;
+/**
+ * Cash pay with no monthly cost on file (stored as 0) earns this share: no
+ * more than a program priced at exactly the budget, so an unknown is never
+ * read as free. It is not hidden (the budget cannot be checked either way)
+ * and sorts after every known cost among equal fit.
+ */
+export const CASH_UNKNOWN_COST_SHARE = 0.5;
 /** Shrinkage prior: a program's outcomes count as if blended with this many network-average cases. */
 export const TRACK_RECORD_PRIOR_CASES = 5;
 /** Needs that are must-have unless the clinician says otherwise (medication-assisted treatment). */
@@ -62,8 +72,22 @@ export function typesForPartner(partner: Partner): Partner['type'][] {
   return legacyTypes.length ? legacyTypes : [partner.type];
 }
 
+/**
+ * The monthly cash cost on file, or null when there is none. The partner form
+ * and the database store "not entered" as 0, so 0 means unknown, never free.
+ * The legacy cashMax / cashMin stand in when monthlyCost is blank (the same
+ * fallback src/lib/store.ts applies on load).
+ */
+export function knownMonthlyCostForPartner(partner: Pick<Partner, 'monthlyCost' | 'cashMax' | 'cashMin'>): number | null {
+  for (const value of [partner.monthlyCost, partner.cashMax, partner.cashMin]) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+  }
+  return null;
+}
+
+/** Display and form value: the known monthly cost, 0 when none is on file. Ranking reads knownMonthlyCostForPartner. */
 export function monthlyCostForPartner(partner: Partner): number {
-  return partner.monthlyCost ?? partner.cashMax ?? partner.cashMin ?? 0;
+  return knownMonthlyCostForPartner(partner) ?? 0;
 }
 
 export function networkCapabilitiesForPartner(partner: Partner, insurance: string): InsuranceNetworkPreference[] {
@@ -168,16 +192,24 @@ export function preferredNeedsForProfile(profile: Pick<ReferralMatch, 'therapies
 export type PaymentFit = {
   paymentFit: boolean;
   networkStatus: InsuranceNetworkPreference | null; // null when cash pay
-  /** Cash pay: the monthly cost. Insurance: 0 in-network, 1 out-of-network. Lower wins ties. */
-  familyCost: number;
+  /**
+   * Cash pay: the monthly cost, or null when none is on file. Insurance: 0
+   * in-network, 1 out-of-network. Lower wins ties; null sorts last.
+   */
+  familyCost: number | null;
   verifyBenefits: boolean;
   costScore: number;
 };
 
 export function paymentFitForPartner(profile: Pick<ReferralMatch, 'insurance' | 'networkPreferences' | 'maxBudget'>, partner: Partner): PaymentFit {
   if (profile.insurance === 'Cash pay') {
-    const cost = monthlyCostForPartner(partner);
+    const cost = knownMonthlyCostForPartner(partner);
     const budget = profile.maxBudget && profile.maxBudget > 0 ? profile.maxBudget : null;
+    // An unknown cost is neither hidden nor rewarded: neutral points, sorted
+    // after known costs (compareFamilyCost), and never "within budget".
+    if (cost == null) {
+      return { paymentFit: true, networkStatus: null, familyCost: null, verifyBenefits: false, costScore: WEIGHT_FAMILY_COST * CASH_UNKNOWN_COST_SHARE };
+    }
     const paymentFit = budget == null || cost <= budget;
     let costScore = 0;
     if (paymentFit) {
@@ -210,15 +242,29 @@ export function paymentFitForPartner(profile: Pick<ReferralMatch, 'insurance' | 
 
 // ─── Location ───────────────────────────────────────────────────────────────
 
-export function regionFitForPartner(profile: Pick<ReferralMatch, 'state'>, partner: Partner): boolean {
-  return !profile.state || profile.state === 'ANY' || partner.state === profile.state || partner.regions.includes('Nationwide');
+/**
+ * What the profile's GEOGRAPHY state means, per location preference:
+ *   - No preference / Close to family: the search area. A program elsewhere
+ *     is hidden unless it serves Nationwide (a requirement).
+ *   - Away from home: the family's home state. Nothing is hidden for where it
+ *     is; the state is only what "away" is measured from (locationScore).
+ * No state (or ANY) is never a filter.
+ */
+export function stateIsSearchArea(profile: Pick<ReferralMatch, 'state' | 'locationPreference'>): boolean {
+  return Boolean(profile.state) && profile.state !== 'ANY' && profile.locationPreference !== 'Away from home';
+}
+
+export function regionFitForPartner(profile: Pick<ReferralMatch, 'state' | 'locationPreference'>, partner: Partner): boolean {
+  if (!stateIsSearchArea(profile)) return true;
+  return partner.state === profile.state || partner.regions.includes('Nationwide');
 }
 
 /**
  * Distance proxy: the only location data on both sides is the state, so
  * "close" means the program is in the client's state and "away" means it is
  * not. With no client state there is nothing to compare, so the score is
- * neutral (half).
+ * neutral (half). Under "Away from home" every state is searched, so this
+ * score is what puts out-of-state programs first.
  */
 export function locationScore(profile: Pick<ReferralMatch, 'state' | 'locationPreference'>, partner: Partner): { score: number; sameState: boolean | null } {
   const preference: LocationPreference = profile.locationPreference || 'No preference';
@@ -307,15 +353,16 @@ export function trackRecordPrior(scorecards: Record<string, TrackRecord | undefi
 }
 
 /**
- * The prior for one program. With fewer than TRACK_RECORD_PRIOR_CASES decided
- * cases here, the disclosed network figures for its listing stand in for
- * this workspace's averages, signal by signal; a network figure the directory
- * withheld falls back to the workspace average.
+ * The prior for one program: the disclosed network figures for its listing
+ * stand in for this workspace's averages, signal by signal; a network figure
+ * the directory withheld falls back to the workspace average. The prior does
+ * not depend on how much local history there is (that would let bad local
+ * evidence lift a score by switching priors); local history outweighs it by
+ * itself as cases accrue, since the prior counts as TRACK_RECORD_PRIOR_CASES
+ * cases: all of the score at 0 local cases, half at 5, a fifth at 20.
  */
 export function priorForCard(card: TrackRecord | undefined, prior: TrackRecordPrior): TrackRecordPrior {
   if (!card?.network) return prior;
-  const decided = card.admits + card.nonAdmits;
-  if (decided >= TRACK_RECORD_PRIOR_CASES) return prior;
   const { network } = card;
   return {
     experience: network.familyExperience != null ? normaliseExperience(network.familyExperience) : prior.experience,
@@ -324,18 +371,33 @@ export function priorForCard(card: TrackRecord | undefined, prior: TrackRecordPr
   };
 }
 
+function blendTrackRecord(experience: number, completion: number, admitRate: number): number {
+  return WEIGHT_TRACK_RECORD * clamp01(
+    TRACK_RECORD_BLEND.experience * experience
+    + TRACK_RECORD_BLEND.completion * completion
+    + TRACK_RECORD_BLEND.admitRate * admitRate,
+  );
+}
+
+/** What a program scores on its prior alone: the no-evidence score. Half (7.5) when nobody has data. */
+export function priorTrackRecordScore(prior: TrackRecordPrior): number {
+  return blendTrackRecord(prior.experience, prior.completion, prior.admitRate);
+}
+
 /**
- * 0..WEIGHT_TRACK_RECORD. No decided cases scores neutral (half). Otherwise
- * each signal is blended with TRACK_RECORD_PRIOR_CASES prior cases (the
- * workspace average, or the network figure when this workspace has too
- * little history with the program), so one great review cannot outrank
- * twenty good ones. The signals combine per TRACK_RECORD_BLEND.
+ * 0..WEIGHT_TRACK_RECORD. Each signal is blended with TRACK_RECORD_PRIOR_CASES
+ * prior cases (priorForCard: the listing's network figure, else the workspace
+ * average), so one great review cannot outrank twenty good ones. No decided
+ * cases scores exactly the prior, so evidence moves the score one way only:
+ * worse than the prior lowers it, better raises it, and a program with a bad
+ * record never outranks the same program with none. The signals combine per
+ * TRACK_RECORD_BLEND.
  */
 export function trackRecordScore(card: TrackRecord | undefined, prior: TrackRecordPrior): { score: number; decidedCases: number } {
-  const decided = card ? card.admits + card.nonAdmits : 0;
-  if (!card || decided <= 0) return { score: WEIGHT_TRACK_RECORD / 2, decidedCases: 0 };
-  const k = TRACK_RECORD_PRIOR_CASES;
   const p = priorForCard(card, prior);
+  const decided = card ? card.admits + card.nonAdmits : 0;
+  if (!card || !(decided > 0)) return { score: priorTrackRecordScore(p), decidedCases: 0 };
+  const k = TRACK_RECORD_PRIOR_CASES;
   const admitRate = (card.admits + k * p.admitRate) / (decided + k);
   const experienceRaw = card.avgFamilyExperience != null ? normaliseExperience(card.avgFamilyExperience) : p.experience;
   const experience = (decided * experienceRaw + k * p.experience) / (decided + k);
@@ -344,10 +406,7 @@ export function trackRecordScore(card: TrackRecord | undefined, prior: TrackReco
   const placements = Math.max(0, Math.min(decided, card.decidedPlacements ?? 0));
   const completionRaw = placements > 0 && card.completionRate != null ? clamp01(card.completionRate) : p.completion;
   const completion = (placements * completionRaw + k * p.completion) / (placements + k);
-  const blended = TRACK_RECORD_BLEND.experience * experience
-    + TRACK_RECORD_BLEND.completion * completion
-    + TRACK_RECORD_BLEND.admitRate * admitRate;
-  return { score: WEIGHT_TRACK_RECORD * clamp01(blended), decidedCases: decided };
+  return { score: blendTrackRecord(experience, completion, admitRate), decidedCases: decided };
 }
 
 // ─── Scoring ────────────────────────────────────────────────────────────────
@@ -388,7 +447,8 @@ export type ProgramScore = {
   missingNeeds: string[];
   networkStatus: InsuranceNetworkPreference | null;
   verifyBenefits: boolean;
-  familyCost: number;
+  /** See PaymentFit.familyCost: null is a cash cost not on file. */
+  familyCost: number | null;
   regionFit: boolean;
   sameState: boolean | null;
   decidedCases: number;
@@ -485,10 +545,16 @@ export function compareBedAvailability(a: ProgramScore, b: ProgramScore): number
   return rank(a.bedAvailability) - rank(b.bedAvailability);
 }
 
+/** Lower family cost first; a cash cost not on file (null) after every known one. */
+export function compareFamilyCost(a: Pick<ProgramScore, 'familyCost'>, b: Pick<ProgramScore, 'familyCost'>): number {
+  if (a.familyCost == null || b.familyCost == null) return Number(a.familyCost == null) - Number(b.familyCost == null);
+  return a.familyCost - b.familyCost;
+}
+
 export function compareScored(profileId: string, a: ProgramScore, b: ProgramScore): number {
   return b.total - a.total
     || compareBedAvailability(a, b)
-    || a.familyCost - b.familyCost
+    || compareFamilyCost(a, b)
     || rotationKey(profileId, a.partner.id) - rotationKey(profileId, b.partner.id)
     || a.partner.id.localeCompare(b.partner.id);
 }

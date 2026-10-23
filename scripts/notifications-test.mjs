@@ -129,4 +129,66 @@ assert.deepEqual(remote, [['case', undefined, 'c1'], ['workspace', undefined, un
 assert.deepEqual(notifications.remotePushTarget({ kind: 'new_lead' }), { target: 'home' }, 'a lead push without a case id lands on Today');
 unsubscribeRemote();
 
+// ─── Reminders follow Today's Mine rule ─────────────────────────────────────
+// Assigned to me, or to nobody (and its case assigned to me or to nobody).
+const ME = 'aaaaaaaa-1111-4111-8111-111111111111';
+const MATE = 'bbbbbbbb-2222-4222-8222-222222222222';
+const stamp = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+const tomorrow = new Date();
+tomorrow.setDate(tomorrow.getDate() + 1);
+const mineFollowUps = [
+  { id: 'f-mine', title: 'Mine', dueOn: stamp(tomorrow), status: 'open', note: '', assignedTo: ME },
+  { id: 'f-mate', title: 'Teammate', dueOn: stamp(tomorrow), status: 'open', note: '', assignedTo: MATE },
+  { id: 'f-nobody', title: 'Nobody', dueOn: stamp(tomorrow), status: 'open', note: '' },
+  { id: 'f-mate-case', title: 'Teammate case', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-mate' },
+  { id: 'f-my-case', title: 'My case', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-me' },
+  { id: 'f-mate-consult', title: 'Teammate consult', kind: 'consult', dueTime: '15:00', dueOn: stamp(tomorrow), status: 'open', note: '', assignedTo: MATE },
+  { id: 'f-my-consult', title: 'My consult', kind: 'consult', dueTime: '15:00', dueOn: stamp(tomorrow), status: 'open', note: '', assignedTo: ME.toUpperCase() },
+];
+const mineCases = [{ id: 'c-mate', assignedTo: MATE }, { id: 'c-me', assignedTo: ME }];
+assert.equal(notifications.followUpIsMine(mineFollowUps[0], ME, () => undefined), true);
+assert.equal(notifications.followUpIsMine(mineFollowUps[1], ME, () => undefined), false);
+assert.equal(notifications.followUpIsMine(mineFollowUps[3], ME, (id) => (id === 'c-mate' ? MATE : undefined)), false);
+assert.deepEqual(
+  notifications.reminderFollowUps({ partners: [], referrals: [], referralMatches: [], followUps: mineFollowUps, cases: mineCases }, ME).map((item) => item.id),
+  ['f-mine', 'f-nobody', 'f-my-case', 'f-my-consult'],
+  'a teammate’s follow-ups and consults never remind this user',
+);
+assert.equal(
+  notifications.reminderFollowUps({ partners: [], referrals: [], referralMatches: [], followUps: mineFollowUps, cases: mineCases, scope: 'everyone' }, ME).length,
+  mineFollowUps.length,
+  "scope 'everyone' keeps every open follow-up",
+);
+
+// The user's own reminders are scheduled before partner cadence nags, so a
+// long list of partners past cadence cannot use up every slot.
+nativeState.scheduled = [];
+await notifications.activateReferralFitNotificationOwner(ME);
+const coldPartners = Array.from({ length: 20 }, (_, index) => partner(`cold-${index}`, `Cold ${index}`));
+await notifications.rescheduleNotifications({ partners: coldPartners, referrals: [], referralMatches: [], followUps: mineFollowUps, cases: mineCases }, ME);
+const titles = nativeState.scheduled.map((item) => item.content.title);
+const reminderBodies = nativeState.scheduled.filter((item) => item.content.title === 'Follow-up due').map((item) => item.content.body).sort();
+assert.deepEqual(reminderBodies, ['Mine', 'My case', 'Nobody'], 'every one of my follow-ups is scheduled despite 20 overdue partners');
+assert.deepEqual(nativeState.scheduled.filter((item) => item.content.title === 'Consult in 30 minutes').map((item) => item.content.body), ['My consult · 15:00']);
+assert.equal(nativeState.scheduled.length, 50, 'the cap still holds');
+assert.ok(titles.lastIndexOf('Follow-up due') < titles.indexOf('ReferralFit'), 'cadence nags only fill what is left');
+assert.equal(nativeState.scheduled.some((item) => /Teammate/.test(item.content.body)), false);
+
+// ─── Cadence counts calendar days in the device's time zone ────────────────
+{
+  const previousTz = process.env.TZ;
+  process.env.TZ = 'America/Los_Angeles';
+  try {
+    const at = new Date(2026, 9, 23, 10, 0, 0); // Oct 23, 10:00 local
+    const contacted = { ...partner('tz', 'TZ'), lastContact: '2026-10-20', touchCadenceDays: 3 };
+    // 3 days since Oct 20: cadence reached today, not yet past it.
+    assert.deepEqual(notifications.partnersGoingCold([contacted], at), [], 'a YYYY-MM-DD stamp is a local day, not UTC midnight');
+    assert.equal(notifications.todayLoad([], [contacted], at).actions, 1, 'cadence reached today counts, like Today');
+    assert.equal(notifications.todayLoad([], [{ ...contacted, touchCadenceDays: 4 }], at).actions, 0, 'one day before cadence is not due');
+    assert.deepEqual(notifications.partnersGoingCold([{ ...contacted, touchCadenceDays: 2 }], at).map((entry) => [entry.daysSince, entry.overdueBy]), [[3, 1]]);
+  } finally {
+    if (previousTz === undefined) delete process.env.TZ; else process.env.TZ = previousTz;
+  }
+}
+
 console.log('notification permission/scheduling/deep-link regression checks: ok');

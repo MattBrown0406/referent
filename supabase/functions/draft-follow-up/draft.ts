@@ -45,14 +45,14 @@ export type Draft = TextDraft | EmailDraft | CallDraft;
 export class DraftRequestError extends Error {}
 
 // Each practitioner brings their own Anthropic API key (the app is free, so
-// drafts run on the user's own Anthropic account). It arrives in the
-// x-anthropic-key header on every request, is used for that one call, and is
-// never stored or logged. Anything that is not shaped like a key is refused
-// before it goes anywhere.
+// drafts run on the user's own Anthropic account). It arrives in the request
+// body (`anthropicKey`) — never a header, which platform request logs can
+// record — is used for that one call, and is never stored or logged.
+// Anything that is not shaped like a key is refused before it goes anywhere.
 const ANTHROPIC_KEY = /^sk-ant-[A-Za-z0-9_-]{20,250}$/;
 
-export function parseApiKeyHeader(value: string | null): string | null {
-  if (!value) return null;
+export function parseApiKey(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
   const key = value.trim();
   return ANTHROPIC_KEY.test(key) ? key : null;
 }

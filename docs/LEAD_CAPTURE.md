@@ -58,7 +58,7 @@ Then:
 | `cases.first_touch_at` | Set once by the `case_events_first_touch` trigger on the first `call`, `text`, `email`, or `meeting` event for the case. Never moves. Backfilled for existing cases from their earliest logged touch. |
 | `cases.lead_channel` | `app` or `intake_link`. |
 | `cases.lead_urgency` | `none` or `immediate_danger`. |
-| `intake_rate_limits` | Fixed-window counters keyed `token:<token>` and `ip:<hmac>`. Service role only. |
+| `intake_rate_limits` | Fixed-window counters keyed `token:<token>`, `ip:<hmac>` and `ip-post:<hmac>`. Service role only. |
 
 Only leads captured through New lead or the intake link count toward speed to
 lead. A case created with the full New case form is not a lead (its
@@ -170,9 +170,19 @@ until the function exists. Nothing else depends on it.
 | Honeypot (`company`) filled | 200 thank-you page, nothing created. |
 | Other methods | 405. |
 
-Rate limits (in `supabase/functions/intake/intake.ts`): 30 submissions per
-token per hour, 6 per visitor address per hour, enforced by
-`intake_rate_limit_hit` in the database. Pages carry a strict
+Rate limits (in `supabase/functions/intake/intake.ts`), enforced by
+`intake_rate_limit_hit` in the database, in this order (`admitPost`):
+
+1. every POST from a visitor address, whatever it contains: 20 per hour
+   (`ip-post:<hmac>`);
+2. the form is read, the honeypot checked, and the fields validated; a
+   honeypot or invalid post stops here and is charged to nothing else;
+3. a submission that will create a lead: 6 per visitor address per hour
+   (`ip:<hmac>`), then 30 per link per hour (`token:<token>`).
+
+Junk posts therefore never spend the practice's 30-an-hour link budget
+(before 2026-10-24 about 30 junk posts could lock a link for an hour), and
+a family that mistypes a few times is not locked out. Pages carry a strict
 Content-Security-Policy, no scripts, `noindex`, and `no-store`.
 
 Local checks, matching CI:
