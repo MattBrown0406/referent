@@ -49,6 +49,7 @@ export function AiKeyDisclosure() {
       <Text style={styles.body}>
         If your practice needs a business associate agreement for this, set it up with Anthropic on your own account.
       </Text>
+      <Text style={styles.body}>By saving your key, you agree to send the information above to Anthropic each time you ask for a draft.</Text>
     </View>
   );
 }
@@ -89,9 +90,12 @@ export function AiKeySetup({ userId, saveLabel, onSaved, onCancel, cancelLabel }
     try {
       await verifyAnthropicKey(apiKey);
       if (abandonedRef.current) return;
+      const previous = await getAnthropicKey(userId);
       await saveAnthropicKey(userId, apiKey);
       if (abandonedRef.current) {
-        await removeAnthropicKey(userId); // cancelled while the keychain write was in flight
+        // Cancelled while the keychain write was in flight: put back what was there.
+        if (previous) await saveAnthropicKey(userId, previous).catch(() => undefined);
+        else await removeAnthropicKey(userId);
         return;
       }
       setValue('');

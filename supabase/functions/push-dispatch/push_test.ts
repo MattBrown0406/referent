@@ -64,12 +64,14 @@ Deno.test('collectSendResults treats a missing ticket as a failed attempt', () =
   assertEquals(results, [{ id: 'r1', tickets: [], error: 'no_ticket', retry: true }]);
 });
 
-Deno.test('a failed send request is retryable for network errors and Expo 5xx / 429, final for other 4xx', () => {
+Deno.test('a failed send request is retryable for network errors, Expo 5xx / 429 and 401 / 403, final for other 4xx', () => {
   assert(isTransientSendFailure(new TypeError('error sending request: connection reset')));
   assert(isTransientSendFailure(new ExpoHttpError(503)));
   assert(isTransientSendFailure(new ExpoHttpError(429)));
+  assert(isTransientSendFailure(new ExpoHttpError(401)), 'a bad access token is a config fix; keep the row');
+  assert(isTransientSendFailure(new ExpoHttpError(403)));
   assert(!isTransientSendFailure(new ExpoHttpError(400)));
-  assert(!isTransientSendFailure(new ExpoHttpError(401)));
+  assert(!isTransientSendFailure(new ExpoHttpError(413)));
   assertEquals(new ExpoHttpError(502).message, 'Expo push API answered 502');
 });
 

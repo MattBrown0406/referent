@@ -85,7 +85,7 @@ module.exports = api; module.exports.default = api; module.exports.__esModule = 
 writeFileSync(path.join(tmpDir, 'supabase.js'), `
 const s = globalThis.__offlineSyncState;
 function query(table) {
-  const b = { table, filters: [], op: 'select', payload: null, options: null, range: null, single: false, order: [] };
+  const b = { table, filters: [], op: 'select', payload: null, options: null, range: null, single: false, order: [], returning: false };
   const run = () => {
     if (s.offline) return { data: null, error: { message: 'TypeError: Network request failed', details: '', hint: '', code: '' } };
     const failure = s.failOn && s.failOn(b);
@@ -113,8 +113,10 @@ function query(table) {
     if (b.op === 'update') {
       s.updates = s.updates || [];
       s.updates.push({ table, patch: { ...b.payload } });
-      rows.filter((row) => b.filters.every((f) => f(row))).forEach((row) => Object.assign(row, b.payload));
-      return { data: null, error: null };
+      const matched = rows.filter((row) => b.filters.every((f) => f(row)));
+      matched.forEach((row) => Object.assign(row, b.payload));
+      // .update(...).select('id') returns the rows it changed (PostgREST return=representation).
+      return { data: b.returning ? matched.map((row) => ({ id: row.id })) : null, error: null };
     }
     if (b.op === 'delete') {
       s.db[table] = rows.filter((row) => !b.filters.every((f) => f(row)));
@@ -123,7 +125,7 @@ function query(table) {
     return { data: null, error: null };
   };
   const api = {
-    select() { return api; },
+    select() { if (b.op !== 'select') b.returning = true; return api; },
     order(col) { b.order.push([col]); return api; },
     eq(col, value) { b.filters.push((row) => row[col] === value); return api; },
     in(col, values) { b.filters.push((row) => values.includes(row[col])); return api; },
@@ -134,7 +136,12 @@ function query(table) {
     insert(row) { b.op = 'insert'; b.payload = row; return api; },
     update(patch) { b.op = 'update'; b.payload = patch; return api; },
     delete() { b.op = 'delete'; return api; },
-    then(resolve, reject) { return Promise.resolve().then(run).then(resolve, reject); },
+    then(resolve, reject) {
+      // selectGate: answer one read of a table now but deliver it later (a refresh in flight).
+      const gate = s.selectGate && b.op === 'select' && s.selectGate.table === table ? s.selectGate : null;
+      if (gate) s.selectGate = null;
+      return Promise.resolve().then(run).then(async (value) => { if (gate) await gate.promise; return value; }).then(resolve, reject);
+    },
   };
   return api;
 }
@@ -170,6 +177,7 @@ exports.supabase = {
     storage,
     storageKey: '${STORAGE_KEY}',
     async signOut() { s.signedOut = true; return { error: null }; },
+    async _removeSession() { if (s.noRemoveSession) throw new Error('gone'); s.storage.delete('${STORAGE_KEY}'); s.authEvents = s.authEvents || []; s.authEvents.push('SIGNED_OUT'); },
     getSession() {
       s.getSessionCalls += 1;
       if (s.auth === 'hang') return new Promise(() => {});
@@ -509,10 +517,14 @@ await check('a cache-only row survives while its creating op is queued or reject
   assert.ok(snap.followUps.some((row) => row.id === R), 'queued outreach.sent keeps its next step');
   assert.equal(snap.touches.length, 1, 'queued outreach.sent keeps its touch');
 
-  // The partner insert is refused: still visible while it awaits a decision.
+  // The partner insert is refused: still visible while it awaits a decision,
+  // and the outreach that logged a touch for it is held with it.
   state.failOn = (b) => (b.op === 'upsert' && b.table === 'partners') ? { message: 'name too long', code: '23514' } : null;
   await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
-  assert.ok(state.rpcCalls.some((call) => call.name === 'record_outreach_sent'), "the 'outreach.sent' op still flushes");
+  assert.equal(state.rpcCalls.some((call) => call.name === 'record_outreach_sent'), false, 'a touch for the refused partner waits with it');
+  const [held] = await store.listRejectedWrites(U);
+  assert.equal(held.heldChanges, 1);
+  assert.equal(held.status, 'rejected');
   state.failOn = null;
   snap = await store.refreshSnapshot(U);
   assert.ok(snap.partners.some((row) => row.id === P), 'a rejected insert keeps its row until discarded');
@@ -632,6 +644,217 @@ await check('workspace changes handle the rejected list', async () => {
   state.offline = false;
 });
 
+// ─── Round 2: related changes stay together ─────────────────────────────────
+
+const snapOf = (extra = {}) => ({ partners: [], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {}, ...extra });
+
+await check('an edit to a row whose insert was set aside waits with it and lands on retry', async () => {
+  await freshAccount();
+  const F = 'f0f0f0f0-f0f0-4f0f-8f0f-f0f0f0f0f0f0';
+  state.offline = true;
+  const created = followUp(F, { assignedTo: TEAMMATE, title: 'Call the family' });
+  await store.createFollowUp(created, U);
+  await store.persistCache(snapOf({ followUps: [created] }), U);
+  state.offline = false;
+  let calls = 0;
+  state.failOn = (b) => (b.table === 'follow_ups' && b.op === 'upsert' && calls++ === 0) ? { message: 'The assignee must be a member of this workspace', code: '22023' } : null;
+  const hydrated = await store.hydrate(U);
+  assert.ok(hydrated.syncError);
+  assert.ok(hydrated.snapshot.followUps.some((row) => row.id === F), 'still shown while it awaits a decision');
+  const done = { ...created, status: 'done', completedAt: new Date().toISOString() };
+  state.updates = [];
+  await store.updateFollowUp(done, U); // online, but its insert is set aside
+  assert.deepEqual(state.updates, [], 'the edit is not sent ahead of its insert (it would match nothing)');
+  const [entry] = await store.listRejectedWrites(U);
+  assert.equal(entry.heldChanges, 1, 'the edit is held with the refused insert');
+  assert.equal(await store.pendingWriteCount(U), 0);
+  await store.retryRejectedWrite(U, entry.id);
+  assert.equal(state.db.follow_ups.find((row) => row.id === F).status, 'done', 'insert, then the edit');
+});
+
+await check('a refused partner insert holds the follow-up for it and that follow-up’s completion', async () => {
+  await freshAccount();
+  const P = '56565656-5656-4565-8565-565656565656';
+  const F = '78787878-7878-4787-8787-787878787878';
+  state.offline = true;
+  const p = partner(P, 'New program');
+  const f = followUp(F, { partnerId: P });
+  await store.createPartner(p, U);
+  await store.createFollowUp(f, U);
+  await store.persistCache(snapOf({ partners: [p], followUps: [f] }), U);
+  await store.updateFollowUp({ ...f, status: 'done', completedAt: new Date().toISOString() }, U);
+  state.offline = false;
+  let refuse = true;
+  state.failOn = (b) => {
+    if (b.table === 'partners' && b.op === 'upsert' && refuse) return { message: 'violates check constraint', code: '23514' };
+    if (b.table === 'follow_ups' && b.op === 'upsert' && !state.db.partners.some((row) => row.id === P)) return { message: 'violates foreign key constraint', code: '23503' };
+    return null;
+  };
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
+  const [entry] = await store.listRejectedWrites(U);
+  assert.equal(entry.kind, 'partner.insert');
+  assert.equal(entry.heldChanges, 2, 'the follow-up insert and its completion wait with the partner');
+  assert.equal(await store.pendingWriteCount(U), 0);
+  refuse = false;
+  await store.retryRejectedWrite(U, entry.id);
+  assert.equal(state.db.follow_ups.find((row) => row.id === F)?.status, 'done', 'completed offline, saved completed');
+});
+
+await check('an edit queued behind an insert waiting on its parent stays behind it', async () => {
+  await freshAccount();
+  const P = '57575757-5757-4575-8575-575757575757';
+  const F = '79797979-7979-4797-8797-797979797979';
+  state.offline = true;
+  const f = followUp(F, { partnerId: P });
+  await store.createFollowUp(f, U); // queued before its partner (e.g. created from an older screen)
+  await store.persistCache(snapOf({ followUps: [f] }), U);
+  await store.updateFollowUp({ ...f, status: 'done' }, U);
+  await store.createPartner(partner(P, 'Parent later in the queue'), U);
+  state.offline = false;
+  state.failOn = (b) => (b.table === 'follow_ups' && b.op === 'upsert' && !state.db.partners.some((row) => row.id === P)) ? { message: 'violates foreign key constraint', code: '23503' } : null;
+  assert.equal(await store.flushWriteQueue(U), 3);
+  assert.equal(state.db.follow_ups.find((row) => row.id === F).status, 'done');
+});
+
+await check('a queued update that matches no row waits like a missing parent; online it is refused at once', async () => {
+  await freshAccount();
+  const F = '7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a70';
+  state.offline = true;
+  await store.updateFollowUp(followUp(F, { note: 'edit of a row a teammate deleted' }), U);
+  state.offline = false;
+  for (let attempt = 1; attempt < store.MAX_PARENT_WAIT_ATTEMPTS; attempt += 1) assert.equal(await store.flushWriteQueue(U), 0);
+  assert.equal(await store.waitingWriteCount(U), 1);
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
+  const [entry] = await store.listRejectedWrites(U);
+  assert.match(entry.reason, /never saved or was deleted/);
+  await store.discardRejectedWrite(U, entry.id);
+  await assert.rejects(store.updateFollowUp(followUp(F, { note: 'again, online' }), U), /no longer on the server/);
+  assert.equal(await store.pendingWriteCount(U), 0);
+});
+
+// ─── Round 2: passing server failures never park the queue ──────────────────
+
+await check('transient server failures keep the queue intact; deterministic refusals are set aside', async () => {
+  const transients = [
+    { message: 'Timed out acquiring connection from connection pool.', code: 'PGRST003', details: '', hint: '' },
+    { message: 'Database client error. Retrying the connection.', code: 'PGRST001', details: '', hint: '' },
+    { message: '<html><head><title>502 Bad Gateway</title></head></html>' },
+    { message: 'error code: 520' },
+    { message: 'deadlock detected', code: '40P01', details: '', hint: '' },
+    { message: 'could not serialize access', code: '40001' },
+    { message: 'too many connections', code: '53300' },
+    { message: 'canceling statement due to statement timeout', code: '57014' },
+    { message: 'terminating connection due to administrator command', code: '57P01' },
+  ];
+  for (const transient of transients) {
+    await freshAccount();
+    state.offline = true;
+    await store.createPartner(partner('12121212-1212-4121-8121-121212121212', 'Queued partner'), U);
+    await store.createFollowUp(followUp('34343434-3434-4343-8343-343434343434', { partnerId: '12121212-1212-4121-8121-121212121212' }), U);
+    state.offline = false;
+    state.failOn = (b) => (b.op !== 'select' && b.op !== 'rpc') ? transient : null;
+    assert.equal(await store.flushWriteQueue(U), 0, `${transient.code || transient.message}: no throw`);
+    assert.equal(await store.pendingWriteCount(U), 2, `${transient.code || transient.message}: nothing leaves the live queue`);
+    assert.equal(await store.rejectedWriteCount(U), 0, `${transient.code || transient.message}: nothing set aside`);
+    // An online save during the blip queues behind instead of failing.
+    await store.createFollowUp(followUp('34343434-3434-4343-8343-343434343435'), U);
+    assert.equal(await store.pendingWriteCount(U), 3);
+    state.failOn = null;
+    assert.equal(await store.flushWriteQueue(U), 3, `${transient.code || transient.message}: all land once the server is healthy`);
+  }
+  assert.equal(store.isTransientServerError({ message: 'x', code: '23514' }), false);
+  assert.equal(store.isTransientServerError({ message: 'x', code: '42501' }), false);
+  assert.equal(store.isTransientServerError({ message: 'x', code: '22P02' }), false);
+  assert.equal(store.isTransientServerError({ message: 'x', code: 'P0001' }), false);
+  assert.equal(store.isTransientServerError({ message: 'x', code: 'PGRST204' }), false);
+  assert.equal(store.isTransientServerError({ message: 'Internal Server Error', httpStatus: 503 }), true);
+});
+
+await check('a "transient" failure that lasts over a day and 25 tries is set aside', async () => {
+  await freshAccount();
+  state.offline = true;
+  await store.createPartner(partner('13131313-1313-4131-8131-131313131313', 'Stuck'), U);
+  state.offline = false;
+  state.failOn = (b) => (b.op === 'upsert') ? { message: 'internal error', code: 'XX000' } : null;
+  assert.equal(await store.flushWriteQueue(U), 0);
+  const envelope = JSON.parse(state.asyncStorage.get(queueKey));
+  const [key] = Object.keys(envelope.transientWaits);
+  envelope.transientWaits[key] = { first: new Date(Date.now() - 2 * 86400000).toISOString(), attempts: store.MAX_TRANSIENT_ATTEMPTS - 1 };
+  state.asyncStorage.set(queueKey, JSON.stringify(envelope));
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
+  const [entry] = await store.listRejectedWrites(U);
+  assert.match(entry.reason, /kept failing/);
+});
+
+// ─── Round 2: a change waiting on a missing parent does not hold up others ──
+
+await check('a waiting op does not make unrelated online saves queue, and can be discarded', async () => {
+  await freshAccount();
+  const GONE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const P2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const W = 'cccccccc-cccc-4ccc-8ccc-cccccccccccd';
+  state.offline = true;
+  await store.createTouch({ id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', partnerId: GONE, kind: 'call', note: '', occurredAt: new Date().toISOString() }, U);
+  const waitingFollowUp = followUp(W, { partnerId: GONE });
+  await store.createFollowUp(waitingFollowUp, U);
+  state.offline = false;
+  state.failOn = (b) => (b.payload && b.payload.partner_id === GONE) ? { message: 'violates foreign key constraint', code: '23503' } : null;
+  await store.createPartner(partner(P2, 'Online save'), U);
+  assert.ok(state.db.partners.some((row) => row.id === P2), 'an unrelated save goes straight to the server');
+  assert.deepEqual(await store.syncStatus(U), { pending: 0, waiting: 2, rejected: 0 }, 'nothing is "to sync": the device is online');
+  // A change to the waiting follow-up queues behind it.
+  await store.updateFollowUp({ ...waitingFollowUp, note: 'more' }, U);
+  assert.deepEqual(await store.syncStatus(U), { pending: 0, waiting: 2, rejected: 0 });
+  const waiting = await store.listWaitingWrites(U);
+  assert.equal(waiting.length, 2);
+  assert.ok(waiting.every((item) => item.status === 'waiting'));
+  const followUpGroup = waiting.find((item) => item.kind === 'follow_up.insert');
+  assert.equal(followUpGroup.heldChanges, 1, 'its later edit is held with it');
+  await assert.rejects(store.prepareForWorkspaceChange(U), /waiting for a record that never reached the server/);
+  await store.discardWaitingWrite(U, followUpGroup.id);
+  assert.equal(await store.pendingWriteCount(U), 1, 'the follow-up and its edit are gone; the touch still waits');
+  await store.prepareForWorkspaceChange(U, { discardRejected: true });
+  assert.equal(state.asyncStorage.has(queueKey), false, 'an explicit discard lets the workspace change proceed');
+});
+
+// ─── Round 2: a row saved during a refresh stays on screen ──────────────────
+
+await check('a row saved online while a refresh is in flight is kept by the merge', async () => {
+  await freshAccount();
+  const P0 = '0a0a0a0a-0a0a-4a0a-8a0a-0a0a0a0a0a0a';
+  state.db.partners.push({ id: P0, name: 'Existing', organization: 'Org', types: ['Inpatient'], created_at: new Date().toISOString(), org_id: ORG });
+  const base = await store.refreshSnapshot(U);
+  let release;
+  state.selectGate = { table: 'touches', promise: new Promise((resolve) => { release = resolve; }) };
+  const refreshing = store.refreshSnapshot(U);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const touch = { id: '7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a', partnerId: P0, kind: 'call', note: 'Spoke with intake', occurredAt: new Date().toISOString() };
+  await store.createTouch(touch, U);
+  await store.persistCache({ ...base, touches: [touch, ...base.touches] }, U);
+  release();
+  const refreshed = await refreshing;
+  assert.ok(refreshed.touches.some((row) => row.id === touch.id), 'the server has it, so it stays');
+});
+
+// ─── Round 2: sign out with no connection ───────────────────────────────────
+
+await check('forceLocalSignOut removes the persisted session offline', async () => {
+  goOfflineExpired();
+  state.authEvents = [];
+  await auth.forceLocalSignOut();
+  assert.equal(state.storage.has(STORAGE_KEY), false);
+  assert.deepEqual(state.authEvents, ['SIGNED_OUT'], 'subscribers hear SIGNED_OUT');
+  assert.equal(await auth.currentAuthSessionIdentity({ allowOffline: true }), null, 'no offline identity survives it');
+  // Without the private teardown hook it still clears storage itself.
+  goOfflineExpired();
+  state.noRemoveSession = true;
+  await auth.forceLocalSignOut();
+  assert.equal(state.storage.has(STORAGE_KEY), false);
+  state.noRemoveSession = false;
+  signIn();
+  state.offline = false;
+});
+
 // ─── account.ts: every document is removed, past the 1,000-row cap ──────────
 
 {
@@ -649,6 +872,7 @@ exports.prepareForWorkspaceChange = async (userId, options) => {
   if (s.refuseFirstPrepare && s.prepared.length === 1) throw new RejectedWritesError('1 queued change could not be saved', 1);
 };
 exports.rejectedWriteCount = async () => (s.refuseFirstPrepare ? 1 : 0);
+exports.waitingWriteCount = async () => (s.waitingOnPrepare ? 1 : 0);
 `);
   const account = require(path.join(accountDir, 'account.js'));
   await check('account deletion removes every case document, paged', async () => {
@@ -674,6 +898,20 @@ exports.rejectedWriteCount = async () => (s.refuseFirstPrepare ? 1 : 0);
     await account.deleteOwnAccount({ userId: U, removeWorkspaceFiles: false });
     assert.deepEqual(state.prepared, [{ userId: U, options: undefined }, { userId: U, options: { discardRejected: true } }]);
     state.refuseFirstPrepare = false;
+  });
+  await check('account deletion is not blocked by changes waiting on a record that never arrives', async () => {
+    state.prepared = [];
+    state.waitingOnPrepare = true;
+    const real = require(path.join(accountDir, 'store.js'));
+    const original = real.prepareForWorkspaceChange;
+    real.prepareForWorkspaceChange = async (userId, options) => {
+      state.prepared.push({ userId, options });
+      if (!options) throw new errors.StoreError('1 change on this device is waiting for a record that never reached the server.', true);
+    };
+    await account.deleteOwnAccount({ userId: U, removeWorkspaceFiles: false });
+    assert.deepEqual(state.prepared.map((call) => call.options), [undefined, { discardRejected: true }]);
+    real.prepareForWorkspaceChange = original;
+    state.waitingOnPrepare = false;
   });
 }
 
@@ -753,6 +991,32 @@ exports.rejectedWriteCount = async () => (s.refuseFirstPrepare ? 1 : 0);
     await push.refreshPushRegistration(U);
     assert.ok(state.rpcCalls.some((call) => call.name === 'unregister_push_token' && call.args.p_token === 'ExponentPushToken[device-1]'));
     assert.equal(state.asyncStorage.has(`referralfit-push-registration-v1:${U}`), false);
+  });
+  await check('another account’s pending unregister is finished at any sign-in on the device', async () => {
+    resetDb();
+    state.asyncStorage.clear();
+    signIn();
+    let push = freshPush();
+    await push.registerThisDevice(U);
+    goOfflineExpired();
+    push = freshPush();
+    await push.unregisterThisDevice(U); // signed out offline: pending
+    // A different account signs in on the same device, push off for them.
+    const B = '99999999-9999-4999-8999-999999999990';
+    state.storage.set(STORAGE_KEY, JSON.stringify(makeSession(B, 'sess-b', nowS() + 3600)));
+    state.auth = 'online';
+    state.offline = false;
+    auth.resetAuthNetworkStateForTests();
+    state.db.notification_preferences.push({ user_id: B, push_enabled: false, new_lead: true, assigned_to_me: true, overdue_mine: true, directory_decision: true, directory_submission: false, bed_opened: false });
+    state.rpcCalls = [];
+    push = freshPush();
+    await push.refreshPushRegistration(B);
+    assert.deepEqual(state.rpcCalls.map((call) => [call.name, call.args.p_token]), [
+      ['register_push_token', 'ExponentPushToken[device-1]'],
+      ['unregister_push_token', 'ExponentPushToken[device-1]'],
+    ], 'claimed from the old account, then released');
+    assert.equal(state.asyncStorage.has(`referralfit-push-registration-v1:${U}`), false);
+    signIn();
   });
 }
 

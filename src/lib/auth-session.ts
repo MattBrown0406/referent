@@ -204,6 +204,48 @@ export async function resolveLaunchSession(timeoutMs = SESSION_LOOKUP_TIMEOUT_MS
   return { session: fallback, offline: Boolean(fallback) };
 }
 
+// Sign this device out without the server. supabase-js's signOut() (both the
+// global and the 'local' scope) first loads — i.e. refreshes — the session;
+// with an expired token and no connection that fails with
+// AuthRetryableFetchError and the persisted session stays, so the user cannot
+// sign out offline. This removes the persisted session itself (the storage
+// adapter in supabase.ts deletes every SecureStore chunk of the key) and emits
+// SIGNED_OUT. The refresh token is not revoked on the server; it simply
+// leaves the device. Call it only after signOut() failed for lack of a
+// connection (isAuthNetworkError).
+export async function forceLocalSignOut(): Promise<void> {
+  networkDownUntil = 0;
+  const auth = supabase.auth as unknown as {
+    _removeSession?: () => Promise<void>;
+    storage?: { removeItem(key: string): Promise<void> | void };
+    storageKey?: unknown;
+  };
+  let removedByClient = false;
+  if (typeof auth._removeSession === 'function') {
+    try {
+      // supabase-js's own teardown: clears the stored session, the cached
+      // refresh failure, and guards against an in-flight refresh re-saving
+      // it, then notifies onAuthStateChange subscribers.
+      await auth._removeSession();
+      removedByClient = true;
+    } catch {
+      removedByClient = false;
+    }
+  }
+  if (auth.storage && typeof auth.storage.removeItem === 'function' && typeof auth.storageKey === 'string') {
+    for (const suffix of ['', '-code-verifier', '-user']) {
+      try {
+        await auth.storage.removeItem(`${auth.storageKey}${suffix}`);
+      } catch {
+        // Already gone, or the store is unavailable; nothing else to do.
+      }
+    }
+  }
+  if (await readPersistedSession()) {
+    throw new Error('The saved sign-in could not be removed from this device.');
+  }
+}
+
 // Test hook: forget a remembered network failure.
 export function resetAuthNetworkStateForTests(): void {
   networkDownUntil = 0;

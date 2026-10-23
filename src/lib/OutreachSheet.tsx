@@ -129,6 +129,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
   const [pendingCallResult, setPendingCallResult] = useState<CallResult | null>(null);
   const [logNotice, setLogNotice] = useState('');
   const [keyProblem, setKeyProblem] = useState(false); // Anthropic refused the saved key
+  const [composerSaidSent, setComposerSaidSent] = useState(false); // Messages/Mail reported it sent
   const openGeneration = useRef(0);
   const sendingRef = useRef(false); // a second tap before re-render must not open Messages twice
   const draftingRef = useRef(false); // …or request (and bill) two drafts
@@ -160,6 +161,8 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
     setPendingCallResult(null);
     setLogNotice('');
     setKeyProblem(false);
+    setComposerSaidSent(false);
+    draftingRef.current = false; // a draft still in flight from before belongs to the old sheet
     setHistory(knownHistory);
     setChannel(suggestedChannel(first, knownHistory, request.startedFrom?.kind));
     sentAtRef.current = null;
@@ -331,6 +334,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
       return;
     }
     if (result === 'sent') {
+      setComposerSaidSent(true);
       await record();
       return;
     }
@@ -516,13 +520,15 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
   function renderConfirmSent() {
     return (
       <View>
-        <Text style={styles.consentTitle}>Did it go out?</Text>
+        <Text style={styles.consentTitle}>{composerSaidSent ? 'Sent, but not logged yet' : 'Did it go out?'}</Text>
         {logNotice ? <Text style={styles.notice}>{logNotice}</Text> : null}
         <Text style={styles.consentBody}>
-          {channel === 'text' ? 'Messages' : 'Your mail app'} doesn’t tell ReferralFit whether you sent it. If you did, it’s logged and the next follow-up is set {OUTREACH_INTERVAL_HOURS} hours out.
+          {composerSaidSent
+            ? `Your message went out. Log it to set the next follow-up ${OUTREACH_INTERVAL_HOURS} hours out — there is no need to send it again.`
+            : `${channel === 'text' ? 'Messages' : 'Your mail app'} doesn’t tell ReferralFit whether you sent it. If you did, it’s logged and the next follow-up is set ${OUTREACH_INTERVAL_HOURS} hours out.`}
         </Text>
         <TouchableOpacity accessibilityRole="button" onPress={() => { void record(); }} style={styles.primaryButton}>
-          <Text style={styles.primaryButtonText}>Yes, I sent it</Text>
+          <Text style={styles.primaryButtonText}>{composerSaidSent ? 'Log it' : 'Yes, I sent it'}</Text>
         </TouchableOpacity>
         <TouchableOpacity accessibilityRole="button" onPress={() => { setDraftNotice('Not sent, so nothing was logged.'); setStage('compose'); }} style={styles.textButton}>
           <Text style={styles.textButtonText}>No, not yet</Text>

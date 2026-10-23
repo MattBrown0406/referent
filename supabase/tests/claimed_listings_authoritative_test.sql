@@ -382,9 +382,9 @@ SELECT set_config('test.profile_result', public.upsert_org_directory_profile(
     "phone":"541-555-0500","website":"https://cascadefamily.example"}'::jsonb)::text, true);
 
 SELECT is(
-  (current_setting('test.profile_result')::jsonb ->> 'status') || '|' || (current_setting('test.profile_result')::jsonb ->> 'listing_id'),
-  'claim_requested|e2000000-0000-0000-0000-0000000000c1',
-  'a matching email domain no longer takes the listing over; it files a claim request'
+  (current_setting('test.profile_result')::jsonb ->> 'status') || '|' || coalesce(current_setting('test.profile_result')::jsonb ->> 'listing_id', 'hidden'),
+  'claim_requested|hidden',
+  'a matching email domain no longer takes the listing over; it files a claim request (the pending listing''s id is not revealed)'
 );
 
 -- The listing is not the caller's, so it is read back as the superuser.

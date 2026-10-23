@@ -18,13 +18,13 @@ const mustContain = [
   "const QUEUE_KEY_PREFIX = 'referralfit-write-queue-v2:'",
   "const WORKSPACE_KEY_PREFIX = 'referralfit-workspace-v1:'",
   'type CacheEnvelope = { version: 2; userId: string; snapshot: Snapshot }',
-  'type QueueEnvelope = { version: 2; userId: string; ops: QueueOp[]; parentWaits?: Record<string, ParentWait> }',
+  'type QueueEnvelope = { version: 2; userId: string; ops: QueueOp[]; parentWaits?: Record<string, OpWait>; transientWaits?: Record<string, OpWait> }',
   "const REJECTED_KEY_PREFIX = 'referralfit-rejected-writes-v1:'",
   'type RejectedEnvelope = { version: 1; userId: string; entries: RejectedEntry[] }',
   'parsed.userId?.toLowerCase() !== userId',
   'envelope.userId?.toLowerCase() !== fence.userId',
   'await withQueueLock(async () =>',
-  'await writeQueueUnlocked(fence.userId, [...ops, bindQueueOp(op, fence.userId)], parentWaits)',
+  'await writeQueueUnlocked(fence.userId, [...state.ops, bindQueueOp(op, fence.userId)], state)',
   "throw persistenceError('offline queue', error)",
   "throw persistenceError('cache', error)",
   "owner_id: userId",
@@ -100,7 +100,7 @@ assert.match(source, /async function mergeUnsyncedLocal\(remote: Snapshot, local
 assert.match(source, /local\.followUps\.filter\(\(row\) => row\.id && row\.status === 'open' && !remoteFollowUpIds\.has\(row\.id\)\)/, 'only open cached follow-ups may be merge candidates');
 assert.match(source, /from\('follow_ups'\)\.select\('\*'\)\.in\('id', chunk\)/, 'merge candidates must be verified against the server by id');
 assert.match(source, /openCandidates\.filter\(\(row\) => !serverById\.has\(row\.id\) && isPendingRow\(pending\.followUps, row\.id\)\)/, 'only ids unknown to the server AND still created by a pending op may survive');
-assert.match(source, /readQueueUnlocked\(fence\.userId\);\s*const rejected = await readRejectedUnlocked\(fence\.userId\);\s*return pendingCreatedRows\(\[\.\.\.queued, \.\.\.rejected\.map/, 'pending rows come from the live queue and the rejected list');
+assert.match(source, /readQueueUnlocked\(fence\.userId\);\s*const rejected = await readRejectedUnlocked\(fence\.userId\);\s*return pendingCreatedRows\(\[\.\.\.queued, \.\.\.rejected\.flatMap\(\(entry\) => entry\.ops\)\]\)/, 'pending rows come from the live queue and the rejected list (every held op)');
 
 // The case list and every case contact load workspace-wide (each case card
 // shows the family's primary name and phone without opening the file).
@@ -202,7 +202,7 @@ assert.match(appSource, /const FOREGROUND_REFRESH_MIN_INTERVAL_MS = 30_000;/);
 assert.match(appSource, /if \(trigger === 'foreground' && Date\.now\(\) - lastServerRefreshAtRef\.current < FOREGROUND_REFRESH_MIN_INTERVAL_MS\) return 'ok';/, 'foreground refresh must be debounced');
 assert.match(appSource, /if \(refreshInFlightRef\.current\) return refreshInFlightRef\.current;/, 'concurrent refreshes must coalesce');
 // Unconditional and in order: flush, then snapshot, then cases, then the open file.
-assert.match(appSource, /await flushWriteQueue\(userId\);[\s\S]{0,700}const refreshed = await refreshSnapshot\(userId\);[\s\S]{0,400}const caseLoad = await loadCaseList\(userId\);[\s\S]{0,1600}const fileLoad = await loadCaseFile\(userId, openCaseId\);/, 'refresh must keep flush → snapshot → cases → open file');
+assert.match(appSource, /await flushWriteQueue\(userId\);[\s\S]{0,1100}const refreshed = await refreshSnapshot\(userId\);[\s\S]{0,900}const caseLoad = await loadCaseList\(userId\);[\s\S]{0,2200}const fileLoad = await loadCaseFile\(userId, openCaseId\);/, 'refresh must keep flush → snapshot → cases → open file');
 assert.doesNotMatch(appSource, /if \(flushed > 0\) \{\s*refreshed = await refreshSnapshot/, 'foreground refresh must no longer depend on a flushed write');
 assert.match(appSource, /await refreshFromServer\('foreground'\);/);
 assert.match(appSource, /if \(stillCurrent\(\) && !isNetworkError\(error\)\) Alert\.alert\('Sync issue'/, 'a foreground return with no connection must not alert');

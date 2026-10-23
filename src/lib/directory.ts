@@ -546,11 +546,19 @@ export type OrgDirectoryProfileState = {
   pendingClaim: OrgDirectoryClaimRequest | null;
 };
 
+// 'claimed' comes only from a server that predates migration 20261024120000
+// (collisions now always go to ReferralFit review).
+export type UpsertOrgDirectoryProfileStatus = 'created' | 'updated' | 'updated_pending_review' | 'conflict' | 'claim_requested' | 'claimed';
+
 export type UpsertOrgDirectoryProfileResult = {
-  status: 'created' | 'updated' | 'claimed' | 'claim_requested';
-  listingId: string;
+  status: UpsertOrgDirectoryProfileStatus;
+  listingId: string | null;
   requestId?: string;
+  // The server's own explanation for review outcomes, shown as-is.
+  message?: string;
 };
+
+const PROFILE_STATUSES: UpsertOrgDirectoryProfileStatus[] = ['created', 'updated', 'updated_pending_review', 'conflict', 'claim_requested', 'claimed'];
 
 export async function fetchOrgDirectoryProfile(): Promise<OrgDirectoryProfileState> {
   const [orgResult, roleResult] = await Promise.all([
@@ -623,13 +631,16 @@ export function orgDirectoryProfilePayload(input: OrgDirectoryProfileInput): Rec
 export async function upsertOrgDirectoryProfile(input: OrgDirectoryProfileInput): Promise<UpsertOrgDirectoryProfileResult> {
   const { data, error } = await supabase.rpc('upsert_org_directory_profile', { p_payload: orgDirectoryProfilePayload(input) });
   if (error) throw new StoreError(error.message || 'Could not publish your directory profile.', false);
-  const result = (data || {}) as { status?: string; listing_id?: string; request_id?: string };
-  const status = result.status;
-  if (status !== 'created' && status !== 'updated' && status !== 'claimed' && status !== 'claim_requested') {
+  const result = (data || {}) as { status?: string; listing_id?: string | null; request_id?: string; review_id?: string; message?: string };
+  const status = result.status as UpsertOrgDirectoryProfileStatus | undefined;
+  if (!status || !PROFILE_STATUSES.includes(status)) {
     throw new StoreError('The directory returned an unexpected response. Try again.', false);
   }
-  if (typeof result.listing_id !== 'string' || !result.listing_id) {
+  const listingId = typeof result.listing_id === 'string' && result.listing_id ? result.listing_id : null;
+  // Only a review request may come back without a listing the caller can see.
+  if (!listingId && status !== 'claim_requested') {
     throw new StoreError('The directory returned an unexpected response. Try again.', false);
   }
-  return { status, listingId: result.listing_id, requestId: typeof result.request_id === 'string' ? result.request_id : undefined };
+  const requestId = typeof result.request_id === 'string' ? result.request_id : typeof result.review_id === 'string' ? result.review_id : undefined;
+  return { status, listingId, requestId, message: typeof result.message === 'string' && result.message.trim() ? result.message.trim() : undefined };
 }

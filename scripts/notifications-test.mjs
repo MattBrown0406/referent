@@ -174,6 +174,59 @@ assert.equal(nativeState.scheduled.length, 50, 'the cap still holds');
 assert.ok(titles.lastIndexOf('Follow-up due') < titles.indexOf('ReferralFit'), 'cadence nags only fill what is left');
 assert.equal(nativeState.scheduled.some((item) => /Teammate/.test(item.content.body)), false);
 
+// Overdue follow-ups collapse into ONE summary at 9:00 instead of each firing
+// at once; future ones keep their own reminder; cadence nags still come last.
+{
+  nativeState.scheduled = [];
+  await notifications.activateReferralFitNotificationOwner(ME);
+  const longAgo = new Date();
+  longAgo.setDate(longAgo.getDate() - 5);
+  const overdue = Array.from({ length: 30 }, (_, index) => ({ id: `od-${index}`, title: `Overdue ${index}`, dueOn: stamp(longAgo), status: 'open', note: '', assignedTo: ME }));
+  const future = { id: 'later', title: 'Later', dueOn: stamp(tomorrow), status: 'open', note: '', assignedTo: ME };
+  await notifications.rescheduleNotifications({ partners: coldPartners.slice(0, 2), referrals: [], referralMatches: [], followUps: [...overdue, future], cases: [] }, ME);
+  const summaries = nativeState.scheduled.filter((item) => item.content.title === 'Follow-ups due');
+  assert.equal(summaries.length, 1, 'one summary for every overdue follow-up');
+  assert.equal(summaries[0].content.body, '30 overdue follow-ups');
+  const nine = summaries[0].trigger.date;
+  assert.equal(nine.getHours(), 9);
+  assert.equal(nativeState.scheduled.filter((item) => item.content.title === 'Follow-up due').map((item) => item.content.body).join(), 'Later', 'a future follow-up keeps its own reminder');
+  const order = nativeState.scheduled.map((item) => item.content.title);
+  assert.ok(order.indexOf('ReferralFit') > order.indexOf('Follow-up due'), 'cadence nags after the user’s own items');
+  assert.equal(nativeState.scheduled.length, 1 + 1 + 1 + 2 * 3, 'briefing + summary + future + nags');
+
+  nativeState.scheduled = [];
+  await notifications.rescheduleNotifications({ partners: [], referrals: [], referralMatches: [], followUps: [overdue[0]], cases: [] }, ME);
+  assert.deepEqual(nativeState.scheduled.filter((item) => /^Follow-up/.test(item.content.title)).map((item) => [item.content.title, item.content.body]), [['Follow-up due', 'Overdue 0']], 'a single overdue item still reads as itself');
+}
+
+// A tap that launches the app (cold start) arrives before any account is
+// active. It is held and delivered once that same account becomes active.
+{
+  await notifications.cancelReferralFitNotifications(); // no owner, as at launch
+  const coldTargets = [];
+  nativeState.lastResponse = { notification: { request: { identifier: 'cold-1', content: { data: { kind: 'assigned_to_me', user_id: ME, case_id: 'case-cold' } } } } };
+  const unsubscribeCold = notifications.subscribeToNotificationResponses((target, partnerId, caseId) => coldTargets.push([target, partnerId, caseId]));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(coldTargets, [], 'nothing is opened before the account is known');
+  assert.equal(nativeState.lastResponse, null, 'the OS copy is cleared once it is held in memory');
+  // A local reminder tapped for another account is never delivered.
+  nativeState.responseListener({ notification: { request: { identifier: 'cold-other', content: { data: { target: 'directory', partnerId: 'p-other', ownerId: MATE } } } } });
+  await notifications.activateReferralFitNotificationOwner(ME);
+  assert.deepEqual(coldTargets, [['case', undefined, 'case-cold']], 'delivered once the same account is active, and only for it');
+  await notifications.activateReferralFitNotificationOwner(ME);
+  assert.equal(coldTargets.length, 1, 'never delivered twice');
+  unsubscribeCold();
+
+  // A held tap for one account is not delivered to a different account.
+  await notifications.cancelReferralFitNotifications();
+  const wrongTargets = [];
+  const unsubscribeWrong = notifications.subscribeToNotificationResponses((target, partnerId, caseId) => wrongTargets.push([target, partnerId, caseId]));
+  nativeState.responseListener({ notification: { request: { identifier: 'cold-2', content: { data: { target: 'directory', partnerId: 'p-1', ownerId: MATE } } } } });
+  await notifications.activateReferralFitNotificationOwner(ME);
+  assert.deepEqual(wrongTargets, []);
+  unsubscribeWrong();
+}
+
 // ─── Cadence counts calendar days in the device's time zone ────────────────
 {
   const previousTz = process.env.TZ;

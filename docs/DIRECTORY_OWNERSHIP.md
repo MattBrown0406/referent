@@ -73,23 +73,35 @@ searchable. The search RPC gained an optional `p_types text[]` overlap filter
 (appended last; positional callers unaffected) and a `claimed boolean` output
 column.
 
-Return value: `{"status": ..., "listing_id": ..., "request_id"?: ...}`.
+Return value: `{"status": ..., "listing_id": ..., ...}`. The review
+statuses also carry a `message` the app can show as is.
 
-| `status` | Meaning |
-| --- | --- |
-| `created` | No duplicate; a new active, verified listing owned by the workspace. |
-| `updated` | The workspace already owned a listing; it was updated and re-verified. Status untouched (an admin-archived profile stays archived). |
-| `claim_requested` | A duplicate exists (same phone digits or website domain). A `center_claim_requests` row was recorded (or the existing open one returned). **Nothing on the listing changed**; a platform admin decides. |
+| `status` | Extra keys | Meaning |
+| --- | --- | --- |
+| `created` | | No duplicate; a new active, verified listing owned by the workspace. |
+| `updated` | | The workspace already owned a listing; it was updated and re-verified. Status untouched (an admin-archived profile stays archived). |
+| `updated_pending_review` | `review_id`, `held_fields` (any of `"name"`, `"phone"`, `"website"`), `message` | Updated, but the new organization/name, phone or website matches **another** listing. Those identity fields keep their live values; everything else in the save landed. An `identity_edit` review request holds the change. |
+| `conflict` | `review_id`, `message` | The duplicate is **owned by another workspace**, so a claim could never be approved. The caller's profile is created owned but `pending` (hidden from the directory) with a `profile_conflict` review request. Saving again returns `conflict` while the review is open. `listing_id` is the caller's own new profile. |
+| `claim_requested` | `request_id`, `message` | A duplicate exists that no workspace owns (it may be center-claimed). A `center_claim_requests` row was recorded (or the open one returned). **Nothing on the listing changed**; a platform admin decides. `listing_id` is returned only when the caller may see that listing (it is active, or the caller's workspace submitted or created it); otherwise it is `null`. |
+
+Messages, verbatim:
+
+- `updated_pending_review`: "Your other changes are live. The new name, phone number, or website matches another directory listing, so ReferralFit will review it first. Your current details stay up until then."
+- `conflict` (first save): "Another practice already manages a directory listing with this phone number or website. Your profile is saved and ReferralFit will review it before it appears in the directory."
+- `conflict` (later saves): "Your profile is saved and waits for ReferralFit to review it before it appears in the directory."
+- `claim_requested`: "A directory listing with this phone number or website already exists. ReferralFit will review your request to manage it; nothing changes until then."
 
 `claimed` (automatic takeover) was removed on 2026-10-24. Older app builds
 that still know the word simply never receive it.
 
 ### Anti-hijack rule
 
-There is **no automatic takeover**. Whenever a duplicate exists — claimed
-or not, whoever created or submitted it — the profile save files a claim
-request and changes nothing on the listing until a platform admin approves
-it with `approve_center_claim_request`.
+There is **no automatic takeover**. Whenever a duplicate exists, whoever
+created or submitted it, the profile save changes nothing on that listing.
+If no workspace owns it, a claim request is filed for a platform admin
+(`approve_center_claim_request`); if another workspace owns it, the
+caller's profile is saved pending with a `profile_conflict` review instead,
+because that claim could never be approved.
 
 Until 2026-10-24 three signals handed an unclaimed duplicate over on the
 spot: the caller's workspace had submitted it (`suggested_by_org_id`), the
@@ -104,6 +116,38 @@ into the request's `note` for the reviewer, for example
 Re-submitting returns the same open request (one pending request per
 workspace per listing). A workspace never has more than one profile
 (`global_partners_owner_org_unique`).
+
+### Claimant identity edits that collide
+
+A claimant (the owning workspace, through the profile RPC, or a center
+account, through its direct update) can change its listing's organization,
+contact name, phone or website. If the new organization/name key, phone
+digits or website domain is **already used by another non-archived
+listing**, the trigger `global_partners_hold_colliding_edits` keeps the old
+values live, files (or refreshes) an `identity_edit` review request with
+the proposed values, and lets the rest of the edit through. Nothing
+propagates to linked partners until an admin approves. A later identity
+change that collides with nothing goes live and withdraws the held one.
+Platform admins, service code and the SQL editor are never held.
+
+This closes the "rename your claimed listing to a competitor and copy its
+phone" path. Suggestions never auto-link to a claimed listing at all
+(`docs/DIRECTORY_SUBMISSIONS.md`).
+
+### Joining a team
+
+When a solo owner accepts a team invite (`accept_org_invite`), their
+workspace's directory state moves with them:
+
+- their profile (`owner_org_id`) becomes the team's when the team has
+  none; when the team already owns one, the joiner's profile is left
+  **live and unowned** and an `orphaned_profile` review request (visible
+  to the team) asks the admin to keep or archive it;
+- listings they submitted (`suggested_by_org_id`) count as the team's;
+- their pending claim requests move to the team (a duplicate of one the
+  team already has is dropped);
+- their `org_entitlements` merge into the team's (active if either is, the
+  later expiry, no expiry when an active row had none).
 
 ### The workspace's own partner network
 
@@ -121,6 +165,26 @@ Owners read their own listing regardless of status through the RLS policy
 `global_partners: org owner read own`. Members of the requesting workspace
 (and platform admins) read `center_claim_requests`. Nothing else changed for
 readers; `search_global_partners` still shows active listings only.
+
+## Reviewing review requests (Matt, SQL editor)
+
+Identity edits, profile conflicts and orphaned profiles wait in
+`directory_review_requests`:
+
+```sql
+SELECT * FROM public.list_directory_review_requests();
+SELECT public.resolve_directory_review_request('<id>', true);   -- approve
+SELECT public.resolve_directory_review_request('<id>', false);  -- decline
+```
+
+| kind | approve | decline |
+| --- | --- | --- |
+| `identity_edit` | applies `proposed` (organization, name, phone, website) | nothing changes |
+| `profile_conflict` | the pending profile goes live and verified | the pending profile is archived |
+| `orphaned_profile` | the listing stays live and unowned | the listing is archived |
+
+The requesting workspace (and, for a center, the requesting account) can
+read its own rows to show "under review".
 
 ## Reviewing claim requests (Matt, SQL editor)
 
@@ -206,4 +270,10 @@ only backfills `verified_at` on listings that already have a center claim.
 - Every duplicate needs an admin decision, including a listing the
   practice itself submitted earlier through the partner flow. Expect more
   claim requests in the queue than before 2026-10-24.
+- A claimed listing can still be renamed to a program that is **not** in
+  the directory yet; nothing can detect that. It no longer captures other
+  practices' partners (suggestions never link to claimed listings), and the
+  real program's own profile then lands as a `conflict` for the admin.
+- A profile created with only a name that matches another listing (no
+  shared phone or website) is still created live.
 - Approving a claim request does not apply the submitted payload.

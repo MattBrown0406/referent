@@ -1,7 +1,7 @@
 import { RejectedWritesError, StoreError, describeError } from './errors';
 import { fetchCurrentOrgId } from './org';
 import { fetchAllPages } from './paging';
-import { prepareForWorkspaceChange, rejectedWriteCount } from './store';
+import { prepareForWorkspaceChange, rejectedWriteCount, waitingWriteCount } from './store';
 import { supabase } from './supabase';
 
 // Self-serve account deletion (App Store guideline 5.1.1(v)).
@@ -62,10 +62,11 @@ export async function deleteOwnAccount({ userId, removeWorkspaceFiles }: DeleteO
     try {
       await prepareForWorkspaceChange(userId);
     } catch (error) {
-      // Changes the server already refused (set aside on this device) are
-      // moot once the account is gone; anything else still blocks deletion.
-      const refused = error instanceof RejectedWritesError || await rejectedWriteCount(userId).catch(() => 0) > 0;
-      if (!refused) throw error;
+      // Changes the server already refused, and changes waiting on a record
+      // that never reached the server, are moot once the account is gone;
+      // changes that can still sync (offline, server trouble) block deletion.
+      const unsaved = (await rejectedWriteCount(userId).catch(() => 0)) + (await waitingWriteCount(userId).catch(() => 0));
+      if (!(error instanceof RejectedWritesError) && unsaved === 0) throw error;
       await prepareForWorkspaceChange(userId, { discardRejected: true });
     }
   } catch (error) {

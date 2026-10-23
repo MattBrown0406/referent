@@ -58,11 +58,15 @@ export class ExpoHttpError extends Error {
   }
 }
 
-// Whole-request failures: Expo 5xx and 429 are transient, other 4xx
-// answers are not; anything thrown before an answer (network error,
-// timeout, unreadable body) is transient.
+// Whole-request failures: Expo 5xx and 429 are transient, and so are 401
+// and 403 (a missing or rotated EXPO_ACCESS_TOKEN is a configuration fix,
+// not a reason to drop the notification; five attempts still bound it).
+// Other 4xx answers are final. Anything thrown before an answer (network
+// error, timeout, unreadable body) is transient.
 export function isTransientSendFailure(error: unknown): boolean {
-  if (error instanceof ExpoHttpError) return error.status >= 500 || error.status === 429;
+  if (error instanceof ExpoHttpError) {
+    return error.status >= 500 || error.status === 429 || error.status === 401 || error.status === 403;
+  }
   return true;
 }
 

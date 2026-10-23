@@ -182,7 +182,14 @@ Rate limits (in `supabase/functions/intake/intake.ts`), enforced by
 
 Junk posts therefore never spend the practice's 30-an-hour link budget
 (before 2026-10-24 about 30 junk posts could lock a link for an hour), and
-a family that mistypes a few times is not locked out. Pages carry a strict
+a family that mistypes a few times is not locked out.
+
+Known limitation: the visitor address is the first entry of
+`X-Forwarded-For` (then `cf-connecting-ip` / `x-real-ip`). A client can put
+any value in that first entry, so the two per-address buckets slow down
+casual abuse but do not stop a sender that rotates the header. The
+per-link bucket (charged only for leads that would be created) is the
+backstop; a lead flood still needs valid-looking names and phone numbers. Pages carry a strict
 Content-Security-Policy, no scripts, `noindex`, and `no-store`.
 
 Local checks, matching CI:

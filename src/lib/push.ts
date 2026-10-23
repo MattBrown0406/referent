@@ -277,9 +277,47 @@ export async function enablePush(userId?: string): Promise<PushRegistration> {
   return registerThisDevice(userId);
 }
 
-// Sign-in: keep the registration fresh for members who turned push on, and
-// finish an unregister that could not reach the server at the last sign-out.
-// Silent by design; any failure is simply "no push on this device".
+// Other accounts on this device whose sign-out could not unregister the
+// device (no connection at the time).
+async function otherAccountsPendingUnregister(userId: string): Promise<StoredPushRegistration[]> {
+  let keys: readonly string[];
+  try {
+    keys = await AsyncStorage.getAllKeys();
+  } catch {
+    return [];
+  }
+  const own = pushRegistrationKey(userId);
+  const records: StoredPushRegistration[] = [];
+  for (const key of keys) {
+    if (!key.startsWith(PUSH_REGISTRATION_KEY_PREFIX) || key === own) continue;
+    const record = await readStoredRegistration(key.slice(PUSH_REGISTRATION_KEY_PREFIX.length));
+    if (record?.pendingUnregister) records.push(record);
+  }
+  return records;
+}
+
+// Only a token's owner can unregister it (unregister_push_token deletes WHERE
+// user_id = auth.uid(), and there is no session-less path), but
+// register_push_token moves a token to the caller and deletes every other
+// account's row for it. So the signed-in account claims the old account's
+// token and then releases it: the device stops receiving the old account's
+// pushes, and receives this account's only if it registers below.
+async function releaseOtherAccountToken(record: StoredPushRegistration): Promise<boolean> {
+  const claimed = await supabase.rpc('register_push_token', {
+    p_token: record.token,
+    p_platform: Platform.OS === 'android' ? 'android' : 'ios',
+    p_tz_offset_minutes: null,
+  });
+  if (claimed.error) return false; // retried at the next sign-in or launch
+  const released = await supabase.rpc('unregister_push_token', { p_token: record.token });
+  return !released.error;
+}
+
+// Sign-in (any account): keep the registration fresh for members who turned
+// push on, and finish any unregister that could not reach the server at an
+// earlier sign-out on this device — this account's or another account's.
+// Silent by design; any failure is simply "no push on this device", retried
+// at the next sign-in or launch.
 export async function refreshPushRegistration(userId: string): Promise<void> {
   try {
     const stored = await readStoredRegistration(userId);
@@ -287,13 +325,22 @@ export async function refreshPushRegistration(userId: string): Promise<void> {
       registeredToken = stored.token;
       registeredUserId = stored.userId;
     }
+    const others = await otherAccountsPendingUnregister(userId);
     const { preferences, available } = await fetchNotificationPreferences(userId);
     if (!available) return;
+    let registeredNow: string | null = null;
     if (preferences.pushEnabled) {
-      await registerThisDevice(userId);
-      return;
+      const registration = await registerThisDevice(userId);
+      if (registration.ok) registeredNow = registration.token;
+    } else if (stored?.pendingUnregister) {
+      await unregisterThisDevice(userId);
     }
-    if (stored?.pendingUnregister) await unregisterThisDevice(userId);
+    for (const record of others) {
+      // Registering this account already moved the same token away from them.
+      if ((registeredNow && registeredNow === record.token) || await releaseOtherAccountToken(record)) {
+        await clearStoredRegistration(record.userId);
+      }
+    }
   } catch {
     // Offline, or the server does not have push yet.
   }

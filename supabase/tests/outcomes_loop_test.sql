@@ -35,15 +35,15 @@ UPDATE public.org_members SET org_id = current_setting('test.org_p')::uuid, role
  WHERE user_id = 'a2000000-0000-0000-0000-00000000c100';
 
 -- Network stats count only established workspaces (20261024120000): make
--- P and n1..n4 60 days old with three cases each.
-UPDATE public.orgs SET created_at = now() - interval '60 days'
+-- P and n1..n4 90 days old with ten cases each, one per day.
+UPDATE public.orgs SET created_at = now() - interval '90 days'
  WHERE id IN (current_setting('test.org_p')::uuid, current_setting('test.org_n1')::uuid, current_setting('test.org_n2')::uuid,
               current_setting('test.org_n3')::uuid, current_setting('test.org_n4')::uuid);
-INSERT INTO public.cases (owner_id, title)
-SELECT u.id, 'Established fixture ' || g
+INSERT INTO public.cases (owner_id, title, created_at)
+SELECT u.id, 'Established fixture ' || g, now() - make_interval(days => g)
   FROM unnest(ARRAY['a1000000-0000-0000-0000-00000000c100', 'c1000000-0000-0000-0000-00000000c100', 'c2000000-0000-0000-0000-00000000c100',
                     'c3000000-0000-0000-0000-00000000c100', 'c4000000-0000-0000-0000-00000000c100']::uuid[]) AS u(id),
-       generate_series(1, 3) AS g;
+       generate_series(1, 10) AS g;
 
 -- One shared listing G1, linked from P and from n1..n4.
 INSERT INTO public.global_partners (id, name, organization, types, city, state, phone, status, verified_at)

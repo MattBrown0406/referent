@@ -71,7 +71,7 @@ import {
 } from './src/lib/matching';
 import { bedForFromPopulation, bedsCadenceLine, bedsLine, type BedFor } from './src/lib/beds';
 import { supabase } from './src/lib/supabase';
-import { offlineSessionFallback, resolveLaunchSession } from './src/lib/auth-session';
+import { forceLocalSignOut, isAuthNetworkError, offlineSessionFallback, resolveLaunchSession } from './src/lib/auth-session';
 import { describeError, RejectedWritesError } from './src/lib/errors';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
@@ -148,10 +148,12 @@ import {
   hydrate,
   discardAllRejectedWrites,
   discardRejectedWrite,
+  discardWaitingWrite,
   isOfflineSession,
   listRejectedWrites,
-  rejectedWriteCount,
+  listWaitingWrites,
   retryRejectedWrite,
+  syncStatus,
   type RejectedWrite,
   isNetworkError,
   loadCaseFile,
@@ -290,7 +292,7 @@ function makeId(_prefix?: string) {
 // server is skipped; pull-to-refresh always runs.
 const FOREGROUND_REFRESH_MIN_INTERVAL_MS = 30_000;
 // Long enough for an iOS sheet's dismissal to finish before the next presents.
-const SHEET_SWAP_MS = 450;
+const SHEET_SWAP_MS = 600;
 
 // Where the case list / open case file on screen came from. 'cache' is the
 // saved offline copy (read-only until the server is reached again);
@@ -1166,6 +1168,15 @@ export default function App() {
   const activeOrgIdRef = useRef('');
   const businessLoadGenerationRef = useRef(0);
   const caseLoadGenerationRef = useRef(0);
+  // Bumped by every local change (an optimistic write or a timeline entry). A
+  // refresh that read the server before a change landed must not paint over
+  // it: it skips applying what it read, and the next refresh catches up.
+  const localChangeSerialRef = useRef(0);
+  // Whether any sheet is up right now (kept current every render), so a sheet
+  // opened on a timer never tries to present over another one.
+  const anySheetOpenRef = useRef(false);
+  // The packet composer is closing (its nested confirm first, then itself).
+  const packetClosingRef = useRef(false);
   activeUserIdRef.current = activeUserId;
 
   const refreshBusiness = useCallback(async () => {
@@ -1201,11 +1212,15 @@ export default function App() {
     const activeCases = caseList ?? cases;
     await persistCache(data, userId);
     if (!accountIsCurrent()) throw new Error('The account changed before local data could be saved.');
-    const pending = await pendingWriteCount(userId);
+    // Pending: still to send. Waiting (on a record the server lacks) and
+    // rejected: the user's to review, so they sit in the banner, not the badge.
+    const status = await syncStatus(userId).catch(() => null);
+    if (!accountIsCurrent()) throw new Error('The account changed before local data could be saved.');
+    const pending = status ? status.pending : await pendingWriteCount(userId);
     if (!accountIsCurrent()) throw new Error('The account changed before local data could be saved.');
     setQueuedWrites(pending);
     setOffline(pending > 0);
-    setRejectedWrites(await rejectedWriteCount(userId).catch(() => 0));
+    setRejectedWrites(status ? status.waiting + status.rejected : 0);
     await withTimeout(
       rescheduleNotifications({ ...data, cases: activeCases }, userId),
       6000,
@@ -1231,6 +1246,7 @@ export default function App() {
       Alert.alert('Save in progress', `Wait for the current save to finish, then retry ${label.toLowerCase()}.`);
       return false;
     }
+    localChangeSerialRef.current += 1;
     const mutationToken = Symbol(label);
     mutationActiveRef.current = mutationToken;
     let accepted = false;
@@ -1495,8 +1511,9 @@ export default function App() {
         const result = await hydrate(userId);
         if (!active || generation !== authGenerationRef.current) return;
         applySnapshot(result.snapshot);
-        const setAside = await rejectedWriteCount(userId).catch(() => 0);
+        const hydratedStatus = await syncStatus(userId).catch(() => null);
         if (!active || generation !== authGenerationRef.current) return;
+        const setAside = hydratedStatus ? hydratedStatus.waiting + hydratedStatus.rejected : 0;
         setRejectedWrites(setAside);
         if (result.syncError && !setAside) setRefreshNotice('Some offline changes have not synced yet. Pull down to try again.');
 
@@ -1655,22 +1672,39 @@ export default function App() {
         // snapshot that would otherwise re-queue them is read back.
         await flushWriteQueue(userId);
       } catch (error) {
-        if (isNetworkError(error)) return 'offline';
-        // Refused changes were set aside; everything else synced. Say so, and carry on.
-        if (!(error instanceof RejectedWritesError)) throw error;
+        // Refused changes were set aside; everything else synced. Say so, and
+        // carry on (checked first: a refusal reason can mention a "timeout").
+        if (!(error instanceof RejectedWritesError)) {
+          if (isNetworkError(error)) return 'offline';
+          throw error;
+        }
       }
       if (!stillCurrent()) return 'ok';
-      setRejectedWrites(await rejectedWriteCount(userId).catch(() => 0));
+      const refreshedStatus = await syncStatus(userId).catch(() => null);
       if (!stillCurrent()) return 'ok';
+      setRejectedWrites(refreshedStatus ? refreshedStatus.waiting + refreshedStatus.rejected : 0);
+      if (!stillCurrent()) return 'ok';
+      const serialBeforeRead = localChangeSerialRef.current;
+      const changedMeanwhile = () => localChangeSerialRef.current !== serialBeforeRead || Boolean(mutationActiveRef.current);
       const refreshed = await refreshSnapshot(userId);
       if (!stillCurrent()) return 'ok';
       if (!refreshed) return 'offline';
+      if (changedMeanwhile()) {
+        // Something was saved while this read was in flight; what was read is
+        // older than the screen. Leave it, and let the next refresh run soon.
+        lastServerRefreshAtRef.current = 0;
+        return 'ok';
+      }
       lastServerRefreshAtRef.current = Date.now();
       applySnapshot(refreshed, false);
       // The case list and contacts reload; the timeline is re-read for the one
       // open case file (below), never for every case.
       const caseLoad = await loadCaseList(userId);
       if (!stillCurrent()) return 'ok';
+      if (changedMeanwhile()) {
+        lastServerRefreshAtRef.current = 0;
+        return 'ok';
+      }
       setCases(caseLoad.list.cases);
       setAllCaseContacts(caseLoad.list.contacts);
       setCaseListSource({ userId, source: caseLoad.source, savedAt: caseLoad.savedAt, truncated: false });
@@ -1702,8 +1736,9 @@ export default function App() {
       if (openCaseId) {
         const fileLoad = await loadCaseFile(userId, openCaseId);
         if (!stillCurrent()) return 'ok';
-        // The user may have closed this case or opened another meanwhile.
-        if (caseLoadGenerationRef.current === caseGeneration && activeCaseIdRef.current === openCaseId) {
+        // The user may have closed this case or opened another meanwhile, or
+        // added to its timeline since the read began.
+        if (caseLoadGenerationRef.current === caseGeneration && activeCaseIdRef.current === openCaseId && !changedMeanwhile()) {
           setCaseEvents(fileLoad.file.events);
           setCaseDocuments(fileLoad.file.documents);
           setCaseFileSource({ userId, source: fileLoad.source, savedAt: fileLoad.savedAt, truncated: fileLoad.truncated });
@@ -1718,7 +1753,8 @@ export default function App() {
       } catch {
         // Keep the last known member list.
       }
-      await syncDerived(refreshed, caseLoad.list.cases);
+      // A change that landed meanwhile saves its own copy; never overwrite it with this read.
+      if (!changedMeanwhile()) await syncDerived(refreshed, caseLoad.list.cases);
       if (stillCurrent()) setRefreshNotice('');
       return 'ok';
     })();
@@ -1796,28 +1832,30 @@ export default function App() {
 
   // Tapping a notification jumps to the relevant tab and, for cadence nudges,
   // opens the named partner once that account's directory has hydrated.
+  // Whatever sheet is up closes first; the target opens once it is gone.
+  const notificationTapRef = useRef<(...args: Parameters<Parameters<typeof subscribeToNotificationResponses>[0]>) => void>(() => undefined);
+  notificationTapRef.current = (target, partnerId, caseId) => {
+    closeAllSheets(() => {
+      // Server-sent pushes carry only ids; the item opens once it has loaded.
+      if (target === 'case') {
+        setTab('home');
+        if (caseId) setPendingNotificationCaseId(caseId);
+        return;
+      }
+      if (target === 'workspace') {
+        setTab('home');
+        setShowWorkspace(true);
+        return;
+      }
+      setTab(target);
+      if (partnerId) setPendingNotificationPartnerId(partnerId);
+    });
+  };
   useEffect(() => {
     if (!session?.user?.id) return undefined;
-    return subscribeToNotificationResponses((target, partnerId, caseId) => {
-      // Whatever sheet is up closes first; the target opens once it is gone
-      // (iOS cannot present a second sheet over a sibling).
-      closeAllSheets();
-      afterSheetCloses(() => {
-        // Server-sent pushes carry only ids; the item opens once it has loaded.
-        if (target === 'case') {
-          setTab('home');
-          if (caseId) setPendingNotificationCaseId(caseId);
-          return;
-        }
-        if (target === 'workspace') {
-          setTab('home');
-          setShowWorkspace(true);
-          return;
-        }
-        setTab(target);
-        if (partnerId) setPendingNotificationPartnerId(partnerId);
-      });
-    });
+    // Through a ref, so the handler always sees this render's state (the
+    // subscription itself lives for the whole sign-in).
+    return subscribeToNotificationResponses((target, partnerId, caseId) => notificationTapRef.current(target, partnerId, caseId));
   }, [session?.user?.id]);
 
   useEffect(() => {
@@ -2163,41 +2201,69 @@ export default function App() {
     setShowAddReferral(true);
   }
 
-  // Closes every sheet a notification tap could land on top of.
-  function closeAllSheets() {
-    closeCase();
-    setSelectedPartner(null);
-    setShowAddPartner(false);
-    setShowAddReferral(false);
-    setTouchPartner(null);
-    setPacketTarget(null);
-    setPacketSendConfirm(false);
-    setOutcomeFollowUp(null);
-    setShowNewCase(false);
-    setShowNewLead(false);
-    setShowOrgProfile(false);
-    setShowBusinessDashboard(false);
-    setShowGlobalDirectory(false);
-    setShowWorkspace(false);
-    setDoneCard(null);
-    setNextStepCard(null);
-    setSnoozeCard(null);
-    setShowQuickAdd(false);
-    setContactPick(null);
-    setTodayQuickNote(null);
+  // Closes every sheet a notification tap could land on top of, then runs
+  // `then`. Two steps: sheets nested inside another sheet close first, and
+  // their parents once that has finished — iOS cannot dismiss a sheet while
+  // the one it presented is still on screen (it would stay frozen).
+  function closeAllSheets(then: () => void) {
+    const userId = activeUserIdRef.current;
+    const generation = authGenerationRef.current;
+    const stillCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
     setOutreach(null);
+    setTouchPartner(null);
+    setPacketSendConfirm(false);
+    setTimeout(() => {
+      if (!stillCurrent()) return;
+      closeCase();
+      setSelectedPartner(null);
+      setShowAddPartner(false);
+      setShowAddReferral(false);
+      setPacketTarget(null);
+      packetClosingRef.current = false;
+      setOutcomeFollowUp(null);
+      setShowNewCase(false);
+      setShowNewLead(false);
+      setShowOrgProfile(false);
+      setShowBusinessDashboard(false);
+      setShowGlobalDirectory(false);
+      setShowWorkspace(false);
+      setDoneCard(null);
+      setNextStepCard(null);
+      setSnoozeCard(null);
+      setShowQuickAdd(false);
+      setContactPick(null);
+      setTodayQuickNote(null);
+      setRejectedList(null);
+      setProfilePromptVisible(false);
+      setNotifPrePromptVisible(false);
+      setWelcomeVisible(false);
+      afterSheetCloses(then, { ifScreenBusy: 'wait' });
+    }, SHEET_SWAP_MS);
   }
 
   // iOS shows one sheet at a time from a screen: presenting the next while the
   // last is still animating away fails silently, and React Native then thinks
   // it is showing, so that sheet stays stuck until restart. Close first, then
   // open once the dismissal has finished (same delay used elsewhere here).
-  function afterSheetCloses(open: () => void) {
+  // `ifScreenBusy`: when another sheet is up at that moment, 'skip' (the
+  // user moved on; default), 'wait' and try again (prompts the app offers on
+  // its own), or 'ignore' (the step closes a sheet rather than opening one).
+  // `stillWanted` lets the caller cancel, e.g. after a rollback.
+  function afterSheetCloses(open: () => void, options: { ifScreenBusy?: 'skip' | 'wait' | 'ignore'; stillWanted?: () => boolean } = {}) {
     const userId = activeUserIdRef.current;
     const generation = authGenerationRef.current;
-    setTimeout(() => {
-      if (activeUserIdRef.current === userId && authGenerationRef.current === generation) open();
-    }, SHEET_SWAP_MS);
+    const attempt = (tries: number) => {
+      setTimeout(() => {
+        if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation) return;
+        if (options.stillWanted && !options.stillWanted()) return;
+        if (options.ifScreenBusy !== 'ignore' && anySheetOpenRef.current) {
+          if (options.ifScreenBusy === 'wait' && tries < 50) attempt(tries + 1);
+          return;
+        }
+        open();
+      }, SHEET_SWAP_MS);
+    };
+    attempt(0);
   }
 
   function openReferral(direction: ReferralDirection, partnerId?: string) {
@@ -2320,7 +2386,7 @@ export default function App() {
   }
 
   async function sharePacketText() {
-    if (!packetTarget) return;
+    if (!packetTarget || packetClosingRef.current) return;
     try {
       const result = await Share.share({
         title: `Placement recommendation — ${packetTarget.match.clientLabel}`,
@@ -2340,10 +2406,22 @@ export default function App() {
   }
 
   function closePacketComposer() {
-    setPacketTarget(null);
-    setPacketSendConfirm(false);
-    setPacketAudience('family');
-    clearPendingPlacement();
+    const finish = () => {
+      setPacketSendConfirm(false);
+      setPacketTarget(null);
+      setPacketAudience('family');
+      clearPendingPlacement();
+      packetClosingRef.current = false;
+    };
+    if (packetSendConfirm) {
+      // The confirm is nested in the composer: iOS has to finish closing it
+      // before the composer itself can close, or the composer stays frozen.
+      packetClosingRef.current = true;
+      setPacketSendConfirm(false);
+      afterSheetCloses(finish, { ifScreenBusy: 'ignore' });
+      return;
+    }
+    finish();
   }
 
   // Post-send automation ("the loop"): referral + touch + follow-up, all
@@ -2951,6 +3029,7 @@ export default function App() {
   // Insert or replace an event in the local timeline and reflect the
   // activity on the case's updated_at ordering.
   function applyCaseEvent(event: CaseEvent) {
+    localChangeSerialRef.current += 1;
     if (activeCaseIdRef.current === event.caseId) {
       setCaseEvents((current) => [event, ...current.filter((item) => item.id !== event.id)]);
     }
@@ -3041,7 +3120,7 @@ export default function App() {
       'The case',
       [record, ...previous],
       previous,
-    ).then((saved) => { if (saved) openCase(record.id); });
+    ).then((saved) => { if (saved) afterSheetCloses(() => openCase(record.id)); });
   }
 
   function changeCaseStatus(record: CaseRecord, status: CaseStatus) {
@@ -3438,8 +3517,18 @@ export default function App() {
   // dialer, and — once it is sent or the call is logged — close the step it
   // came from and set the next follow-up 48 hours out (src/lib/outreach.ts).
 
-  const senderName = members.find((member) => member.userId === activeUserId.toLowerCase())?.displayName || '';
+  // Who signs a draft: the member name, or (offline, before members load) the
+  // name given at sign-up.
+  const senderName = members.find((member) => member.userId === activeUserId.toLowerCase())?.displayName
+    || (typeof session?.user?.user_metadata?.display_name === 'string' ? session.user.user_metadata.display_name : '')
+    || '';
   latestSnapshotRef.current = { partners, referrals, referralMatches, touches, followUps, scorecards };
+  anySheetOpenRef.current = Boolean(
+    selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
+    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory
+    || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
+    || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible,
+  );
 
   // From the case file or a profile there is no card: the step this outreach
   // would close is the one the timeline rules pick (never a consult, a
@@ -4474,7 +4563,7 @@ export default function App() {
 
   // The logging half of a card call/text. A case event and partner touch are
   // committed/queued as one owner-fenced operation after the OS handoff succeeds.
-  function logCardContact(card: TodayCard, action: 'call' | 'text', contact?: CaseContact) {
+  function logCardContact(card: TodayCard, action: 'call' | 'text', contact?: CaseContact, options: { deferNoteSheet?: boolean } = {}) {
     if (!mutationSlotAvailable('The contact log')) return;
     const now = new Date().toISOString();
     const verb = action === 'call' ? 'Called' : 'Texted';
@@ -4502,7 +4591,9 @@ export default function App() {
       setPartners(nextPartners);
     }
     setQuickNoteText('');
-    setTodayQuickNote({ card, action, contact });
+    // From the contact picker, the note sheet waits for the picker to close.
+    if (options.deferNoteSheet) afterSheetCloses(() => setTodayQuickNote({ card, action, contact }));
+    else setTodayQuickNote({ card, action, contact });
     if (!event && !touch) return;
     void settleOptimisticWrite(
       () => logContactActivity(event, touch, activeUserId),
@@ -4817,7 +4908,9 @@ export default function App() {
     setPartnerForm(makeEmptyPartnerForm());
     setShowAddPartner(false);
     setEditingPartnerId(null);
-    afterSheetCloses(() => setSelectedPartner((current) => current ?? partner));
+    afterSheetCloses(() => setSelectedPartner((current) => current ?? partner), {
+      stillWanted: () => Boolean(latestSnapshotRef.current?.partners.some((item) => item.id === partner.id)),
+    });
     void settleOptimisticWrite(
       () => existing ? updatePartner(partner, activeUserId) : createPartner(partner, activeUserId),
       { partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards },
@@ -5050,9 +5143,18 @@ export default function App() {
           // Best effort: no signal must never trap someone signed in.
           await unregisterThisDevice(activeUserIdRef.current || undefined).catch(() => undefined);
           await cancelReferralFitNotifications().catch(() => undefined);
-          let { error } = await supabase.auth.signOut();
-          if (error && isNetworkError(error)) ({ error } = await supabase.auth.signOut({ scope: 'local' }));
-          if (error) throw error;
+          // Offline, supabase-js cannot sign out (it tries to refresh first and
+          // gives up after ~25 s without clearing anything): clear it here.
+          if (await isOfflineSession(activeUserIdRef.current).catch(() => false)) {
+            await forceLocalSignOut();
+          } else {
+            const { error } = await supabase.auth.signOut();
+            if (error) {
+              if (isAuthNetworkError(error) || isNetworkError(error)) await forceLocalSignOut();
+              else throw error;
+            }
+          }
+          setSession(null);
           resetAccountState();
         } catch (error) {
           Alert.alert('Could not sign out', (error as Error).message);
@@ -5113,7 +5215,7 @@ export default function App() {
         {rejectedWrites > 0 ? (
           <TouchableOpacity
             accessibilityRole="button"
-            accessibilityLabel={`${rejectedWrites} ${rejectedWrites === 1 ? 'change' : 'changes'} could not be saved. Review.`}
+            accessibilityLabel={`${rejectedWrites} ${rejectedWrites === 1 ? 'change' : 'changes'} not saved. Review.`}
             onPress={() => { void openRejectedWrites(); }}
             style={[styles.refreshNotice, styles.rejectedNotice]}
           >
@@ -5135,8 +5237,8 @@ export default function App() {
     const userId = activeUserIdRef.current;
     if (!userId) return;
     try {
-      const list = await listRejectedWrites(userId);
-      if (activeUserIdRef.current === userId) setRejectedList(list);
+      const [rejected, waiting] = await Promise.all([listRejectedWrites(userId), listWaitingWrites(userId)]);
+      if (activeUserIdRef.current === userId) setRejectedList([...rejected, ...waiting]);
     } catch (error) {
       Alert.alert('Could not open the list', describeError(error));
     }
@@ -5144,14 +5246,19 @@ export default function App() {
 
   // Retry or discard one set-aside change (or discard all), then re-read the
   // workspace so the screen matches the server.
-  async function resolveRejectedWrite(action: 'retry' | 'discard' | 'discard_all', id?: string) {
+  async function resolveRejectedWrite(action: 'retry' | 'discard' | 'discard_all', item?: RejectedWrite) {
     const userId = activeUserIdRef.current;
     if (!userId || rejectedBusy) return;
     setRejectedBusy(true);
     try {
-      if (action === 'retry' && id) await retryRejectedWrite(userId, id);
-      else if (action === 'discard' && id) await discardRejectedWrite(userId, id);
-      else if (action === 'discard_all') await discardAllRejectedWrites(userId);
+      if (action === 'retry' && item && item.status === 'rejected') await retryRejectedWrite(userId, item.id);
+      else if (action === 'discard' && item) {
+        if (item.status === 'waiting') await discardWaitingWrite(userId, item.id);
+        else await discardRejectedWrite(userId, item.id);
+      } else if (action === 'discard_all') {
+        await discardAllRejectedWrites(userId);
+        for (const waiting of await listWaitingWrites(userId)) await discardWaitingWrite(userId, waiting.id);
+      }
     } catch (error) {
       if (activeUserIdRef.current === userId) Alert.alert(action === 'retry' ? 'Still not saved' : 'Could not discard', describeError(error));
     }
@@ -5162,8 +5269,9 @@ export default function App() {
       // The next refresh catches up.
     }
     if (activeUserIdRef.current === userId) {
-      const [list, count] = await Promise.all([listRejectedWrites(userId).catch(() => []), rejectedWriteCount(userId).catch(() => 0)]);
-      setRejectedWrites(count);
+      const [rejected, waiting] = await Promise.all([listRejectedWrites(userId).catch(() => []), listWaitingWrites(userId).catch(() => [])]);
+      const list = [...rejected, ...waiting];
+      setRejectedWrites(list.length);
       setRejectedList(list.length ? list : null);
     }
     setRejectedBusy(false);
@@ -5182,17 +5290,19 @@ export default function App() {
             <View style={{ width: 44 }} />
           </View>
           <ScrollView contentContainerStyle={styles.modalContent}>
-            <Text style={styles.formIntro}>These changes were made without a connection and the server would not accept them. Everything else has synced. Retry one if the problem is fixed, or discard it.</Text>
+            <Text style={styles.formIntro}>These changes were made without a connection and could not be saved: the server refused them, or they need a record that never reached it. Everything else has synced. Retry one if the problem is fixed, or discard it.</Text>
             {rejectedList.map((item) => (
               <View key={item.id} style={styles.infoCard}>
                 <Text style={styles.touchLogTitle}>{item.summary}</Text>
-                <Text style={styles.touchLogNote}>{item.reason}</Text>
-                <Text style={styles.touchLogNote}>{relativeActivity(item.rejectedAt)}</Text>
+                <Text style={styles.touchLogNote}>{item.status === 'waiting' ? `Waiting for a record that has not reached the server. ${item.reason}` : item.reason}</Text>
+                <Text style={styles.touchLogNote}>{relativeActivity(item.rejectedAt)}{item.heldChanges > 0 ? ` · +${item.heldChanges} related ${item.heldChanges === 1 ? 'change' : 'changes'}` : ''}</Text>
                 <View style={[styles.caseSectionActions, { marginTop: 8 }]}>
-                  <TouchableOpacity accessibilityRole="button" disabled={rejectedBusy} onPress={() => { void resolveRejectedWrite('retry', item.id); }} style={styles.caseSectionAction}>
-                    <AppIcon name="refresh" size={15} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Retry</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity accessibilityRole="button" disabled={rejectedBusy} onPress={() => { void resolveRejectedWrite('discard', item.id); }} style={styles.caseSectionAction}>
+                  {item.status === 'rejected' ? (
+                    <TouchableOpacity accessibilityRole="button" disabled={rejectedBusy} onPress={() => { void resolveRejectedWrite('retry', item); }} style={styles.caseSectionAction}>
+                      <AppIcon name="refresh" size={15} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Retry</Text>
+                    </TouchableOpacity>
+                  ) : null}
+                  <TouchableOpacity accessibilityRole="button" disabled={rejectedBusy} onPress={() => { void resolveRejectedWrite('discard', item); }} style={styles.caseSectionAction}>
                     <AppIcon name="trash-outline" size={15} color={COLORS.coral} /><Text style={[styles.caseSectionActionText, { color: COLORS.coral }]}>Discard</Text>
                   </TouchableOpacity>
                 </View>
@@ -6083,7 +6193,11 @@ export default function App() {
                 accessibilityRole="button"
                 accessibilityLabel="Edit case name and summary"
                 style={styles.modalHeaderAction}
-                onPress={() => { flushPendingCaseFields(); setCaseEditForm({ title: record.title, summary: record.summary }); }}
+                onPress={() => {
+                  const typed = pendingCaseFieldsRef.current?.caseId === record.id ? pendingCaseFieldsRef.current.summary : undefined;
+                  flushPendingCaseFields();
+                  setCaseEditForm({ title: record.title, summary: typed ?? record.summary });
+                }}
               >
                 <Text style={styles.saveText}>Edit</Text>
               </TouchableOpacity>
@@ -7030,7 +7144,7 @@ export default function App() {
       orgProfileReturnToWorkspaceRef.current = false;
       setTimeout(() => setShowWorkspace(true), 400);
     } else {
-      afterSheetCloses(showDeferredNotificationPrompt);
+      afterSheetCloses(showDeferredNotificationPrompt, { ifScreenBusy: 'wait' });
     }
   }
 
@@ -7072,15 +7186,18 @@ export default function App() {
       });
       if (activeUserIdRef.current !== userId) return;
       closeOrgProfileForm();
+      // The alert waits for the form to finish closing, so iOS can show it.
+      const say = (title: string, body: string) => afterSheetCloses(() => Alert.alert(title, body), { ifScreenBusy: 'ignore' });
       if (result.status === 'claim_requested') {
-        Alert.alert(
-          'We found an existing listing',
-          'A directory listing already matches your phone number or website. ReferralFit will confirm you own it, and then it becomes your profile. Nothing else is needed from you.',
-        );
+        say('We found an existing listing', result.message || 'A directory listing already matches your phone number or website. ReferralFit will review your request to manage it; nothing changes until then.');
+      } else if (result.status === 'conflict') {
+        say('Saved for review', result.message || 'Your profile is saved and waits for ReferralFit to review it before it appears in the directory.');
+      } else if (result.status === 'updated_pending_review') {
+        say('Saved — part of it is in review', result.message || 'Your other changes are live. The new name, phone number, or website matches another directory listing, so ReferralFit will review it first.');
       } else if (result.status === 'claimed') {
-        Alert.alert('Profile published', 'An existing listing for your practice is now yours. It is live, verified, and updated with what you entered.');
+        say('Profile published', 'An existing listing for your practice is now yours. It is live, verified, and updated with what you entered.');
       } else {
-        Alert.alert('Profile published', result.status === 'created'
+        say('Profile published', result.status === 'created'
           ? 'Your verified profile is live in the Directory. Other practices can now find you and add you to their network.'
           : 'Your changes are live and your listing stays verified.');
       }
@@ -7193,9 +7310,9 @@ export default function App() {
       }
       if (!accountIsCurrent()) return;
       if (buildNow) {
-        afterSheetCloses(() => { void openOrgProfileForm(false); });
+        afterSheetCloses(() => { void openOrgProfileForm(false); }, { ifScreenBusy: 'wait' });
       } else {
-        afterSheetCloses(showDeferredNotificationPrompt);
+        afterSheetCloses(showDeferredNotificationPrompt, { ifScreenBusy: 'wait' });
       }
     };
     return (
@@ -7453,8 +7570,8 @@ export default function App() {
       const offerProfile = await shouldShowProfilePrompt(userId);
       if (!accountIsCurrent()) return;
       // Wait for the welcome sheet to finish closing before the next one.
-      if (offerProfile) afterSheetCloses(() => setProfilePromptVisible(true));
-      else afterSheetCloses(showDeferredNotificationPrompt);
+      if (offerProfile) afterSheetCloses(() => setProfilePromptVisible(true), { ifScreenBusy: 'wait' });
+      else afterSheetCloses(showDeferredNotificationPrompt, { ifScreenBusy: 'wait' });
     };
     return (
       <Modal visible transparent animationType="fade" onRequestClose={dismiss}>
@@ -8234,7 +8351,7 @@ export default function App() {
                     const supported = await Linking.canOpenURL(url);
                     if (!supported) throw new Error('Unsupported contact action');
                     await Linking.openURL(url);
-                    afterSheetCloses(() => logCardContact(pick.card, pick.action, contact));
+                    logCardContact(pick.card, pick.action, contact, { deferNoteSheet: true });
                   } catch {
                     Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
                   }

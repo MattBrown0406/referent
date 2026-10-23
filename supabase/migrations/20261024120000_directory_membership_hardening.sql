@@ -1,18 +1,21 @@
 -- ReferralFit - directory and membership hardening (reviewer findings, 2026-10-24).
 --
+--   0. A directory review queue (directory_review_requests) for what a
+--      platform admin must decide: claimant identity edits that collide
+--      with another listing, profiles that collide with another
+--      workspace's listing, and profiles left unowned by a team join.
 --   1. Directory profiles never take over an existing listing on their own.
 --      upsert_org_directory_profile used to hand an unclaimed duplicate to
 --      the caller when the caller's workspace had suggested it, the caller
 --      had created it, or the caller's (unconfirmed) sign-in email domain
 --      matched its website. None of those prove the caller IS that program.
---      Every duplicate now becomes a center_claim_requests row that a
---      platform admin approves (approve_center_claim_request); the listing
---      is not touched until then. A brand-new profile is still created live.
---   2. suggest_global_listing links a private partner to an existing listing
---      only when the normalized organization name ALSO matches (on top of
---      phone digits or website domain). Otherwise a new pending suggestion
---      is created, exactly as for a brand-new program. A claimed center can
---      no longer capture other practices' partners by copying a phone number.
+--      A duplicate becomes a claim request for an admin, or (when another
+--      workspace owns it) a pending profile plus a profile_conflict review;
+--      the listing is not touched. A brand-new profile is still created live.
+--   2. suggest_global_listing links a private partner only to an UNCLAIMED
+--      listing with the same phone or domain AND a matching name (exact
+--      first; a prefix match also needs the same state / city). Claimant
+--      identity edits that collide with another listing are held.
 --   3. accept_org_invite works for a typical solo practitioner: a partner
 --      linked to a directory listing the team already tracks is merged into
 --      the team's copy (its activity is repointed, then it is deleted), the
@@ -23,9 +26,9 @@
 --      practice's records when the member who created them deletes their
 --      account (owner_id is nullable, ON DELETE SET NULL).
 --   5. Network stats and benchmarks count only established workspaces
---      (public.org_is_established: 30+ days old AND 3+ cases or 5+
---      referrals), so free throwaway workspaces cannot satisfy the
---      k-anonymity floor or skew the aggregates.
+--      (public.org_is_established: 60+ days old, 3+ cases or 5+ referrals,
+--      activity on 10+ distinct days), so throwaway workspaces cannot
+--      satisfy the k-anonymity floor or skew the aggregates.
 --   6. push_outbox_record keeps a transiently failed push retryable.
 --   7. Cross-tenant references closed: vob_requests.follow_up_id and
 --      placement_decisions.referral_id are org-scoped composite FKs, and
@@ -42,6 +45,130 @@
 -- under 3,700 characters.
 
 BEGIN;
+
+-- ===========================================================================
+-- 0. Directory review queue: a platform admin decides, nothing changes first
+-- ===========================================================================
+
+-- kind:
+--   identity_edit     a claimant (owner workspace or center) changed the
+--                     organization, name, phone or website to values that
+--                     another listing already uses. The listing keeps its
+--                     live values; proposed holds the change.
+--   profile_conflict  a workspace's first profile collides with a listing
+--                     another workspace owns. The new profile exists
+--                     (global_partner_id), owned but pending (hidden);
+--                     related_listing_id is the other listing.
+--   orphaned_profile  a solo workspace joined a practice that already owns
+--                     a profile. The joiner's listing stays live, unowned,
+--                     until the admin keeps or archives it.
+CREATE TABLE public.directory_review_requests (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  kind               text NOT NULL CHECK (kind IN ('identity_edit', 'profile_conflict', 'orphaned_profile')),
+  global_partner_id  uuid NOT NULL REFERENCES public.global_partners(id) ON DELETE CASCADE,
+  related_listing_id uuid REFERENCES public.global_partners(id) ON DELETE SET NULL,
+  org_id             uuid REFERENCES public.orgs(id) ON DELETE SET NULL,
+  requested_by       uuid REFERENCES auth.users(id) ON DELETE SET NULL,
+  proposed           jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(proposed) = 'object'),
+  collisions         text[] NOT NULL DEFAULT '{}',
+  note               text NOT NULL DEFAULT '' CHECK (length(note) <= 2000),
+  status             text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'withdrawn')),
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  resolved_at        timestamptz,
+  resolved_by        uuid REFERENCES auth.users(id) ON DELETE SET NULL
+);
+CREATE UNIQUE INDEX directory_review_requests_one_pending
+  ON public.directory_review_requests (kind, global_partner_id) WHERE status = 'pending';
+CREATE INDEX directory_review_requests_org_idx ON public.directory_review_requests (org_id, status);
+
+ALTER TABLE public.directory_review_requests ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE public.directory_review_requests FROM PUBLIC, anon, authenticated;
+GRANT SELECT ON TABLE public.directory_review_requests TO authenticated;
+CREATE POLICY "directory_review_requests: requester or admin read" ON public.directory_review_requests
+  FOR SELECT USING (
+    org_id = (SELECT public.current_org_id())
+    OR requested_by = (SELECT auth.uid())
+    OR (SELECT public.is_platform_admin())
+  );
+
+-- Pending requests for the reviewer (platform admin, or the SQL editor).
+CREATE OR REPLACE FUNCTION public.list_directory_review_requests()
+RETURNS TABLE (id uuid, kind text, global_partner_id uuid, listing text, related_listing_id uuid, related_listing text,
+               org_id uuid, practice text, requested_by uuid, proposed jsonb, collisions text[], note text, created_at timestamptz)
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+#variable_conflict use_column
+BEGIN
+  IF auth.uid() IS NOT NULL AND NOT public.is_platform_admin() THEN
+    RAISE EXCEPTION 'Platform admin required' USING ERRCODE = '42501';
+  END IF;
+  RETURN QUERY
+  SELECT r.id, r.kind, r.global_partner_id, coalesce(nullif(g.organization, ''), g.name),
+         r.related_listing_id, coalesce(nullif(x.organization, ''), x.name),
+         r.org_id, o.name, r.requested_by, r.proposed, r.collisions, r.note, r.created_at
+    FROM public.directory_review_requests r
+    JOIN public.global_partners g ON g.id = r.global_partner_id
+    LEFT JOIN public.global_partners x ON x.id = r.related_listing_id
+    LEFT JOIN public.orgs o ON o.id = r.org_id
+   WHERE r.status = 'pending'
+   ORDER BY r.created_at, r.id;
+END
+$$;
+REVOKE ALL ON FUNCTION public.list_directory_review_requests() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.list_directory_review_requests() TO authenticated;
+
+-- Approve or decline. identity_edit: approve applies the proposed values.
+-- profile_conflict: approve makes the new profile live and verified,
+-- decline archives it. orphaned_profile: approve keeps the listing live and
+-- unowned, decline archives it. Returns 'approved' or 'rejected'.
+CREATE OR REPLACE FUNCTION public.resolve_directory_review_request(p_request_id uuid, p_approve boolean)
+RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_req public.directory_review_requests%ROWTYPE;
+BEGIN
+  IF auth.uid() IS NOT NULL AND NOT public.is_platform_admin() THEN
+    RAISE EXCEPTION 'Platform admin required' USING ERRCODE = '42501';
+  END IF;
+  IF p_approve IS NULL THEN
+    RAISE EXCEPTION 'Choose approve or decline' USING ERRCODE = '22023';
+  END IF;
+  SELECT * INTO v_req FROM public.directory_review_requests WHERE id = p_request_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Review request not found' USING ERRCODE = 'P0002';
+  END IF;
+  IF v_req.status <> 'pending' THEN
+    RAISE EXCEPTION 'Review request was already %', v_req.status USING ERRCODE = '22023';
+  END IF;
+
+  IF v_req.kind = 'identity_edit' AND p_approve THEN
+    UPDATE public.global_partners g
+       SET organization = coalesce(v_req.proposed ->> 'organization', g.organization),
+           name = coalesce(v_req.proposed ->> 'name', g.name),
+           phone = coalesce(v_req.proposed ->> 'phone', g.phone),
+           website = CASE WHEN v_req.proposed ? 'website' THEN v_req.proposed ->> 'website' ELSE g.website END
+     WHERE g.id = v_req.global_partner_id;
+  ELSIF v_req.kind = 'profile_conflict' THEN
+    UPDATE public.global_partners
+       SET status = CASE WHEN p_approve THEN 'active' ELSE 'archived' END,
+           verified_at = CASE WHEN p_approve THEN now() ELSE NULL END
+     WHERE id = v_req.global_partner_id;
+  ELSIF v_req.kind = 'orphaned_profile' AND NOT p_approve THEN
+    UPDATE public.global_partners SET status = 'archived' WHERE id = v_req.global_partner_id;
+  END IF;
+
+  UPDATE public.directory_review_requests
+     SET status = CASE WHEN p_approve THEN 'approved' ELSE 'rejected' END,
+         resolved_at = now(), resolved_by = auth.uid()
+   WHERE id = v_req.id;
+  RETURN CASE WHEN p_approve THEN 'approved' ELSE 'rejected' END;
+END
+$$;
+REVOKE ALL ON FUNCTION public.resolve_directory_review_request(uuid, boolean) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.resolve_directory_review_request(uuid, boolean) TO authenticated;
 
 -- ===========================================================================
 -- 1. Directory profiles: duplicates always go to admin review
@@ -112,8 +239,9 @@ $$;
 REVOKE ALL ON FUNCTION public.org_directory_profile_row(jsonb) FROM PUBLIC, anon, authenticated;
 
 -- Internal. Writes a validated profile: updates p_listing, or inserts a new
--- live listing owned by p_org when p_listing is NULL. Returns the id.
-CREATE OR REPLACE FUNCTION public.org_directory_profile_save(p_listing uuid, p_row public.global_partners, p_org uuid, p_user uuid)
+-- listing owned by p_org when p_listing is NULL (live and verified when
+-- p_live, otherwise pending for review). Returns the id.
+CREATE OR REPLACE FUNCTION public.org_directory_profile_save(p_listing uuid, p_row public.global_partners, p_org uuid, p_user uuid, p_live boolean)
 RETURNS uuid
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public
@@ -122,8 +250,9 @@ DECLARE
   v_id uuid := p_listing;
   v_prev_pub text := coalesce(current_setting('referralfit.seed_publish', true), '');
 BEGIN
-  PERFORM set_config('referralfit.seed_publish', 'on', true);
   IF v_id IS NOT NULL THEN
+    -- Not flagged as a seed publish: the claimant guards (verification and
+    -- the identity-collision hold) apply to the owner's own edits.
     UPDATE public.global_partners
        SET name = p_row.name, organization = p_row.organization, types = p_row.types, city = p_row.city,
            state = p_row.state, regions = p_row.regions, phone = p_row.phone, email = p_row.email,
@@ -133,6 +262,7 @@ BEGIN
            verified_at = now()
      WHERE id = v_id;
   ELSE
+    PERFORM set_config('referralfit.seed_publish', 'on', true);
     INSERT INTO public.global_partners (
       name, organization, types, city, state, regions, phone, email, website, monthly_cost,
       insurance, insurance_networks, therapies, populations, levels, description,
@@ -141,14 +271,14 @@ BEGIN
       p_row.name, p_row.organization, p_row.types, p_row.city, p_row.state, p_row.regions, p_row.phone,
       p_row.email, p_row.website, p_row.monthly_cost, p_row.insurance, p_row.insurance_networks,
       p_row.therapies, p_row.populations, p_row.levels, p_row.description,
-      'active', now(), p_user, p_org
+      CASE WHEN p_live THEN 'active' ELSE 'pending' END, CASE WHEN p_live THEN now() END, p_user, p_org
     ) RETURNING id INTO v_id;
+    PERFORM set_config('referralfit.seed_publish', v_prev_pub, true);
   END IF;
-  PERFORM set_config('referralfit.seed_publish', v_prev_pub, true);
   RETURN v_id;
 END
 $$;
-REVOKE ALL ON FUNCTION public.org_directory_profile_save(uuid, public.global_partners, uuid, uuid) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.org_directory_profile_save(uuid, public.global_partners, uuid, uuid, boolean) FROM PUBLIC, anon, authenticated;
 
 -- Internal. Files (or returns the open) claim request for p_org on an
 -- existing listing. The note carries hints for the reviewer: who submitted
@@ -188,11 +318,60 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.org_directory_claim_request(public.global_partners, uuid, uuid, jsonb, text) FROM PUBLIC, anon, authenticated;
 
--- Returns {status, listing_id[, request_id]}; status is created, updated, or
--- claim_requested. The old automatic takeover ('claimed') is gone: any
--- existing listing with the same phone digits or website domain is handed
--- over only by a platform admin approving the claim request, and nothing on
--- it changes until then.
+-- Internal. The duplicate is owned by another workspace, so a claim could
+-- never be approved. The caller's profile is created owned but pending
+-- (hidden) and a profile_conflict review request is filed.
+CREATE OR REPLACE FUNCTION public.org_directory_profile_conflict(p_match public.global_partners, p_row public.global_partners, p_org uuid, p_user uuid)
+RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_new uuid := public.org_directory_profile_save(NULL, p_row, p_org, p_user, false);
+  v_review uuid;
+BEGIN
+  INSERT INTO public.directory_review_requests (kind, global_partner_id, related_listing_id, org_id, requested_by, note)
+  VALUES ('profile_conflict', v_new, p_match.id, p_org, p_user,
+          left(format('%s shares a phone number or website with %s, which another workspace manages',
+                      p_row.organization,
+                      CASE WHEN p_match.status = 'active' THEN '"' || coalesce(nullif(p_match.organization, ''), p_match.name) || '"'
+                           ELSE 'a listing' END), 2000))
+  RETURNING id INTO v_review;
+  RETURN jsonb_build_object('status', 'conflict', 'listing_id', v_new, 'review_id', v_review,
+    'message', 'Another practice already manages a directory listing with this phone number or website. Your profile is saved and ReferralFit will review it before it appears in the directory.');
+END
+$$;
+REVOKE ALL ON FUNCTION public.org_directory_profile_conflict(public.global_partners, public.global_partners, uuid, uuid) FROM PUBLIC, anon, authenticated;
+
+-- Internal. The answer after the owner updated their own profile: conflict
+-- or updated_pending_review while a review request is open, else updated.
+CREATE OR REPLACE FUNCTION public.org_directory_profile_update_result(p_listing uuid)
+RETURNS jsonb
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_review public.directory_review_requests%ROWTYPE;
+BEGIN
+  SELECT * INTO v_review FROM public.directory_review_requests
+   WHERE global_partner_id = p_listing AND status = 'pending' AND kind IN ('identity_edit', 'profile_conflict')
+   ORDER BY (kind = 'profile_conflict') DESC LIMIT 1;
+  IF v_review.kind = 'profile_conflict' THEN
+    RETURN jsonb_build_object('status', 'conflict', 'listing_id', p_listing, 'review_id', v_review.id,
+      'message', 'Your profile is saved and waits for ReferralFit to review it before it appears in the directory.');
+  ELSIF v_review.kind = 'identity_edit' THEN
+    RETURN jsonb_build_object('status', 'updated_pending_review', 'listing_id', p_listing, 'review_id', v_review.id,
+      'held_fields', to_jsonb(v_review.collisions),
+      'message', 'Your other changes are live. The new name, phone number, or website matches another directory listing, so ReferralFit will review it first. Your current details stay up until then.');
+  END IF;
+  RETURN jsonb_build_object('status', 'updated', 'listing_id', p_listing);
+END
+$$;
+REVOKE ALL ON FUNCTION public.org_directory_profile_update_result(uuid) FROM PUBLIC, anon, authenticated;
+
+-- {status, listing_id, ...}; status is created, updated,
+-- updated_pending_review, conflict or claim_requested (docs/DIRECTORY_OWNERSHIP.md).
+-- The automatic takeover ('claimed') is gone.
 CREATE OR REPLACE FUNCTION public.upsert_org_directory_profile(p_payload jsonb)
 RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER
@@ -217,8 +396,8 @@ BEGIN
 
   SELECT id INTO v_own FROM public.global_partners WHERE owner_org_id = v_org;
   IF v_own IS NOT NULL THEN
-    PERFORM public.org_directory_profile_save(v_own, v_row, v_org, v_user);
-    RETURN jsonb_build_object('status', 'updated', 'listing_id', v_own);
+    PERFORM public.org_directory_profile_save(v_own, v_row, v_org, v_user, true);
+    RETURN public.org_directory_profile_update_result(v_own);
   END IF;
 
   v_digits := public.directory_phone_digits(v_row.phone);
@@ -231,12 +410,19 @@ BEGIN
    LIMIT 1;
 
   IF v_match.id IS NULL THEN
-    v_own := public.org_directory_profile_save(NULL, v_row, v_org, v_user);
+    v_own := public.org_directory_profile_save(NULL, v_row, v_org, v_user, true);
     RETURN jsonb_build_object('status', 'created', 'listing_id', v_own);
   END IF;
+  IF v_match.owner_org_id IS NOT NULL THEN
+    RETURN public.org_directory_profile_conflict(v_match, v_row, v_org, v_user);
+  END IF;
 
-  RETURN jsonb_build_object('status', 'claim_requested', 'listing_id', v_match.id,
-    'request_id', public.org_directory_claim_request(v_match, v_org, v_user, p_payload, v_row.organization));
+  -- listing_id only when the caller may see that listing anyway.
+  RETURN jsonb_build_object('status', 'claim_requested',
+    'listing_id', CASE WHEN v_match.status = 'active' OR v_match.suggested_by_org_id = v_org OR v_match.created_by = v_user
+                       THEN v_match.id END,
+    'request_id', public.org_directory_claim_request(v_match, v_org, v_user, p_payload, v_row.organization),
+    'message', 'A directory listing with this phone number or website already exists. ReferralFit will review your request to manage it; nothing changes until then.');
 END
 $$;
 REVOKE ALL ON FUNCTION public.upsert_org_directory_profile(jsonb) FROM PUBLIC, anon;
@@ -278,31 +464,49 @@ $$;
 REVOKE ALL ON FUNCTION public.directory_names_match(text, text) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.directory_names_match(text, text) TO authenticated;
 
--- The listing a submitted partner may link to: same phone digits or website
--- domain AND a matching organization name (directory_names_match against
--- the listing's organization, or its name when that is blank). NULL when
--- none qualifies, whether or not the listing is claimed.
+-- The listing a submitted partner may link to. All of:
+--   * not archived, and NOT claimed (no owner workspace, no center
+--     member): a claimant controls its listing's name and phone, so a
+--     private partner is never auto-linked to one (import it explicitly
+--     instead); the submission becomes a new pending listing;
+--   * same phone digits or website domain;
+--   * a matching organization name (the listing's organization, or its
+--     name when that is blank). An exact name-key match is preferred; a
+--     prefix-only match ("Recovery Unplugged" for "Recovery Unplugged
+--     Nashville") also needs the same state, and the same city when both
+--     have one.
 CREATE OR REPLACE FUNCTION public.directory_listing_match_for_partner(p_partner public.partners)
 RETURNS uuid
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public
 AS $$
-  SELECT g.id FROM public.global_partners g
+  SELECT g.id
+    FROM public.global_partners g
+   CROSS JOIN LATERAL (
+     SELECT public.directory_name_key(p_partner.organization)
+            = public.directory_name_key(coalesce(nullif(btrim(g.organization), ''), g.name)) AS exact
+   ) AS m
    WHERE g.status <> 'archived'
+     AND g.owner_org_id IS NULL
+     AND NOT EXISTS (SELECT 1 FROM public.center_members c WHERE c.global_partner_id = g.id)
      AND ((public.directory_website_domain(p_partner.website) <> ''
            AND g.website_domain = public.directory_website_domain(p_partner.website))
        OR (public.directory_phone_digits(p_partner.phone) <> ''
            AND g.phone_digits = public.directory_phone_digits(p_partner.phone)))
      AND public.directory_names_match(p_partner.organization, coalesce(nullif(btrim(g.organization), ''), g.name))
-   ORDER BY (g.status = 'active') DESC, g.created_at
+     AND (m.exact OR (
+           NOT public.directory_text_is_blank(p_partner.state)
+           AND upper(btrim(p_partner.state)) = upper(btrim(g.state))
+           AND (public.directory_text_is_blank(p_partner.city) OR public.directory_text_is_blank(g.city)
+                OR lower(btrim(p_partner.city)) = lower(btrim(g.city)))))
+   ORDER BY m.exact DESC, (g.status = 'active') DESC, g.created_at
    LIMIT 1
 $$;
 REVOKE ALL ON FUNCTION public.directory_listing_match_for_partner(public.partners) FROM PUBLIC, anon, authenticated;
 
 -- Same as 20260930120000 except the existing listing comes from
--- directory_listing_match_for_partner (name must match too). Without a match
--- a new pending listing is created for admin review, even when the phone or
--- domain belongs to a claimed listing.
+-- directory_listing_match_for_partner. Without a match a new pending
+-- listing is created for admin review.
 CREATE OR REPLACE FUNCTION public.suggest_global_listing(p_partner_id uuid)
 RETURNS uuid
 LANGUAGE plpgsql SECURITY DEFINER
@@ -377,6 +581,71 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.suggest_global_listing(uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.suggest_global_listing(uuid) TO authenticated;
+
+-- A claimant (owner workspace member or center account) may edit its
+-- listing freely, except that a new organization / name, phone, or website
+-- that another listing already uses (same name key, phone digits, or
+-- website domain) is held: the live values stay, the change goes to the
+-- review queue as an identity_edit, and propagation sends nothing to linked
+-- partners until a platform admin approves. A later non-colliding identity
+-- change withdraws the held one. Admins, service code and the SQL editor
+-- (no auth.uid()) are not held. Runs after global_partners_derive_columns.
+CREATE OR REPLACE FUNCTION public.global_partners_hold_colliding_edits()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_hits text[] := '{}';
+  v_key text := public.directory_name_key(coalesce(nullif(btrim(NEW.organization), ''), NEW.name));
+BEGIN
+  IF auth.uid() IS NULL OR public.is_platform_admin()
+     OR (NEW.organization, NEW.name, NEW.phone, NEW.website) IS NOT DISTINCT FROM (OLD.organization, OLD.name, OLD.phone, OLD.website)
+     OR NOT public.global_listing_is_claimed(OLD.id) THEN
+    RETURN NEW;
+  END IF;
+  IF v_key <> '' AND v_key <> public.directory_name_key(coalesce(nullif(btrim(OLD.organization), ''), OLD.name))
+     AND EXISTS (SELECT 1 FROM public.global_partners g WHERE g.id <> OLD.id AND g.status <> 'archived'
+                   AND public.directory_name_key(coalesce(nullif(btrim(g.organization), ''), g.name)) = v_key) THEN
+    v_hits := array_append(v_hits, 'name');
+  END IF;
+  IF NEW.phone_digits <> '' AND NEW.phone_digits <> OLD.phone_digits
+     AND EXISTS (SELECT 1 FROM public.global_partners g WHERE g.id <> OLD.id AND g.status <> 'archived' AND g.phone_digits = NEW.phone_digits) THEN
+    v_hits := array_append(v_hits, 'phone');
+  END IF;
+  IF NEW.website_domain <> '' AND NEW.website_domain <> OLD.website_domain
+     AND EXISTS (SELECT 1 FROM public.global_partners g WHERE g.id <> OLD.id AND g.status <> 'archived' AND g.website_domain = NEW.website_domain) THEN
+    v_hits := array_append(v_hits, 'website');
+  END IF;
+
+  IF cardinality(v_hits) = 0 THEN
+    UPDATE public.directory_review_requests SET status = 'withdrawn', resolved_at = now()
+     WHERE kind = 'identity_edit' AND global_partner_id = OLD.id AND status = 'pending';
+    RETURN NEW;
+  END IF;
+
+  INSERT INTO public.directory_review_requests (kind, global_partner_id, org_id, requested_by, proposed, collisions, note)
+  VALUES ('identity_edit', OLD.id, OLD.owner_org_id, auth.uid(),
+          jsonb_build_object('organization', NEW.organization, 'name', NEW.name, 'phone', NEW.phone, 'website', NEW.website),
+          v_hits, 'Matches another listing on: ' || array_to_string(v_hits, ', '))
+  ON CONFLICT (kind, global_partner_id) WHERE status = 'pending'
+  DO UPDATE SET proposed = EXCLUDED.proposed, collisions = EXCLUDED.collisions, note = EXCLUDED.note,
+                requested_by = EXCLUDED.requested_by, org_id = EXCLUDED.org_id, created_at = now();
+
+  NEW.organization := OLD.organization;
+  NEW.name := OLD.name;
+  NEW.phone := OLD.phone;
+  NEW.website := OLD.website;
+  NEW.phone_digits := OLD.phone_digits;
+  NEW.website_domain := OLD.website_domain;
+  RETURN NEW;
+END
+$$;
+REVOKE ALL ON FUNCTION public.global_partners_hold_colliding_edits() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS global_partners_hold_colliding_edits ON public.global_partners;
+CREATE TRIGGER global_partners_hold_colliding_edits BEFORE UPDATE ON public.global_partners
+  FOR EACH ROW EXECUTE FUNCTION public.global_partners_hold_colliding_edits();
 
 -- ===========================================================================
 -- 3. Insurance / matching tables: attribution and org-scoped relationships
@@ -539,13 +808,76 @@ GRANT EXECUTE ON FUNCTION public.request_vob(jsonb) TO authenticated;
 -- 5. accept_org_invite: a solo practitioner's workspace moves whole
 -- ===========================================================================
 
+-- Internal. What the joiner's copy of a partner (p_dup) knew that the
+-- team's copy (p_keep) should keep. Appended to the team note, attributed
+-- ("From <name>: ..."), one line each, skipping anything blank or already
+-- there: the private note, and a phone or email that differs from the team
+-- copy ("Joiner's contact: ..."). A financial relationship is taken when
+-- the team has none; otherwise the joiner's relationship note is added to
+-- the team's (or to the note when that would pass 300 characters). Touch
+-- cadence fills a blank, favorite is either, last contact is the later.
+CREATE OR REPLACE FUNCTION public.org_merge_partner_fields(p_keep uuid, p_dup uuid, p_name text)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  k public.partners%ROWTYPE;
+  d public.partners%ROWTYPE;
+  v_add text[] := '{}';
+  v_contact text;
+  v_kind text;
+  v_fin text;
+  v_dfin text;
+BEGIN
+  SELECT * INTO k FROM public.partners WHERE id = p_keep;
+  SELECT * INTO d FROM public.partners WHERE id = p_dup;
+  IF btrim(d.note) <> '' AND position(btrim(d.note) IN k.note) = 0 THEN
+    v_add := array_append(v_add, btrim(d.note));
+  END IF;
+  v_contact := concat_ws(', ',
+    CASE WHEN public.directory_phone_digits(d.phone) <> ''
+          AND public.directory_phone_digits(d.phone) <> public.directory_phone_digits(k.phone) THEN btrim(d.phone) END,
+    CASE WHEN btrim(d.email) <> '' AND lower(btrim(d.email)) <> lower(btrim(k.email)) THEN btrim(d.email) END);
+  IF v_contact <> '' AND position(v_contact IN k.note) = 0 THEN
+    v_add := array_append(v_add, 'Joiner''s contact: ' || v_contact);
+  END IF;
+
+  v_kind := k.financial_relationship;
+  v_fin := k.financial_relationship_note;
+  v_dfin := btrim(d.financial_relationship_note);
+  IF d.financial_relationship <> 'none' AND k.financial_relationship = 'none' THEN
+    v_kind := d.financial_relationship;
+    v_fin := d.financial_relationship_note;
+  ELSIF d.financial_relationship <> 'none' AND v_dfin <> '' AND position(v_dfin IN k.financial_relationship_note) = 0 THEN
+    IF length(btrim(k.financial_relationship_note)) + length(v_dfin) + 2 <= 300 THEN
+      v_fin := CASE WHEN btrim(k.financial_relationship_note) = '' THEN v_dfin
+                    ELSE btrim(k.financial_relationship_note) || '; ' || v_dfin END;
+    ELSE
+      v_add := array_append(v_add, 'Financial relationship: ' || v_dfin);
+    END IF;
+  END IF;
+
+  UPDATE public.partners
+     SET note = CASE WHEN cardinality(v_add) = 0 THEN k.note
+                     ELSE CASE WHEN btrim(k.note) = '' THEN '' ELSE k.note || chr(10) || chr(10) END
+                          || 'From ' || p_name || ': ' || array_to_string(v_add, chr(10)) END,
+         financial_relationship = v_kind,
+         financial_relationship_note = v_fin,
+         touch_cadence_days = coalesce(k.touch_cadence_days, d.touch_cadence_days),
+         favorite = k.favorite OR d.favorite,
+         last_contact_at = greatest(k.last_contact_at, d.last_contact_at)
+   WHERE id = p_keep;
+END
+$$;
+REVOKE ALL ON FUNCTION public.org_merge_partner_fields(uuid, uuid, text) FROM PUBLIC, anon, authenticated;
+
 -- Internal. A partner in p_from linked to a listing that p_to already tracks
 -- would break partners_org_global_partner_unique on the move: repoint
--- everything that references it to the team's copy, carry over its private
--- note (appended, attributed, unless blank or already there), its touch
--- cadence (only when the team has none) and its favorite flag, then delete
--- it. Runs with constraints deferred (the repointed rows still carry p_from
--- until the move). Returns the number of partners merged.
+-- everything that references it to the team's copy, carry its private
+-- fields over (org_merge_partner_fields), then delete it. Runs with
+-- constraints deferred (the repointed rows still carry p_from until the
+-- move). Returns the number of partners merged.
 CREATE OR REPLACE FUNCTION public.org_merge_linked_partner_copies(p_from uuid, p_to uuid)
 RETURNS integer
 LANGUAGE plpgsql SECURITY DEFINER
@@ -580,14 +912,7 @@ BEGIN
                     WHERE x.user_id = f.user_id AND x.target_type = 'partner' AND x.target_id = v_pair.keep_id);
     UPDATE public.user_favorites SET target_id = v_pair.keep_id, org_id = p_to
      WHERE org_id = p_from AND target_type = 'partner' AND target_id = v_pair.dup_id;
-    UPDATE public.partners k
-       SET note = CASE WHEN btrim(d.note) = '' OR position(btrim(d.note) IN k.note) > 0 THEN k.note
-                       WHEN btrim(k.note) = '' THEN 'From ' || v_name || ': ' || btrim(d.note)
-                       ELSE k.note || chr(10) || chr(10) || 'From ' || v_name || ': ' || btrim(d.note) END,
-           touch_cadence_days = coalesce(k.touch_cadence_days, d.touch_cadence_days),
-           favorite = k.favorite OR d.favorite
-      FROM public.partners d
-     WHERE k.id = v_pair.keep_id AND d.id = v_pair.dup_id;
+    PERFORM public.org_merge_partner_fields(v_pair.keep_id, v_pair.dup_id, v_name);
     DELETE FROM public.partners WHERE id = v_pair.dup_id AND org_id = p_from;
     v_count := v_count + 1;
   END LOOP;
@@ -629,12 +954,64 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.org_move_workspace_rows(uuid, uuid) FROM PUBLIC, anon, authenticated;
 
--- Same contract as 20260820033721. A solo owner's rows move (merging linked
--- partner copies the team already has); a member leaving a practice brings
--- nothing but their devices. Rows move BEFORE the membership changes so a
--- solo owner's self-assignments survive (the release trigger only clears
--- what is left in the old workspace). Deferred constraints are checked at
--- commit.
+-- Internal. The directory side of a solo workspace joining p_to:
+--   * its own profile (owner_org_id) goes to the team when the team owns
+--     none; otherwise it is left unowned but live and an orphaned_profile
+--     review request (visible to the team) tells the admin;
+--   * listings it submitted (suggested_by_org_id) now count as the team's;
+--   * its pending claim requests move (a duplicate of one the team already
+--     has is dropped);
+--   * its entitlement rows merge into the team's: active if either is, the
+--     later expiry, no expiry when an active row had none.
+CREATE OR REPLACE FUNCTION public.org_move_directory_state(p_from uuid, p_to uuid, p_user uuid)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_listing uuid;
+BEGIN
+  SELECT id INTO v_listing FROM public.global_partners WHERE owner_org_id = p_from;
+  IF v_listing IS NOT NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM public.global_partners WHERE owner_org_id = p_to) THEN
+      UPDATE public.global_partners SET owner_org_id = p_to WHERE id = v_listing;
+    ELSE
+      UPDATE public.global_partners SET owner_org_id = NULL WHERE id = v_listing;
+      INSERT INTO public.directory_review_requests (kind, global_partner_id, org_id, requested_by, note)
+      VALUES ('orphaned_profile', v_listing, p_to, p_user,
+              'The owner of this profile joined a practice that already has a directory profile. It is live and unowned until reviewed.')
+      ON CONFLICT DO NOTHING;
+    END IF;
+  END IF;
+
+  UPDATE public.global_partners SET suggested_by_org_id = p_to WHERE suggested_by_org_id = p_from;
+
+  DELETE FROM public.center_claim_requests r
+   WHERE r.org_id = p_from AND r.status = 'pending'
+     AND EXISTS (SELECT 1 FROM public.center_claim_requests t
+                  WHERE t.org_id = p_to AND t.status = 'pending' AND t.global_partner_id = r.global_partner_id);
+  UPDATE public.center_claim_requests SET org_id = p_to WHERE org_id = p_from AND status = 'pending';
+
+  INSERT INTO public.org_entitlements AS t (org_id, entitlement, active, source, rc_app_user_id, expires_at)
+  SELECT p_to, e.entitlement, e.active, e.source, e.rc_app_user_id, e.expires_at
+    FROM public.org_entitlements e WHERE e.org_id = p_from
+  ON CONFLICT (org_id, entitlement) DO UPDATE SET
+    active = t.active OR EXCLUDED.active,
+    expires_at = CASE WHEN (t.active AND t.expires_at IS NULL) OR (EXCLUDED.active AND EXCLUDED.expires_at IS NULL) THEN NULL
+                      ELSE greatest(t.expires_at, EXCLUDED.expires_at) END,
+    source = CASE WHEN t.active THEN t.source ELSE EXCLUDED.source END,
+    rc_app_user_id = CASE WHEN t.active THEN t.rc_app_user_id ELSE EXCLUDED.rc_app_user_id END;
+END
+$$;
+REVOKE ALL ON FUNCTION public.org_move_directory_state(uuid, uuid, uuid) FROM PUBLIC, anon, authenticated;
+
+-- Same contract as 20260820033721. A solo owner's rows and directory state
+-- move (merging linked partner copies the team already has); a member
+-- leaving a practice brings nothing but their devices. The invite and the
+-- caller's membership are locked. Rows move BEFORE the membership changes
+-- so a solo owner's self-assignments survive (the release trigger only
+-- clears what is left in the old workspace). Deferred constraints are
+-- checked at commit.
 CREATE OR REPLACE FUNCTION public.accept_org_invite(p_code text)
 RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER
@@ -663,7 +1040,8 @@ BEGIN
     RAISE EXCEPTION 'Invite code has expired' USING ERRCODE = '22023';
   END IF;
 
-  SELECT org_id, role INTO v_old_org, v_old_role FROM public.org_members WHERE user_id = v_user;
+  -- Locked: two accepts for one user run one after the other.
+  SELECT org_id, role INTO v_old_org, v_old_role FROM public.org_members WHERE user_id = v_user FOR UPDATE;
   IF v_old_org IS NULL THEN
     RAISE EXCEPTION 'Workspace membership required' USING ERRCODE = '42501';
   END IF;
@@ -681,6 +1059,7 @@ BEGIN
   IF v_old_role = 'owner' THEN
     PERFORM public.org_merge_linked_partner_copies(v_old_org, v_invite.org_id);
     PERFORM public.org_move_workspace_rows(v_old_org, v_invite.org_id);
+    PERFORM public.org_move_directory_state(v_old_org, v_invite.org_id, v_user);
   END IF;
 
   UPDATE public.org_members SET org_id = v_invite.org_id, role = 'member' WHERE user_id = v_user;
@@ -704,8 +1083,12 @@ GRANT EXECUTE ON FUNCTION public.accept_org_invite(text) TO authenticated;
 -- ===========================================================================
 
 -- A workspace counts toward cross-practice figures (and their k-anonymity
--- floors) only once it is at least 30 days old AND has at least 3 cases or
--- at least 5 referrals, all-time. See docs/OUTCOMES.md.
+-- floors) only once ALL of these hold (docs/OUTCOMES.md):
+--   * it was created at least 60 days ago;
+--   * it has at least 3 cases or at least 5 referrals, all-time;
+--   * cases, referrals or touches were created on at least 10 distinct
+--     calendar days (UTC).
+-- Every created_at involved is server-set (see pin_row_created_at below).
 CREATE OR REPLACE FUNCTION public.org_is_established(p_org_id uuid)
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
@@ -714,32 +1097,56 @@ AS $$
   SELECT EXISTS (
     SELECT 1 FROM public.orgs o
      WHERE o.id = p_org_id
-       AND o.created_at <= now() - interval '30 days'
+       AND o.created_at <= now() - interval '60 days'
        AND ((SELECT count(*) FROM (SELECT 1 FROM public.cases c WHERE c.org_id = o.id LIMIT 3) AS c3) >= 3
          OR (SELECT count(*) FROM (SELECT 1 FROM public.referrals r WHERE r.org_id = o.id LIMIT 5) AS r5) >= 5)
+       AND (SELECT count(*) FROM (
+              SELECT a.day FROM (
+                SELECT (c.created_at AT TIME ZONE 'UTC')::date AS day FROM public.cases c WHERE c.org_id = o.id
+                UNION
+                SELECT (r.created_at AT TIME ZONE 'UTC')::date FROM public.referrals r WHERE r.org_id = o.id
+                UNION
+                SELECT (t.created_at AT TIME ZONE 'UTC')::date FROM public.touches t WHERE t.org_id = o.id
+              ) AS a LIMIT 10) AS d10) >= 10
   )
 $$;
 REVOKE ALL ON FUNCTION public.org_is_established(uuid) FROM PUBLIC, anon, authenticated;
 
--- The age rule needs a created_at no client can rewrite (the owner may
--- rename the workspace, nothing else).
-CREATE OR REPLACE FUNCTION public.orgs_pin_created_at()
+-- The rule needs created_at values no client can write: a client insert
+-- gets now(), a client update keeps the old value. Server code (definer
+-- functions, service role, the SQL editor) is unaffected. Covers orgs
+-- (the owner may rename the workspace, nothing else) and the three
+-- activity tables.
+CREATE OR REPLACE FUNCTION public.pin_row_created_at()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $$
 BEGIN
   IF current_user IN ('authenticated', 'anon') THEN
-    NEW.created_at := OLD.created_at;
+    IF TG_OP = 'INSERT' THEN
+      NEW.created_at := now();
+    ELSE
+      NEW.created_at := OLD.created_at;
+    END IF;
   END IF;
   RETURN NEW;
 END
 $$;
-REVOKE ALL ON FUNCTION public.orgs_pin_created_at() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.pin_row_created_at() FROM PUBLIC, anon, authenticated;
 
 DROP TRIGGER IF EXISTS orgs_pin_created_at ON public.orgs;
 CREATE TRIGGER orgs_pin_created_at BEFORE UPDATE ON public.orgs
-  FOR EACH ROW EXECUTE FUNCTION public.orgs_pin_created_at();
+  FOR EACH ROW EXECUTE FUNCTION public.pin_row_created_at();
+DROP TRIGGER IF EXISTS cases_pin_created_at ON public.cases;
+CREATE TRIGGER cases_pin_created_at BEFORE INSERT OR UPDATE ON public.cases
+  FOR EACH ROW EXECUTE FUNCTION public.pin_row_created_at();
+DROP TRIGGER IF EXISTS referrals_pin_created_at ON public.referrals;
+CREATE TRIGGER referrals_pin_created_at BEFORE INSERT OR UPDATE ON public.referrals
+  FOR EACH ROW EXECUTE FUNCTION public.pin_row_created_at();
+DROP TRIGGER IF EXISTS touches_pin_created_at ON public.touches;
+CREATE TRIGGER touches_pin_created_at BEFORE INSERT OR UPDATE ON public.touches
+  FOR EACH ROW EXECUTE FUNCTION public.pin_row_created_at();
 
 -- Same measures as 20261001160000, restricted to established workspaces,
 -- so importing_orgs / referring_orgs (the disclosure floors) and every

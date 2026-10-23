@@ -96,13 +96,20 @@ export function partnerRecipient(partner: Pick<Partner, 'id' | 'name' | 'phone' 
   return { key: partner.id, name: partner.name.trim(), relationship: '', phone: partner.phone.trim(), email: partner.email.trim() };
 }
 
-// "Dr. Jane Smith" → "Jane"; "ana" → "ana". Only the first name ever leaves
-// the device for drafting.
+// "Dr. Jane Smith" → "Jane"; "Rivera, Ana" → "Ana"; "Mrs. Rivera" → "" (an
+// honorific and one name is a surname). Only a first name ever leaves the
+// device for drafting.
 export function firstName(name: string): string {
-  const words = name.trim().split(/\s+/).filter(Boolean);
+  const trimmed = name.trim();
+  if (!trimmed) return '';
+  const comma = trimmed.indexOf(',');
+  const afterComma = comma > 0 ? trimmed.slice(comma + 1).trim() : '';
+  const given = afterComma || (comma > 0 ? trimmed.slice(0, comma) : trimmed);
+  const words = given.split(/\s+/).filter(Boolean);
   if (!words.length) return '';
-  const honorific = /^(dr|mr|mrs|ms|mx|rev|fr|sr|prof)\.?$/i;
-  return (words.length > 1 && honorific.test(words[0]) ? words[1] : words[0]).replace(/[,;:]+$/, '');
+  const honorific = /^(dr|mr|mrs|ms|mx|miss|rev|fr|sr|prof)\.?$/i;
+  if (honorific.test(words[0])) return words.length > 2 ? words[1].replace(/[,;:]+$/, '') : '';
+  return words[0].replace(/[,;:]+$/, '');
 }
 
 export function digitsForPhone(phone: string): string {
@@ -414,7 +421,8 @@ export function templateDraft(params: {
   const signOff = name ? `${name}${practice ? `\n${practice}` : ''}` : practice;
   const later = params.history.count > 0;
   if (params.target.kind === 'partner') {
-    const org = targetAnchor(params.target);
+    // Never the contact's full name standing in for an organization.
+    const org = partnerOrganization(params.target) || 'your work';
     if (params.channel === 'text') {
       return { channel: 'text', body: `${hi}, ${thisIs}. ${later ? 'Checking back in' : 'Good to connect'} — I'd like to stay in touch and learn more about ${org}. Talk soon.` };
     }

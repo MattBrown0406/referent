@@ -115,10 +115,17 @@ subtraction) nor skew them. Definition, in
 `public.org_is_established(org uuid)`
 (`20261024120000_directory_membership_hardening.sql`):
 
-- the workspace was created **at least 30 days ago** (`orgs.created_at`,
-  which no client can change; the owner can still rename the workspace), and
+- the workspace was created **at least 60 days ago**;
 - it has **at least 3 cases or at least 5 referrals**, all-time, in any
-  status or direction.
+  status or direction; and
+- cases, referrals or touches were created on **at least 10 distinct
+  calendar days** (UTC), so a burst of fake activity in one sitting does
+  not count.
+
+Every timestamp involved is server-set: `pin_row_created_at` gives a
+client insert into `cases`, `referrals` or `touches` `created_at = now()`
+and ignores a client change to it, and the same trigger keeps
+`orgs.created_at` fixed (the owner can still rename the workspace).
 
 Where it applies:
 
@@ -131,8 +138,9 @@ Where it applies:
   that are also established (`benchmark_cohort_orgs()`), still excluding the
   caller. The caller's own workspace column is unaffected.
 
-A brand-new practice therefore contributes to the network about a month
-after it signs up and starts recording work; its own screens are unchanged.
+A brand-new practice therefore contributes to the network about two months
+after it signs up and starts recording work regularly; its own screens are
+unchanged.
 
 ## Matching
 

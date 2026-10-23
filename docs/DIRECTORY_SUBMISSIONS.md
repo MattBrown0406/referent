@@ -88,16 +88,24 @@ Partner detail → **Shared directory**:
 
 If the program or professional is already in the directory, submitting
 links the partner to the existing listing instead of creating a duplicate.
-"Already in the directory" means the same phone digits or website domain
-**and** a matching organization name (`directory_names_match`: the names
-are equal ignoring case, punctuation and a leading "The", or one name of at
-least four letters starts the other, so "Cedar Ridge" matches "Cedar Ridge
-Recovery"). Since 2026-10-24 (`20261024120000_directory_membership_hardening.sql`)
-a phone or domain match alone is not enough: a claimed center that copied
-another program's phone number could otherwise capture every practice's
-partner for that program and overwrite it through propagation. Without a
-name match the submission becomes a new pending listing; the admin can
-merge true duplicates (`merge_global_partners`).
+Since 2026-10-24 (`20261024120000_directory_membership_hardening.sql`,
+`directory_listing_match_for_partner`) "already in the directory" means all of:
+
+- the listing is **not claimed** (no owner workspace, no center account).
+  A claimant controls its listing's name and phone, so linking to it could
+  hand another practice's partner to an impersonator and overwrite it
+  through propagation. To track a claimed program, import it from the
+  directory instead;
+- the same phone digits or website domain;
+- a matching organization name (`directory_names_match`: equal ignoring
+  case, punctuation and a leading "The", or one name of at least four
+  letters starts the other). An **exact** name match is preferred; a
+  prefix-only match ("Recovery Unplugged" for "Recovery Unplugged
+  Nashville") also needs the same state, and the same city when both have
+  one, so one campus is never linked to another.
+
+Otherwise the submission becomes a new pending listing; the admin can merge
+true duplicates (`merge_global_partners`).
 
 Approved interventionists and therapists are found in the Directory screen
 under its existing **Interventionists** and **Therapists** filter pills

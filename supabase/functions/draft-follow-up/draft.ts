@@ -236,7 +236,11 @@ export function buildUserPrompt(request: DraftRequest): string {
   const kind = channel === 'text' ? 'a text message' : channel === 'email' ? 'an email' : 'a phone call (opener, talking points, and a voicemail)';
   lines.push(`Draft ${kind}.`);
   lines.push('');
-  lines.push(`Sender: ${sender.firstName || 'the practitioner'}${sender.practiceName ? ` at ${sender.practiceName}` : ''}.`);
+  if (sender.firstName) {
+    lines.push(`Sender: ${sender.firstName}${sender.practiceName ? ` at ${sender.practiceName}` : ''}.`);
+  } else {
+    lines.push(`The sender's name is not known${sender.practiceName ? ` (practice: ${sender.practiceName})` : ''}: do not sign with a name, and do not leave a place for one.`);
+  }
 
   if (request.target.kind === 'case') {
     const who = recipient.firstName || 'the family member';

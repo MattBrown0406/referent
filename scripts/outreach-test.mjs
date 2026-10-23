@@ -226,6 +226,8 @@ check('a partner draft request names the organization and types only', () => {
 check('first names drop honorifics and trailing punctuation', () => {
   assert.equal(outreach.firstName('Dr. Jane Smith'), 'Jane');
   assert.equal(outreach.firstName('  ana,  '), 'ana');
+  assert.equal(outreach.firstName('Rivera, Ana'), 'Ana', '"Last, First" sends the first name');
+  assert.equal(outreach.firstName('Mrs. Rivera'), '', 'an honorific and one name is a surname: send nothing');
   assert.equal(outreach.firstName(''), '');
 });
 

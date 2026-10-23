@@ -67,7 +67,7 @@ trigger / hourly job  ->  notification_outbox  ->  push-dispatch (edge fn)  ->  
    as `DeviceNotRegistered` (in a ticket or a receipt) is deleted so it is
    never tried again. The service role has no table grants; it only runs
    those four RPCs.
-   A **transient** send failure (network error or timeout, Expo 5xx or 429,
+   A **transient** send failure (network error or timeout, Expo 5xx, 429, 401 or 403,
    `MessageRateExceeded`, a missing ticket) is recorded with `retry: true`:
    `error` stays empty, the reason goes to `last_error`, and the claim picks
    the row up again five minutes later, up to five attempts in all (then

@@ -292,19 +292,49 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
     .filter((followUp) => followUp.status === 'open' && !(followUp.kind === 'consult' && followUp.dueTime))
     .sort((a, b) => (a.snoozedUntil || a.dueOn).localeCompare(b.snoozedUntil || b.dueOn));
   const partnerById = new Map(partners.map((partner) => [partner.id, partner]));
+  const followUpBody = (followUp: FollowUp) => {
+    const partnerName = followUp.partnerId ? partnerById.get(followUp.partnerId)?.name : undefined;
+    return partnerName ? `${followUp.title} — ${partnerName}` : followUp.title;
+  };
+  // Items whose 9:00 reminder time has already passed (overdue, or due today
+  // after 9) would all fire at the next 9:00 at once — one summary instead.
+  // Items due later each keep their own reminder on their day.
+  const todayStamp = dateStamp(startOfToday(now));
+  const pastDue: FollowUp[] = [];
+  const upcoming: { followUp: FollowUp; when: Date }[] = [];
   for (const followUp of openFollowUps) {
-    if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;
     const effectiveDue = followUp.snoozedUntil || followUp.dueOn;
     const parsed = new Date(`${effectiveDue}T12:00:00`);
     if (Number.isNaN(parsed.getTime())) continue;
-    const dueDay = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
-    let when = atTime(dueDay, 9, 0);
-    if (when.getTime() <= now.getTime()) when = nextTime(9, 0, now);
-    const partnerName = followUp.partnerId ? partnerById.get(followUp.partnerId)?.name : undefined;
+    const when = atTime(new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate()), 9, 0);
+    if (when.getTime() <= now.getTime()) pastDue.push(followUp);
+    else upcoming.push({ followUp, when });
+  }
+  if (pastDue.length && remaining > 0 && isScheduleCurrent(generation, ownerId)) {
+    const allOverdue = pastDue.every((followUp) => (followUp.snoozedUntil || followUp.dueOn) < todayStamp);
+    const body = pastDue.length === 1
+      ? followUpBody(pastDue[0])
+      : allOverdue ? `${pastDue.length} overdue follow-ups` : `${pastDue.length} follow-ups due or overdue`;
+    if (await scheduleIfCurrent(generation, ownerId, {
+      content: {
+        title: pastDue.length === 1 ? 'Follow-up due' : 'Follow-ups due',
+        body,
+        data: { target: 'home', ownerId },
+        ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+      },
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DATE,
+        date: nextTime(9, 0, now),
+        ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+      },
+    })) remaining -= 1;
+  }
+  for (const { followUp, when } of upcoming) {
+    if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;
     if (await scheduleIfCurrent(generation, ownerId, {
       content: {
         title: 'Follow-up due',
-        body: partnerName ? `${followUp.title} — ${partnerName}` : followUp.title,
+        body: followUpBody(followUp),
         data: { target: 'home', ownerId },
         ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
       },
@@ -366,6 +396,9 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
 export function activateReferralFitNotificationOwner(ownerId: string): Promise<void> {
   scheduleOwnerId = ownerId;
   ++scheduleGeneration;
+  // A tap that launched the app arrived before anyone was signed in: hand it
+  // over now (for this account only) — the work below clears the OS copy.
+  deliverHeldTaps();
   return queueScheduleWork(async () => {
     await Notifications.cancelAllScheduledNotificationsAsync();
     await Notifications.dismissAllNotificationsAsync();
@@ -424,35 +457,75 @@ export function remotePushTarget(data: RemotePushData): { target: NotificationTa
   }
 }
 
-export function subscribeToNotificationResponses(
-  onTarget: (target: NotificationTarget, partnerId?: string, caseId?: string) => void,
-): () => void {
-  const extract = (response: Notifications.NotificationResponse | null) => {
-    const requestId = response?.notification?.request?.identifier;
-    if (!requestId || handledResponseIds.has(requestId)) return;
-    const data = response.notification.request.content.data as ({ target?: string; partnerId?: string; ownerId?: string } & RemotePushData) | undefined;
-    if (!scheduleOwnerId || !data) return;
-    if (typeof data.kind === 'string') {
-      if (typeof data.user_id !== 'string' || data.user_id.toLowerCase() !== scheduleOwnerId.toLowerCase()) return;
-      const remote = remotePushTarget(data);
-      if (!remote) return;
-      handledResponseIds.add(requestId);
-      onTarget(remote.target, undefined, remote.caseId);
-      return;
-    }
-    if (data.ownerId !== scheduleOwnerId) return;
-    if (data.target !== 'home' && data.target !== 'directory') return;
-    handledResponseIds.add(requestId);
-    onTarget(data.target, typeof data.partnerId === 'string' ? data.partnerId : undefined);
-  };
+type TapListener = (target: NotificationTarget, partnerId?: string, caseId?: string) => void;
+type Tap = { requestId: string; ownerId: string; target: NotificationTarget; partnerId?: string; caseId?: string };
 
-  const subscription = Notifications.addNotificationResponseReceivedListener(extract);
+const tapListeners = new Set<TapListener>();
+// Taps that arrived while no account was active yet (the app was launched by
+// the tap, before hydration reached activateReferralFitNotificationOwner) or
+// before anything subscribed. Bounded; another account's taps are dropped.
+const heldTaps: Tap[] = [];
+const MAX_HELD_TAPS = 10;
+
+function tapOf(response: Notifications.NotificationResponse | null): Tap | null {
+  const requestId = response?.notification?.request?.identifier;
+  if (!requestId) return null;
+  const data = response.notification.request.content.data as ({ target?: string; partnerId?: string; ownerId?: string } & RemotePushData) | undefined;
+  if (!data) return null;
+  if (typeof data.kind === 'string') {
+    if (typeof data.user_id !== 'string' || !data.user_id) return null;
+    const remote = remotePushTarget(data);
+    if (!remote) return null;
+    return { requestId, ownerId: data.user_id.toLowerCase(), target: remote.target, caseId: remote.caseId };
+  }
+  if (typeof data.ownerId !== 'string' || !data.ownerId) return null;
+  if (data.target !== 'home' && data.target !== 'directory') return null;
+  return { requestId, ownerId: data.ownerId.toLowerCase(), target: data.target, partnerId: typeof data.partnerId === 'string' ? data.partnerId : undefined };
+}
+
+// true when the tap is finished with (delivered, a duplicate, or another
+// account's); false when it must wait for an owner or a subscriber.
+function deliverTap(tap: Tap): boolean {
+  if (handledResponseIds.has(tap.requestId)) return true;
+  if (!scheduleOwnerId) return false;
+  if (tap.ownerId !== scheduleOwnerId.toLowerCase()) return true;
+  if (!tapListeners.size) return false;
+  handledResponseIds.add(tap.requestId);
+  for (const listener of Array.from(tapListeners)) listener(tap.target, tap.partnerId, tap.caseId);
+  return true;
+}
+
+function receiveResponse(response: Notifications.NotificationResponse | null): void {
+  const tap = tapOf(response);
+  if (!tap || deliverTap(tap)) return;
+  if (heldTaps.some((held) => held.requestId === tap.requestId)) return;
+  heldTaps.push(tap);
+  if (heldTaps.length > MAX_HELD_TAPS) heldTaps.shift();
+}
+
+function deliverHeldTaps(): void {
+  const waiting = heldTaps.splice(0);
+  for (const tap of waiting) if (!deliverTap(tap)) heldTaps.push(tap);
+}
+
+// The callback receives (target, partnerId, caseId). A tap is delivered once,
+// only while its account is the active notification owner; a tap that
+// arrives before the owner is set (cold start) is held and delivered when
+// activateReferralFitNotificationOwner names that same account.
+export function subscribeToNotificationResponses(onTarget: TapListener): () => void {
+  tapListeners.add(onTarget);
+  const subscription = Notifications.addNotificationResponseReceivedListener(receiveResponse);
+  deliverHeldTaps();
   Notifications.getLastNotificationResponseAsync()
     .then((response) => {
-      extract(response);
+      // Held in memory if it cannot be delivered yet, so the OS copy can go.
+      receiveResponse(response);
       if (response) return Notifications.clearLastNotificationResponseAsync();
       return undefined;
     })
     .catch(() => undefined);
-  return () => subscription.remove();
+  return () => {
+    tapListeners.delete(onTarget);
+    subscription.remove();
+  };
 }

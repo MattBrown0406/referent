@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(67);
+SELECT plan(91);
 
 -- Actors (suffix d7)
 --   ad  platform admin
@@ -13,6 +13,8 @@ SELECT plan(67);
 --   o1  owner who submitted a third-party program   (finding 1)
 --   o2  owner whose email domain matches a listing  (finding 1)
 --   o3  owner with a brand-new profile              (finding 1)
+--   o4  owner whose profile collides with o3's      (round 2, item 5)
+--   s2  second solo practitioner with a profile     (round 2, item 4)
 --   c1  center account holding a claimed listing    (finding 2)
 --   p1  practice submitting partners                (finding 2)
 --   f1..f5  five practices referring to one listing (finding 5)
@@ -25,6 +27,8 @@ VALUES
   ('b1000000-0000-0000-0000-0000000000d7', 'owner@helpful-practice.example'),
   ('b2000000-0000-0000-0000-0000000000d7', 'dr@northstar.example'),
   ('b3000000-0000-0000-0000-0000000000d7', 'owner@fresh-practice.example'),
+  ('b4000000-0000-0000-0000-0000000000d7', 'owner@second-practice.example'),
+  ('a3000000-0000-0000-0000-0000000000d7', 'second-solo@solo-two.example'),
   ('c1000000-0000-0000-0000-0000000000d7', 'admissions@attacker.example'),
   ('c2000000-0000-0000-0000-0000000000d7', 'owner@submitting-practice.example'),
   ('f1000000-0000-0000-0000-0000000000d7', 'f1@example.test'),
@@ -41,6 +45,8 @@ SELECT set_config('test.org_s', org_id::text, true) FROM public.org_members WHER
 SELECT set_config('test.org_t', org_id::text, true) FROM public.org_members WHERE user_id = 'a2000000-0000-0000-0000-0000000000d7';
 SELECT set_config('test.org_o1', org_id::text, true) FROM public.org_members WHERE user_id = 'b1000000-0000-0000-0000-0000000000d7';
 SELECT set_config('test.org_o3', org_id::text, true) FROM public.org_members WHERE user_id = 'b3000000-0000-0000-0000-0000000000d7';
+SELECT set_config('test.org_o4', org_id::text, true) FROM public.org_members WHERE user_id = 'b4000000-0000-0000-0000-0000000000d7';
+SELECT set_config('test.org_s2', org_id::text, true) FROM public.org_members WHERE user_id = 'a3000000-0000-0000-0000-0000000000d7';
 SELECT set_config('test.org_p1', org_id::text, true) FROM public.org_members WHERE user_id = 'c2000000-0000-0000-0000-0000000000d7';
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -83,10 +89,11 @@ SELECT ok(
 SELECT set_config('request.jwt.claim.sub', 'b2000000-0000-0000-0000-0000000000d7', true);
 SET LOCAL ROLE authenticated;
 SELECT is(
-  public.upsert_org_directory_profile(
-    '{"name":"Dr. North","organization":"North Star Family Therapy","types":["Therapist"],"website":"https://www.northstar.example"}'::jsonb) ->> 'status',
-  'claim_requested',
-  'a sign-in email domain that matches the website is not proof either'
+  (SELECT (r ->> 'status') || '|' || coalesce(r ->> 'listing_id', 'hidden')
+     FROM public.upsert_org_directory_profile(
+       '{"name":"Dr. North","organization":"North Star Family Therapy","types":["Therapist"],"website":"https://www.northstar.example"}'::jsonb) AS r),
+  'claim_requested|hidden',
+  'a sign-in email domain that matches the website is not proof either, and a pending listing''s id is not revealed'
 );
 RESET ROLE;
 SELECT ok(
@@ -116,6 +123,91 @@ SELECT is(
   'updated',
   'the owner keeps editing the profile'
 );
+
+-- Round 2, item 1: an owner's identity edit that collides with another
+-- listing (here North Star's phone) is held for review.
+SELECT set_config('test.edit', public.upsert_org_directory_profile(
+  '{"name":"Fresh Owner","organization":"Fresh Practice","types":["Interventionist"],"phone":"(541) 555-0820","city":"Bend","description":"Now with a description"}'::jsonb)::text, true);
+SELECT is(
+  (current_setting('test.edit')::jsonb ->> 'status') || '|' || (current_setting('test.edit')::jsonb -> 'held_fields')::text,
+  'updated_pending_review|["phone"]',
+  'a phone number another listing uses is held for review'
+);
+SELECT ok(
+  (SELECT phone_digits = '5415550830' AND description = 'Now with a description' AND verified_at IS NOT NULL
+     FROM public.global_partners WHERE owner_org_id = current_setting('test.org_o3')::uuid)
+  AND (SELECT kind = 'identity_edit' AND proposed ->> 'phone' = '(541) 555-0820' AND collisions = ARRAY['phone']
+         FROM public.directory_review_requests WHERE id = (current_setting('test.edit')::jsonb ->> 'review_id')::uuid),
+  'the live phone stays, the other changes land, and the owner can see the held change'
+);
+SELECT is(
+  public.upsert_org_directory_profile(
+    '{"name":"Fresh Owner","organization":"Fresh Practice","types":["Interventionist"],"phone":"(541) 555-0831","city":"Bend"}'::jsonb) ->> 'status',
+  'updated',
+  'a later phone change that collides with nothing goes live'
+);
+SELECT is(
+  (SELECT status FROM public.directory_review_requests WHERE id = (current_setting('test.edit')::jsonb ->> 'review_id')::uuid),
+  'withdrawn',
+  'and withdraws the held change'
+);
+
+-- Round 2, item 5: a first profile that collides with a listing another
+-- workspace owns is saved pending, with a conflict review.
+SELECT set_config('request.jwt.claim.sub', 'b4000000-0000-0000-0000-0000000000d7', true);
+SELECT set_config('test.conflict', public.upsert_org_directory_profile(
+  '{"name":"Copy","organization":"Second Practice","types":["Interventionist"],"phone":"541.555.0831"}'::jsonb)::text, true);
+SELECT is(
+  current_setting('test.conflict')::jsonb ->> 'status',
+  'conflict',
+  'a collision with another workspace''s listing is a conflict, not an unapprovable claim'
+);
+SELECT ok(
+  (SELECT owner_org_id = current_setting('test.org_o4')::uuid AND status = 'pending' AND verified_at IS NULL
+     FROM public.global_partners WHERE id = (current_setting('test.conflict')::jsonb ->> 'listing_id')::uuid)
+  AND (SELECT kind = 'profile_conflict' AND status = 'pending'
+              AND related_listing_id = (SELECT id FROM public.global_partners WHERE phone_digits = '5415550831' AND owner_org_id <> current_setting('test.org_o4')::uuid)
+         FROM public.directory_review_requests WHERE id = (current_setting('test.conflict')::jsonb ->> 'review_id')::uuid),
+  'the new profile is owned but pending, and the review points at the other listing'
+);
+SELECT is(
+  public.upsert_org_directory_profile(
+    '{"name":"Copy","organization":"Second Practice","types":["Interventionist"],"phone":"541.555.0831","city":"Salem"}'::jsonb) ->> 'status',
+  'conflict',
+  'saving again reports the open conflict'
+);
+SELECT throws_ok(
+  $$ SELECT public.resolve_directory_review_request((current_setting('test.conflict')::jsonb ->> 'review_id')::uuid, true) $$,
+  '42501',
+  'Platform admin required',
+  'only a platform admin resolves a review'
+);
+SELECT set_config('request.jwt.claim.sub', 'ad000000-0000-0000-0000-0000000000d7', true);
+SELECT is(
+  public.resolve_directory_review_request((current_setting('test.conflict')::jsonb ->> 'review_id')::uuid, true),
+  'approved',
+  'the admin approves the conflicting profile'
+);
+SELECT ok(
+  (SELECT status = 'active' AND verified_at IS NOT NULL AND city = 'Salem'
+     FROM public.global_partners WHERE id = (current_setting('test.conflict')::jsonb ->> 'listing_id')::uuid),
+  'and it goes live'
+);
+SELECT set_config('request.jwt.claim.sub', 'b3000000-0000-0000-0000-0000000000d7', true);
+SELECT set_config('test.edit2', (public.upsert_org_directory_profile(
+  '{"name":"Fresh Owner","organization":"Fresh Practice","types":["Interventionist"],"phone":"(541) 555-0820","city":"Bend"}'::jsonb) ->> 'review_id'), true);
+SELECT set_config('request.jwt.claim.sub', 'ad000000-0000-0000-0000-0000000000d7', true);
+SELECT is(
+  public.resolve_directory_review_request(current_setting('test.edit2')::uuid, true),
+  'approved',
+  'the admin approves the held identity edit'
+);
+SELECT is(
+  (SELECT phone FROM public.global_partners WHERE owner_org_id = current_setting('test.org_o3')::uuid),
+  '(541) 555-0820',
+  'an approved identity edit is applied'
+);
+SELECT set_config('request.jwt.claim.sub', 'b3000000-0000-0000-0000-0000000000d7', true);
 SELECT throws_ok(
   $$ SELECT public.upsert_org_directory_profile('{"name":"x","organization":"y","types":["Detox"],"owner_org_id":"x"}'::jsonb) $$,
   '22023',
@@ -139,7 +231,7 @@ SELECT is(
 RESET ROLE;
 
 SELECT ok(
-  position('suggested_by_org_id = v_org' in pg_get_functiondef('public.upsert_org_directory_profile(jsonb)'::regprocedure)) = 0
+  position('UPDATE' in pg_get_functiondef('public.upsert_org_directory_profile(jsonb)'::regprocedure)) = 0
   AND position('owner_org_id = v_org' in pg_get_functiondef('public.upsert_org_directory_profile(jsonb)'::regprocedure)) > 0,
   'the profile RPC no longer has an automatic takeover branch'
 );
@@ -163,6 +255,11 @@ INSERT INTO public.global_partners (id, name, organization, types, phone, websit
 VALUES ('d3000000-0000-0000-0000-0000000000d7', 'Admissions', 'Attacker Recovery', ARRAY['Inpatient'], '(541) 555-0700', 'https://attacker.example', 'active', now()),
        ('d4000000-0000-0000-0000-0000000000d7', 'Admissions', 'Summit Detox', ARRAY['Detox'], '(541) 555-0710', 'https://summit-detox.example', 'active', now()),
        ('d5000000-0000-0000-0000-0000000000d7', 'Admissions', 'Cedar Hills Recovery', ARRAY['Inpatient'], '(541) 555-0720', 'https://cedarhills.example', 'active', now());
+UPDATE public.global_partners SET city = 'Bend', state = 'OR' WHERE id = 'd5000000-0000-0000-0000-0000000000d7';
+-- Two campuses of one brand sharing a phone and website (round 2, item 2).
+INSERT INTO public.global_partners (id, name, organization, types, city, state, phone, website, status, verified_at, created_at)
+VALUES ('d8000000-0000-0000-0000-0000000000d7', 'Admissions', 'Recovery Unplugged', ARRAY['Inpatient'], 'Austin', 'TX', '(800) 555-0101', 'https://recoveryunplugged.example', 'active', now(), now() - interval '2 days'),
+       ('d9000000-0000-0000-0000-0000000000d7', 'Admissions', 'Recovery Unplugged Nashville', ARRAY['Inpatient'], 'Nashville', 'TN', '(800) 555-0101', 'https://recoveryunplugged.example', 'active', now(), now() - interval '1 day');
 INSERT INTO public.center_members (user_id, global_partner_id)
 VALUES ('c1000000-0000-0000-0000-0000000000d7', 'd3000000-0000-0000-0000-0000000000d7');
 
@@ -172,7 +269,10 @@ INSERT INTO public.partners (id, owner_id, name, organization, types, city, stat
 VALUES
   ('92000000-0000-0000-0000-0000000000d7', 'c2000000-0000-0000-0000-0000000000d7', 'Intake', 'Victim Recovery Center', ARRAY['Inpatient'], 'Bend', 'OR', '541.555.0700', 'intake@victim.example', 'https://victim.example', 28000, ARRAY['Aetna']),
   ('93000000-0000-0000-0000-0000000000d7', 'c2000000-0000-0000-0000-0000000000d7', 'Intake', 'Valley Detox', ARRAY['Detox'], 'Bend', 'OR', '(541) 555-0710', 'intake@valley.example', 'https://valley-detox.example', 9000, ARRAY['Aetna']),
-  ('94000000-0000-0000-0000-0000000000d7', 'c2000000-0000-0000-0000-0000000000d7', 'Intake', 'Cedar Hills', ARRAY['Inpatient'], 'Bend', 'OR', '(503) 555-0000', 'intake@cedarhills.example', 'https://www.cedarhills.example/', 31000, ARRAY['Aetna']);
+  ('94000000-0000-0000-0000-0000000000d7', 'c2000000-0000-0000-0000-0000000000d7', 'Intake', 'Cedar Hills', ARRAY['Inpatient'], 'Bend', 'OR', '(503) 555-0000', 'intake@cedarhills.example', 'https://www.cedarhills.example/', 31000, ARRAY['Aetna']),
+  ('9d000000-0000-0000-0000-0000000000d7', 'c2000000-0000-0000-0000-0000000000d7', 'Intake', 'Attacker Recovery', ARRAY['Inpatient'], 'Bend', 'OR', '(541) 555-0700', 'intake@attacker.example', 'https://attacker.example', 28000, ARRAY['Aetna']),
+  ('9e000000-0000-0000-0000-0000000000d7', 'c2000000-0000-0000-0000-0000000000d7', 'Intake', 'Recovery Unplugged Nashville', ARRAY['Inpatient'], 'Nashville', 'TN', '800-555-0101', 'a@ru.example', 'https://recoveryunplugged.example', 20000, ARRAY['Aetna']),
+  ('9f000000-0000-0000-0000-0000000000d7', 'c2000000-0000-0000-0000-0000000000d7', 'Intake', 'Recovery Unplugged Orlando', ARRAY['Inpatient'], 'Orlando', 'FL', '800-555-0101', 'o@ru.example', 'https://recoveryunplugged.example', 20000, ARRAY['Aetna']);
 
 SELECT isnt(
   public.suggest_global_listing('92000000-0000-0000-0000-0000000000d7'),
@@ -196,12 +296,42 @@ SELECT is(
   'd5000000-0000-0000-0000-0000000000d7'::uuid,
   'same website domain and a matching name still links to the existing listing'
 );
+SELECT isnt(
+  public.suggest_global_listing('9d000000-0000-0000-0000-0000000000d7'),
+  'd3000000-0000-0000-0000-0000000000d7'::uuid,
+  'a claimed listing is never auto-linked, even with the same name and phone'
+);
+SELECT is(
+  public.suggest_global_listing('9e000000-0000-0000-0000-0000000000d7'),
+  'd9000000-0000-0000-0000-0000000000d7'::uuid,
+  'an exact name match wins over an older prefix match'
+);
+SELECT ok(
+  public.suggest_global_listing('9f000000-0000-0000-0000-0000000000d7')
+    NOT IN ('d8000000-0000-0000-0000-0000000000d7'::uuid, 'd9000000-0000-0000-0000-0000000000d7'::uuid),
+  'a prefix-only match in another state is not the same program'
+);
 RESET ROLE;
 SELECT is(
   (SELECT organization || '|' || phone FROM public.partners WHERE id = '92000000-0000-0000-0000-0000000000d7'),
   'Victim Recovery Center|541.555.0700',
   'the claimed listing never overwrote the other practice''s partner'
 );
+
+-- Round 2, item 1: a center renaming its listing to another listing's name
+-- is held; its other edits land.
+SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+UPDATE public.global_partners SET organization = 'Summit Detox', description = 'Center edit'
+ WHERE id = 'd3000000-0000-0000-0000-0000000000d7';
+SELECT ok(
+  (SELECT organization = 'Attacker Recovery' AND description = 'Center edit' FROM public.global_partners WHERE id = 'd3000000-0000-0000-0000-0000000000d7')
+  AND (SELECT collisions = ARRAY['name'] AND proposed ->> 'organization' = 'Summit Detox' AND org_id IS NULL
+         FROM public.directory_review_requests
+        WHERE kind = 'identity_edit' AND global_partner_id = 'd3000000-0000-0000-0000-0000000000d7' AND status = 'pending'),
+  'a center cannot take another listing''s name without review, and sees its request'
+);
+RESET ROLE;
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Finding 3: a solo practitioner with benefits and a shared listing joins
@@ -215,6 +345,7 @@ SELECT set_config('request.jwt.claim.sub', 'a2000000-0000-0000-0000-0000000000d7
 SET LOCAL ROLE authenticated;
 SELECT public.import_global_partner('d1000000-0000-0000-0000-0000000000d7', '81000000-0000-0000-0000-0000000000d7');
 SELECT set_config('test.invite', code, true) FROM public.create_org_invite();
+SELECT set_config('test.invite2', code, true) FROM public.create_org_invite();
 
 SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-0000000000d7', true);
 SELECT public.import_global_partner('d1000000-0000-0000-0000-0000000000d7', '82000000-0000-0000-0000-0000000000d7');
@@ -237,11 +368,25 @@ SELECT id FROM public.request_vob('{"id":"8a000000-0000-0000-0000-0000000000d7",
 SELECT public.toggle_user_favorite('partner', '82000000-0000-0000-0000-0000000000d7');
 SELECT public.toggle_user_favorite('partner', '83000000-0000-0000-0000-0000000000d7');
 SELECT public.register_push_token('ExponentPushToken[solohardening0001]', 'ios');
+-- Round 2, item 4: the solo workspace's own directory profile.
+SELECT public.upsert_org_directory_profile('{"name":"Sol","organization":"Solo Interventions","types":["Interventionist"],"phone":"(541) 555-1234"}'::jsonb);
 RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', '', true);
+-- ...a listing it submitted, a pending claim request, and a benchmarks comp
+-- (the team has an expired one).
+INSERT INTO public.global_partners (id, name, organization, types, phone, status, suggested_by_org_id)
+VALUES ('da000000-0000-0000-0000-0000000000d7', 'Intake', 'Solo Submitted Program', ARRAY['Detox'], '(541) 555-1250', 'pending', current_setting('test.org_s')::uuid);
+INSERT INTO public.center_claim_requests (org_id, global_partner_id, requested_by, note)
+VALUES (current_setting('test.org_s')::uuid, 'd2000000-0000-0000-0000-0000000000d7', 'a1000000-0000-0000-0000-0000000000d7', 'solo claim');
+INSERT INTO public.org_entitlements (org_id, entitlement, active, source, expires_at)
+VALUES (current_setting('test.org_s')::uuid, 'benchmarks', true, 'manual', NULL),
+       (current_setting('test.org_t')::uuid, 'benchmarks', false, 'manual', now() - interval '1 day');
 SELECT public.claim_outreach_draft('a1000000-0000-0000-0000-0000000000d7', 'text', NULL, '82000000-0000-0000-0000-0000000000d7');
 -- Both copies carry their own private fields.
-UPDATE public.partners SET note = 'Team note' WHERE id = '81000000-0000-0000-0000-0000000000d7';
-UPDATE public.partners SET note = 'Ask for Dana in admissions', touch_cadence_days = 14, favorite = true
+UPDATE public.partners SET note = 'Team note', last_contact_at = now() - interval '10 days' WHERE id = '81000000-0000-0000-0000-0000000000d7';
+UPDATE public.partners SET note = 'Ask for Dana in admissions', touch_cadence_days = 14, favorite = true,
+       phone = '541-555-0000', email = 'dana@direct.example', last_contact_at = now() - interval '1 day',
+       financial_relationship = 'consulting_fee', financial_relationship_note = 'Paid monthly consulting'
  WHERE id = '82000000-0000-0000-0000-0000000000d7';
 
 SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-0000000000d7', true);
@@ -268,9 +413,29 @@ SELECT ok(
 );
 SELECT ok(
   (SELECT note = 'Team note' || chr(10) || chr(10) || 'From solo: Ask for Dana in admissions'
+                 || chr(10) || 'Joiner''s contact: 541-555-0000, dana@direct.example'
           AND touch_cadence_days = 14 AND favorite
      FROM public.partners WHERE id = '81000000-0000-0000-0000-0000000000d7'),
-  'the joiner''s private note is appended (attributed), and cadence and favorite carry over'
+  'the joiner''s private note and differing contact details are appended (attributed); cadence and favorite carry over'
+);
+SELECT ok(
+  (SELECT financial_relationship = 'consulting_fee' AND financial_relationship_note = 'Paid monthly consulting'
+          AND last_contact_at > now() - interval '2 days'
+     FROM public.partners WHERE id = '81000000-0000-0000-0000-0000000000d7'),
+  'the joiner''s disclosed financial relationship and later last contact are kept'
+);
+SELECT ok(
+  (SELECT owner_org_id = current_setting('test.org_t')::uuid AND status = 'active'
+     FROM public.global_partners WHERE organization = 'Solo Interventions')
+  AND (SELECT suggested_by_org_id = current_setting('test.org_t')::uuid FROM public.global_partners WHERE id = 'da000000-0000-0000-0000-0000000000d7'),
+  'the solo profile becomes the team''s (it had none) and its submissions count as the team''s'
+);
+SELECT ok(
+  (SELECT org_id = current_setting('test.org_t')::uuid AND status = 'pending'
+     FROM public.center_claim_requests WHERE note = 'solo claim')
+  AND (SELECT active AND expires_at IS NULL FROM public.org_entitlements
+        WHERE org_id = current_setting('test.org_t')::uuid AND entitlement = 'benchmarks'),
+  'the pending claim request moves, and entitlements merge to the most generous'
 );
 SELECT ok(
   (SELECT partner_id = '81000000-0000-0000-0000-0000000000d7' AND org_id = current_setting('test.org_t')::uuid
@@ -324,6 +489,29 @@ SELECT ok(
                       'placement_decisions_referral_org_fk')
     HAVING count(*) = 8),
   'the insurance and placement composite FKs are deferrable'
+);
+
+-- Round 2, item 4: a second solo practitioner with a profile joins a team
+-- that now owns one; the joiner's profile is left live, unowned, reviewed.
+SELECT set_config('request.jwt.claim.sub', 'a3000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT public.upsert_org_directory_profile('{"name":"Two","organization":"Solo Two Interventions","types":["Interventionist"],"phone":"(541) 555-1240"}'::jsonb);
+SELECT lives_ok(
+  $$ SELECT public.accept_org_invite(current_setting('test.invite2')) $$,
+  'a second solo practitioner with a profile joins'
+);
+SET CONSTRAINTS ALL IMMEDIATE;
+RESET ROLE;
+SELECT ok(
+  (SELECT owner_org_id IS NULL AND status = 'active' FROM public.global_partners WHERE organization = 'Solo Two Interventions')
+  AND (SELECT kind = 'orphaned_profile' AND org_id = current_setting('test.org_t')::uuid AND status = 'pending'
+         FROM public.directory_review_requests
+        WHERE global_partner_id = (SELECT id FROM public.global_partners WHERE organization = 'Solo Two Interventions')),
+  'the team keeps one profile; the joiner''s stays live, unowned, and is queued for the admin'
+);
+SELECT ok(
+  position('WHERE user_id = v_user FOR UPDATE' in pg_get_functiondef('public.accept_org_invite(text)'::regprocedure)) > 0,
+  'accept_org_invite locks the caller''s membership row'
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -440,20 +628,45 @@ SELECT ok(
   'a fresh benchmarks subscriber is not part of the benchmark cohort'
 );
 
--- Age alone is not enough: 30+ days old but only two referrals each.
-UPDATE public.orgs SET created_at = now() - interval '45 days'
+-- Age alone is not enough: 90 days old but only two referrals each.
+UPDATE public.orgs SET created_at = now() - interval '90 days'
  WHERE id IN (SELECT org_id FROM public.org_members WHERE user_id::text LIKE 'f_000000-0000-0000-0000-0000000000d7');
 SELECT ok(
   NOT public.org_is_established(current_setting('test.org_f1')::uuid),
   'an old workspace with almost no activity is not established'
 );
 
+-- Volume in one sitting is not enough either: activity must span 10 days.
 INSERT INTO public.cases (owner_id, title)
-SELECT ('f' || n || '000000-0000-0000-0000-0000000000d7')::uuid, 'Established fixture'
+SELECT ('f' || n || '000000-0000-0000-0000-0000000000d7')::uuid, 'Same-day fixture'
   FROM generate_series(1, 5) AS n, generate_series(1, 3) AS k;
 SELECT ok(
+  NOT public.org_is_established(current_setting('test.org_f1')::uuid),
+  'three cases created on one day do not make a workspace established'
+);
+
+-- A client cannot backdate activity: created_at is server-set.
+SELECT set_config('request.jwt.claim.sub', 'f1000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+INSERT INTO public.cases (owner_id, title, created_at)
+VALUES ('f1000000-0000-0000-0000-0000000000d7', 'Backdated by a client', now() - interval '300 days');
+UPDATE public.referrals SET created_at = now() - interval '300 days' WHERE owner_id = 'f1000000-0000-0000-0000-0000000000d7';
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', '', true);
+SELECT ok(
+  (SELECT created_at > now() - interval '1 minute' FROM public.cases WHERE title = 'Backdated by a client')
+  AND (SELECT bool_and(created_at > now() - interval '1 minute') FROM public.referrals WHERE owner_id = 'f1000000-0000-0000-0000-0000000000d7')
+  AND NOT public.org_is_established(current_setting('test.org_f1')::uuid),
+  'client-supplied created_at values are ignored on insert and update'
+);
+
+-- Server-side history on ten distinct days (as an imported backlog would be).
+INSERT INTO public.cases (owner_id, title, created_at)
+SELECT ('f' || n || '000000-0000-0000-0000-0000000000d7')::uuid, 'History fixture', now() - make_interval(days => d)
+  FROM generate_series(1, 5) AS n, generate_series(1, 10) AS d;
+SELECT ok(
   public.org_is_established(current_setting('test.org_f1')::uuid),
-  '30+ days old with three cases is established'
+  '60+ days old, 3+ cases, activity on 10+ days: established'
 );
 SELECT lives_ok($$ SELECT public.refresh_global_partner_stats() $$, 'stats refresh with five established workspaces');
 SELECT set_config('request.jwt.claim.sub', 'f2000000-0000-0000-0000-0000000000d7', true);
