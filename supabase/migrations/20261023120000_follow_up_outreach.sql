@@ -4,7 +4,10 @@
 --
 --   1. outreach_drafts: one metadata row per AI draft request (who, which
 --      channel, which case or partner, when). The drafted text is never
---      stored. No client access at all; it exists for the daily cap.
+--      stored, and neither is the user's own Anthropic key (it travels with
+--      each request only). No client access at all; it exists for the daily
+--      cap, which keeps the drafting function from being used as a general
+--      proxy.
 --   2. claim_outreach_draft(): service-role only (the draft-follow-up Edge
 --      Function). Confirms the user belongs to the workspace that holds the
 --      case or partner, enforces the per-user daily cap, records the request.
@@ -48,7 +51,7 @@ CREATE OR REPLACE FUNCTION public.outreach_draft_daily_limit()
 RETURNS integer
 LANGUAGE sql IMMUTABLE
 SET search_path = pg_catalog
-AS $$ SELECT 60 $$;
+AS $$ SELECT 200 $$;
 GRANT EXECUTE ON FUNCTION public.outreach_draft_daily_limit() TO authenticated, service_role;
 
 CREATE OR REPLACE FUNCTION public.claim_outreach_draft(

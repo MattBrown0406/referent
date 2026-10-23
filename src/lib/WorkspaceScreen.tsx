@@ -33,6 +33,8 @@ import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySu
 import DirectoryReviewQueue from './DirectoryReviewQueue';
 import { prepareForWorkspaceChange } from './store';
 import { deleteOwnAccount } from './account';
+import { AiDraftsCard } from './AiDraftKey';
+import { removeAnthropicKey } from './outreach-api';
 import {
   enablePush,
   fetchNotificationPreferences,
@@ -197,6 +199,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
           { text: 'Keep my account', style: 'cancel' },
           { text: 'Delete account', style: 'destructive', onPress: () => run(async () => {
             await deleteOwnAccount({ userId, removeWorkspaceFiles: soloOwner });
+            await removeAnthropicKey(userId); // the account's AI key leaves this phone with it
             onAccountDeleted();
           }, 'Could not delete the account') },
         ]);
@@ -642,6 +645,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 ReferralFit is free to use. There is nothing to buy in this app and no charge to your practice.
               </Text>
             </View>
+
+            <AiDraftsCard userId={userId} visible={visible} />
 
             {isOwner && entitlements.entitlements.pro ? (
               <View style={styles.card}>

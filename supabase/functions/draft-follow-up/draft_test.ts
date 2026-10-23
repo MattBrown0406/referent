@@ -7,6 +7,7 @@ import {
   DraftRequestError,
   LIMITS,
   outputSchema,
+  parseApiKeyHeader,
   parseDraftOutput,
   parseDraftRequest,
   SYSTEM_PROMPT,
@@ -163,4 +164,16 @@ Deno.test('parseDraftOutput caps a runaway text', () => {
 Deno.test('clean collapses whitespace and control characters', () => {
   assertEquals(clean(' a\u0000\u0007 b\n\tc ', 10), 'a b c');
   assertEquals(clean(42, 10), '');
+});
+
+Deno.test('parseApiKeyHeader accepts an Anthropic key and nothing else', () => {
+  const key = `sk-ant-api03-${'a'.repeat(80)}_-Z9`;
+  assertEquals(parseApiKeyHeader(key), key);
+  assertEquals(parseApiKeyHeader(`  ${key}\n`), key, 'surrounding whitespace is trimmed');
+  assertEquals(parseApiKeyHeader(null), null);
+  assertEquals(parseApiKeyHeader(''), null);
+  assertEquals(parseApiKeyHeader('sk-ant-short'), null);
+  assertEquals(parseApiKeyHeader(`sk-proj-${'a'.repeat(40)}`), null, 'another provider\'s key');
+  assertEquals(parseApiKeyHeader(`sk-ant-${'a'.repeat(30)} DROP`), null, 'no spaces inside');
+  assertEquals(parseApiKeyHeader(`sk-ant-${'a'.repeat(300)}`), null, 'absurd length');
 });

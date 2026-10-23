@@ -123,6 +123,14 @@ never write it here.
 > They are not a way to pay ReferralFit, and the app never collects payment
 > details.
 >
+> FOLLOW UP / AI DRAFTS (optional): the Follow up button (Today, a case, or a
+> partner) gives a ready draft to edit and send from the iPhone's own Messages
+> or Mail; it works without any setup. "Draft with AI" is optional and uses
+> the practice's own Anthropic API key, which the user adds in the app and
+> which is billed by Anthropic to their own Anthropic account. ReferralFit
+> sells nothing and receives no payment for it. Before a key is added, the
+> app explains exactly what is sent to Anthropic.
+>
 > Push notifications are optional. Local reminders (daily briefing,
 > follow-up cadence) are scheduled on the device; server-sent pushes (a new
 > lead, something assigned to you, your follow-ups past due, a directory

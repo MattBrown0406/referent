@@ -1,5 +1,5 @@
-// Pure pieces of the draft-follow-up function: request validation, the
-// prompt, the per-channel output schema, and output validation. No network,
+// Pure pieces of the draft-follow-up function: API key and request
+// validation, the prompt, the per-channel output schema, and output validation. No network,
 // no environment, so draft_test.ts covers all of it.
 //
 // What reaches the model is deliberately small (docs/FOLLOW_UP_OUTREACH.md):
@@ -43,6 +43,19 @@ export type CallDraft = { channel: 'call'; opener: string; talkingPoints: string
 export type Draft = TextDraft | EmailDraft | CallDraft;
 
 export class DraftRequestError extends Error {}
+
+// Each practitioner brings their own Anthropic API key (the app is free, so
+// drafts run on the user's own Anthropic account). It arrives in the
+// x-anthropic-key header on every request, is used for that one call, and is
+// never stored or logged. Anything that is not shaped like a key is refused
+// before it goes anywhere.
+const ANTHROPIC_KEY = /^sk-ant-[A-Za-z0-9_-]{20,250}$/;
+
+export function parseApiKeyHeader(value: string | null): string | null {
+  if (!value) return null;
+  const key = value.trim();
+  return ANTHROPIC_KEY.test(key) ? key : null;
+}
 
 const CASE_STAGES = ['inquiry', 'consult', 'deciding', 'engaged', 'intervention', 'placed', 'aftercare', 'closed', 'lost'];
 const PURPOSES: FollowUpPurpose[] = ['first_call', 'follow_up', 'promised_call', 'touch', 'none'];

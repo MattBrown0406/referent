@@ -7,9 +7,13 @@ phone's own Messages or Mail (or dials). Once it is sent, or the call is
 logged, the step is closed, the outreach is on the timeline, and the next
 follow-up is set for 48 hours later.
 
-Nothing in this document is applied automatically. The migration, the
-`ANTHROPIC_API_KEY` secret, and the `draft-follow-up` function are separate
-steps, listed in order under **Deploy**.
+AI drafts are **bring your own key**: ReferralFit is free, so each
+practitioner adds their own Anthropic API key in the app, and drafts run on
+(and are billed to) their own Anthropic account. ReferralFit holds no
+Anthropic key and pays for no one's drafts.
+
+Nothing in this document is applied automatically. The migration and the
+`draft-follow-up` function are separate steps, listed under **Deploy**.
 
 ## What the user sees
 
@@ -30,9 +34,14 @@ The sheet:
    a text; after a text, an email).
 2. A plain, discreet starting draft is already filled in, so the
    practitioner can send without the AI at all.
-3. **Anything to mention?** (optional) and **✦ Draft with AI**. The first
-   time, a consent screen says exactly what is sent and to whom (App Review
-   guideline 5.1.2(i)); the answer is remembered per account on the device.
+3. **Anything to mention?** (optional) and **✦ Draft with AI**. With no key
+   on the phone yet, **Turn on AI drafts** explains that drafts run on the
+   user's own Anthropic account, says exactly what is sent and to whom (App
+   Review guideline 5.1.2(i)), links to the Anthropic Console to create a
+   key, and takes the pasted key. The key is checked with Anthropic (a free
+   model-list call) before it is saved; saving it is the user's agreement.
+   **Workspace → AI drafts** shows the saved key masked (`sk-ant-…a1B2`)
+   with Replace and Remove.
 4. The draft is editable. **Open in Messages** / **Open in Mail** presents
    the iOS compose sheet with the recipient and the message filled in;
    **Call** dials and shows the opener, talking points, and voicemail.
@@ -67,6 +76,22 @@ through the offline queue like every other write: offline, it is queued and
 lands in order when the phone reconnects. A replay never creates a second
 follow-up, and a step deleted in the meantime does not block the log.
 
+## The user's Anthropic key
+
+- Stored only in this phone's keychain, per account
+  (`expo-secure-store`, `WHEN_UNLOCKED_THIS_DEVICE_ONLY`: never synced to
+  iCloud Keychain or backups, never written to ReferralFit's database).
+  Another account signed in on the same phone cannot use it. Deleting the
+  account removes it; signing out keeps it for that account's next sign-in.
+- Sent with each draft request in the `x-anthropic-key` header over TLS. The
+  function checks its shape (`sk-ant-…`), uses it for that one Anthropic call,
+  and never stores, logs, or returns it.
+- Anthropic's answers are passed back in plain words: a key Anthropic does
+  not accept (or without permission) sends the user back to **Update your
+  Anthropic key**; no credit or billing, or the account's rate limit, says so.
+- Web (`npm run web`) has no keychain, so AI drafts are set up in the iPhone
+  app only; everything else works there.
+
 ## What leaves the device, and what does not
 
 The AI draft is the only part that talks to a third party. The request the
@@ -93,17 +118,17 @@ value with partners (EKRA / patient-brokering); facts only, no placeholders;
 the 911 / 988 line when the note suggests danger. Drafts with a `[blank]` or
 `{{slot}}` are rejected rather than shown.
 
-**Before regular use in a HIPAA or 42 CFR Part 2 practice:** the practitioner's
-note is free text and could carry health details despite the on-screen hint.
-Put a Business Associate Agreement (and, ideally, zero data retention) in
-place with Anthropic for the API key the function uses, or keep the note
-field out of the request.
+**HIPAA / 42 CFR Part 2:** the practitioner's note is free text and could
+carry health details despite the on-screen hint. Because each practice uses
+its own Anthropic account, each practice arranges its own Business Associate
+Agreement (and, if it wants, zero data retention) with Anthropic; the setup
+screen says so.
 
 ## Deploy
 
-Order matters only in that the function needs the migration and the secret;
-the app works before any of it (the ✦ Draft with AI button says drafting is
-unavailable, and the starting draft and sending still work).
+The function needs the migration. The app works before either (Draft with AI
+says drafting is unavailable; the starting draft and sending still work).
+There is no Anthropic secret to set on the server.
 
 ### 1. Apply the migration
 
@@ -132,20 +157,7 @@ statement under 3,700 characters, wrapped in `BEGIN ... COMMIT`.
 
    All three should be `true`.
 
-### 2. Set `ANTHROPIC_API_KEY`
-
-Create a key in the Anthropic Console for this app (its own key, so usage
-and any BAA are scoped to it), then either Supabase → **Edge Functions** →
-**Secrets** → add `ANTHROPIC_API_KEY`, or:
-
-```sh
-supabase secrets set ANTHROPIC_API_KEY='sk-ant-…' --project-ref ovfafffvcpaahktvlsdm
-```
-
-Never put the key in the app or in Git. The function also uses the
-platform-provided `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
-
-### 3. Deploy the function
+### 2. Deploy the function
 
 ```sh
 supabase functions deploy draft-follow-up --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm
@@ -154,28 +166,32 @@ supabase functions deploy draft-follow-up --no-verify-jwt --project-ref ovfafffv
 `--no-verify-jwt` is intentional: the function checks the caller's access
 token itself with `auth.getUser`, which works with the project's publishable
 and secret API keys (the gateway's legacy JWT check does not).
-`supabase/config.toml` carries the same setting for local serving.
+`supabase/config.toml` carries the same setting for local serving. The
+function uses only the platform-provided `SUPABASE_URL` and
+`SUPABASE_SERVICE_ROLE_KEY`.
 
-### 4. Check it
+### 3. Check it
 
 From the app (a build that contains this change, on a device): open a case
-with a contact, ✦ Follow up → Draft with AI → Allow. A draft appears in a few
-seconds. Send it to your own number; Messages reports it sent, the
+with a contact, ✦ Follow up → Draft with AI → paste your Anthropic key →
+Save key and draft. A draft appears in a few seconds. Send it to your own number; Messages reports it sent, the
 confirmation shows a follow-up two days out, the case timeline shows the
 text, and Today shows the new step on that date.
 
-Without a device, with a signed-in user's access token in `$TOKEN` and a case
-id from that user's workspace in `$CASE`:
+Without a device, with a signed-in user's access token in `$TOKEN`, a case
+id from that user's workspace in `$CASE`, and an Anthropic key in `$KEY`:
 
 ```sh
 curl -s -X POST "https://ovfafffvcpaahktvlsdm.supabase.co/functions/v1/draft-follow-up" \
-  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -H "Authorization: Bearer $TOKEN" -H "x-anthropic-key: $KEY" -H 'content-type: application/json' \
   -d '{"channel":"text","target":{"kind":"case","caseId":"'"$CASE"'"},"recipient":{"firstName":"Ana","relationship":"mother"},"sender":{"firstName":"Matt","practiceName":"Freedom Interventions"},"situation":{"stage":"inquiry","attempt":2,"lastChannel":"call","daysSinceLastContact":2,"purpose":"follow_up"}}'
 ```
 
-Expect `{"draft":{"channel":"text","body":"…"},"remaining":59}`.
+Expect `{"draft":{"channel":"text","body":"…"},"remaining":199}`. The same
+call with the body `{"action":"verify"}` checks the key and returns
+`{"ok":true}`.
 
-### 5. Ship a native build
+### 4. Ship a native build
 
 `expo-sms` and `expo-mail-composer` are native modules, so the compose
 sheets need a new binary (EAS build); an over-the-air update cannot add them.
@@ -185,21 +201,27 @@ go out?" question instead of crashing. Both are pinned at 57.0.1 with the rest
 of the native set and covered by `scripts/native-compat-test.mjs`.
 
 Before submitting, update App Store Connect → **App Privacy**: names (first
-names of contacts) are now shared with a service provider (Anthropic) for App
-Functionality, not linked to tracking. The privacy policy (`docs/privacy.html`)
-has an "AI-drafted follow-ups" section and lists Anthropic as a provider.
+names of contacts) can be shared with Anthropic for App Functionality when a
+user turns on AI drafts, not linked to tracking. The privacy policy
+(`docs/privacy.html`) has an "AI-drafted follow-ups" section and lists
+Anthropic. `APP_REVIEW.md` has a reviewer note: AI drafts are optional and use
+the user's own Anthropic account, so nothing is sold.
 
 ## Function behaviour
 
 | Request | Response |
 | --- | --- |
 | No or bad `Authorization` | 401 `unauthorized` |
+| No `x-anthropic-key`, or not shaped like `sk-ant-…` | 400 `key_required` |
+| Anthropic does not accept the key / key lacks permission | 401 `key_invalid` / 403 `key_forbidden` |
+| Anthropic rejects the request (no credit or billing) | 400 `key_rejected` |
+| The user's Anthropic account is rate-limited | 429 `key_rate_limited` |
+| `{"action":"verify"}` with a working key | 200 `{ ok: true }` (no draft, no cap) |
 | Unreadable body, unknown channel, bad id, no recipient name | 400 `bad_request` |
 | Case or partner not in the caller's workspace | 404 `not_found` |
 | Caller has no workspace | 403 `forbidden` |
-| 60 drafts in the last 24 hours (per user) | 429 `daily_limit` |
-| `ANTHROPIC_API_KEY` not set | 503 `not_configured` |
-| Model busy / timed out / API error | 503 `busy` / 504 `timeout` / 502 `upstream_error` |
+| 200 drafts in the last 24 hours (per user) | 429 `daily_limit` |
+| Anthropic busy or erroring / timed out | 503 `busy` / 504 `timeout` |
 | Model declined | 422 `refused` |
 | Unusable draft (empty, placeholder, malformed) | 502 `bad_output` |
 | Success | 200 `{ draft, remaining }` |
@@ -210,8 +232,9 @@ draft, so a failed draft never blocks a follow-up.
 Model: `claude-opus-5-5` at low effort with structured JSON output and
 server-side fallback (`fallbacks: "default"`), `@anthropic-ai/sdk` 1.1.0.
 A draft is roughly 1,500 input and 300–1,500 output tokens, about one to
-four cents at $4 / $20 per million tokens; the daily cap bounds a user at
-60 drafts. The cap lives in `public.outreach_draft_daily_limit()`.
+four cents at $4 / $20 per million tokens, billed to the user's own Anthropic
+account. The daily cap (200 per user, `public.outreach_draft_daily_limit()`)
+only keeps the function from being used as a general proxy.
 
 ## Tests
 
@@ -219,8 +242,8 @@ four cents at $4 / $20 per million tokens; the daily cap bounds a user at
   48-hour rhythm across daylight-saving changes, which step a send closes,
   the minimal draft request, the fallback drafts, composer URLs.
 - `deno test --node-modules-dir=none supabase/functions/draft-follow-up/`
-  (in CI): request validation and minimization, the prompt, the output
-  schema, output validation.
+  (in CI): key-header validation, request validation and minimization, the
+  prompt, the output schema, output validation.
 - `supabase/tests/follow_up_outreach_test.sql` (pgTAP, in CI): privileges,
   the workspace fence and daily cap, and `record_outreach_sent` (complete +
   log + next, replay safety, guards, other-workspace isolation).

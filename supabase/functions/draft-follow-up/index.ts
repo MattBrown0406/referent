@@ -3,9 +3,15 @@
 // practitioner sends it from their own Messages / Mail / dialer; nothing is
 // sent from here. See docs/FOLLOW_UP_OUTREACH.md for deployment.
 //
+// Bring your own key: ReferralFit is free, so each practitioner adds their
+// own Anthropic API key in the app. It lives in their phone's keychain and
+// arrives here in the x-anthropic-key header on each request.
+//
 // Safety properties:
 //   * every request must carry a signed-in user's access token; it is checked
 //     against Supabase Auth before anything else happens;
+//   * the Anthropic key is format-checked, used for this one call, and never
+//     stored, logged, or echoed back;
 //   * claim_outreach_draft (service-role only) confirms the case or partner
 //     is in the caller's own workspace and enforces the daily cap before the
 //     model is called;
@@ -13,6 +19,9 @@
 //     names, relationship, stage, attempt count, the practitioner's note) —
 //     never phone numbers, email addresses, case titles, or timeline notes;
 //   * neither the request nor the draft is logged or stored.
+//
+// POST { action: "verify" } checks a key (a free model-list call) without
+// drafting anything; any other body is a draft request.
 
 import Anthropic from 'npm:@anthropic-ai/sdk@1.1.0';
 import { createClient } from 'npm:@supabase/supabase-js@2.110.8';
@@ -24,6 +33,7 @@ import {
   DraftOutputError,
   DraftRequestError,
   outputSchema,
+  parseApiKeyHeader,
   parseDraftOutput,
   parseDraftRequest,
   SYSTEM_PROMPT,
@@ -33,7 +43,7 @@ const MODEL = 'claude-opus-5-5';
 
 const CORS_HEADERS = {
   'access-control-allow-origin': '*',
-  'access-control-allow-headers': 'authorization, x-client-info, apikey, content-type',
+  'access-control-allow-headers': 'authorization, x-client-info, apikey, content-type, x-anthropic-key',
   'access-control-allow-methods': 'POST, OPTIONS',
 };
 
@@ -60,12 +70,36 @@ function bearerToken(request: Request): string | null {
   return match ? match[1].trim() : null;
 }
 
+// What went wrong on the Anthropic side, in words the practitioner can act
+// on. Errors are told apart by the SDK's typed classes, most specific first;
+// only the status code is ever logged (never the key or the request).
+function anthropicFailure(error: unknown): Response {
+  if (error instanceof Anthropic.AuthenticationError) {
+    return failure(401, 'key_invalid', 'Anthropic did not accept this API key. Check it, or create a new key in the Anthropic Console.');
+  }
+  if (error instanceof Anthropic.PermissionDeniedError) {
+    return failure(403, 'key_forbidden', 'This API key is not allowed to use Claude. Check the key’s workspace in the Anthropic Console.');
+  }
+  if (error instanceof Anthropic.RateLimitError) {
+    return failure(429, 'key_rate_limited', 'Your Anthropic account is at its rate limit. Try again in a minute.');
+  }
+  if (error instanceof Anthropic.BadRequestError) {
+    return failure(400, 'key_rejected', 'Anthropic turned the request down. Check that your Anthropic account has credit or billing set up.');
+  }
+  if (error instanceof Anthropic.APIConnectionTimeoutError) {
+    return failure(504, 'timeout', 'The draft took too long. Try again.');
+  }
+  if (error instanceof Anthropic.APIError) {
+    console.error('Anthropic request failed', error.status);
+    return failure(503, 'busy', 'Drafting is unavailable right now. Try again in a minute.');
+  }
+  console.error('Anthropic request failed');
+  return failure(502, 'upstream_error', 'Drafting is unavailable right now.');
+}
+
 Deno.serve(async (request) => {
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
   if (request.method !== 'POST') return failure(405, 'method_not_allowed', 'Use POST.');
-
-  const apiKey = Deno.env.get('ANTHROPIC_API_KEY');
-  if (!apiKey) return failure(503, 'not_configured', 'AI drafting is not set up yet.');
 
   const token = bearerToken(request);
   if (!token) return failure(401, 'unauthorized', 'Sign in to draft follow-ups.');
@@ -74,16 +108,40 @@ Deno.serve(async (request) => {
   try {
     supabase = serviceClient();
   } catch {
-    return failure(503, 'not_configured', 'AI drafting is not set up yet.');
+    return failure(503, 'not_configured', 'Drafting is not set up yet.');
   }
 
   const { data: userData, error: userError } = await supabase.auth.getUser(token);
   const userId = userData?.user?.id;
   if (userError || !userId) return failure(401, 'unauthorized', 'Your session has expired. Sign in again.');
 
+  const apiKey = parseApiKeyHeader(request.headers.get('x-anthropic-key'));
+  if (!apiKey) {
+    return failure(400, 'key_required', 'Add your Anthropic API key to use AI drafts. It starts with sk-ant-.');
+  }
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return failure(400, 'bad_request', 'The draft request was not readable.');
+  }
+
+  const anthropic = new Anthropic({ apiKey, timeout: 45_000, maxRetries: 1 });
+
+  // Key check: one free model-list call, no draft, no cap.
+  if (body && typeof body === 'object' && (body as { action?: unknown }).action === 'verify') {
+    try {
+      await anthropic.models.list({ limit: 1 });
+      return reply({ ok: true });
+    } catch (error) {
+      return anthropicFailure(error);
+    }
+  }
+
   let draftRequest: DraftRequest;
   try {
-    draftRequest = parseDraftRequest(await request.json());
+    draftRequest = parseDraftRequest(body);
   } catch (error) {
     const message = error instanceof DraftRequestError ? error.message : 'The draft request was not readable.';
     return failure(400, 'bad_request', message);
@@ -105,7 +163,6 @@ Deno.serve(async (request) => {
     return failure(500, 'server_error', 'Drafting is unavailable right now.');
   }
 
-  const anthropic = new Anthropic({ apiKey, timeout: 45_000, maxRetries: 1 });
   let response;
   try {
     response = await anthropic.beta.messages.create({
@@ -121,18 +178,7 @@ Deno.serve(async (request) => {
       messages: [{ role: 'user', content: buildUserPrompt(draftRequest) }],
     });
   } catch (error) {
-    if (error instanceof Anthropic.RateLimitError) {
-      return failure(503, 'busy', 'Drafting is busy right now. Try again in a minute.');
-    }
-    if (error instanceof Anthropic.APIConnectionTimeoutError) {
-      return failure(504, 'timeout', 'The draft took too long. Try again.');
-    }
-    if (error instanceof Anthropic.APIError) {
-      console.error('Anthropic request failed', error.status);
-      return failure(502, 'upstream_error', 'Drafting is unavailable right now.');
-    }
-    console.error('Anthropic request failed');
-    return failure(502, 'upstream_error', 'Drafting is unavailable right now.');
+    return anthropicFailure(error);
   }
 
   if (response.stop_reason === 'refusal') {

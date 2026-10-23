@@ -434,6 +434,27 @@ export function templateDraft(params: {
   };
 }
 
+// ─── The practitioner's own Anthropic key ───────────────────────────────────
+// ReferralFit is free, so AI drafts run on each user's own Anthropic account.
+// The key is pasted once, kept in the phone's keychain, and checked here for
+// shape only; Anthropic is the authority on whether it works.
+
+const ANTHROPIC_KEY = /^sk-ant-[A-Za-z0-9_-]{20,250}$/;
+
+// Pasted keys often arrive wrapped in quotes or with a stray line break.
+export function normalizeAnthropicKey(input: string): string {
+  return input.replace(/[\s"'`“”‘’]+/g, '');
+}
+
+export function looksLikeAnthropicKey(key: string): boolean {
+  return ANTHROPIC_KEY.test(key);
+}
+
+// "sk-ant-…a1B2": enough to recognize which key is saved, never the key.
+export function maskAnthropicKey(key: string): string {
+  return key.length > 11 ? `sk-ant-…${key.slice(-4)}` : 'sk-ant-…';
+}
+
 // ─── Sending: native composer fallbacks ─────────────────────────────────────
 
 // iOS separates the body with '&', Android with '?'.

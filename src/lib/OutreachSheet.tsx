@@ -32,13 +32,14 @@ import {
   type OutreachRecipient,
   type OutreachTarget,
 } from './outreach';
+import { AiKeySetup } from './AiDraftKey';
 import {
+  aiKeysSupported,
   DraftUnavailableError,
   fetchPracticeName,
-  hasAiDraftConsent,
+  getAnthropicKey,
   placeCall,
   requestOutreachDraft,
-  saveAiDraftConsent,
   sendEmailMessage,
   sendTextMessage,
 } from './outreach-api';
@@ -79,7 +80,7 @@ type Props = {
   onSent: (sent: OutreachSent) => Promise<FollowUp | null>;
 };
 
-type Stage = 'compose' | 'consent' | 'confirm_sent' | 'call_result' | 'saving' | 'done';
+type Stage = 'compose' | 'setup' | 'confirm_sent' | 'call_result' | 'saving' | 'done';
 
 const COLORS = {
   ink: '#16352E',
@@ -127,6 +128,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
   const [nextFollowUp, setNextFollowUp] = useState<FollowUp | null>(null);
   const [pendingCallResult, setPendingCallResult] = useState<CallResult | null>(null);
   const [logNotice, setLogNotice] = useState('');
+  const [keyProblem, setKeyProblem] = useState(false); // Anthropic refused the saved key
   const openGeneration = useRef(0);
   const sendingRef = useRef(false); // a second tap before re-render must not open Messages twice
   const recordingRef = useRef(false); // …or log the same send twice
@@ -154,6 +156,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
     setNextFollowUp(null);
     setPendingCallResult(null);
     setLogNotice('');
+    setKeyProblem(false);
     setHistory(knownHistory);
     setChannel(suggestedChannel(first, knownHistory, request.startedFrom?.kind));
     sentAtRef.current = null;
@@ -204,10 +207,17 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
     if (!channelAvailable(next, channel)) setChannel(suggestedChannel(next, history, request?.startedFrom?.kind));
   }
 
-  async function draftWithAi(consented = false) {
+  // AI drafts run on the user's own Anthropic key (the app is free). No key on
+  // this phone yet → the setup screen, which explains what is shared first.
+  async function draftWithAi(savedKey?: string) {
     if (!request || !recipient || drafting) return;
-    if (!consented && !(await hasAiDraftConsent(userId))) {
-      setStage('consent');
+    if (!aiKeysSupported) {
+      setDraftNotice('AI drafts are set up in the iPhone app. The starting draft below is yours to edit.');
+      return;
+    }
+    const apiKey = savedKey || await getAnthropicKey(userId);
+    if (!apiKey) {
+      setStage('setup');
       return;
     }
     const generation = openGeneration.current;
@@ -225,23 +235,25 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
         purposeKind: request.startedFrom?.kind,
         instructions,
         now: new Date(),
-      }));
+      }), apiKey);
       if (openGeneration.current !== generation) return;
       if (aiDraft.channel !== forChannel) throw new DraftUnavailableError('The draft came back for the wrong channel. Try again.', 'unavailable');
       updateDraft(aiDraft);
       if (remaining !== null && remaining <= 5) setDraftNotice(`${remaining} AI ${remaining === 1 ? 'draft' : 'drafts'} left today.`);
     } catch (error) {
       if (openGeneration.current !== generation) return;
+      setKeyProblem(error instanceof DraftUnavailableError && error.reason === 'key');
       setDraftNotice(error instanceof DraftUnavailableError ? error.message : 'Drafting is unavailable right now. The starting draft below is yours to edit.');
     } finally {
       if (openGeneration.current === generation) setDrafting(false);
     }
   }
 
-  async function allowAndDraft() {
-    await saveAiDraftConsent(userId);
+  function keySaved(apiKey: string) {
+    setKeyProblem(false);
+    setDraftNotice('');
     setStage('compose');
-    await draftWithAi(true);
+    void draftWithAi(apiKey);
   }
 
   async function record(callResult?: CallResult) {
@@ -459,6 +471,11 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
           {drafting ? <ActivityIndicator color={COLORS.forest} /> : <Text style={styles.secondaryButtonText}>✦ Draft with AI</Text>}
         </TouchableOpacity>
         {draftNotice ? <Text style={styles.notice}>{draftNotice}</Text> : null}
+        {keyProblem ? (
+          <TouchableOpacity accessibilityRole="button" onPress={() => setStage('setup')} style={styles.textButton}>
+            <Text style={styles.textButtonText}>Update your Anthropic key</Text>
+          </TouchableOpacity>
+        ) : null}
 
         {renderDraftEditor()}
 
@@ -474,28 +491,17 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
     );
   }
 
-  function renderConsent() {
+  function renderSetup() {
     return (
       <View>
-        <Text style={styles.consentTitle}>Allow AI drafts?</Text>
-        <Text style={styles.consentBody}>
-          Drafts are written by Claude, an AI model from Anthropic. To write one, ReferralFit sends Anthropic only:
-        </Text>
-        {[
-          'the recipient’s first name, and their relationship (or the partner’s organization and type)',
-          'your first name and your practice’s name',
-          'the case stage and how many times you have reached out',
-          'anything you type in “Anything to mention?”',
-        ].map((line) => <Text key={line} style={styles.consentBullet}>•  {line}</Text>)}
-        <Text style={styles.consentBody}>
-          It never sends phone numbers, email addresses, case notes, documents, or your client’s name. Anthropic does not train its models on this data. You review every draft, and nothing is sent to anyone until you send it yourself.
-        </Text>
-        <TouchableOpacity accessibilityRole="button" onPress={() => { void allowAndDraft(); }} style={styles.primaryButton}>
-          <Text style={styles.primaryButtonText}>Allow AI drafts</Text>
-        </TouchableOpacity>
-        <TouchableOpacity accessibilityRole="button" onPress={() => setStage('compose')} style={styles.textButton}>
-          <Text style={styles.textButtonText}>Not now — I’ll write it myself</Text>
-        </TouchableOpacity>
+        <Text style={styles.consentTitle}>Turn on AI drafts</Text>
+        <AiKeySetup
+          userId={userId}
+          saveLabel="Save key and draft"
+          onSaved={keySaved}
+          onCancel={() => setStage('compose')}
+          cancelLabel="Not now — I’ll write it myself"
+        />
       </View>
     );
   }
@@ -589,7 +595,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
           <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
             <Text style={styles.anchor} numberOfLines={2}>{anchor}</Text>
             {stage === 'compose' ? renderCompose() : null}
-            {stage === 'consent' ? renderConsent() : null}
+            {stage === 'setup' ? renderSetup() : null}
             {stage === 'confirm_sent' ? renderConfirmSent() : null}
             {stage === 'call_result' ? renderCallResult() : null}
             {stage === 'saving' ? <ActivityIndicator style={styles.saving} color={COLORS.forest} /> : null}

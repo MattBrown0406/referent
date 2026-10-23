@@ -280,6 +280,17 @@ check('the timeline lists recent outreach, oldest first, then the open steps', (
   assert.deepEqual(entries.map((entry) => entry.id), ['e1', 'e3', 'n0', 'n1']);
 });
 
+check('a pasted Anthropic key is cleaned, recognized, and masked', () => {
+  const key = `sk-ant-api03-${'Ab9_-'.repeat(18)}xY7z`;
+  assert.equal(outreach.normalizeAnthropicKey(`  "${key}"\n`), key);
+  assert.equal(outreach.normalizeAnthropicKey(`“${key}”`), key);
+  assert.equal(outreach.looksLikeAnthropicKey(key), true);
+  assert.equal(outreach.looksLikeAnthropicKey('sk-ant-tooshort'), false);
+  assert.equal(outreach.looksLikeAnthropicKey(`sk-proj-${'a'.repeat(40)}`), false);
+  assert.equal(outreach.maskAnthropicKey(key), 'sk-ant-…xY7z');
+  assert.equal(outreach.maskAnthropicKey(key).includes(key.slice(8, 20)), false, 'the mask never shows the middle of the key');
+});
+
 check('due labels read naturally', () => {
   const now = new Date(2026, 9, 21, 9, 0);
   assert.equal(outreach.describeDue('2026-10-21', '15:15', now), 'Today 3:15 PM');

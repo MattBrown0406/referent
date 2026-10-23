@@ -1,9 +1,10 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { requireOptionalNativeModule } from 'expo';
+import * as SecureStore from 'expo-secure-store';
 import { Linking, Platform } from 'react-native';
 
 import {
   digitsForPhone,
+  looksLikeAnthropicKey,
   mailtoUrl,
   smsUrl,
   type CallDraft,
@@ -14,9 +15,15 @@ import { supabase } from './supabase';
 
 // ─── AI drafts (the draft-follow-up Edge Function) ──────────────────────────
 
+export type DraftFailureReason =
+  | 'offline' // no connection; try again later
+  | 'key' // no key, or Anthropic refused this one: set it up again
+  | 'limit' // the daily cap
+  | 'refused' // the model declined this request
+  | 'unavailable'; // anything else, usually transient
+
 export class DraftUnavailableError extends Error {
-  // 'limit' and 'refused' are final for this request; the rest may clear up.
-  constructor(message: string, readonly reason: 'offline' | 'limit' | 'refused' | 'unavailable') {
+  constructor(message: string, readonly reason: DraftFailureReason) {
     super(message);
   }
 }
@@ -35,6 +42,32 @@ async function functionErrorBody(error: unknown): Promise<FunctionErrorBody> {
   return {};
 }
 
+const OFFLINE_MESSAGE = 'No connection. Write this one yourself, or try again when you are back online.';
+const KEY_CODES = ['key_required', 'key_invalid', 'key_forbidden'];
+
+// The user's own Anthropic key rides along in a header on every call; the
+// function uses it for that one request and never stores it.
+async function invokeDraftFunction(body: unknown, apiKey: string): Promise<unknown> {
+  let result: Awaited<ReturnType<typeof supabase.functions.invoke>>;
+  try {
+    result = await supabase.functions.invoke('draft-follow-up', { body: body as Record<string, unknown>, headers: { 'x-anthropic-key': apiKey } });
+  } catch {
+    throw new DraftUnavailableError(OFFLINE_MESSAGE, 'offline');
+  }
+  if (result.error) {
+    const name = (result.error as { name?: string }).name || '';
+    if (name === 'FunctionsFetchError' || name === 'FunctionsRelayError') throw new DraftUnavailableError(OFFLINE_MESSAGE, 'offline');
+    const payload = await functionErrorBody(result.error);
+    const code = payload.error?.code || '';
+    const message = payload.error?.message || 'Drafting is unavailable right now.';
+    if (KEY_CODES.includes(code)) throw new DraftUnavailableError(message, 'key');
+    if (code === 'daily_limit') throw new DraftUnavailableError(message, 'limit');
+    if (code === 'refused') throw new DraftUnavailableError(message, 'refused');
+    throw new DraftUnavailableError(message, 'unavailable');
+  }
+  return result.data;
+}
+
 function isDraft(value: unknown): value is OutreachDraft {
   const draft = value as Partial<OutreachDraft> | null;
   if (!draft || typeof draft !== 'object') return false;
@@ -47,30 +80,20 @@ function isDraft(value: unknown): value is OutreachDraft {
   return false;
 }
 
-export async function requestOutreachDraft(body: DraftRequestBody): Promise<{ draft: OutreachDraft; remaining: number | null }> {
-  let result: Awaited<ReturnType<typeof supabase.functions.invoke>>;
-  try {
-    result = await supabase.functions.invoke('draft-follow-up', { body });
-  } catch {
-    throw new DraftUnavailableError('No connection. Write this one yourself, or try again when you are back online.', 'offline');
-  }
-  if (result.error) {
-    const name = (result.error as { name?: string }).name || '';
-    if (name === 'FunctionsFetchError' || name === 'FunctionsRelayError') {
-      throw new DraftUnavailableError('No connection. Write this one yourself, or try again when you are back online.', 'offline');
-    }
-    const payload = await functionErrorBody(result.error);
-    const code = payload.error?.code || '';
-    const message = payload.error?.message || 'Drafting is unavailable right now.';
-    if (code === 'daily_limit') throw new DraftUnavailableError(message, 'limit');
-    if (code === 'refused') throw new DraftUnavailableError(message, 'refused');
-    throw new DraftUnavailableError(message, 'unavailable');
-  }
-  const data = result.data as { draft?: unknown; remaining?: unknown } | null;
+export async function requestOutreachDraft(body: DraftRequestBody, apiKey: string): Promise<{ draft: OutreachDraft; remaining: number | null }> {
+  const data = await invokeDraftFunction(body, apiKey) as { draft?: unknown; remaining?: unknown } | null;
   if (!data || !isDraft(data.draft)) {
     throw new DraftUnavailableError('The draft came back unreadable. Try again.', 'unavailable');
   }
   return { draft: data.draft, remaining: typeof data.remaining === 'number' ? data.remaining : null };
+}
+
+// One free call (Anthropic's model list) through the function: proves the key
+// works before it is saved. Throws DraftUnavailableError with reason 'key'
+// when Anthropic refuses it.
+export async function verifyAnthropicKey(apiKey: string): Promise<void> {
+  const data = await invokeDraftFunction({ action: 'verify' }, apiKey) as { ok?: unknown } | null;
+  if (!data || data.ok !== true) throw new DraftUnavailableError('The key could not be checked. Try again.', 'unavailable');
 }
 
 // The practice name signs emails. RLS limits the read to the caller's org.
@@ -84,27 +107,36 @@ export async function fetchPracticeName(): Promise<string> {
   }
 }
 
-// ─── Consent before anything goes to the AI provider ────────────────────────
-// Asked once per account on this device (App Review 5.1.2: say what is shared
-// with a third-party AI and get permission first). Withdrawn by simply not
-// using the AI button; nothing is sent until the user taps Draft.
+// ─── The user's own Anthropic key, in this phone's keychain ─────────────────
+// One per account per device, never synced (WHEN_UNLOCKED_THIS_DEVICE_ONLY
+// keeps it out of iCloud Keychain and backups), never sent to ReferralFit's
+// database. Saving it is also the consent to AI drafts: the setup screen says
+// exactly what is shared and with whom first (App Review 5.1.2(i)).
 
-const CONSENT_KEY_PREFIX = 'referralfit.outreach.aiConsent.v1:';
+export const aiKeysSupported = Platform.OS === 'ios' || Platform.OS === 'android';
 
-export async function hasAiDraftConsent(userId: string): Promise<boolean> {
+function keyName(userId: string): string {
+  return `referralfit.anthropicKey.v1.${userId.toLowerCase().replace(/[^a-z0-9._-]/g, '')}`;
+}
+
+export async function getAnthropicKey(userId: string): Promise<string | null> {
+  if (!aiKeysSupported || !userId) return null;
   try {
-    return Boolean(await AsyncStorage.getItem(`${CONSENT_KEY_PREFIX}${userId.toLowerCase()}`));
+    const key = await SecureStore.getItemAsync(keyName(userId));
+    return key && looksLikeAnthropicKey(key) ? key : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-export async function saveAiDraftConsent(userId: string): Promise<void> {
-  try {
-    await AsyncStorage.setItem(`${CONSENT_KEY_PREFIX}${userId.toLowerCase()}`, new Date().toISOString());
-  } catch {
-    // Not durable on this device: the sheet simply asks again next time.
-  }
+export async function saveAnthropicKey(userId: string, apiKey: string): Promise<void> {
+  if (!aiKeysSupported) throw new Error('AI drafts need the iPhone app.');
+  await SecureStore.setItemAsync(keyName(userId), apiKey, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
+}
+
+export async function removeAnthropicKey(userId: string): Promise<void> {
+  if (!aiKeysSupported || !userId) return;
+  await SecureStore.deleteItemAsync(keyName(userId)).catch(() => undefined);
 }
 
 // ─── Sending from the phone's own apps ──────────────────────────────────────
