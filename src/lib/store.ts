@@ -265,6 +265,7 @@ type QueueOp =
   | { kind: 'referral.assign_match'; referral: Record<string, unknown>; match: Record<string, unknown> }
   | { kind: 'packet.finalize'; referral: Record<string, unknown>; match: Record<string, unknown> | null; touch: Record<string, unknown>; followUp: Record<string, unknown>; event: Record<string, unknown> | null }
   | { kind: 'contact.log_activity'; event: Record<string, unknown> | null; touch: Record<string, unknown> | null }
+  | { kind: 'outreach.sent'; completedId: string | null; next: Record<string, unknown>; event: Record<string, unknown> | null; touch: Record<string, unknown> | null }
   | { kind: 'referral.update'; id: string; patch: Record<string, unknown> }
   | { kind: 'placement.insert'; row: Record<string, unknown> }
   | { kind: 'referral.record_outcome'; referralId: string; outcome: Record<string, unknown>; completed: Record<string, unknown> | null };
@@ -286,7 +287,7 @@ async function withQueueLock<T>(work: () => Promise<T>): Promise<T> {
 
 function isQueueOp(value: unknown): value is QueueOp {
   if (!value || typeof value !== 'object') return false;
-  const op = value as { kind?: unknown; row?: unknown; id?: unknown; patch?: unknown; completed?: unknown; next?: unknown; event?: unknown; referralId?: unknown; outcome?: unknown; referral?: unknown; match?: unknown; caseId?: unknown; touch?: unknown; followUp?: unknown };
+  const op = value as { kind?: unknown; row?: unknown; id?: unknown; patch?: unknown; completed?: unknown; completedId?: unknown; next?: unknown; event?: unknown; referralId?: unknown; outcome?: unknown; referral?: unknown; match?: unknown; caseId?: unknown; touch?: unknown; followUp?: unknown };
   const insertKinds = ['partner.insert', 'referral.insert', 'match.insert', 'touch.insert', 'follow_up.insert', 'placement.insert'];
   const updateKinds = ['partner.update', 'match.update', 'follow_up.update', 'referral.update'];
   if (typeof op.kind !== 'string') return false;
@@ -308,6 +309,12 @@ function isQueueOp(value: unknown): value is QueueOp {
   if (op.kind === 'packet.finalize') return Boolean(op.referral && typeof op.referral === 'object' && op.touch && typeof op.touch === 'object'
     && op.followUp && typeof op.followUp === 'object' && (op.match === null || (op.match && typeof op.match === 'object'))
     && (op.event === null || (op.event && typeof op.event === 'object')));
+  if (op.kind === 'outreach.sent') return Boolean(
+    (op.completedId === null || typeof op.completedId === 'string')
+    && op.next && typeof op.next === 'object'
+    && (op.event === null || (op.event && typeof op.event === 'object'))
+    && (op.touch === null || (op.touch && typeof op.touch === 'object'))
+    && (op.event !== null || op.touch !== null));
   if (op.kind === 'contact.log_activity') return Boolean(
     (op.event === null || (op.event && typeof op.event === 'object'))
     && (op.touch === null || (op.touch && typeof op.touch === 'object'))
@@ -436,6 +443,11 @@ async function applyQueueOp(op: QueueOp, userId: string, orgId: string): Promise
     case 'contact.log_activity':
       ({ error } = await supabase.rpc('log_contact_activity', {
         p_expected_owner_id: userId, p_event: op.event, p_touch: op.touch,
+      }));
+      break;
+    case 'outreach.sent':
+      ({ error } = await supabase.rpc('record_outreach_sent', {
+        p_expected_owner_id: userId, p_completed_id: op.completedId, p_next: op.next, p_event: op.event, p_touch: op.touch,
       }));
       break;
     case 'referral.update':
@@ -1588,6 +1600,30 @@ export async function logContactActivity(
   };
   await runOrQueue(expectedUserId, op, (userId) => supabase.rpc('log_contact_activity', {
     p_expected_owner_id: userId, p_event: op.event, p_touch: op.touch,
+  }));
+}
+
+// A follow-up text or email that was sent, or a call that was logged, from
+// the outreach sheet: closes the step it came from (if any), logs the case
+// event and/or partner touch, and creates the next step — one atomic,
+// replay-safe write (record_outreach_sent).
+export async function recordOutreachSent(
+  completedId: string | null,
+  next: FollowUp,
+  event: PacketCaseEvent | null,
+  touch: Touch | null,
+  expectedUserId: string,
+): Promise<void> {
+  if (!event && !touch) throw new StoreError('A case event or partner touch is required.', false);
+  const op: QueueOp = {
+    kind: 'outreach.sent',
+    completedId: completedId ? safeId(completedId) as string : null,
+    next: followUpToRow(next),
+    event: event ? packetEventToRow(event) : null,
+    touch: touch ? touchToRow(touch) : null,
+  };
+  await runOrQueue(expectedUserId, op, (userId) => supabase.rpc('record_outreach_sent', {
+    p_expected_owner_id: userId, p_completed_id: op.completedId, p_next: op.next, p_event: op.event, p_touch: op.touch,
   }));
 }
 

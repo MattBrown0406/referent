@@ -73,6 +73,22 @@ import { supabase } from './src/lib/supabase';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
+import OutreachSheet, { type OutreachSent, type OutreachSheetRequest } from './src/lib/OutreachSheet';
+import {
+  caseRecipients,
+  caseTarget,
+  describeDue,
+  dueAfter,
+  followUpToComplete,
+  initialCaseFollowUp,
+  initialPartnerFollowUp,
+  nextOutreachFollowUp,
+  OUTREACH_INTERVAL_HOURS,
+  outreachEventBody,
+  outreachTimeline,
+  partnerRecipient,
+  partnerTarget,
+} from './src/lib/outreach';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
 import { isRecoveryRedirect, parseAuthRedirect } from './src/lib/auth-flows';
@@ -136,6 +152,7 @@ import {
   persistCaseList,
   PlacementDecision,
   readBoundWorkspace,
+  recordOutreachSent,
   recordPlacementDecision,
   refreshSnapshot,
   saveMatchWithCase,
@@ -935,6 +952,23 @@ export default function App() {
   // card can show the family's primary name and phone. The open file's own
   // contact list is derived below; edits replace that case's slice in here.
   const [allCaseContacts, setAllCaseContacts] = useState<CaseContact[]>([]);
+  // Follow-up outreach sheet. `origin` is where it renders: inside the case
+  // file or partner profile when opened there (iOS presents a modal only from
+  // the topmost one), otherwise at the root.
+  const [outreach, setOutreach] = useState<(OutreachSheetRequest & { origin: 'root' | 'case' | 'partner' }) | null>(null);
+  // Latest state for work that runs after an await or a retry timer (the
+  // first follow-up of a newly added partner), where the render closure is stale.
+  const latestSnapshotRef = useRef<Snapshot | null>(null);
+  // A sheet opened inside the case file or partner profile closes with it,
+  // so it can never reappear later over a different case, partner, or account.
+  useEffect(() => {
+    setOutreach((current) => {
+      if (!current) return current;
+      if (current.origin === 'case' && (current.target.kind !== 'case' || current.target.caseId !== activeCaseId)) return null;
+      if (current.origin === 'partner' && (current.target.kind !== 'partner' || current.target.partnerId !== selectedPartner?.id)) return null;
+      return current;
+    });
+  }, [activeCaseId, selectedPartner?.id]);
   const caseContacts = useMemo(
     () => (activeCaseId ? allCaseContacts.filter((item) => item.caseId === activeCaseId) : []),
     [allCaseContacts, activeCaseId],
@@ -1228,6 +1262,7 @@ export default function App() {
   }, []);
 
   const resetAccountState = useCallback(() => {
+    setOutreach(null);
     setMembers([]);
     setTodayScopeChoice(null);
     setPendingNotificationCaseId(null);
@@ -2820,6 +2855,12 @@ export default function App() {
         status: 'open',
         note: '',
       };
+    } else {
+      // Follow-up timeline: any other open case starts with a follow-up 48
+      // hours out (closed and lost cases get none).
+      firstCall = initialCaseFollowUp(makeId('f'), record, new Date());
+    }
+    if (firstCall) {
       nextFollowUps = [firstCall, ...followUps];
       setFollowUps(nextFollowUps);
     }
@@ -3225,6 +3266,172 @@ export default function App() {
         );
       } },
     ]);
+  }
+
+  // ─── Follow-up outreach ─────────────────────────────────────────────────
+  // Draft (by hand or with AI), send from the phone's own Messages / Mail /
+  // dialer, and — once it is sent or the call is logged — close the step it
+  // came from and set the next follow-up 48 hours out (src/lib/outreach.ts).
+
+  const senderName = members.find((member) => member.userId === activeUserId.toLowerCase())?.displayName || '';
+  latestSnapshotRef.current = { partners, referrals, referralMatches, touches, followUps, scorecards };
+
+  // From the case file or a profile there is no card: the step this outreach
+  // would close is the one the timeline rules pick (never a consult, a
+  // waiting-on item, a check-in, or a referral's admit check).
+  function currentOutreachStep(target: OutreachSheetRequest['target']): FollowUp | undefined {
+    return followUpToComplete(followUps, target, dueAfter(new Date(), OUTREACH_INTERVAL_HOURS).dueOn) || undefined;
+  }
+
+  function openOutreachForCase(record: CaseRecord, origin: 'root' | 'case', startedFrom?: FollowUp, contactId?: string) {
+    const contacts = allCaseContacts.filter((item) => item.caseId === record.id);
+    const target = caseTarget(record);
+    setOutreach({ origin, target, recipients: caseRecipients(contacts), initialRecipientKey: contactId, startedFrom: startedFrom ?? currentOutreachStep(target) });
+  }
+
+  function openOutreachForPartner(partner: Partner, origin: 'root' | 'partner', startedFrom?: FollowUp) {
+    const recipient = partnerRecipient(partner);
+    const target = partnerTarget(partner);
+    setOutreach({ origin, target, recipients: recipient ? [recipient] : [], startedFrom: startedFrom ?? currentOutreachStep(target) });
+  }
+
+  function openOutreachForCard(card: TodayCard) {
+    if (card.caseId) {
+      const record = cases.find((item) => item.id === card.caseId);
+      if (!record) {
+        Alert.alert('Case not loaded yet', 'Pull down to refresh, then try again.');
+        return;
+      }
+      openOutreachForCase(record, 'root', card.followUp);
+      return;
+    }
+    if (card.partnerId) {
+      const partner = partners.find((item) => item.id === card.partnerId);
+      if (!partner) {
+        Alert.alert('Partner not found', 'Pull down to refresh, then try again.');
+        return;
+      }
+      openOutreachForPartner(partner, 'root', card.followUp);
+      return;
+    }
+    Alert.alert('No one to reach', 'Link this item to a case or partner to draft a follow-up.');
+  }
+
+  async function loadOutreachCaseEvents(caseId: string): Promise<CaseEvent[]> {
+    const { file } = await loadCaseFile(activeUserId, caseId);
+    return file.events;
+  }
+
+  // One atomic, replay-safe write (record_outreach_sent): the step it came
+  // from is done, the text/email/call is on the case timeline or the
+  // partner's touches, and the next step is due 48 hours after the send.
+  async function recordOutreach(sent: OutreachSent): Promise<FollowUp | null> {
+    if (!mutationSlotAvailable('The follow-up')) return null;
+    const userId = activeUserId;
+    const sentAtIso = sent.sentAt.toISOString();
+    const planned = nextOutreachFollowUp({ id: makeId('f'), target: sent.target, sentAt: sent.sentAt });
+    const completed = followUpToComplete(followUps, sent.target, planned.dueOn, sent.startedFromId);
+    // Keep the owner of the step it replaces, while they are still on the team.
+    const owner = completed?.assignedTo && members.some((member) => member.userId === completed.assignedTo?.toLowerCase())
+      ? completed.assignedTo
+      : undefined;
+    const next: FollowUp = owner ? { ...planned, assignedTo: owner } : planned;
+    const event: CaseEvent | null = sent.target.kind === 'case' ? {
+      id: makeId('e'),
+      caseId: sent.target.caseId,
+      kind: sent.channel,
+      body: outreachEventBody(sent.channel, sent.recipient, sent.callResult),
+      contactId: sent.recipient.contactId,
+      occurredAt: sentAtIso,
+    } : null;
+    const touch: Touch | null = sent.target.kind === 'partner' ? {
+      id: makeId('t'),
+      partnerId: sent.target.partnerId,
+      kind: sent.channel,
+      note: outreachEventBody(sent.channel, sent.recipient, sent.callResult),
+      occurredAt: sentAtIso,
+    } : null;
+    const previousFollowUps = followUps;
+    const previousTouches = touches;
+    const previousPartners = partners;
+    const previousCases = cases;
+    const nextFollowUps = [next, ...followUps.map((item) => (item.id === completed?.id
+      ? { ...item, status: 'done' as const, completedAt: sentAtIso, snoozedUntil: undefined }
+      : item))];
+    const todayStamp = localDateStamp();
+    const nextTouches = touch ? [touch, ...touches] : touches;
+    const nextPartners = touch
+      ? partners.map((partner) => (partner.id === touch.partnerId ? { ...partner, lastContact: todayStamp } : partner))
+      : partners;
+    setFollowUps(nextFollowUps);
+    if (touch) {
+      setTouches(nextTouches);
+      setPartners(nextPartners);
+      setSelectedPartner((current) => (current && current.id === touch.partnerId ? { ...current, lastContact: todayStamp } : current));
+    }
+    if (event) applyCaseEvent(event);
+    const saved = await settleOptimisticWrite(
+      () => recordOutreachSent(completed?.id ?? null, next, event, touch, userId),
+      { partners: nextPartners, referrals, referralMatches, touches: nextTouches, followUps: nextFollowUps, scorecards },
+      { partners: previousPartners, referrals, referralMatches, touches: previousTouches, followUps: previousFollowUps, scorecards },
+      () => {
+        setFollowUps(previousFollowUps);
+        setTouches(previousTouches);
+        setPartners(previousPartners);
+        if (event) {
+          setCaseEvents((current) => current.filter((item) => item.id !== event.id));
+          setCases(previousCases); // undoes the first-touch / activity stamp too
+        }
+      },
+      'The follow-up',
+    );
+    return saved ? next : null;
+  }
+
+  // The first step of a new partner's timeline (added by hand or from the
+  // directory), unless one is already open. It waits — briefly, on a timer —
+  // for the partner to be in state and for any save in progress to finish,
+  // so adding two partners back to back never drops the second one's step.
+  function scheduleFirstPartnerFollowUp(partnerId: string, attempt = 0) {
+    const userId = activeUserIdRef.current;
+    const generation = authGenerationRef.current;
+    const base = latestSnapshotRef.current;
+    const partner = base?.partners.find((item) => item.id === partnerId);
+    if (!userId) return;
+    if (!base || !partner || mutationActiveRef.current) {
+      if (attempt < 40) {
+        setTimeout(() => {
+          if (activeUserIdRef.current === userId && authGenerationRef.current === generation) scheduleFirstPartnerFollowUp(partnerId, attempt + 1);
+        }, 500);
+      }
+      return;
+    }
+    if (base.followUps.some((item) => item.status === 'open' && item.partnerId === partnerId && !item.caseId)) return;
+    const followUp = initialPartnerFollowUp(makeId('f'), partner, new Date());
+    const nextSnapshot: Snapshot = { ...base, followUps: [followUp, ...base.followUps] };
+    setFollowUps(nextSnapshot.followUps);
+    void settleOptimisticWrite(
+      () => createFollowUp(followUp, userId),
+      nextSnapshot,
+      base,
+      () => setFollowUps((current) => current.filter((item) => item.id !== followUp.id)),
+      'The first follow-up',
+    );
+  }
+
+  function OutreachSheetView() {
+    return (
+      <OutreachSheet
+        request={outreach}
+        userId={activeUserId}
+        senderName={senderName}
+        touches={touches}
+        caseEvents={caseEvents}
+        loadCaseEvents={loadOutreachCaseEvents}
+        onClose={() => setOutreach(null)}
+        onSent={recordOutreach}
+      />
+    );
   }
 
   // One-tap contact action: open the dialer/messages/mail AND log the
@@ -4448,7 +4655,10 @@ export default function App() {
       { partners, referrals, referralMatches, touches, followUps, scorecards },
       () => { setPartners(partners); setSelectedPartner(existing || null); },
       'The partner',
-    );
+    ).then((saved) => {
+      // Follow-up timeline: a new partner's first follow-up is due a day out.
+      if (saved && !existing) scheduleFirstPartnerFollowUp(partner.id);
+    });
   }
 
   // Send one of the practice's own partners — a program, an interventionist,
@@ -4803,6 +5013,11 @@ export default function App() {
             <TouchableOpacity accessibilityLabel={`Text — ${card.title}`} onPress={() => cardContactAction(card, 'text')} style={styles.todayIconButton}>
               <AppIcon name="chatbubble" size={14} color={COLORS.forest} />
             </TouchableOpacity>
+            {card.caseId || card.partnerId ? (
+              <TouchableOpacity accessibilityLabel={`Draft a follow-up — ${card.title}`} onPress={() => openOutreachForCard(card)} style={styles.todayIconButton}>
+                <AppIcon name="sparkles" size={15} color={COLORS.forest} />
+              </TouchableOpacity>
+            ) : null}
             <TouchableOpacity accessibilityLabel={`Done — ${card.title}`} onPress={() => openDoneSheet(card)} style={styles.todayDoneButton}>
               <Text style={styles.todayDoneButtonText}>Done</Text>
             </TouchableOpacity>
@@ -5580,6 +5795,8 @@ export default function App() {
     const linkedFollowUps = followUps
       .filter((item) => item.caseId === record.id && item.status === 'open')
       .sort((a, b) => `${a.dueOn} ${a.dueTime || ''}`.localeCompare(`${b.dueOn} ${b.dueTime || ''}`));
+    const pastOutreach = outreachTimeline(caseTarget(record), [], caseEvents, [], 3)
+      .filter((entry): entry is Extract<typeof entry, { kind: 'past' }> => entry.kind === 'past');
     const timeline = caseEvents.slice().sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={closeCase}>
@@ -5631,25 +5848,44 @@ export default function App() {
 
               <View style={styles.infoCard}>
                 <View style={styles.caseSectionHeader}>
-                  <View>
-                    <Text style={styles.infoTitle}>Next steps</Text>
-                    <Text style={styles.caseSectionHint}>Scheduled here also appears on Today when it is due.</Text>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.infoTitle}>Follow-up timeline</Text>
+                    <Text style={styles.caseSectionHint}>Scheduled here also appears on Today when it is due. A text, email, or call sent from Follow up sets the next step {OUTREACH_INTERVAL_HOURS} hours out.</Text>
                   </View>
-                  <TouchableOpacity
-                    accessibilityRole="button"
-                    accessibilityLabel={`Schedule a next step for ${record.title}`}
-                    onPress={() => openCaseNextStep(record)}
-                    style={styles.caseSectionAction}
-                  >
-                    <AppIcon name="calendar-outline" size={15} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Schedule</Text>
-                  </TouchableOpacity>
+                  <View style={styles.caseSectionActions}>
+                    <TouchableOpacity
+                      accessibilityRole="button"
+                      accessibilityLabel={`Draft a follow-up for ${record.title}`}
+                      onPress={() => openOutreachForCase(record, 'case')}
+                      style={styles.caseSectionAction}
+                    >
+                      <AppIcon name="sparkles" size={15} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Follow up</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      accessibilityRole="button"
+                      accessibilityLabel={`Schedule a next step for ${record.title}`}
+                      onPress={() => openCaseNextStep(record)}
+                      style={styles.caseSectionAction}
+                    >
+                      <AppIcon name="calendar-outline" size={15} color={COLORS.forest} /><Text style={styles.caseSectionActionText}>Schedule</Text>
+                    </TouchableOpacity>
+                  </View>
                 </View>
+                {pastOutreach.map((entry) => (
+                  <View key={entry.id} style={styles.caseNextStepRow}>
+                    <View style={[styles.followUpIcon, { width: 30, height: 30 }]}><AppIcon name={entry.channel === 'call' ? 'call-outline' : entry.channel === 'text' ? 'chatbubble-outline' : 'mail-outline'} size={14} color={COLORS.forest} /></View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.touchLogTitle} numberOfLines={1}>{entry.label}</Text>
+                      <Text style={styles.touchLogNote}>{relativeActivity(entry.at) || shortDate(entry.at.slice(0, 10))}</Text>
+                    </View>
+                  </View>
+                ))}
                 {linkedFollowUps.length ? linkedFollowUps.map((followUp) => (
                   <View key={followUp.id} style={styles.caseNextStepRow}>
                     <View style={[styles.followUpIcon, { width: 30, height: 30 }]}><AppIcon name="arrow-forward-circle-outline" size={15} color={COLORS.coral} /></View>
                     <View style={{ flex: 1 }}>
                       <Text style={styles.touchLogTitle}>{followUp.title}</Text>
-                      <Text style={styles.touchLogNote}>Due {shortDate(followUp.dueOn)}{followUp.dueTime ? ` at ${followUp.dueTime}` : ''}{followUp.waitingOn ? ` · Waiting on ${followUp.waitingOn}` : ''}</Text>
+                      <Text style={styles.touchLogNote}>Due {describeDue(followUp.dueOn, followUp.dueTime, new Date())}{followUp.waitingOn ? ` · Waiting on ${followUp.waitingOn}` : ''}</Text>
                     </View>
                     {teamWorkspace ? (
                       <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Assigned to: ${followUpAssigneeLabel(followUp, record)}. Tap to change.`} onPress={() => pickFollowUpAssignee(followUp)} style={[styles.caseChip, { backgroundColor: COLORS.mintPale }]}>
@@ -5884,6 +6120,7 @@ export default function App() {
                           <TouchableOpacity accessibilityLabel={`Call ${contact.name}`} onPress={() => contactAction(contact, 'call')} style={styles.caseContactAction}><AppIcon name="call" size={15} color={COLORS.forest} /><Text style={styles.caseContactActionText}>Call</Text></TouchableOpacity>
                           <TouchableOpacity accessibilityLabel={`Text ${contact.name}`} onPress={() => contactAction(contact, 'text')} style={styles.caseContactAction}><AppIcon name="chatbubble" size={14} color={COLORS.forest} /><Text style={styles.caseContactActionText}>Text</Text></TouchableOpacity>
                           <TouchableOpacity accessibilityLabel={`Email ${contact.name}`} onPress={() => contactAction(contact, 'email')} style={styles.caseContactAction}><AppIcon name="mail" size={15} color={COLORS.forest} /><Text style={styles.caseContactActionText}>Email</Text></TouchableOpacity>
+                          <TouchableOpacity accessibilityLabel={`Draft a follow-up to ${contact.name}`} onPress={() => openOutreachForCase(record, 'case', undefined, contact.id)} style={styles.caseContactAction}><AppIcon name="sparkles" size={14} color={COLORS.forest} /><Text style={styles.caseContactActionText}>Follow up</Text></TouchableOpacity>
                           <TouchableOpacity accessibilityLabel={`Edit ${contact.name}`} onPress={() => setCaseContactForm({ id: contact.id, name: contact.name, relationship: contact.relationship, phone: contact.phone, email: contact.email, note: contact.note, isPrimary: contact.isPrimary })} style={styles.caseContactAction}><AppIcon name="create" size={14} color={COLORS.gray} /><Text style={[styles.caseContactActionText, { color: COLORS.gray }]}>Edit</Text></TouchableOpacity>
                           <TouchableOpacity accessibilityLabel={`Remove ${contact.name}`} onPress={() => removeCaseContact(contact)} style={styles.caseContactAction}><AppIcon name="trash" size={14} color={COLORS.coral} /></TouchableOpacity>
                         </View>
@@ -6005,6 +6242,7 @@ export default function App() {
               </View>
             </ScrollView>
           </KeyboardAvoidingView>
+          {outreach?.origin === 'case' ? OutreachSheetView() : null}
         </SafeAreaView>
       </Modal>
     );
@@ -6244,6 +6482,7 @@ export default function App() {
               <TouchableOpacity style={styles.profileAction} onPress={() => selectedPartner.phone && Linking.openURL(`tel:${selectedPartner.phone.replace(/[^\d+]/g, '')}`)}><AppIcon name="call" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Call</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => selectedPartner.email && Linking.openURL(`mailto:${selectedPartner.email}`)}><AppIcon name="mail" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Email</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openReferral('Outbound', selectedPartner.id)}><AppIcon name="paper-plane" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Refer</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityLabel={`Draft a follow-up to ${selectedPartner.organization || selectedPartner.name}`} style={styles.profileAction} onPress={() => openOutreachForPartner(selectedPartner, 'partner')}><AppIcon name="sparkles" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Follow up</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openTouchLogger(selectedPartner)}><AppIcon name="chatbox-ellipses" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Log touch</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => sharePartner(selectedPartner)}><AppIcon name="share-social" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Share</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openEditPartner(selectedPartner)}><AppIcon name="create" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Edit</Text></TouchableOpacity>
@@ -6291,7 +6530,26 @@ export default function App() {
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Staying in touch</Text>
               <View style={styles.infoLine}><AppIcon name="calendar-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Cadence</Text><Text style={styles.infoValue}>{selectedPartner.touchCadenceDays ? `Every ${selectedPartner.touchCadenceDays} days` : 'No cadence set'}</Text></View></View>
-              <View style={[styles.infoLine, { borderBottomWidth: 0 }]}><AppIcon name="time-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Last contact</Text><Text style={styles.infoValue}>{selectedPartner.lastContact ? shortDate(selectedPartner.lastContact) : 'Not recorded'}</Text></View></View>
+              <View style={styles.infoLine}><AppIcon name="time-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Last contact</Text><Text style={styles.infoValue}>{selectedPartner.lastContact ? shortDate(selectedPartner.lastContact) : 'Not recorded'}</Text></View></View>
+              {(() => {
+                const nextStep = outreachTimeline(partnerTarget(selectedPartner), followUps, [], [])
+                  .find((entry): entry is Extract<typeof entry, { kind: 'next' }> => entry.kind === 'next');
+                return (
+                  <TouchableOpacity
+                    accessibilityRole="button"
+                    accessibilityLabel={nextStep ? `Next follow-up ${describeDue(nextStep.followUp.dueOn, nextStep.followUp.dueTime, new Date())}. Draft it now.` : 'No follow-up scheduled. Draft one now.'}
+                    onPress={() => openOutreachForPartner(selectedPartner, 'partner')}
+                    style={[styles.infoLine, { borderBottomWidth: 0 }]}
+                  >
+                    <AppIcon name="sparkles-outline" size={18} color={COLORS.gray} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.infoLabel}>Next follow-up</Text>
+                      <Text style={styles.infoValue}>{nextStep ? describeDue(nextStep.followUp.dueOn, nextStep.followUp.dueTime, new Date()) : 'None scheduled'}</Text>
+                    </View>
+                    <AppIcon name="chevron-forward" size={15} color={COLORS.gray} />
+                  </TouchableOpacity>
+                );
+              })()}
             </View>
             {(() => {
               // Track record from the partner_scorecard view — hidden until
@@ -6438,6 +6696,7 @@ export default function App() {
               <View style={styles.contactLine}><AppIcon name="globe-outline" size={17} color={COLORS.gray} /><Text style={styles.contactText}>{selectedPartner.website || 'No website recorded'}</Text></View>
             </View>
           </ScrollView>
+          {outreach?.origin === 'partner' ? OutreachSheetView() : null}
         </SafeAreaView>
       </Modal>
     );
@@ -7815,11 +8074,15 @@ export default function App() {
         userId={activeUserId}
         importedGlobalIds={new Set(partners.map((partner) => partner.globalPartnerId).filter((id): id is string => Boolean(id)))}
         onClose={() => setShowGlobalDirectory(false)}
-        onImported={(_partner, _globalId, initiatingUserId) => {
+        onImported={(importedPartner, _globalId, initiatingUserId) => {
           if (activeUserIdRef.current !== initiatingUserId) return;
           void refreshSnapshot(initiatingUserId)
             .then((snapshot) => {
-              if (snapshot && activeUserIdRef.current === initiatingUserId) applySnapshot(snapshot);
+              if (snapshot && activeUserIdRef.current === initiatingUserId) {
+                applySnapshot(snapshot);
+                // Follow-up timeline: an imported program gets its first step too.
+                if (snapshot.partners.some((item) => item.id === importedPartner.id)) scheduleFirstPartnerFollowUp(importedPartner.id);
+              }
             })
             .catch((error) => {
               if (activeUserIdRef.current === initiatingUserId) {
@@ -7846,6 +8109,7 @@ export default function App() {
         }}
       />
       {DoneSheet()}
+      {outreach?.origin === 'root' ? OutreachSheetView() : null}
       {NextStepSheet()}
       {SnoozeSheet()}
       {QuickAddSheet()}
@@ -8242,6 +8506,7 @@ const styles = StyleSheet.create({
   closedToggleText: { color: COLORS.gray, fontSize: 12, fontWeight: '800' },
   caseSectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   caseSectionAction: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 3, paddingVertical: 6 },
+  caseSectionActions: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   caseSectionActionText: { color: COLORS.forest, fontSize: 12, fontWeight: '800' },
   caseSectionHint: { color: COLORS.gray, fontSize: 9, lineHeight: 13, marginTop: 2, maxWidth: 250 },
   caseNextStepRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: '#EDF0ED' },
