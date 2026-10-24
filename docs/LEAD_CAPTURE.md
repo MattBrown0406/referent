@@ -14,7 +14,9 @@ Two doors into the same place:
 1. **New lead** on Today (the app). Phone-first, under ten seconds: caller
    name, phone, optional email, who they are calling about (relationship and
    first name only), lead source, and one safety choice. Saving creates the
-   case (status inquiry), the caller as primary contact, a **first-call**
+   case (status inquiry), the caller as primary contact (with their own side
+   of the relationship: calling about a son makes them "parent";
+   `lead_caller_relationship()`, "family member" when unsure), a **first-call**
    follow-up due today at now + the workspace's first-call target, and a
    system timeline entry, in one transaction (`create_lead`).
 2. **The intake link** (hosted form). Each workspace has an opaque token on

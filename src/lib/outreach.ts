@@ -431,6 +431,15 @@ export function buildDraftRequest(params: {
 
 // ─── Without AI: a plain, discreet starting point ───────────────────────────
 
+// The case contact who is the person the family is worried about, read the
+// same way the draft function reads it (SUBJECT_RELATIONSHIP in
+// supabase/functions/draft-follow-up/draft.ts; outreach-test checks they match).
+const SUBJECT_RELATIONSHIP = /^(the )?(subject|client|patient|self|loved one|identified (patient|person)|ip)$/i;
+
+export function isCaseSubject(relationship: string): boolean {
+  return SUBJECT_RELATIONSHIP.test(relationship.replace(/\s+/g, ' ').trim());
+}
+
 export function templateDraft(params: {
   channel: OutreachChannel;
   target: OutreachTarget;
@@ -465,6 +474,28 @@ export function templateDraft(params: {
       opener: `${hi}, ${thisIs}. Do you have a couple of minutes?`,
       talkingPoints: [`Ask what is new at ${org}`, 'Ask who is best to reach for admissions questions', 'Offer to be a resource for their team'],
       voicemail: `${hi}, ${thisIs}. Just checking in and would love to connect. Give me a call back when you have a minute.`,
+    };
+  }
+  if (isCaseSubject(params.recipient.relationship)) {
+    // The case history is contact with the family, so nothing here says
+    // "again", "our conversation", or "thank you for reaching out", and
+    // nothing is written as to someone worried about a loved one.
+    const intro = name ? `, this is ${name}` : '';
+    if (params.channel === 'text') {
+      return { channel: 'text', body: `${hi}${intro}. Just checking in to see how you're doing. No need to reply unless you'd like to.` };
+    }
+    if (params.channel === 'email') {
+      return {
+        channel: 'email',
+        subject: 'Checking in',
+        body: `${hi},\n\nJust checking in to see how you're doing. There's nothing you need to do, and no need to reply unless you'd like to.\n\nIf you ever want to talk, you can reply here.${signOff ? `\n\n${signOff}` : ''}`,
+      };
+    }
+    return {
+      channel: 'call',
+      opener: `${hi}${intro}. Is now an okay time to talk for a few minutes?`,
+      talkingPoints: ['Ask how they have been doing', 'Listen first; let them set the pace', 'Keep it about them: no mention of family or anyone else being in touch'],
+      voicemail: `${hi}${intro}. Just checking in to see how you're doing. Call me back whenever it works for you.`,
     };
   }
   if (params.channel === 'text') {

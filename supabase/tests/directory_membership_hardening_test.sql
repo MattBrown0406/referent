@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(134);
+SELECT plan(142);
 
 -- Actors (suffix d7)
 --   ad  platform admin
@@ -1257,6 +1257,69 @@ SELECT ok(
 );
 SELECT set_config('request.jwt.claim.sub', '', true);
 
+-- A platform admin who reviewed a listing deletes their account. Their
+-- platform_admins row cascades before reviewed_by is cleared, so the FK's
+-- SET NULL alone ran as a non-admin and un-verified the listing.
+INSERT INTO auth.users (id, email) VALUES ('af000000-0000-0000-0000-0000000000d7', 'second-admin@example.test');
+INSERT INTO public.platform_admins (user_id) VALUES ('af000000-0000-0000-0000-0000000000d7');
+INSERT INTO public.global_partners (id, name, organization, types, phone, status, verified_at, reviewed_by)
+VALUES ('d6400000-0000-0000-0000-0000000000d7', 'Intake', 'Reviewed Program', ARRAY['Detox'], '(541) 555-1967',
+        'active', '2026-09-05 12:00:00+00', 'af000000-0000-0000-0000-0000000000d7');
+SELECT set_config('request.jwt.claim.sub', 'af000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT lives_ok($$ SELECT public.delete_own_account() $$, 'a platform admin who reviewed a listing deletes their account');
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', '', true);
+SELECT ok(
+  (SELECT status = 'active' AND verified_at = '2026-09-05 12:00:00+00'::timestamptz AND reviewed_by IS NULL
+     FROM public.global_partners WHERE id = 'd6400000-0000-0000-0000-0000000000d7'),
+  'the reviewed listing stays live and verified; only the reviewer is cleared'
+);
+
+-- A team member who completed follow-ups deletes their account: one they
+-- own, one they own and were assigned, and one the team owner owns. The old
+-- completion stamp put the deleted account back into completed_by, a
+-- foreign key violation that aborted the deletion.
+INSERT INTO auth.users (id, email) VALUES
+  ('ab000000-0000-0000-0000-0000000000d7', 'owner@verify-follow-ups.example'),
+  ('ac000000-0000-0000-0000-0000000000d7', 'member@verify-follow-ups.example');
+SELECT set_config('test.org_ab', org_id::text, true) FROM public.org_members WHERE user_id = 'ab000000-0000-0000-0000-0000000000d7';
+UPDATE public.org_members SET org_id = current_setting('test.org_ab')::uuid, role = 'member'
+ WHERE user_id = 'ac000000-0000-0000-0000-0000000000d7';
+INSERT INTO public.follow_ups (id, org_id, title, due_on, owner_id, assigned_to)
+VALUES ('ae100000-0000-0000-0000-0000000000d7', current_setting('test.org_ab')::uuid, 'Own', current_date,
+        'ac000000-0000-0000-0000-0000000000d7', NULL),
+       ('ae200000-0000-0000-0000-0000000000d7', current_setting('test.org_ab')::uuid, 'Own and assigned', current_date,
+        'ac000000-0000-0000-0000-0000000000d7', 'ac000000-0000-0000-0000-0000000000d7'),
+       ('ae300000-0000-0000-0000-0000000000d7', current_setting('test.org_ab')::uuid, 'The owner''s', current_date,
+        'ab000000-0000-0000-0000-0000000000d7', NULL);
+SELECT set_config('request.jwt.claim.sub', 'ac000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+UPDATE public.follow_ups SET status = 'done', completed_at = now()
+ WHERE id IN ('ae100000-0000-0000-0000-0000000000d7', 'ae200000-0000-0000-0000-0000000000d7', 'ae300000-0000-0000-0000-0000000000d7');
+RESET ROLE;
+SELECT is(
+  (SELECT count(*)::integer FROM public.follow_ups
+    WHERE id IN ('ae100000-0000-0000-0000-0000000000d7', 'ae200000-0000-0000-0000-0000000000d7', 'ae300000-0000-0000-0000-0000000000d7')
+      AND completed_by = 'ac000000-0000-0000-0000-0000000000d7'),
+  3,
+  'the member is recorded as completing all three follow-ups'
+);
+SET LOCAL ROLE authenticated;
+SELECT lives_ok($$ SELECT public.delete_own_account() $$, 'a team member who completed follow-ups deletes their account');
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', '', true);
+SELECT is(
+  (SELECT count(*)::integer FROM public.follow_ups
+    WHERE id IN ('ae100000-0000-0000-0000-0000000000d7', 'ae200000-0000-0000-0000-0000000000d7', 'ae300000-0000-0000-0000-0000000000d7')
+      AND org_id = current_setting('test.org_ab')::uuid AND status = 'done'
+      AND completed_by IS NULL AND assigned_to IS NULL
+      AND owner_id IS NOT DISTINCT FROM CASE WHEN id = 'ae300000-0000-0000-0000-0000000000d7'
+                                             THEN 'ab000000-0000-0000-0000-0000000000d7'::uuid END),
+  3,
+  'the practice keeps the finished follow-ups, with no completer and no deleted owner'
+);
+
 -- Any other non-admin write still pins the status and clears verification,
 -- even when it also changes an ownership pointer.
 SELECT set_config('request.jwt.claim.sub', 'e1000000-0000-0000-0000-0000000000d7', true);
@@ -1295,6 +1358,35 @@ SELECT throws_ok(
   'a workspace owner cannot set the intake token directly'
 );
 RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', '', true);
+
+-- 12. A new lead's caller is saved with their own relationship.
+SELECT is(
+  ARRAY[
+    public.lead_caller_relationship('son'), public.lead_caller_relationship('My  Daughter'),
+    public.lead_caller_relationship('  wife '), public.lead_caller_relationship('mom'),
+    public.lead_caller_relationship('client'), public.lead_caller_relationship('nephew'),
+    public.lead_caller_relationship(''), public.lead_caller_relationship(NULL)
+  ],
+  ARRAY['parent', 'parent', 'spouse', 'son or daughter', 'referring professional', 'family member', '', ''],
+  'the caller''s side of the relationship, with "family member" when unsure'
+);
+INSERT INTO auth.users (id, email) VALUES ('1e000000-0000-0000-0000-0000000000d7', 'lead-caller@example.test');
+SELECT set_config('request.jwt.claim.sub', '1e000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT public.create_lead('1e000000-0000-0000-0000-0000000000d7', jsonb_build_object(
+  'id', '1e100000-0000-0000-0000-0000000000d7', 'contact_id', '1e200000-0000-0000-0000-0000000000d7',
+  'caller_name', 'Maria Rivera', 'phone', '5415550142', 'about_relationship', 'son', 'about_first_name', 'Jake'));
+RESET ROLE;
+SELECT is(
+  (SELECT relationship FROM public.case_contacts WHERE id = '1e200000-0000-0000-0000-0000000000d7'),
+  'parent',
+  'a caller calling about her son is saved as the parent'
+);
+SELECT ok(
+  (SELECT title LIKE '%son Jake' FROM public.cases WHERE id = '1e100000-0000-0000-0000-0000000000d7'),
+  'the case title still says who the lead is about'
+);
 SELECT set_config('request.jwt.claim.sub', '', true);
 
 SELECT * FROM finish();

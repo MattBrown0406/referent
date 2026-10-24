@@ -284,6 +284,27 @@ check('family fallback drafts are discreet', () => {
   }
 });
 
+check('a fallback draft to the case subject never presents the family\'s history as contact with them', () => {
+  const draftFn = readFileSync(path.join(repoRoot, 'supabase/functions/draft-follow-up/draft.ts'), 'utf8');
+  const pattern = (text) => /const SUBJECT_RELATIONSHIP = (\/.+\/i);/.exec(text)?.[1];
+  assert.ok(pattern(source));
+  assert.equal(pattern(source), pattern(draftFn), 'the app and the draft function read "subject" the same way');
+  for (const relationship of ['subject', 'Subject', 'the  IP', 'loved one']) assert.equal(outreach.isCaseSubject(relationship), true, relationship);
+  for (const relationship of ['', 'mother', 'son', 'referent']) assert.equal(outreach.isCaseSubject(relationship), false, relationship);
+  const jake = { ...ana, key: 'cc2', name: 'Jake Rivera', relationship: 'subject', contactId: 'cc2' };
+  for (const channel of ['text', 'email', 'call']) {
+    const draft = outreach.templateDraft({ channel, target: caseTarget, recipient: jake, senderName: 'Matt', practiceName: 'Freedom Interventions', history: { count: 3, lastChannel: 'call', lastAt: 'x' } });
+    const text = Object.values(draft).flat().join(' ').toLowerCase();
+    for (const phrase of ['again', 'our conversation', 'reaching out', 'last spoke', 'you\'re seeing', 'options', 'a lot to carry', 'intervention ']) {
+      assert.equal(text.includes(phrase), false, `${channel} draft to the subject must not say "${phrase}"`);
+    }
+    assert.match(channel === 'call' ? draft.opener : draft.body, /^Hi Jake[,.]/);
+  }
+  // Family drafts keep their history-aware wording.
+  const family = outreach.templateDraft({ channel: 'text', target: caseTarget, recipient: ana, senderName: 'Matt', practiceName: '', history: { count: 3, lastChannel: 'call', lastAt: 'x' } });
+  assert.match(family.body, /again/);
+});
+
 check('partner fallback drafts never trade referrals', () => {
   const draft = outreach.templateDraft({ channel: 'email', target: partnerTarget, recipient: outreach.partnerRecipient(PARTNER), senderName: 'Matt', practiceName: 'Freedom Interventions', history: { count: 0, lastChannel: '', lastAt: '' } });
   assert.equal(/referral|send you|in exchange/i.test(draft.body), false);
@@ -368,6 +389,23 @@ check('due labels read naturally', () => {
   assert.equal(outreach.describeDue('2026-10-21', '15:15', now), 'Today 3:15 PM');
   assert.equal(outreach.describeDue('2026-10-22', undefined, now), 'Tomorrow');
   assert.equal(outreach.describeDue('2026-10-24', '09:05', now), 'Sat, Oct 24 · 9:05 AM');
+});
+
+check('a new lead\'s caller gets the same relationship in the app as on the server', () => {
+  // The app's optimistic contact (leadCallerRelationship) and the saved one
+  // (lead_caller_relationship in the migration) must turn words around alike.
+  const app = readFileSync(path.join(repoRoot, 'src/lib/cases.ts'), 'utf8');
+  const sql = readFileSync(path.join(repoRoot, 'supabase/migrations/20261024120000_directory_membership_hardening.sql'), 'utf8');
+  const appTable = [...(/const CALLER_RELATIONSHIP[^=]*= \[([\s\S]*?)\n\];/.exec(app)?.[1] ?? '').matchAll(/\[\[([^\]]*)\], '([^']+)'\]/g)]
+    .map(([, words, caller]) => `${words.replace(/\s+/g, '')}=>${caller}`);
+  const fn = /FUNCTION public\.lead_caller_relationship[\s\S]*?\$\$;/.exec(sql)?.[0] ?? '';
+  const sqlTable = [...fn.matchAll(/WHEN v IN \(([^)]*)\) THEN '([^']+)'/g)]
+    .map(([, words, caller]) => `${words.replace(/\s+/g, '')}=>${caller}`);
+  assert.ok(appTable.length >= 9, 'the app table was read');
+  assert.deepEqual(appTable, sqlTable);
+  assert.ok(/ELSE 'family member'/.test(fn) && app.includes("?? 'family member'"), 'both fall back to "family member"');
+  assert.ok(fn.includes("'^(my|her|his|their|our|the)[[:space:]]+'") && app.includes('/^(my|her|his|their|our|the)\\s+/'), 'both drop "my", "her", ... first');
+  assert.ok(/public\.lead_caller_relationship\(v_lead ->> 'about_relationship'\)/.test(sql), 'the saved lead contact uses it');
 });
 
 console.log(`\nAll ${passed} outreach checks passed.`);

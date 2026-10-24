@@ -513,6 +513,28 @@ export function leadCaseTitle(input: Pick<NewLeadInput, 'callerName' | 'aboutRel
   return about ? `${caller} — ${about}` : caller;
 }
 
+// The caller's own relationship, from who they are calling about: "Calling
+// about: son" makes the caller a parent. Mirrors lead_caller_relationship()
+// in the migration, so the optimistic contact reads like the saved one.
+// Anything not listed is "family member"; the practitioner can edit it.
+const CALLER_RELATIONSHIP: [string[], string][] = [
+  [['son', 'daughter', 'child', 'kid', 'boy', 'girl'], 'parent'],
+  [['stepson', 'stepdaughter', 'stepchild'], 'stepparent'],
+  [['grandson', 'granddaughter', 'grandchild'], 'grandparent'],
+  [['husband', 'wife', 'spouse'], 'spouse'],
+  [['partner', 'boyfriend', 'girlfriend', 'fiance', 'fiancee'], 'partner'],
+  [['mother', 'mom', 'mum', 'father', 'dad', 'parent'], 'son or daughter'],
+  [['brother', 'sister', 'sibling'], 'sibling'],
+  [['friend', 'best friend'], 'friend'],
+  [['client', 'patient'], 'referring professional'],
+];
+
+export function leadCallerRelationship(about: string): string {
+  const value = about.trim().toLowerCase().replace(/^(my|her|his|their|our|the)\s+/, '').replace(/\s+/g, ' ').trim();
+  if (!value) return '';
+  return CALLER_RELATIONSHIP.find(([words]) => words.includes(value))?.[1] ?? 'family member';
+}
+
 export function leadFollowUpTitle(caseTitle: string): string {
   return `First call — ${caseTitle}`;
 }

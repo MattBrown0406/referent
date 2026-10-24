@@ -89,8 +89,8 @@ SELECT ok(
 SELECT is(
   (SELECT (name, relationship, phone, email, is_primary, case_id::text)::text
      FROM public.case_contacts WHERE id = '1a200000-0000-0000-0000-00000000001a'),
-  ('Maria Lopez', 'son', '(541) 555-0142', 'maria@example.test', true, '1a100000-0000-0000-0000-00000000001a')::text,
-  'the caller becomes the primary contact'
+  ('Maria Lopez', 'parent', '(541) 555-0142', 'maria@example.test', true, '1a100000-0000-0000-0000-00000000001a')::text,
+  'the caller becomes the primary contact, as the parent of the son they called about'
 );
 
 SELECT is(

@@ -40,9 +40,11 @@
 --   9. Placement check-ins due "today" in US evening hours are no longer
 --      skipped because the server's UTC date already rolled over.
 --  10. Moving or releasing a listing (team join, account deletion) keeps
---      its verification, and an account that confirmed beds can be
---      deleted.
+--      its verification, and an account that confirmed beds or completed
+--      a follow-up can be deleted.
 --  11. Production table grants match what the migrations grant.
+--  12. A new lead's caller is saved with their own relationship. "Calling
+--      about: son" used to save the caller as "son"; they are the parent.
 --
 -- Transit rule: this file is pasted into the SQL editor from a chat client.
 -- ASCII only, no backslash characters anywhere, every top-level statement
@@ -2049,6 +2051,42 @@ $$;
 REVOKE ALL ON FUNCTION public.delete_own_account() FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.delete_own_account() TO authenticated;
 
+-- Same as 20261001140000, except for a server-side write (not a client) to
+-- a follow-up that is already finished: it never stamps a completer in, and
+-- it lets go of a completer whose account no longer exists. Deleting an
+-- account clears completed_by (ON DELETE SET NULL) and, in the same
+-- deletion, owner_id and assigned_to on the same rows. The old trigger put
+-- the deleted account back each time, so a team member who had completed a
+-- follow-up they owned could not delete their account (foreign key
+-- violation). A client write is stamped exactly as before.
+CREATE OR REPLACE FUNCTION public.follow_ups_stamp_completion()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF NEW.status = 'open' THEN
+    NEW.completed_by := NULL;
+  ELSIF TG_OP = 'UPDATE' AND OLD.status <> 'open' AND current_user NOT IN ('authenticated', 'anon') THEN
+    IF NEW.completed_by IS NOT NULL THEN
+      NEW.completed_by := OLD.completed_by;
+    END IF;
+    -- Only roles that can see accounts check (service_role cannot).
+    IF NEW.completed_by IS NOT NULL AND has_table_privilege('auth.users', 'SELECT') THEN
+      IF NOT EXISTS (SELECT 1 FROM auth.users u WHERE u.id = NEW.completed_by) THEN
+        NEW.completed_by := NULL;
+      END IF;
+    END IF;
+  ELSIF TG_OP = 'INSERT' OR OLD.status = 'open' OR NEW.completed_by IS NULL THEN
+    NEW.completed_by := coalesce(auth.uid(), NEW.completed_by, NEW.owner_id);
+  ELSE
+    NEW.completed_by := OLD.completed_by;
+  END IF;
+  RETURN NEW;
+END
+$$;
+REVOKE ALL ON FUNCTION public.follow_ups_stamp_completion() FROM PUBLIC, anon, authenticated;
+
 -- ===========================================================================
 -- 11. Production table grants match the migrations
 -- ===========================================================================
@@ -2066,5 +2104,112 @@ REVOKE INSERT, UPDATE, DELETE ON public.orgs, public.org_members, public.org_inv
   public.center_members, public.center_claim_codes, public.center_claim_requests,
   public.case_stage_history FROM authenticated;
 GRANT UPDATE (name, lead_response_target_minutes) ON public.orgs TO authenticated;
+
+-- ===========================================================================
+-- 12. A new lead's caller gets their own relationship
+-- ===========================================================================
+
+-- "Calling about: son" names the loved one; the caller is the parent. The
+-- lead's contact used to be saved with the loved one's relationship, so the
+-- case file and AI drafts called the caller "son". Common words are turned
+-- around; anything else is "family member" (the practitioner can edit it).
+-- The case title keeps "son Jake". The app mirrors this in
+-- leadCallerRelationship (src/lib/cases.ts).
+CREATE OR REPLACE FUNCTION public.lead_caller_relationship(p_about text)
+RETURNS text
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT CASE
+    WHEN v = '' THEN ''
+    WHEN v IN ('son', 'daughter', 'child', 'kid', 'boy', 'girl') THEN 'parent'
+    WHEN v IN ('stepson', 'stepdaughter', 'stepchild') THEN 'stepparent'
+    WHEN v IN ('grandson', 'granddaughter', 'grandchild') THEN 'grandparent'
+    WHEN v IN ('husband', 'wife', 'spouse') THEN 'spouse'
+    WHEN v IN ('partner', 'boyfriend', 'girlfriend', 'fiance', 'fiancee') THEN 'partner'
+    WHEN v IN ('mother', 'mom', 'mum', 'father', 'dad', 'parent') THEN 'son or daughter'
+    WHEN v IN ('brother', 'sister', 'sibling') THEN 'sibling'
+    WHEN v IN ('friend', 'best friend') THEN 'friend'
+    WHEN v IN ('client', 'patient') THEN 'referring professional'
+    ELSE 'family member'
+  END
+  FROM (
+    SELECT btrim(regexp_replace(regexp_replace(lower(btrim(coalesce(p_about, ''))),
+      '^(my|her|his|their|our|the)[[:space:]]+', ''), '[[:space:]]+', ' ', 'g')) AS v
+  ) AS normalized
+$$;
+REVOKE ALL ON FUNCTION public.lead_caller_relationship(text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.lead_caller_relationship(text) TO authenticated, service_role;
+
+-- Same as 20261001120000 (the only earlier definition), except the contact's
+-- relationship.
+CREATE OR REPLACE FUNCTION public.create_lead_internal(
+  p_org_id uuid,
+  p_owner_id uuid,
+  p_lead jsonb,
+  p_channel text
+)
+RETURNS uuid
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_lead jsonb := public.lead_payload_normalize(p_lead);
+  v_case_id uuid := coalesce(nullif(p_lead ->> 'id', '')::uuid, gen_random_uuid());
+  v_contact_id uuid := coalesce(nullif(p_lead ->> 'contact_id', '')::uuid, gen_random_uuid());
+  v_follow_up_id uuid := coalesce(nullif(p_lead ->> 'follow_up_id', '')::uuid, gen_random_uuid());
+  v_title text := public.lead_case_title(v_lead);
+  v_now timestamptz := now();
+  v_summary text;
+BEGIN
+  IF p_channel NOT IN ('app', 'intake_link') THEN
+    RAISE EXCEPTION 'Unknown lead channel' USING ERRCODE = '22023';
+  END IF;
+  v_summary := CASE WHEN v_lead ->> 'urgency' = 'immediate_danger'
+    THEN 'Caller reported immediate danger when this lead arrived.' ELSE '' END;
+  IF v_lead ->> 'note' <> '' THEN
+    v_summary := btrim(v_summary || chr(10) || (v_lead ->> 'note'));
+  END IF;
+
+  INSERT INTO public.cases (
+    id, owner_id, org_id, title, status, summary, payment_status, paid_amount,
+    lead_source, lead_source_detail, lost_reason,
+    lead_captured_at, lead_channel, lead_urgency
+  ) VALUES (
+    v_case_id, p_owner_id, p_org_id, v_title, 'inquiry', v_summary, 'none', 0,
+    v_lead ->> 'lead_source', v_lead ->> 'lead_source_detail', '',
+    v_now, p_channel, v_lead ->> 'urgency'
+  );
+
+  INSERT INTO public.case_contacts (
+    id, owner_id, org_id, case_id, name, relationship, phone, email, is_primary, note
+  ) VALUES (
+    v_contact_id, p_owner_id, p_org_id, v_case_id,
+    v_lead ->> 'caller_name', public.lead_caller_relationship(v_lead ->> 'about_relationship'),
+    v_lead ->> 'phone', v_lead ->> 'email', true, ''
+  );
+
+  INSERT INTO public.follow_ups (
+    id, owner_id, org_id, case_id, title, due_on, status, note, kind, due_time
+  ) VALUES (
+    v_follow_up_id, p_owner_id, p_org_id, v_case_id,
+    'First call ' || chr(8212) || ' ' || v_title,
+    coalesce(nullif(p_lead ->> 'due_on', '')::date, CURRENT_DATE),
+    'open', '', 'first_call',
+    nullif(p_lead ->> 'due_time', '')::time
+  );
+
+  INSERT INTO public.case_events (owner_id, org_id, case_id, kind, body, contact_id, occurred_at)
+  VALUES (
+    p_owner_id, p_org_id, v_case_id, 'system',
+    CASE WHEN p_channel = 'intake_link' THEN 'New lead arrived through the intake link'
+         ELSE 'New lead added in the app' END,
+    v_contact_id, v_now
+  );
+
+  RETURN v_case_id;
+END
+$$;
+REVOKE ALL ON FUNCTION public.create_lead_internal(uuid, uuid, jsonb, text) FROM PUBLIC, anon, authenticated, service_role;
 
 COMMIT;
