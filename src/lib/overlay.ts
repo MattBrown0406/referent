@@ -5,10 +5,12 @@
 // timed sheet opens wait for it to finish first.
 
 let openCount = 0;
+let openedTotal = 0; // only grows: lets awaited work tell one came and went
 
 // Returns the matching end call; calling it more than once is harmless.
 export function beginOverlay(): () => void {
   openCount += 1;
+  openedTotal += 1;
   let ended = false;
   return () => {
     if (ended) return;
@@ -19,4 +21,8 @@ export function beginOverlay(): () => void {
 
 export function overlayOpen(): boolean {
   return openCount > 0;
+}
+
+export function overlaysOpened(): number {
+  return openedTotal;
 }

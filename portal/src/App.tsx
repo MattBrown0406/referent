@@ -305,12 +305,14 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (session) void loadListing();
+    if (session) { setPassword(''); void loadListing(); }
     else {
-      // Nothing from the previous account (its held edit, its last notice)
+      // Nothing from the previous account (its held edit, its last notice,
+      // the email and password it signed in with, a claim code it typed)
       // may show for the next one on a shared browser.
       setListing(null); setForm(null); setImportCount(null); setBeds(null); setBedHistory([]);
-      setHeldEdit(null); setNotice('');
+      setHeldEdit(null); setNotice(''); setError('');
+      setEmail(''); setPassword(''); setClaimCode(''); setBedsForm(toBedsForm(null));
     }
   }, [session, loadListing]);
 

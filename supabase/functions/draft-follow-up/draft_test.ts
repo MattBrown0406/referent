@@ -81,10 +81,21 @@ Deno.test('a draft to the case subject is written to them, never as the worried 
   assertStringIncludes(prompt, 'Never mention their family');
   assert(!prompt.includes('intervention is being planned'), 'the case stage is not shared for a message to the subject');
   assert(!prompt.includes('family member who contacted the practice'));
+  // The case timeline's outreach (with the family) is never presented as
+  // contact with the subject, and the first call never says they reached out.
+  const firstCall = buildUserPrompt(parseDraftRequest(caseRequest({
+    recipient: { firstName: 'Jake', relationship: 'subject' },
+    situation: { stage: 'inquiry', attempt: 3, lastChannel: 'text', daysSinceLastContact: 1, purpose: 'first_call' },
+  })));
+  for (const leak of ['outreach number', 'last reached out', 'made contact', 'by text']) {
+    assert(!firstCall.includes(leak), `"${leak}" is not in a prompt to the subject`);
+  }
+  assertStringIncludes(firstCall, 'Do not refer to an earlier message, call, or conversation with them');
   const referrer = buildUserPrompt(parseDraftRequest(caseRequest({ recipient: { firstName: 'Lee', relationship: 'referent' } })));
   assertStringIncludes(referrer, 'Lee, a professional who referred this family to the practice');
   const family = buildUserPrompt(parseDraftRequest(caseRequest()));
   assertStringIncludes(family, 'They are a family member who contacted the practice.');
+  for (const prompt of [referrer, family]) assertStringIncludes(prompt, 'outreach number 2 on this follow-up timeline');
 });
 
 Deno.test('parseDraftRequest rejects what it cannot use', () => {

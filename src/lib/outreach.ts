@@ -134,7 +134,8 @@ export function firstName(name: string): string {
   }
   word = word.replace(/^["'“”‘’()[\]<>«»*•–—-]+|["“”‘’()[\]<>«»,;:!?*•–—-]+$/g, '');
   if (!word || /[@\d]/.test(word) || /['’]s$/i.test(word)) return '';
-  const handle = /^([A-Za-z]+)[._][A-Za-z]/.exec(word);
+  // Two letters at least before the dot: initials ("T.J.", "A.J.") are the name.
+  const handle = /^([A-Za-z]{2,})[._][A-Za-z]/.exec(word);
   return handle ? handle[1] : word;
 }
 

@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(131);
+SELECT plan(134);
 
 -- Actors (suffix d7)
 --   ad  platform admin
@@ -1166,14 +1166,16 @@ INSERT INTO auth.users (id, email) VALUES
 SELECT set_config('test.org_a6', org_id::text, true) FROM public.org_members WHERE user_id = 'a6000000-0000-0000-0000-0000000000d7';
 SELECT set_config('test.org_a7', org_id::text, true) FROM public.org_members WHERE user_id = 'a7000000-0000-0000-0000-0000000000d7';
 SELECT set_config('test.org_a8', org_id::text, true) FROM public.org_members WHERE user_id = 'a8000000-0000-0000-0000-0000000000d7';
--- Programs these solo workspaces submitted and ReferralFit approved.
-INSERT INTO public.global_partners (id, name, organization, types, phone, status, verified_at, suggested_by_org_id)
+-- Programs these solo workspaces submitted and ReferralFit approved. A
+-- submission records its submitter too (created_by), as
+-- suggest_global_listing does.
+INSERT INTO public.global_partners (id, name, organization, types, phone, status, verified_at, suggested_by_org_id, created_by)
 VALUES ('dd000000-0000-0000-0000-0000000000d7', 'Intake', 'Approved Submission Recovery', ARRAY['Detox'], '(541) 555-1961',
-        'active', '2026-08-15 12:00:00+00', current_setting('test.org_a6')::uuid),
+        'active', '2026-08-15 12:00:00+00', current_setting('test.org_a6')::uuid, 'a6000000-0000-0000-0000-0000000000d7'),
        ('d6100000-0000-0000-0000-0000000000d7', 'Intake', 'Approved Before Leaving', ARRAY['Detox'], '(541) 555-1962',
-        'active', '2026-08-20 12:00:00+00', current_setting('test.org_a8')::uuid),
+        'active', '2026-08-20 12:00:00+00', current_setting('test.org_a8')::uuid, 'a8000000-0000-0000-0000-0000000000d7'),
        ('d6200000-0000-0000-0000-0000000000d7', 'Intake', 'Approved Third Program', ARRAY['Detox'], '(541) 555-1963',
-        'active', '2026-08-25 12:00:00+00', current_setting('test.org_a8')::uuid);
+        'active', '2026-08-25 12:00:00+00', current_setting('test.org_a8')::uuid, 'a8000000-0000-0000-0000-0000000000d7');
 -- The team's pro plan runs out in a month; the joiner's pro comp was
 -- switched off but still carries a far-off date.
 INSERT INTO public.org_entitlements (org_id, entitlement, active, source, expires_at)
@@ -1221,10 +1223,39 @@ SET LOCAL ROLE authenticated;
 SELECT lives_ok($$ SELECT public.delete_own_account() $$, 'a solo practitioner with approved submissions deletes their account');
 RESET ROLE;
 SELECT ok(
-  (SELECT status = 'active' AND verified_at = '2026-08-20 12:00:00+00'::timestamptz AND suggested_by_org_id IS NULL
+  (SELECT status = 'active' AND verified_at = '2026-08-20 12:00:00+00'::timestamptz
+          AND suggested_by_org_id IS NULL AND created_by IS NULL
      FROM public.global_partners WHERE id = 'd6100000-0000-0000-0000-0000000000d7'),
   'the approved submission stays live and verified, no longer attributed'
 );
+
+-- A program's staff member who confirmed beds deletes their account: the
+-- listing keeps its counts and its verification; only the confirmer is
+-- cleared (the ON DELETE SET NULL used to trip the beds guard and abort).
+SELECT set_config('request.jwt.claim.sub', '', true);
+INSERT INTO auth.users (id, email) VALUES ('a9000000-0000-0000-0000-0000000000d7', 'staff@verify-beds.example');
+INSERT INTO public.global_partners (id, name, organization, types, phone, status, verified_at)
+VALUES ('d6300000-0000-0000-0000-0000000000d7', 'Admissions', 'Verified Beds Program', ARRAY['Inpatient'], '(541) 555-1965',
+        'active', '2026-08-30 12:00:00+00');
+INSERT INTO public.center_members (user_id, global_partner_id)
+VALUES ('a9000000-0000-0000-0000-0000000000d7', 'd6300000-0000-0000-0000-0000000000d7');
+SELECT set_config('request.jwt.claim.sub', 'a9000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT beds_male FROM public.set_listing_beds('d6300000-0000-0000-0000-0000000000d7', 3, 2, 'Pat', '541-555-1966');
+SELECT lives_ok($$ SELECT public.delete_own_account() $$, 'a staff member who confirmed beds deletes their account');
+RESET ROLE;
+SELECT ok(
+  (SELECT status = 'active' AND verified_at = '2026-08-30 12:00:00+00'::timestamptz
+          AND beds_male = 3 AND beds_female = 2 AND beds_updated_by IS NULL
+     FROM public.global_partners WHERE id = 'd6300000-0000-0000-0000-0000000000d7'),
+  'the program keeps its bed counts and verification; only the confirmer is cleared'
+);
+SELECT ok(
+  coalesce(current_setting('referralfit.seed_publish', true), '') = ''
+  AND coalesce(current_setting('referralfit.beds_rpc', true), '') = '',
+  'account deletion leaves no directory bypass flag on'
+);
+SELECT set_config('request.jwt.claim.sub', '', true);
 
 -- Any other non-admin write still pins the status and clears verification,
 -- even when it also changes an ownership pointer.

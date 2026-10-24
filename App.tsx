@@ -73,7 +73,7 @@ import { bedForFromPopulation, bedsCadenceLine, bedsLine, type BedFor } from './
 import { supabase } from './src/lib/supabase';
 import { forceLocalSignOut, isAuthNetworkError, offlineSessionFallback, resolveLaunchSession } from './src/lib/auth-session';
 import { describeError, RejectedWritesError } from './src/lib/errors';
-import { beginOverlay, overlayOpen } from './src/lib/overlay';
+import { beginOverlay, overlayOpen, overlaysOpened } from './src/lib/overlay';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
@@ -1182,6 +1182,13 @@ export default function App() {
   // Whether any sheet is up right now (kept current every render), so a sheet
   // opened on a timer never tries to present over another one.
   const anySheetOpenRef = useRef(false);
+  // How many times the screen has gone from no sheet to a sheet. Work that
+  // awaited compares it to tell that a sheet came up meanwhile, even one
+  // already closed again (it may still be animating away).
+  const sheetOpenedCountRef = useRef(0);
+  // Sheets plus overlays (a picker, the share sheet) opened so far; both
+  // counts only grow, so a change means one came up — maybe already gone.
+  const screenOpenings = () => sheetOpenedCountRef.current + overlaysOpened();
   // The packet composer is closing (its nested confirm first, then itself).
   const packetClosingRef = useRef(false);
   // Each composer close gets a token; a rollback cancels a pending close.
@@ -2279,12 +2286,14 @@ export default function App() {
   }
 
   async function openMatchedReferral(partnerId: string) {
+    const openings = screenOpenings();
     const referralMatch = await saveCurrentReferralMatch();
     if (!referralMatch) return;
     // The save can take a few seconds. A sheet opened meanwhile (a match
     // card's profile) means the user moved on: presenting over it, or as it
-    // closes, would freeze the new sheet. The match itself is saved.
-    if (anySheetOpenRef.current || overlayOpen()) return;
+    // closes, would freeze the new sheet. The count catches one already
+    // closed again. The match itself is saved.
+    if (anySheetOpenRef.current || overlayOpen() || screenOpenings() !== openings) return;
     setPendingPlacement({ matchProfileId: referralMatch.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
     setPlacementReason(null);
     setPlacementReasonNote('');
@@ -2379,10 +2388,11 @@ export default function App() {
   // Referred) if the packet is actually sent. The shortlist is captured now,
   // while the card order the clinician saw is still on screen.
   async function openPacketComposer(partner: Partner, score: ProgramScore) {
+    const openings = screenOpenings();
     const matchProfile = await currentOrSavedMatch();
     if (!matchProfile) return;
-    // As in openMatchedReferral: never present over a sheet opened during the save.
-    if (anySheetOpenRef.current || overlayOpen()) return;
+    // As in openMatchedReferral: never present over (or as it closes) a sheet opened during the save.
+    if (anySheetOpenRef.current || overlayOpen() || screenOpenings() !== openings) return;
     setPendingPlacement({ matchProfileId: matchProfile.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
     setPlacementReason(null);
     setPlacementReasonNote('');
@@ -3622,12 +3632,14 @@ export default function App() {
     || '';
   latestSnapshotRef.current = { partners, referrals, referralMatches, touches, followUps, scorecards };
   latestCasesRef.current = cases;
-  anySheetOpenRef.current = Boolean(
+  const sheetOpenNow = Boolean(
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
     || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory
     || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
     || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible,
   );
+  if (sheetOpenNow && !anySheetOpenRef.current) sheetOpenedCountRef.current += 1;
+  anySheetOpenRef.current = sheetOpenNow;
 
   // From the case file or a profile there is no card: the step this outreach
   // would close is the one the timeline rules pick (never a consult, a
@@ -4116,6 +4128,8 @@ export default function App() {
     try {
       const saved = await assignCase(caseId, assignedTo, eventId);
       if (!stillCurrent()) return;
+      // …nor one that started while this was in flight.
+      localChangeSerialRef.current += 1;
       if (activeCaseIdRef.current === caseId) {
         applyCaseEvent({ id: eventId, caseId, kind: 'system', body: saved.eventBody, occurredAt: saved.occurredAt, actorId: activeUserId.toLowerCase() });
       }
@@ -4123,6 +4137,7 @@ export default function App() {
       // Undo this one assignment only, and only in the account and workspace
       // it was made in: the list on screen may be newer, or someone else's.
       if (!stillCurrent()) return;
+      localChangeSerialRef.current += 1;
       setCases((current) => current.map((item) => (item.id === caseId ? { ...item, assignedTo: previousAssignee } : item)));
       Alert.alert('Assignment not saved', (error as Error).message);
     }
@@ -7276,6 +7291,7 @@ export default function App() {
     const userId = activeUserIdRef.current;
     // Same account in another workspace is a different listing.
     const generation = authGenerationRef.current;
+    const openings = screenOpenings();
     let existing: OrgDirectoryProfile | null = null;
     try {
       existing = (await fetchOrgDirectoryProfile()).profile;
@@ -7291,8 +7307,9 @@ export default function App() {
       // Let the Workspace sheet finish dismissing before presenting another.
       setShowWorkspace(false);
       afterSheetCloses(() => setShowOrgProfile(true));
-    } else if (anySheetOpenRef.current || overlayOpen()) {
-      // Something opened while the profile loaded: present once it is gone.
+    } else if (anySheetOpenRef.current || overlayOpen() || screenOpenings() !== openings) {
+      // Something opened while the profile loaded (and may still be closing):
+      // present once it is gone.
       afterSheetCloses(() => setShowOrgProfile(true), { ifScreenBusy: 'wait' });
     } else {
       setShowOrgProfile(true);

@@ -248,6 +248,9 @@ check('a name field holding contact details or someone else\'s name sends no nam
     assert.equal(outreach.firstName(name), '', JSON.stringify(name));
   }
   assert.equal(outreach.firstName('jane.smith'), 'jane', 'a sign-up handle sends the first part only');
+  for (const [name, given] of [['T.J. Miller', 'T.J.'], ['A.J.', 'A.J.'], ['J.R. Smith', 'J.R.'], ['jane_doe', 'jane']]) {
+    assert.equal(outreach.firstName(name), given, `${name}: initials are the name, not a handle`);
+  }
   assert.equal(outreach.firstName('“Ana” Rivera'), 'Ana');
   assert.equal(outreach.firstName('Mary Ann (sister)'), 'Mary');
   const body = outreach.buildDraftRequest({

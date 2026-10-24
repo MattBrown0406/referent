@@ -40,7 +40,8 @@
 --   9. Placement check-ins due "today" in US evening hours are no longer
 --      skipped because the server's UTC date already rolled over.
 --  10. Moving or releasing a listing (team join, account deletion) keeps
---      its verification.
+--      its verification, and an account that confirmed beds can be
+--      deleted.
 --  11. Production table grants match what the migrations grant.
 --
 -- Transit rule: this file is pasted into the SQL editor from a chat client.
@@ -1922,6 +1923,13 @@ GRANT EXECUTE ON FUNCTION public.schedule_placement_check_ins(uuid) TO authentic
 -- 10. Moving or releasing a listing keeps its verification
 -- ===========================================================================
 
+-- An account deletion also clears created_by, reviewed_by and
+-- beds_updated_by (ON DELETE SET NULL), and that ran as the member too: on
+-- beds_updated_by it tripped the beds guard and aborted the deletion, and on
+-- created_by it cleared the verification of every program the account had
+-- submitted. delete_own_account (below) now clears those pointers itself,
+-- before the auth.users row goes, through the path set_listing_beds uses.
+
 -- Same as 20260928170000, except that a write changing only who owns or
 -- submitted the listing (owner_org_id, suggested_by_org_id) leaves
 -- verified_at as it was. A team join (org_move_directory_state) and an
@@ -1954,6 +1962,92 @@ BEGIN
 END
 $$;
 REVOKE ALL ON FUNCTION public.guard_global_partner_verification() FROM PUBLIC, anon, authenticated;
+
+-- Same as 20260929174333, plus the pointer release described above.
+CREATE OR REPLACE FUNCTION public.delete_own_account()
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_user uuid := auth.uid();
+  v_org uuid;
+  v_role text;
+  v_others integer := 0;
+  v_prev_pub text := coalesce(current_setting('referralfit.seed_publish', true), '');
+  v_prev_beds text := coalesce(current_setting('referralfit.beds_rpc', true), '');
+BEGIN
+  IF v_user IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM auth.users WHERE id = v_user) THEN
+    RAISE EXCEPTION 'This account no longer exists' USING ERRCODE = 'P0002';
+  END IF;
+
+  SELECT org_id, role INTO v_org, v_role
+    FROM public.org_members
+   WHERE user_id = v_user;
+
+  IF v_org IS NOT NULL AND v_role = 'owner' THEN
+    SELECT count(*) INTO v_others
+      FROM public.org_members
+     WHERE org_id = v_org AND user_id <> v_user;
+    IF v_others > 0 THEN
+      RAISE EXCEPTION
+        'Your workspace still has % other member(s). Remove them from the Workspace screen first (each keeps their own workspace), or contact ReferralFit to transfer ownership, then delete your account.',
+        v_others
+        USING ERRCODE = '22023';
+    END IF;
+
+    -- Sole owner: the workspace goes with the account. Delete the data tables
+    -- whose org_id foreign key has no ON DELETE action, children first. The
+    -- remaining tables cascade from orgs.
+    DELETE FROM public.follow_ups         WHERE org_id = v_org;
+    DELETE FROM public.case_events        WHERE org_id = v_org;
+    DELETE FROM public.case_integrations  WHERE org_id = v_org;
+    DELETE FROM public.case_documents     WHERE org_id = v_org;
+    DELETE FROM public.case_stage_history WHERE org_id = v_org;
+    DELETE FROM public.case_contacts      WHERE org_id = v_org;
+    DELETE FROM public.referrals          WHERE org_id = v_org;
+    DELETE FROM public.match_profiles     WHERE org_id = v_org;
+    DELETE FROM public.cases              WHERE org_id = v_org;
+    DELETE FROM public.touches            WHERE org_id = v_org;
+    DELETE FROM public.partners           WHERE org_id = v_org;
+
+    -- Directory listings this practice claimed stay public but become
+    -- unclaimed. The FK is ON DELETE SET NULL as well; this is explicit so the
+    -- rule is visible here.
+    UPDATE public.global_partners
+       SET owner_org_id = NULL
+     WHERE owner_org_id = v_org;
+
+    -- Cascades: org_members, org_invites, org_entitlements,
+    -- org_revenuecat_grants, user_favorites, center_claim_requests.
+    DELETE FROM public.orgs WHERE id = v_org;
+  END IF;
+
+  -- Member of a shared workspace: membership is removed by the auth.users
+  -- cascade below; their contributions stay with the practice.
+  DELETE FROM public.center_members WHERE user_id = v_user;
+
+  -- Listings keep their status, verification and bed counts.
+  PERFORM set_config('referralfit.beds_rpc', 'on', true);
+  PERFORM set_config('referralfit.seed_publish', 'on', true);
+  UPDATE public.global_partners
+     SET created_by = nullif(created_by, v_user),
+         reviewed_by = nullif(reviewed_by, v_user),
+         beds_updated_by = nullif(beds_updated_by, v_user)
+   WHERE v_user IN (created_by, reviewed_by, beds_updated_by);
+  PERFORM set_config('referralfit.seed_publish', v_prev_pub, true);
+  PERFORM set_config('referralfit.beds_rpc', v_prev_beds, true);
+
+  -- auth schema rows (identities, sessions, refresh tokens, mfa factors)
+  -- cascade from auth.users in Supabase.
+  DELETE FROM auth.users WHERE id = v_user;
+END
+$$;
+REVOKE ALL ON FUNCTION public.delete_own_account() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.delete_own_account() TO authenticated;
 
 -- ===========================================================================
 -- 11. Production table grants match the migrations

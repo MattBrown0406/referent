@@ -253,14 +253,14 @@ export function buildUserPrompt(request: DraftRequest): string {
     lines.push(`The sender's name is not known${sender.practiceName ? ` (practice: ${sender.practiceName})` : ''}: do not sign with a name, and do not leave a place for one.`);
   }
 
+  // A case contact is usually family, but the app also suggests "subject"
+  // (the person the family is worried about) and "referent". Writing to
+  // the subject as if they were the worried family member could tell them
+  // their family contacted the practice.
+  const subject = request.target.kind === 'case' && SUBJECT_RELATIONSHIP.test(recipient.relationship);
   if (request.target.kind === 'case') {
-    // A case contact is usually family, but the app also suggests "subject"
-    // (the person the family is worried about) and "referent". Writing to
-    // the subject as if they were the worried family member could tell them
-    // their family contacted the practice.
     // The case stage stays out of a message to the subject: "the intervention
     // is being planned" is exactly what must not reach them.
-    const subject = SUBJECT_RELATIONSHIP.test(recipient.relationship);
     if (subject) {
       lines.push(`Recipient: ${recipient.firstName || 'the person'}, the person this case is about, not a family member. Write to them directly and gently. Never mention their family, that anyone else contacted the practice, or any plan for them.`);
     } else if (REFERRER_RELATIONSHIP.test(recipient.relationship)) {
@@ -277,9 +277,17 @@ export function buildUserPrompt(request: DraftRequest): string {
     lines.push(`Recipient: ${who || 'the contact'}${org}${types}, a referral partner.`);
   }
 
-  lines.push(`This is ${PURPOSE_LABELS[situation.purpose]}, outreach number ${situation.attempt} on this follow-up timeline.`);
-  const last = lastContactPhrase(situation.daysSinceLastContact, situation.lastChannel);
-  if (last) lines.push(last);
+  if (subject) {
+    // The attempt count and last contact are the case timeline's (calls and
+    // texts with the family), and the first-call purpose says the recipient
+    // made contact. Told to the subject, either one reads as "someone has
+    // been talking to this practice about you".
+    lines.push('This is a check-in. Do not refer to an earlier message, call, or conversation with them unless the practitioner\'s note mentions one.');
+  } else {
+    lines.push(`This is ${PURPOSE_LABELS[situation.purpose]}, outreach number ${situation.attempt} on this follow-up timeline.`);
+    const last = lastContactPhrase(situation.daysSinceLastContact, situation.lastChannel);
+    if (last) lines.push(last);
+  }
 
   if (request.instructions) {
     lines.push('');
