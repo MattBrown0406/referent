@@ -819,7 +819,16 @@ SELECT ok(
      FROM public.fetch_global_partner_stats(ARRAY['d6000000-0000-0000-0000-0000000000d7'::uuid])),
   'five established workspaces unlock the network figures'
 );
-UPDATE public.orgs SET created_at = '2001-01-01', name = 'Renamed practice' WHERE id = (SELECT public.current_org_id());
+UPDATE public.orgs SET name = 'Renamed practice' WHERE id = (SELECT public.current_org_id());
+-- Where authenticated has only the column grants (CI), backdating is refused
+-- outright; where a default ACL grants the whole table, the trigger pins it.
+DO $$
+BEGIN
+  UPDATE public.orgs SET created_at = '2001-01-01' WHERE id = (SELECT public.current_org_id());
+EXCEPTION WHEN insufficient_privilege THEN
+  NULL;
+END
+$$;
 RESET ROLE;
 SELECT ok(
   (SELECT name = 'Renamed practice' AND created_at > '2020-01-01'::timestamptz FROM public.orgs
