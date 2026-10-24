@@ -116,4 +116,14 @@ for (const operation of [
 }
 assert.match(source, /async \(\) => \{\s*if \(assignedMatch\) \{\s*await assignMatchReferral\(/, 'assignMatchReferral must be deferred until after the mutation/session fence');
 
+// One share sheet at a time: a second one presented over the first never
+// settles, and its overlay would then hold off every later sheet.
+for (const name of ['sharePacketText', 'sharePartner']) {
+  assert.match(
+    source,
+    new RegExp(`async function ${name}\\([^)]*\\) \\{[\\s\\S]{0,400}?const endOverlay = beginShareSheet\\(\\);\\s*if \\(!endOverlay\\) return;\\s*try \\{\\s*(const result = )?await Share\\.share\\(`),
+    `${name} must open its share sheet through beginShareSheet`,
+  );
+}
+
 console.log('optimistic mutation serialization/dependency invariants: ok');

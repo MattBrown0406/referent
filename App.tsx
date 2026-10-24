@@ -1182,6 +1182,10 @@ export default function App() {
   const packetClosingRef = useRef(false);
   // Each composer close gets a token; a rollback cancels a pending close.
   const packetCloseTokenRef = useRef(0);
+  // A share sheet is up or on its way (beginShareSheet). A second tap before
+  // it appears would ask iOS to present over it: that share never shows and
+  // never settles, and its overlay would hold off every later sheet for good.
+  const shareSheetRef = useRef(false);
   // When a notification asked to open something, and the case list as of the
   // latest render (the tap handler runs outside render).
   const pendingNotificationAtRef = useRef(0);
@@ -2410,9 +2414,22 @@ export default function App() {
     setPlacementReasonNote('');
   }
 
+  // One share sheet at a time. Returns its end call (which also ends its
+  // overlay), or null while one is already up or on its way.
+  function beginShareSheet(): (() => void) | null {
+    if (shareSheetRef.current) return null;
+    shareSheetRef.current = true;
+    const endOverlay = beginOverlay();
+    return () => {
+      shareSheetRef.current = false;
+      endOverlay();
+    };
+  }
+
   async function sharePacketText() {
     if (!packetTarget || packetClosingRef.current) return;
-    const endOverlay = beginOverlay();
+    const endOverlay = beginShareSheet();
+    if (!endOverlay) return;
     try {
       const result = await Share.share({
         title: `Placement recommendation — ${packetTarget.match.clientLabel}`,
@@ -4871,7 +4888,8 @@ export default function App() {
   async function sharePartner(partner: Partner) {
     // From a Directory card no sheet is under the share sheet, so only this
     // keeps a notification tap or timed sheet from presenting over it.
-    const endOverlay = beginOverlay();
+    const endOverlay = beginShareSheet();
+    if (!endOverlay) return;
     try {
       await Share.share({
         title: `${partner.organization} referral contact`,
