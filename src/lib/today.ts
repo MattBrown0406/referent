@@ -11,8 +11,9 @@ export type TodayContext = {
   caseTitle?: string;
   partnerName?: string;
   partnerPhone?: string;
-  // Referral admit-check (packet flow): referral with a packet sent and no
-  // admit decision yet — Done routes to the outcome capture sheet.
+  // Referral admit-check: an outbound referral with no admit decision yet
+  // (sent by packet or by Assign & refer) — Done routes to the outcome
+  // capture sheet.
   referralAwaitingAnswer?: boolean;
 };
 
@@ -247,11 +248,15 @@ export function newLeadCards(
   now: Date,
 ): TodayCard[] {
   const cards: TodayCard[] = [];
+  const todayStamp = dateStamp(now);
   for (const record of cases) {
     if (!record.leadCapturedAt || record.firstTouchAt) continue;
     if (record.status === 'closed' || record.status === 'lost') continue;
     const firstCall = followUps.find((item) => item.caseId === record.id && item.kind === 'first_call' && item.status === 'open');
     if (!firstCall) continue;
+    // Snoozed: off NEW LEADS (and off TODAY/OVERDUE, as buildTodaySections
+    // hides any snoozed item) until the snooze date, then back here.
+    if (firstCall.snoozedUntil && firstCall.snoozedUntil > todayStamp) continue;
     const caseContacts = contacts.filter((item) => item.caseId === record.id);
     const contact = caseContacts.find((item) => item.isPrimary) || caseContacts[0];
     const bits: string[] = [];
@@ -341,12 +346,27 @@ const TODAY_KIND_ORDER: Record<string, number> = {
   check_in: 6, // a scheduled outcome check-in; never more urgent than a call
 };
 
+// ─── Closed and lost cases ──────────────────────────────────────────────────
+// A closed or lost case's follow-ups leave Today (and stop reminding; see
+// reminderFollowUps in notifications.ts). The server also skips them when a
+// case closes. A placement check-in stays: the outcome of a placement is still
+// worth recording after the case itself is done.
+
+export function inactiveCaseIds(cases: Pick<CaseRecord, 'id' | 'status'>[]): Set<string> {
+  return new Set(cases.filter((record) => record.status === 'closed' || record.status === 'lost').map((record) => record.id));
+}
+
+export function followUpOnInactiveCase(followUp: FollowUp, inactive: ReadonlySet<string>): boolean {
+  return Boolean(followUp.caseId && inactive.has(followUp.caseId) && followUp.kind !== 'check_in');
+}
+
 export function buildTodaySections(
   followUps: FollowUp[],
   partnersDue: PartnerDue[],
   today: Date,
   contextFor: (followUp: FollowUp) => TodayContext,
   newLeads: TodayCard[] = [],
+  inactiveCases: ReadonlySet<string> = new Set(),
 ): TodaySections {
   const todayStamp = dateStamp(today);
   const overdue: TodayCard[] = [];
@@ -357,6 +377,7 @@ export function buildTodaySections(
   for (const followUp of followUps) {
     if (followUp.status !== 'open') continue;
     if (leadFollowUpIds.has(followUp.id)) continue;
+    if (followUpOnInactiveCase(followUp, inactiveCases)) continue;
     // Snooze mirrors the server view (today_actions uses
     // coalesce(snoozed_until, due_on) <= CURRENT_DATE).
     const effectiveDue = followUp.snoozedUntil || followUp.dueOn;

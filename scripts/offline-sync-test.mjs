@@ -73,10 +73,10 @@ writeFileSync(path.join(tmpDir, 'async-storage.js'), `
 const s = globalThis.__offlineSyncState;
 const api = {
   async getItem(k) { return s.asyncStorage.has(k) ? s.asyncStorage.get(k) : null; },
-  async setItem(k, v) { s.asyncStorage.set(k, String(v)); },
+  async setItem(k, v) { if (s.asyncWriteLog) s.asyncWriteLog.push(k); s.asyncStorage.set(k, String(v)); },
   async removeItem(k) { s.asyncStorage.delete(k); },
   async multiRemove(keys) { keys.forEach((k) => s.asyncStorage.delete(k)); },
-  async multiSet(pairs) { pairs.forEach(([k, v]) => s.asyncStorage.set(k, String(v))); },
+  async multiSet(pairs) { pairs.forEach(([k, v]) => { if (s.asyncWriteLog) s.asyncWriteLog.push(k); s.asyncStorage.set(k, String(v)); }); },
   async getAllKeys() { return [...s.asyncStorage.keys()]; },
 };
 module.exports = api; module.exports.default = api; module.exports.__esModule = true;
@@ -90,6 +90,9 @@ function query(table) {
     if (s.offline) return { data: null, error: { message: 'TypeError: Network request failed', details: '', hint: '', code: '' } };
     const failure = s.failOn && s.failOn(b);
     if (failure) return { data: null, error: failure };
+    // selectOverride: answer a read with synthetic rows (e.g. an endless list).
+    const override = b.op === 'select' && s.selectOverride ? s.selectOverride(b) : null;
+    if (override) return override;
     s.log.push(b.op + ' ' + table);
     const rows = s.db[table] || (s.db[table] = []);
     if (b.op === 'select') {
@@ -203,8 +206,8 @@ state.org = ORG;
 
 writeFileSync(path.join(tmpDir, 'cases.js'), `
 exports.newUuid = () => require('node:crypto').randomUUID();
-exports.fetchCaseList = async () => { const s = globalThis.__offlineSyncState; if (s.offline) throw { message: 'TypeError: Network request failed', code: '' }; return { cases: [], contacts: [] }; };
-exports.fetchCaseFile = async () => ({ events: [], documents: [] });
+exports.fetchCaseList = async () => { const s = globalThis.__offlineSyncState; if (s.caseReadFailure) throw s.caseReadFailure; if (s.offline) throw { message: 'TypeError: Network request failed', code: '' }; return s.caseList || { cases: [], contacts: [] }; };
+exports.fetchCaseFile = async () => { const s = globalThis.__offlineSyncState; if (s.caseReadFailure) throw s.caseReadFailure; return { events: [], documents: [] }; };
 `);
 
 for (const [rel, out] of [
@@ -480,10 +483,16 @@ await check('persistCache with no connection (valid token) uses the verified bin
   const relaunch = await store.hydrate(U);
   assert.equal(relaunch.source, 'cache');
   assert.equal(relaunch.snapshot.partners.length, 1);
-  // A workspace the server reports differently still refuses the save.
+  // Saving the device's own copy asks the server nothing (round 11): the
+  // binding is the fence, and a workspace change is adopted only by
+  // bindLocalWorkspace, which wipes the copy under the same lock.
   state.offline = false;
   state.org = '33333333-3333-4333-8333-333333333399';
-  await assert.rejects(store.persistCache(relaunch.snapshot, U), /active workspace changed/);
+  state.rpcCalls = [];
+  await store.persistCache(relaunch.snapshot, U);
+  assert.deepEqual(state.rpcCalls, [], 'no server round trip inside the cache lock');
+  assert.equal(await store.bindLocalWorkspace(U, state.org), true);
+  assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${U}`), false, 'the new workspace never reads the old copy');
   state.org = ORG;
 });
 
@@ -503,9 +512,11 @@ await check('a server outage (5xx) queues the change AND saves its copy, so a re
   const relaunch = await store.hydrate(U);
   assert.equal(relaunch.source, 'cache');
   assert.deepEqual(relaunch.snapshot.touches.map((row) => row.id), [T], 'the queued touch is on screen after a relaunch, not missing (and redone)');
-  // A non-transient refusal of the workspace check still blocks the save.
-  state.failOn = (b) => (b.op === 'rpc' && b.table === 'current_org_id' ? { message: 'permission denied', code: '42501' } : null);
-  await assert.rejects(store.persistCache(relaunch.snapshot, U), /could not be verified/);
+  // Saving the copy needs no answer from the server at all.
+  let asked = 0;
+  state.failOn = (b) => { if (b.op === 'rpc') asked += 1; return null; };
+  await store.persistCache(relaunch.snapshot, U);
+  assert.equal(asked, 0, 'persistCache makes no current_org_id round trips');
   state.failOn = null;
   await store.hydrate(U);
   assert.equal(state.db.touches.filter((row) => row.id === T).length, 1, 'the touch lands once when the server recovers');
@@ -1005,10 +1016,12 @@ await check('an edit left in the queue by an interrupted flush cannot hold its r
   await store.updateFollowUp(followUp(F, { title: 'Call the family', note: 'ask about insurance' }), U);
   state.offline = false;
   let refuse = true;
-  let orgCalls = 0;
+  let partnerTries = 0;
   state.failOn = (b) => {
     if (refuse && b.table === 'follow_ups' && b.op === 'upsert') return { message: 'The assignee must be a member of this workspace', code: '22023' };
-    if (b.op === 'rpc' && b.table === 'current_org_id' && ++orgCalls === 2) return { message: 'TypeError: Network request failed', code: '' };
+    // The connection drops on the next op (the workspace is no longer
+    // re-verified before every op, so the drop is simulated on the op itself).
+    if (b.table === 'partners' && b.op === 'upsert' && ++partnerTries === 1) return { message: 'TypeError: Network request failed', code: '' };
     return null;
   };
   await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
@@ -1350,6 +1363,552 @@ await check('a flush cut off after an upsert waits keeps it ahead of a later edi
     state.rpcResults = null;
   }
 });
+
+// ─── Round 11: request deadlines, one read classifier, crash-safe copies ────
+
+const cacheKey = `referralfit-cache-v2:${U}`;
+const unreadableKey = `referralfit-unreadable-writes-v1:${U}`;
+const uuid = () => globalThis.crypto.randomUUID();
+const TIMEOUT = () => ({ message: 'AbortError: Network request timed out', details: 'AbortError: Network request timed out\n    at fetch (http://localhost:8081/index.bundle:10:20)', hint: 'Request was aborted (timeout or manual cancellation)', code: '' });
+const GATEWAY_502 = () => ({ message: '<html><head><title>502 Bad Gateway</title></head><body><center>cloudflare</center></body></html>', code: '' });
+// The pre-round-11 retry-bookkeeping key (FNV of the op's JSON), as builds up to now saved it.
+function legacyWaitKey(text) {
+  const hex = [];
+  for (let pass = 0; pass < 4; pass += 1) {
+    let h = 0x811c9dc5 ^ (pass * 0x01000193);
+    for (let i = 0; i < text.length; i += 1) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    hex.push(h.toString(16).padStart(8, '0'));
+  }
+  const raw = hex.join('');
+  const variant = ((parseInt(raw[16], 16) & 0x3) | 0x8).toString(16) + raw.slice(17, 20);
+  return `${raw.slice(0, 8)}-${raw.slice(8, 12)}-4${raw.slice(13, 16)}-${variant}-${raw.slice(20, 32)}`;
+}
+
+// supabase.ts: the real module, with its React Native / Expo / supabase-js imports stubbed.
+{
+  const supaDir = path.join(tmpDir, 'supabase-real');
+  transpile('src/lib/supabase.ts', 'supabase.js', supaDir);
+  writeFileSync(path.join(supaDir, 'stub-secure-store.js'), 'module.exports = { getItemAsync: async () => null, setItemAsync: async () => {}, deleteItemAsync: async () => {} };');
+  writeFileSync(path.join(supaDir, 'stub-react-native.js'), "module.exports = { Platform: { OS: 'ios' } };");
+  writeFileSync(path.join(supaDir, 'stub-supabase-js.js'), 'exports.createClient = (url, key, options) => { globalThis.__offlineSyncState.createdClient = { url, key, options }; return { auth: {} }; };');
+  const supaStubs = { 'expo-secure-store': 'stub-secure-store.js', 'react-native': 'stub-react-native.js', '@supabase/supabase-js': 'stub-supabase-js.js' };
+  for (const [name, file] of Object.entries(supaStubs)) stubs.set(name, path.join(supaDir, file));
+  const supa = require(path.join(supaDir, 'supabase.js'));
+  for (const name of Object.keys(supaStubs)) stubs.delete(name);
+  const abortable = (input, init) => new Promise((resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' })));
+  });
+  const answersAfter = (ms) => (input, init) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve('done'), ms);
+    init?.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(Object.assign(new Error('Aborted'), { name: 'AbortError' })); });
+  });
+
+  await check('every Supabase request gets a deadline: a request that never answers fails fast as a timeout', async () => {
+    assert.equal(typeof state.createdClient?.options?.global?.fetch, 'function', 'createClient must get the deadline-enforcing fetch');
+    assert.equal(supa.REQUEST_TIMEOUT_MS, 15000);
+    let seen;
+    const timed = supa.withRequestTimeout((input, init) => { seen = init.signal; return new Promise(() => {}); }, { timeoutMs: 40 });
+    const started = Date.now();
+    const error = await timed('https://x.supabase.co/rest/v1/partners?select=*', { method: 'GET' }).catch((caught) => caught);
+    assert.ok(Date.now() - started < 1000, 'settles at the deadline even if the fetch ignores the abort');
+    assert.equal(error.name, 'AbortError');
+    assert.equal(error.message, 'Network request timed out');
+    assert.equal(seen.aborted, true, 'the underlying request is aborted');
+    assert.ok(errors.isTimeoutError(error) && store.isNetworkError(error) && store.isServerUnreachable(error));
+  });
+
+  await check('a caller signal still cancels on its own; a quick answer passes straight through', async () => {
+    const controller = new AbortController();
+    const pending = supa.withRequestTimeout(abortable, { timeoutMs: 5000 })('https://x.supabase.co/rest/v1/partners', { signal: controller.signal });
+    controller.abort();
+    const error = await pending.catch((caught) => caught);
+    assert.equal(error.message, 'Aborted', "the caller's own abort is rethrown as is, not as a timeout");
+    assert.equal(await supa.withRequestTimeout(async () => 'response', { timeoutMs: 50 })('https://x.supabase.co/rest/v1/partners'), 'response');
+  });
+
+  await check('Edge Functions keep the caller deadline (the 56 s draft call); storage transfers get a longer one', async () => {
+    const options = { timeoutMs: 20, storageTransferTimeoutMs: 400, functionTimeoutMs: 30 };
+    const caller = new AbortController(); // functions-js makes one for `timeout: 56_000`
+    let passed;
+    const fn = supa.withRequestTimeout((input, init) => { passed = init.signal; return answersAfter(80)(input, init); }, options);
+    assert.equal(await fn('https://x.supabase.co/functions/v1/draft-follow-up', { method: 'POST', signal: caller.signal }), 'done', 'nothing shorter is imposed on a function call that has its own deadline');
+    assert.equal(passed, caller.signal, "the caller's signal is passed through unchanged");
+    assert.equal(supa.requestDeadlineMs('https://x.supabase.co/functions/v1/draft-follow-up', true), null);
+    await assert.rejects(supa.withRequestTimeout(answersAfter(80), options)('https://x.supabase.co/functions/v1/other', { method: 'POST' }), /timed out/, 'a function call with no deadline of its own gets one');
+    assert.equal(await supa.withRequestTimeout(answersAfter(80), options)('https://x.supabase.co/storage/v1/object/case-documents/u/c/d.pdf', { method: 'POST' }), 'done', 'an upload gets the transfer deadline');
+    await assert.rejects(supa.withRequestTimeout(answersAfter(80), options)('https://x.supabase.co/storage/v1/object/sign/case-documents/u/c/d.pdf', { method: 'POST' }), /timed out/, 'signing a link is an ordinary request');
+    assert.ok(supa.requestDeadlineMs('https://x.supabase.co/storage/v1/object/case-documents/a.pdf', false) >= 60000);
+    assert.equal(supa.requestDeadlineMs('https://x.supabase.co/auth/v1/token?grant_type=refresh_token', false), supa.REQUEST_TIMEOUT_MS);
+  });
+
+  await check('through postgrest-js: a hung GET fails once at the deadline (no retries), reads as offline, and never shows a stack', async () => {
+    const { PostgrestClient } = require(path.join(repoRoot, 'node_modules', '@supabase', 'postgrest-js', 'dist', 'index.cjs'));
+    let calls = 0;
+    const client = new PostgrestClient('https://x.supabase.co/rest/v1', { fetch: supa.withRequestTimeout((input, init) => { calls += 1; return abortable(input, init); }, { timeoutMs: 40 }) });
+    const started = Date.now();
+    const result = await client.from('partners').select('*');
+    assert.ok(Date.now() - started < 1000, 'no 1 s / 2 s / 4 s retries after the deadline');
+    assert.equal(calls, 1);
+    assert.equal(result.status, 0);
+    assert.ok(store.isNetworkError(result.error) && errors.isTimeoutError(result.error));
+    const failing = new PostgrestClient('https://x.supabase.co/rest/v1', { fetch: async () => { throw new TypeError('Network request failed'); } });
+    const rpc = await failing.rpc('current_org_id');
+    assert.match(rpc.error.details, /\n\s+at /, 'postgrest-js puts the stack in details');
+    const text = errors.describeError(rpc.error);
+    assert.doesNotMatch(text, /\n|\bat\s+\S+.*:\d+/);
+    assert.match(text, /^Offline:/);
+  });
+}
+
+await check('one read classifier: offline, timed out, status 0 and passing 5xx pages all mean "use the saved copy"', () => {
+  for (const offline of [
+    { name: 'AbortError', message: 'Aborted' },
+    TIMEOUT(),
+    { message: 'TypeError: Network request timed out' },
+    NETWORK(),
+    { message: 'FetchError: socket hang up', httpStatus: 0 },
+    { message: 'whatever', status: 0 },
+  ]) assert.ok(store.isNetworkError(offline) && store.isServerUnreachable(offline), JSON.stringify(offline));
+  for (const passing of [
+    GATEWAY_502(),
+    { message: 'An invalid response was received from the upstream server', httpStatus: 502 },
+    { message: 'Could not connect to the database', code: 'PGRST000' },
+    { message: 'Service Unavailable', httpStatus: 503 },
+  ]) assert.ok(store.isServerUnreachable(passing), JSON.stringify(passing));
+  assert.equal(store.isNetworkError({ message: 'Timed out acquiring connection from connection pool.', code: 'PGRST003' }), false, 'a PostgREST code reached the server');
+  assert.equal(store.isServerUnreachable({ message: 'permission denied for table cases', code: '42501' }), false);
+  assert.equal(store.isServerUnreachable({ message: 'A lead needs a caller name.', code: 'P0001' }), false);
+  const offline = new errors.OfflineError();
+  assert.ok(offline instanceof errors.StoreError && store.isNetworkError(offline) && store.isServerUnreachable(offline));
+});
+
+await check('describeError never shows a gateway page or a stack trace', () => {
+  const page = errors.describeError({ ...GATEWAY_502(), httpStatus: 502 });
+  assert.doesNotMatch(page, /[<>]/);
+  assert.match(page, /temporary problem \(HTTP 502\)/);
+  assert.match(errors.describeError(GATEWAY_502()), /HTTP 502/, 'the status is read from the page when the response had none');
+  assert.doesNotMatch(errors.describeError('<!DOCTYPE html><html><body>Bad gateway</body></html>'), /</);
+  const stacked = errors.describeError({ ...NETWORK(), details: 'TypeError: Network request failed\n    at fetch (http://localhost:8081/index.bundle:1:2)\n    at anonymous (address at index.android.bundle:1:9)' });
+  assert.doesNotMatch(stacked, /index\.bundle|\bat fetch|\n/);
+  const timedOut = errors.describeError(TIMEOUT());
+  assert.doesNotMatch(timedOut, /\bat fetch|aborted \(timeout/);
+  assert.match(timedOut, /did not answer in time/);
+  assert.equal(errors.describeError({ message: 'boom', details: 'fetch@http://localhost:8081/index.bundle:12:34\nanonymous@[native code]', code: 'XX000' }), 'boom (code XX000)');
+  assert.ok(errors.describeError({ message: 'x'.repeat(5000) }).length <= 300);
+  assert.equal(errors.describeError({ message: 'at least one therapy is required', code: '23514' }), 'at least one therapy is required (code 23514)', 'ordinary wording is untouched');
+});
+
+await check('a queued change that keeps timing out counts toward the caps and is set aside, never blocking the queue forever', async () => {
+  await freshAccount();
+  const P = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
+  state.offline = true;
+  await store.createPartner(partner(P, 'Slow to save'), U);
+  state.offline = false;
+  state.failOn = (b) => ((b.op === 'upsert' || b.op === 'insert') && b.table === 'partners') ? TIMEOUT() : null;
+  assert.equal(await store.flushWriteQueue(U), 0);
+  const envelope = JSON.parse(state.asyncStorage.get(queueKey));
+  const [op] = envelope.ops;
+  assert.deepEqual(Object.keys(envelope.transientWaits || {}), [op.opId], "the timeout is counted, under the op's own id");
+  assert.equal(envelope.transientWaits[op.opId].attempts, 1);
+  envelope.transientWaits[op.opId] = { first: new Date(Date.now() - 3 * 3600000).toISOString(), attempts: store.MAX_TRANSIENT_ATTEMPTS - 1 };
+  state.asyncStorage.set(queueKey, JSON.stringify(envelope));
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
+  const [entry] = await store.listRejectedWrites(U);
+  assert.match(entry.reason, /kept timing out/);
+  assert.equal(await store.pendingWriteCount(U), 0, 'the queue head is free again');
+  // An online save that times out is queued, not reported as refused.
+  await store.createPartner(partner('c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c2', 'Timed out online'), U);
+  assert.equal(await store.pendingWriteCount(U), 1);
+  state.failOn = null;
+});
+
+await check('reads fall back to the saved copy on a gateway page or a timeout, not an error', async () => {
+  await freshAccount();
+  const P = 'd1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1';
+  state.db.partners.push({ id: P, name: 'Hope House', organization: 'Org', types: ['Inpatient'], created_at: new Date().toISOString(), org_id: ORG });
+  await store.hydrate(U);
+  for (const failure of [GATEWAY_502(), TIMEOUT(), { message: 'An invalid response was received from the upstream server', code: '' }]) {
+    state.failOn = (b) => (b.op === 'select' ? failure : null);
+    assert.equal(await store.refreshSnapshot(U), null, `${failure.message.slice(0, 30)}: the screen keeps its copy, no "Sync issue"`);
+    const launch = await store.hydrate(U);
+    assert.equal(launch.source, 'cache');
+    assert.deepEqual(launch.snapshot.partners.map((row) => row.id), [P]);
+  }
+  // No saved copy at all: an empty workspace, never an error carrying a gateway page.
+  state.asyncStorage.delete(cacheKey);
+  state.failOn = () => GATEWAY_502();
+  assert.equal((await store.hydrate(U)).source, 'cache');
+  state.failOn = null;
+});
+
+await check('the case list and an open case file fall back to their saved copies on a gateway page or a timeout', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const caseId = 'd2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2';
+  await store.persistCaseList({ cases: [{ id: caseId, title: 'Family', status: 'inquiry' }], contacts: [] }, U);
+  await store.persistCaseFile(caseId, { events: [{ id: 'e1', caseId, kind: 'note', body: 'hi', occurredAt: new Date().toISOString() }], documents: [] }, U);
+  for (const makeFailure of [GATEWAY_502, TIMEOUT, () => new errors.OfflineError()]) {
+    const failure = makeFailure();
+    state.caseReadFailure = failure;
+    const list = await store.loadCaseList(U);
+    assert.equal(list.source, 'cache', String(failure.message));
+    assert.deepEqual(list.list.cases.map((row) => row.id), [caseId]);
+    assert.equal((await store.loadCaseFile(U, caseId)).source, 'cache');
+  }
+  state.caseReadFailure = { message: 'permission denied for table cases', code: '42501' };
+  await assert.rejects(store.loadCaseList(U), (error) => /permission denied/.test(error.message), 'a refusal still surfaces');
+  state.caseReadFailure = null;
+});
+
+await check('a change made durable in the queue but killed before its saved copy still shows after an offline relaunch', async () => {
+  await freshAccount();
+  const P = 'e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5e5';
+  const F = 'e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5e6';
+  const M = 'e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5e7';
+  state.db.partners.push({ id: P, name: 'Hope House', organization: 'Org', types: ['Inpatient'], note: 'old note', created_at: new Date().toISOString(), org_id: ORG });
+  state.db.partner_balances.push({ partner_id: P, inbound: 3, outbound: 2 });
+  state.db.follow_ups.push({ id: F, title: 'Call mom', due_on: '2026-10-23', status: 'open', kind: 'follow_up', org_id: ORG, created_at: new Date().toISOString() });
+  state.db.match_profiles.push(matchRow(M));
+  const { snapshot } = await store.hydrate(U);
+  const cached = snapshot.partners.find((row) => row.id === P);
+  goOfflineExpired();
+  // Each save reaches the durable queue; the app is killed before
+  // persistCache writes the saved copy (so persistCache is never called).
+  await store.updatePartner({ ...cached, note: 'new note' }, U);
+  const Q = 'e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5e8';
+  await store.createPartner(partner(Q, 'Added offline'), U);
+  const N = 'e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5e9';
+  const T = 'e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5ea';
+  await store.recordOutreachSent(F, followUp(N, { title: 'Call mom again', dueOn: '2026-10-26' }), null, { id: T, partnerId: P, kind: 'text', note: '', occurredAt: new Date().toISOString() }, U);
+  await store.deleteMatchProfile(M, U);
+  assert.equal(await store.pendingWriteCount(U), 4);
+  const relaunch = await store.hydrate(U);
+  assert.equal(relaunch.source, 'cache');
+  const shown = relaunch.snapshot;
+  const hope = shown.partners.find((row) => row.id === P);
+  assert.equal(hope.note, 'new note', 'the queued edit is on screen, so it is not redone');
+  assert.deepEqual([hope.inbound, hope.outbound], [3, 2], 'fields the edit did not touch are left alone');
+  assert.ok(shown.partners.some((row) => row.id === Q && row.name === 'Added offline'), 'the queued new partner is on screen');
+  assert.equal(shown.followUps.find((row) => row.id === F)?.status, 'done', 'the step the outreach closed is closed');
+  assert.ok(shown.followUps.some((row) => row.id === N), 'its next step is there');
+  assert.ok(shown.touches.some((row) => row.id === T));
+  assert.equal(shown.referralMatches.some((row) => row.id === M), false, 'the queued removal hides the match');
+  // A saved copy that already has the changes comes back as it was.
+  await store.persistCache(shown, U);
+  const again = (await store.hydrate(U)).snapshot;
+  assert.deepEqual(JSON.parse(JSON.stringify(again)), JSON.parse(JSON.stringify(shown)), 'applying the queue twice changes nothing');
+  // Back online: everything lands once.
+  signIn();
+  state.offline = false;
+  assert.equal((await store.hydrate(U)).source, 'remote');
+  assert.equal(state.db.partners.filter((row) => row.id === Q).length, 1);
+  assert.equal(state.db.partners.find((row) => row.id === P).note, 'new note');
+  assert.equal(await store.pendingWriteCount(U), 0);
+});
+
+await check('a queued change missing from the saved copy stays on screen when the flush stops but the server can be read', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const Q = 'e6e6e6e6-e6e6-4e6e-8e6e-e6e6e6e6e6e6';
+  state.offline = true;
+  await store.createPartner(partner(Q, 'Queued, copy lost'), U); // killed before persistCache
+  state.offline = false;
+  state.failOn = (b) => (b.op !== 'select' && b.op !== 'rpc') ? { message: 'Service Unavailable', httpStatus: 503 } : null;
+  const launch = await store.hydrate(U);
+  assert.equal(launch.source, 'remote');
+  assert.ok(launch.snapshot.partners.some((row) => row.id === Q), 'kept on screen (and in the copy) while its write waits');
+  assert.ok((await store.refreshSnapshot(U)).partners.some((row) => row.id === Q));
+  state.failOn = null;
+});
+
+await check('an op this build does not know (OTA rollback) is set aside as unreadable; everything else keeps working', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const P = 'f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1';
+  const unknown = { kind: 'outreach.scheduled', opId: uuid(), followUpId: 'f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f2', sendAt: '2026-10-25T15:00:00Z' };
+  const known = { kind: 'partner.insert', opId: uuid(), row: { id: P, name: 'Known', organization: 'Org', types: ['Inpatient'], owner_id: U } };
+  state.asyncStorage.set(queueKey, JSON.stringify({ version: 2, userId: U, ops: [unknown, known] }));
+  assert.equal(await store.pendingWriteCount(U), 1, 'the queue still reads');
+  const listed = await store.listRejectedWrites(U);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].status, 'unreadable');
+  assert.equal(listed[0].kind, 'outreach.scheduled');
+  assert.deepEqual(await store.syncStatus(U), { pending: 1, waiting: 0, rejected: 1 }, 'it is in the review banner');
+  // Saves keep working (every one used to fail reading the queue).
+  const Q = 'f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f3';
+  await store.createPartner(partner(Q, 'Saved after the rollback'), U);
+  assert.ok(state.db.partners.some((row) => row.id === P) && state.db.partners.some((row) => row.id === Q));
+  assert.equal(await store.pendingWriteCount(U), 0);
+  // The raw op is kept, never sent; it can only be discarded here.
+  assert.deepEqual(JSON.parse(state.asyncStorage.get(unreadableKey)).entries.map((entry) => entry.raw), [unknown]);
+  await assert.rejects(store.retryRejectedWrite(U, listed[0].id), /different version of ReferralFit/);
+  await assert.rejects(store.prepareForWorkspaceChange(U), /could not be saved/);
+  await store.discardRejectedWrite(U, listed[0].id);
+  assert.deepEqual(await store.listRejectedWrites(U), []);
+});
+
+await check('a damaged queue or rejected list no longer blocks every save', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  state.asyncStorage.set(queueKey, `{"version":2,"userId":"${U}","ops":[{"kind":"partner.insert"`); // a torn write
+  const badEntry = { id: 'bad', ops: [{ kind: 'mystery.op', opId: uuid() }], reason: 'x', rejectedAt: new Date().toISOString() };
+  const goodEntry = { id: 'good', ops: [{ kind: 'partner.update', opId: uuid(), id: 'f2f2f2f2-f2f2-4f2f-8f2f-f2f2f2f2f2f2', patch: { note: 'x' } }], reason: 'refused', rejectedAt: new Date().toISOString() };
+  state.asyncStorage.set(rejectedKey, JSON.stringify({ version: 1, userId: U, entries: [badEntry, goodEntry] }));
+  assert.equal(await store.pendingWriteCount(U), 0);
+  const listed = await store.listRejectedWrites(U);
+  assert.deepEqual(listed.map((item) => item.status).sort(), ['rejected', 'unreadable', 'unreadable']);
+  await store.createPartner(partner('f2f2f2f2-f2f2-4f2f-8f2f-f2f2f2f2f2f3', 'Still saves'), U);
+  assert.ok(state.db.partners.some((row) => row.name === 'Still saves'));
+  await store.discardAllRejectedWrites(U);
+  assert.deepEqual(await store.listRejectedWrites(U), []);
+});
+
+await check('a quarantined change comes back once the app can read it again', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const P = 'f3f3f3f3-f3f3-4f3f-8f3f-f3f3f3f3f3f3';
+  const op = { kind: 'partner.insert', opId: uuid(), row: { id: P, name: 'Back again', organization: 'Org', types: ['Inpatient'], owner_id: U } };
+  state.asyncStorage.set(unreadableKey, JSON.stringify({ version: 1, userId: U, entries: [{ id: uuid(), source: 'queue', raw: op, reason: 'x', quarantinedAt: new Date().toISOString() }] }));
+  assert.equal(await store.flushWriteQueue(U), 1);
+  assert.ok(state.db.partners.some((row) => row.id === P));
+  assert.deepEqual(await store.listRejectedWrites(U), []);
+});
+
+await check('1,000 queued changes flush in reasonable time: no per-op hashing, workspace check or queue rewrite', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const ops = Array.from({ length: 1000 }, (_, i) => ({ kind: 'partner.insert', opId: uuid(), row: { id: `${String(i).padStart(8, '0')}-1000-4000-8000-000000000000`, name: `Program ${i}`, organization: 'Org', types: ['Inpatient'], note: 'x'.repeat(200), owner_id: U } }));
+  state.asyncStorage.set(queueKey, JSON.stringify({ version: 2, userId: U, ops }));
+  state.rpcCalls = [];
+  state.asyncWriteLog = [];
+  const started = Date.now();
+  const flushed = await store.flushWriteQueue(U);
+  const elapsed = Date.now() - started;
+  const verifications = state.rpcCalls.filter((call) => call.name === 'current_org_id').length;
+  const queueWrites = state.asyncWriteLog.filter((key) => key === queueKey).length;
+  state.asyncWriteLog = null;
+  console.log(`  1,000 queued changes flushed in ${elapsed} ms: ${verifications} workspace checks, ${queueWrites} queue writes`);
+  assert.equal(flushed, 1000);
+  assert.ok(verifications <= Math.ceil(1000 / store.WORKSPACE_REVERIFY_OPS) + 5, `workspace re-verified ${verifications} times`);
+  assert.ok(queueWrites <= Math.ceil(1000 / store.QUEUE_PERSIST_EVERY_OPS) + 5, `queue rewritten ${queueWrites} times`);
+  assert.ok(elapsed < 3000, `took ${elapsed} ms`);
+  assert.equal(await store.pendingWriteCount(U), 0);
+  assert.equal(state.db.partners.length, 1000);
+});
+
+await check('a flush cut off between queue writes replays what already landed, exactly once', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const ops = Array.from({ length: 50 }, (_, i) => ({ kind: 'partner.insert', opId: uuid(), row: { id: `${String(i).padStart(8, '0')}-2000-4000-8000-000000000000`, name: `P${i}`, organization: 'Org', types: ['Inpatient'], owner_id: U } }));
+  state.asyncStorage.set(queueKey, JSON.stringify({ version: 2, userId: U, ops }));
+  let inserts = 0;
+  state.failOn = (b) => {
+    // The session ends right after the 31st insert lands (the app is gone).
+    if (b.op === 'upsert' && b.table === 'partners' && ++inserts === 31) setTimeout(() => {}, 0), state.storage.set(STORAGE_KEY, JSON.stringify(makeSession(U, 'sess-2', nowS() + 3600)));
+    return null;
+  };
+  await assert.rejects(store.flushWriteQueue(U), /session changed/);
+  const onDisk = JSON.parse(state.asyncStorage.get(queueKey)).ops.length;
+  assert.ok(onDisk >= 50 - 31 && onDisk < 50, `progress was saved part way (${onDisk} left on disk)`);
+  state.failOn = null;
+  await store.flushWriteQueue(U);
+  assert.equal(state.db.partners.length, 50, 'every change landed once');
+  assert.equal(await store.pendingWriteCount(U), 0);
+  signIn();
+});
+
+await check('waits saved under the old content-hash keys keep their attempt count, now under the op id', async () => {
+  await freshAccount();
+  const op = { kind: 'partner.insert', opId: uuid(), row: { id: 'f4f4f4f4-f4f4-4f4f-8f4f-f4f4f4f4f4f4', name: 'Waiting', organization: 'Org', types: ['Inpatient'], owner_id: U } };
+  const legacy = { first: new Date(Date.now() - 3 * 3600000).toISOString(), attempts: store.MAX_TRANSIENT_ATTEMPTS - 1 };
+  state.asyncStorage.set(queueKey, JSON.stringify({ version: 2, userId: U, ops: [op], transientWaits: { [legacyWaitKey(JSON.stringify(op))]: legacy } }));
+  assert.deepEqual(await store.syncStatus(U), { pending: 1, waiting: 0, rejected: 0 });
+  assert.deepEqual(JSON.parse(state.asyncStorage.get(queueKey)).transientWaits, { [op.opId]: legacy }, 'moved to the op id');
+  state.failOn = (b) => (b.op === 'upsert') ? { message: 'internal error', code: 'XX000' } : null;
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError, 'the 25th try is the 25th, not the 1st');
+  state.failOn = null;
+});
+
+await check('a list past the paging ceiling opens the saved copy with a notice instead of "Could not load account"', async () => {
+  await freshAccount();
+  const P = 'a7a7a7a7-a7a7-4a7a-8a7a-a7a7a7a7a7a7';
+  state.db.partners.push({ id: P, name: 'Hope House', organization: 'Org', types: ['Inpatient'], created_at: new Date().toISOString(), org_id: ORG });
+  await store.hydrate(U);
+  let touchPages = 0;
+  const stamp = new Date().toISOString();
+  state.selectOverride = (b) => {
+    if (b.table !== 'touches' || !b.range) return null;
+    touchPages += 1;
+    return { data: Array.from({ length: b.range[1] - b.range[0] + 1 }, (_, i) => ({ id: `t-${b.range[0] + i}`, partner_id: P, kind: 'call', note: '', occurred_at: stamp })), error: null };
+  };
+  const launch = await store.hydrate(U);
+  state.selectOverride = null;
+  assert.equal(launch.source, 'cache');
+  assert.deepEqual(launch.snapshot.partners.map((row) => row.id), [P]);
+  assert.match(launch.notice, /more than 100000 rows/);
+  assert.equal(launch.syncError, undefined, 'not reported as an unsynced change');
+  assert.equal(touchPages, store.TOUCH_MAX_PAGES, 'touches have their own, higher ceiling');
+  assert.equal(store.TOUCH_MAX_PAGES, 100);
+});
+
+await check('the snapshot a refresh just saved is not written again by persistCache', async () => {
+  await freshAccount();
+  state.db.partners.push({ id: 'a8a8a8a8-a8a8-4a8a-8a8a-a8a8a8a8a8a8', name: 'Hope', organization: 'Org', types: ['Inpatient'], created_at: new Date().toISOString(), org_id: ORG });
+  await store.hydrate(U);
+  const refreshed = await store.refreshSnapshot(U);
+  state.asyncWriteLog = [];
+  await store.persistCache(refreshed, U); // what App.tsx's syncDerived does right after a refresh
+  assert.deepEqual(state.asyncWriteLog.filter((key) => key === cacheKey), [], 'no second write of the same copy');
+  await store.persistCache({ ...refreshed, partners: [] }, U);
+  assert.equal(state.asyncWriteLog.filter((key) => key === cacheKey).length, 1, 'a changed copy is written');
+  state.asyncWriteLog = null;
+});
+
+// cases.ts: the real module over the same fakes.
+{
+  const casesDir = path.join(tmpDir, 'cases-real');
+  transpile('src/lib/cases.ts', 'cases.js', casesDir);
+  transpile('src/lib/phone.ts', 'phone.js', casesDir);
+  transpile('src/lib/insurance.ts', 'insurance.js', casesDir);
+  for (const name of ['errors', 'auth-session', 'paging', 'supabase']) writeFileSync(path.join(casesDir, `${name}.js`), `module.exports = require('../${name}.js');`);
+  writeFileSync(path.join(casesDir, 'stub-expo-crypto.js'), "exports.randomUUID = () => require('node:crypto').randomUUID();");
+  writeFileSync(path.join(casesDir, 'stub-expo-file-system.js'), "exports.readAsStringAsync = async () => '';");
+  stubs.set('expo-crypto', path.join(casesDir, 'stub-expo-crypto.js'));
+  stubs.set('expo-file-system/legacy', path.join(casesDir, 'stub-expo-file-system.js'));
+  const cases = require(path.join(casesDir, 'cases.js'));
+  stubs.delete('expo-crypto');
+  stubs.delete('expo-file-system/legacy');
+  const lead = (extra = {}) => ({
+    caseId: uuid(), contactId: uuid(), followUpId: uuid(), callerName: 'Dana', phone: '5035550100', email: '',
+    aboutRelationship: 'son', aboutFirstName: 'Sam', leadSource: 'Referral', urgency: 'none', dueOn: '2026-10-24', dueTime: null, ...extra,
+  });
+
+  await check('a new lead that cannot reach the server is an OfflineError (keep the draft, retry the same ids), never "rejected"', async () => {
+    await freshAccount();
+    for (const [label, failure] of [['lost connection', NETWORK()], ['gateway page', GATEWAY_502()], ['timeout', TIMEOUT()]]) {
+      state.failOn = (b) => (b.op === 'rpc' && b.table === 'create_lead') ? failure : null;
+      const input = lead();
+      const error = await cases.createLead(input, U).catch((caught) => caught);
+      assert.ok(error instanceof errors.OfflineError, `${label}: ${error && error.message}`);
+      assert.ok(error instanceof errors.StoreError && store.isServerUnreachable(error));
+      assert.equal(error.timedOut, label === 'timeout');
+      assert.doesNotMatch(error.message, /[<>]|\bat\s+\S+:\d|Account changed/);
+      state.failOn = null;
+      state.rpcCalls = [];
+      await cases.createLead(input, U); // Retry: the same ids again
+      assert.deepEqual(state.rpcCalls.filter((call) => call.name === 'create_lead').map((call) => [call.args.p_lead.id, call.args.p_lead.contact_id, call.args.p_lead.follow_up_id]), [[input.caseId, input.contactId, input.followUpId]]);
+    }
+  });
+
+  await check('with no connection at all, or an expired token offline, a lead is an OfflineError, not "Account changed"', async () => {
+    await freshAccount();
+    state.offline = true;
+    const error = await cases.createLead(lead(), U).catch((caught) => caught);
+    assert.ok(error instanceof errors.OfflineError, error && error.message);
+    goOfflineExpired();
+    state.rpcCalls = [];
+    const expired = await cases.createLead(lead(), U).catch((caught) => caught);
+    assert.ok(expired instanceof errors.OfflineError, expired && expired.message);
+    assert.deepEqual(state.rpcCalls, [], 'nothing is sent under a session the device cannot refresh');
+    signIn();
+    state.offline = false;
+  });
+
+  await check("a refused lead or case is a plain StoreError in the server's words", async () => {
+    await freshAccount();
+    state.failOn = (b) => (b.op === 'rpc' && b.table === 'create_lead') ? { message: 'A lead needs a caller name.', details: '', hint: '', code: 'P0001' } : null;
+    const error = await cases.createLead(lead({ callerName: '' }), U).catch((caught) => caught);
+    assert.ok(error instanceof errors.StoreError && !(error instanceof errors.OfflineError));
+    assert.equal(error.message, 'A lead needs a caller name.');
+    state.failOn = null;
+  });
+
+  await check('a new case bundle follows the same contract', async () => {
+    await freshAccount();
+    const record = { id: uuid(), title: 'Family', status: 'inquiry', summary: '', leadSource: 'Referral', leadSourceDetail: '', lostReason: '', stageChangedAt: '', paymentStatus: 'none', quotedAmount: null, paidAmount: 0, createdAt: '', updatedAt: '' };
+    state.failOn = (b) => (b.op === 'rpc' && b.table === 'create_case_bundle') ? TIMEOUT() : null;
+    const error = await cases.createCaseBundle(record, null, null, U).catch((caught) => caught);
+    assert.ok(error instanceof errors.OfflineError && error.timedOut, error && error.message);
+    state.failOn = (b) => (b.op === 'rpc' && b.table === 'create_case_bundle') ? { message: 'duplicate key value violates unique constraint', code: '23505' } : null;
+    const refused = await cases.createCaseBundle(record, null, null, U).catch((caught) => caught);
+    assert.ok(refused instanceof errors.StoreError && !(refused instanceof errors.OfflineError));
+    state.failOn = null;
+  });
+
+  await check('taking a lead: assigns the caller, a replay is a quiet success, a teammate\'s lead is LeadTakenError', async () => {
+    await freshAccount();
+    const C = uuid();
+    const E = uuid();
+    try {
+      state.rpcResults = { take_case: (args) => ({ data: [{ event_body: args.p_event_id === E ? 'Took this case' : '', occurred_at: '2026-10-24T17:00:00Z' }], error: null }) };
+      assert.deepEqual(await cases.takeCase(C, E), { eventBody: 'Took this case', occurredAt: '2026-10-24T17:00:00Z' });
+      assert.deepEqual(state.rpcCalls.filter((call) => call.name === 'take_case').map((call) => call.args), [{ p_case_id: C, p_event_id: E }]);
+      assert.equal((await cases.takeCase(C, uuid())).eventBody, '', 'already yours / a replay: nothing written, no timeline row');
+      state.rpcResults = null;
+      state.failOn = (b) => (b.op === 'rpc' && b.table === 'take_case')
+        ? { message: 'Already taken by Jo Smith', details: TEAMMATE.toUpperCase(), hint: 'already_taken', code: 'P0001' } : null;
+      const taken = await cases.takeCase(C, uuid()).catch((caught) => caught);
+      assert.ok(taken instanceof errors.LeadTakenError && taken instanceof errors.StoreError, taken && taken.message);
+      assert.equal(taken.message, 'Already taken by Jo Smith');
+      assert.equal(taken.takenBy, TEAMMATE);
+      assert.ok(!(taken instanceof errors.OfflineError) && !store.isServerUnreachable(taken), 'not retryable');
+      state.failOn = (b) => (b.op === 'rpc' && b.table === 'take_case') ? NETWORK() : null;
+      assert.ok(await cases.takeCase(C, uuid()).catch((caught) => caught) instanceof errors.OfflineError);
+      state.failOn = (b) => (b.op === 'rpc' && b.table === 'take_case') ? { message: 'Case not found', details: '', hint: '', code: 'P0002' } : null;
+      const missing = await cases.takeCase(C, uuid()).catch((caught) => caught);
+      assert.ok(missing instanceof errors.StoreError && !(missing instanceof errors.LeadTakenError) && /Case not found/.test(missing.message));
+    } finally {
+      state.failOn = null;
+      state.rpcResults = null;
+    }
+  });
+
+  await check('taking a lead before take_case is deployed reads the holder, then assigns through assign_case', async () => {
+    await freshAccount();
+    const notDeployed = { message: 'Could not find the function public.take_case(p_case_id, p_event_id) in the schema cache', details: '', hint: 'Perhaps you meant to call the function public.assign_case', code: 'PGRST202' };
+    const [free, mine, theirs] = [uuid(), uuid(), uuid()];
+    state.db.cases = [
+      { id: free, org_id: ORG, assigned_to: null },
+      { id: mine, org_id: ORG, assigned_to: U.toUpperCase() },
+      { id: theirs, org_id: ORG, assigned_to: TEAMMATE },
+    ];
+    try {
+      state.failOn = (b) => (b.op === 'rpc' && b.table === 'take_case') ? notDeployed : null;
+      state.rpcResults = { assign_case: (args) => ({ data: [{ event_body: `Assigned to Dana (${args.p_assigned_to === U})`, occurred_at: '2026-10-24T17:05:00Z' }], error: null }) };
+      const E = uuid();
+      assert.deepEqual(await cases.takeCase(free, E), { eventBody: 'Assigned to Dana (true)', occurredAt: '2026-10-24T17:05:00Z' });
+      assert.deepEqual(state.rpcCalls.filter((call) => call.name === 'assign_case').map((call) => call.args), [{ p_case_id: free, p_assigned_to: U, p_event_id: E }]);
+      state.rpcCalls = [];
+      assert.equal((await cases.takeCase(mine, uuid())).eventBody, '', 'already yours: nothing written');
+      const taken = await cases.takeCase(theirs, uuid()).catch((caught) => caught);
+      assert.ok(taken instanceof errors.LeadTakenError && taken.takenBy === TEAMMATE, taken && taken.message);
+      assert.equal(taken.message, 'Already taken by a teammate');
+      assert.deepEqual(state.rpcCalls.filter((call) => call.name === 'assign_case'), [], 'never reassigns a held case');
+      state.failOn = (b) => (b.op === 'rpc' && b.table === 'take_case') ? { ...notDeployed, code: '42883', message: 'function public.take_case(uuid, uuid) does not exist' } : null;
+      assert.equal((await cases.takeCase(mine, uuid())).eventBody, '', 'undefined_function falls back the same way');
+    } finally {
+      state.failOn = null;
+      state.rpcResults = null;
+      state.db.cases = [];
+    }
+  });
+
+  await check('case reads that hit a gateway page or a timeout read as offline, so the saved copy opens', async () => {
+    await freshAccount();
+    state.failOn = (b) => (b.op === 'rpc' && b.table === 'current_org_id') ? GATEWAY_502() : null;
+    assert.ok(await cases.fetchCaseList().catch((caught) => caught) instanceof errors.OfflineError);
+    state.failOn = (b) => (b.op === 'select' && b.table === 'cases') ? TIMEOUT() : null;
+    assert.ok(await cases.fetchCaseList().catch((caught) => caught) instanceof errors.OfflineError);
+    state.failOn = (b) => (b.op === 'select' && b.table === 'cases') ? { message: 'permission denied for table cases', code: '42501' } : null;
+    const refused = await cases.fetchCaseList().catch((caught) => caught);
+    assert.ok(refused instanceof errors.StoreError && !(refused instanceof errors.OfflineError) && /permission denied/.test(refused.message));
+    state.failOn = null;
+    assert.deepEqual(await cases.fetchCaseList(), { cases: [], contacts: [] });
+  });
+}
 
 // ─── account.ts: every document is removed, past the 1,000-row cap ──────────
 

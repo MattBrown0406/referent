@@ -98,9 +98,10 @@ const first = notifications.rescheduleNotifications({ partners: [partner('a', 'A
 await notifications.activateReferralFitNotificationOwner('user-b');
 const second = notifications.rescheduleNotifications({ partners: [partner('b', 'Account B')], referrals: [], referralMatches: [], followUps: [] }, 'user-b');
 await Promise.all([first, second]);
-const bodies = nativeState.scheduled.map((item) => item.content.body);
-assert.equal(bodies.some((body) => body.includes('Account A')), false, 'superseded schedule must not survive replacement');
-assert.equal(bodies.some((body) => body.includes('Account B')), true, 'latest schedule must be installed');
+const scheduledPartners = nativeState.scheduled.map((item) => item.content.data.partnerId).filter(Boolean);
+assert.equal(scheduledPartners.includes('a'), false, 'superseded schedule must not survive replacement');
+assert.equal(scheduledPartners.includes('b'), true, 'latest schedule must be installed');
+assert.equal(nativeState.scheduled.some((item) => /Account [AB]/.test(`${item.content.title} ${item.content.body}`)), false, 'a partner name never reaches the lock screen');
 
 await notifications.cancelReferralFitNotifications();
 assert.equal(nativeState.scheduled.length, 0, 'sign-out cancellation removes app schedules');
@@ -167,12 +168,56 @@ await notifications.activateReferralFitNotificationOwner(ME);
 const coldPartners = Array.from({ length: 20 }, (_, index) => partner(`cold-${index}`, `Cold ${index}`));
 await notifications.rescheduleNotifications({ partners: coldPartners, referrals: [], referralMatches: [], followUps: mineFollowUps, cases: mineCases }, ME);
 const titles = nativeState.scheduled.map((item) => item.content.title);
-const reminderBodies = nativeState.scheduled.filter((item) => item.content.title === 'Follow-up due').map((item) => item.content.body).sort();
-assert.deepEqual(reminderBodies, ['Mine', 'My case', 'Nobody'], 'every one of my follow-ups is scheduled despite 20 overdue partners');
-assert.deepEqual(nativeState.scheduled.filter((item) => item.content.title === 'Consult in 30 minutes').map((item) => item.content.body), ['My consult · 15:00']);
+const reminderBodies = nativeState.scheduled.filter((item) => item.content.title === 'Follow-up due').map((item) => item.content.body);
+assert.deepEqual(reminderBodies, [notifications.GENERIC_FOLLOW_UP_BODY, notifications.GENERIC_FOLLOW_UP_BODY, notifications.GENERIC_FOLLOW_UP_BODY], 'every one of my follow-ups is scheduled despite 20 overdue partners');
+assert.deepEqual(nativeState.scheduled.filter((item) => item.content.title === 'Consult in 30 minutes').map((item) => item.content.body), ['Consult at 3:00 PM'], 'a consult says only when');
 assert.equal(nativeState.scheduled.length, 50, 'the cap still holds');
 assert.ok(titles.lastIndexOf('Follow-up due') < titles.indexOf('ReferralFit'), 'cadence nags only fill what is left');
 assert.equal(nativeState.scheduled.some((item) => /Teammate/.test(item.content.body)), false);
+
+// Lock-screen privacy: no follow-up title (they carry family names), partner
+// name, or organization in any title or body. Counts and times only.
+{
+  const named = [
+    ...mineFollowUps.map((item) => item.title),
+    ...coldPartners.map((item) => item.name),
+    'Henderson', 'Riverstone',
+  ];
+  nativeState.scheduled = [];
+  const henderson = { id: 'f-henderson', title: 'Call back — Henderson family', dueOn: stamp(tomorrow), status: 'open', note: '', partnerId: 'riverstone', assignedTo: ME };
+  const riverstone = { ...partner('riverstone', 'Riverstone Recovery'), organization: 'Riverstone Recovery', touchCadenceDays: 30 };
+  await notifications.rescheduleNotifications({ partners: [...coldPartners.slice(0, 3), riverstone], referrals: [], referralMatches: [], followUps: [...mineFollowUps, henderson], cases: mineCases }, ME);
+  assert.ok(nativeState.scheduled.length > 5);
+  for (const item of nativeState.scheduled) {
+    const text = `${item.content.title} ${item.content.body}`;
+    for (const name of named) assert.equal(text.includes(name), false, `"${text}" must not name "${name}"`);
+  }
+  assert.ok(nativeState.scheduled.some((item) => item.content.body.startsWith('Time to reach out to a referral partner')), 'cadence nags are generic');
+  const source = readFileSync(path.join(repoRoot, 'src/lib/notifications.ts'), 'utf8');
+  assert.doesNotMatch(source, /body: `\$\{followUp\.title\}|\$\{partner\.(name|organization)\}|followUpBody/, 'no notification body is built from a title or a partner name');
+}
+
+// A closed or lost case's follow-ups stop reminding; a placement check-in on
+// it still reminds. todayLoad (the header count) agrees.
+{
+  nativeState.scheduled = [];
+  const closedCases = [{ id: 'c-closed', status: 'closed' }, { id: 'c-lost', status: 'lost' }, { id: 'c-open', status: 'engaged' }];
+  const closedFollowUps = [
+    { id: 'f-closed', title: 'Closed', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-closed', assignedTo: ME },
+    { id: 'f-lost-consult', title: 'Lost consult', kind: 'consult', dueTime: '15:00', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-lost', assignedTo: ME },
+    { id: 'f-check-in', title: 'Check-in', kind: 'check_in', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-closed', referralId: 'r1', assignedTo: ME },
+    { id: 'f-open', title: 'Open case', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-open', assignedTo: ME },
+  ];
+  const input = { partners: [], referrals: [], referralMatches: [], followUps: closedFollowUps, cases: closedCases };
+  assert.deepEqual(notifications.reminderFollowUps(input, ME).map((item) => item.id), ['f-check-in', 'f-open'], 'closed and lost cases drop out; check-ins stay');
+  assert.deepEqual(notifications.reminderFollowUps({ ...input, scope: 'everyone' }, ME).map((item) => item.id), ['f-check-in', 'f-open'], 'in every scope');
+  await notifications.rescheduleNotifications(input, ME);
+  assert.equal(nativeState.scheduled.filter((item) => item.content.title === 'Follow-up due').length, 2);
+  assert.equal(nativeState.scheduled.filter((item) => item.content.title === 'Consult in 30 minutes').length, 0, 'no consult alert for a lost case');
+  const dueNow = closedFollowUps.map((item) => ({ ...item, dueOn: stamp(new Date()) }));
+  assert.equal(notifications.todayLoad(dueNow, [], new Date(), closedCases).actions, 2, 'the header count skips closed and lost cases too');
+  assert.equal(notifications.todayLoad(dueNow, [], new Date()).actions, 4, 'without case statuses nothing is dropped');
+}
 
 // Overdue follow-ups collapse into ONE summary at 9:00 instead of each firing
 // at once; future ones keep their own reminder; cadence nags still come last.
@@ -189,14 +234,14 @@ assert.equal(nativeState.scheduled.some((item) => /Teammate/.test(item.content.b
   assert.equal(summaries[0].content.body, '30 overdue follow-ups');
   const nine = summaries[0].trigger.date;
   assert.equal(nine.getHours(), 9);
-  assert.equal(nativeState.scheduled.filter((item) => item.content.title === 'Follow-up due').map((item) => item.content.body).join(), 'Later', 'a future follow-up keeps its own reminder');
+  assert.equal(nativeState.scheduled.filter((item) => item.content.title === 'Follow-up due').map((item) => item.content.body).join(), notifications.GENERIC_FOLLOW_UP_BODY, 'a future follow-up keeps its own reminder');
   const order = nativeState.scheduled.map((item) => item.content.title);
   assert.ok(order.indexOf('ReferralFit') > order.indexOf('Follow-up due'), 'cadence nags after the user’s own items');
   assert.equal(nativeState.scheduled.length, 1 + 1 + 1 + 2 * 3, 'briefing + summary + future + nags');
 
   nativeState.scheduled = [];
   await notifications.rescheduleNotifications({ partners: [], referrals: [], referralMatches: [], followUps: [overdue[0]], cases: [] }, ME);
-  assert.deepEqual(nativeState.scheduled.filter((item) => /^Follow-up/.test(item.content.title)).map((item) => [item.content.title, item.content.body]), [['Follow-up due', 'Overdue 0']], 'a single overdue item still reads as itself');
+  assert.deepEqual(nativeState.scheduled.filter((item) => /^Follow-up/.test(item.content.title)).map((item) => [item.content.title, item.content.body]), [['Follow-up due', notifications.GENERIC_FOLLOW_UP_BODY]], 'a single overdue item reads as one generic reminder');
 }
 
 // A tap that launches the app (cold start) arrives before any account is

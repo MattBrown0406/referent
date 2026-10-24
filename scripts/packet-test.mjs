@@ -211,6 +211,30 @@ assert(buildPacket(profileInsurance, partnerA, reasonsA, 'partner').includes('- 
   assert(buildFitReasons(awayCash, inCA, fitCA).includes('Outside Oregon, away from home'), 'a program confirmed out of state still gets the line');
 }
 
+// ─── 6. The disclosure survives editing (EKRA) ─────────────────────────────
+// The packet text is editable. For a program with a financial relationship,
+// a disclosure deleted or reworded in the editor is put back on the end
+// before sharing, and the composer says it was added back.
+{
+  const { withDisclosure, disclosureLine } = require(path.join(tmpDir, 'lib', 'packet.js'));
+  const line = disclosureLine(disclosedPartner);
+  const full = buildPacket(profileInsurance, disclosedPartner, reasonsA, 'family');
+  assert.deepEqual(withDisclosure(full, disclosedPartner), { text: full, added: false }, 'an intact disclosure is left alone');
+  const stripped = full.replace(line, '').replace(/\n{3,}/g, '\n\n');
+  const restored = withDisclosure(`${stripped}\n\n`, disclosedPartner);
+  assert.equal(restored.added, true, 'a removed disclosure is reported as added back');
+  assert.ok(restored.text.endsWith(`\n\n${line}`), 'the disclosure goes back on the end, after one blank line');
+  assert.equal(restored.text.split(line).length - 1, 1, 'exactly one disclosure');
+  const reworded = withDisclosure(full.replace('It played no part', 'It played little part'), disclosedPartner);
+  assert.equal(reworded.added, true, 'a reworded disclosure does not count');
+  assert.deepEqual(withDisclosure('Short note', partnerA), { text: 'Short note', added: false }, 'no relationship, nothing added');
+  assert.deepEqual(withDisclosure('', disclosedPartner), { text: line, added: true });
+  const appSource = readFileSync(path.join(repoRoot, 'App.tsx'), 'utf8');
+  const shareBody = appSource.slice(appSource.indexOf('async function sharePacketText()'), appSource.indexOf('function closePacketComposer()'));
+  assert.match(shareBody, /const ensured = withDisclosure\(packetText, packetTarget\.partner\);[\s\S]*setPacketDisclosureRestored\(true\)[\s\S]*message: ensured\.text/, 'the share sheet always gets the text with the disclosure');
+  assert.match(appSource, /\{packetDisclosureRestored \? \([\s\S]{0,200}added back/, 'the composer tells the user the disclosure was added back');
+}
+
 // ─── De-identification heuristic spot checks ───────────────────────────────
 
 console.log('\n' + '─'.repeat(64));

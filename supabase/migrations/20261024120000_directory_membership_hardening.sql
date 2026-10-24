@@ -45,12 +45,33 @@
 --  11. Production table grants match what the migrations grant.
 --  12. A new lead's caller is saved with their own relationship. "Calling
 --      about: son" used to save the caller as "son"; they are the parent.
+--  13-21. Round 11 (bug check): listed right after BEGIN, where the list
+--      stays inside the statement size rule.
 --
 -- Transit rule: this file is pasted into the SQL editor from a chat client.
 -- ASCII only, no backslash characters anywhere, every top-level statement
 -- under 3,700 characters.
 
 BEGIN;
+
+-- Round 11 (bug check, 2026-10-24), sections 13 to 21 at the end:
+--  13. prepare_account_deletion(): the app's preflight before it removes a
+--      sole owner's case files. Same checks and errors as
+--      delete_own_account; an owner's unused invites are removed first.
+--  14. A case that becomes closed or lost skips its open follow-ups
+--      (placement check-ins stay open); the overdue push ignores them too.
+--  15. complete_follow_up_with_next: the next step keeps the completed
+--      step's assignee, and a step already finished is never finished
+--      twice (no duplicate next step after a crash).
+--  16. take_case(): "Take this lead" takes only an unassigned case.
+--  17. Leaving a workspace drops your favorites in it.
+--  18. create_lead and create_case_bundle: a retry with the same case id
+--      returns the case and writes nothing.
+--  19. A VOB answer also completes that program's open waiting-on steps.
+--  20. Realtime publishes no deletes; invite and claim codes are 16 hex
+--      characters; at most one bed_opened push per listing per 6 hours.
+--  21. Intake: a link over its hourly budget still keeps the lead, marked
+--      possible spam, with no push (the function has a hard cap).
 
 -- ===========================================================================
 -- 0. Directory review queue: a platform admin decides, nothing changes first
@@ -2214,5 +2235,728 @@ BEGIN
 END
 $$;
 REVOKE ALL ON FUNCTION public.create_lead_internal(uuid, uuid, jsonb, text) FROM PUBLIC, anon, authenticated, service_role;
+
+-- ===========================================================================
+-- 13. Account deletion: a preflight before any file is removed
+-- ===========================================================================
+
+-- The app removes a sole owner's case-document files from storage before
+-- it calls delete_own_account (the RPC cannot reach the bucket). When the
+-- RPC then refused, for example because a colleague accepted one of the
+-- owner's open invites after the screen loaded, the files were gone and
+-- the account stayed. The app now calls this first. It checks what
+-- delete_own_account (section 10) checks and raises the same errors. For
+-- an owner it first deletes the workspace's unused invites, under a lock
+-- on the workspace row, so nobody can join between this call and the
+-- deletion. An accept that already holds an invite finishes first (the
+-- delete waits for it) and is then counted as a member. A refusal rolls
+-- the invite delete back. A member's call changes nothing: the invites
+-- belong to the practice. FOR NO KEY UPDATE rather than FOR UPDATE, so an
+-- accept's foreign key check on orgs never waits on this lock while this
+-- call waits on the accept's invite.
+CREATE OR REPLACE FUNCTION public.prepare_account_deletion()
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_user uuid := auth.uid();
+  v_org uuid;
+  v_role text;
+  v_others integer := 0;
+BEGIN
+  IF v_user IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM auth.users WHERE id = v_user) THEN
+    RAISE EXCEPTION 'This account no longer exists' USING ERRCODE = 'P0002';
+  END IF;
+
+  SELECT org_id, role INTO v_org, v_role
+    FROM public.org_members
+   WHERE user_id = v_user;
+  IF v_org IS NULL OR v_role <> 'owner' THEN
+    RETURN;
+  END IF;
+
+  PERFORM 1 FROM public.orgs WHERE id = v_org FOR NO KEY UPDATE;
+  DELETE FROM public.org_invites WHERE org_id = v_org AND accepted_at IS NULL;
+
+  SELECT count(*) INTO v_others
+    FROM public.org_members
+   WHERE org_id = v_org AND user_id <> v_user;
+  IF v_others > 0 THEN
+    RAISE EXCEPTION
+      'Your workspace still has % other member(s). Remove them from the Workspace screen first (each keeps their own workspace), or contact ReferralFit to transfer ownership, then delete your account.',
+      v_others
+      USING ERRCODE = '22023';
+  END IF;
+END
+$$;
+REVOKE ALL ON FUNCTION public.prepare_account_deletion() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.prepare_account_deletion() TO authenticated;
+
+-- ===========================================================================
+-- 14. Closing a case skips its open follow-ups
+-- ===========================================================================
+
+-- When a case becomes closed or lost (update_case_with_event, or
+-- complete_follow_up_with_case moving the case), its open follow-ups are
+-- marked skipped, so nothing stays on Today or in the overdue push for a
+-- case that is over. Placement check-ins (kind check_in, the only kind
+-- schedule_placement_check_ins creates) stay open: a placement's outcome
+-- is still worth recording after the case is done. A trigger, so every
+-- status write behaves the same. A skip is stamped like a client skip
+-- (completed_at now; completed_by the member who closed the case).
+CREATE OR REPLACE FUNCTION public.cases_skip_follow_ups_on_close()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  UPDATE public.follow_ups f
+     SET status = 'skipped', completed_at = now(), snoozed_until = NULL
+   WHERE f.case_id = NEW.id
+     AND f.org_id = NEW.org_id
+     AND f.status = 'open'
+     AND f.kind <> 'check_in';
+  RETURN NULL;
+END
+$$;
+REVOKE ALL ON FUNCTION public.cases_skip_follow_ups_on_close() FROM PUBLIC, anon, authenticated;
+
+DROP TRIGGER IF EXISTS cases_skip_follow_ups_on_close ON public.cases;
+CREATE TRIGGER cases_skip_follow_ups_on_close
+  AFTER UPDATE OF status ON public.cases
+  FOR EACH ROW
+  WHEN (NEW.status IN ('closed', 'lost') AND OLD.status IS DISTINCT FROM NEW.status)
+  EXECUTE FUNCTION public.cases_skip_follow_ups_on_close();
+
+-- Same as 20261001140000 except a follow-up on a closed or lost case no
+-- longer counts, unless it is a placement check-in (kept open above, and
+-- still on Today in the app).
+CREATE OR REPLACE FUNCTION public.notify_overdue_follow_ups()
+RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_pref record;
+  v_local timestamp;
+  v_count integer := 0;
+BEGIN
+  FOR v_pref IN SELECT user_id, tz_offset_minutes, overdue_notified_on
+                  FROM public.notification_preferences
+                 WHERE push_enabled AND overdue_mine LOOP
+    v_local := (now() AT TIME ZONE 'UTC') + make_interval(mins => v_pref.tz_offset_minutes);
+    IF extract(hour FROM v_local) <> 9 THEN CONTINUE; END IF;
+    IF v_pref.overdue_notified_on IS NOT DISTINCT FROM v_local::date THEN CONTINUE; END IF;
+    IF NOT EXISTS (
+      SELECT 1 FROM public.follow_ups f
+        LEFT JOIN public.cases c ON c.id = f.case_id
+       WHERE f.status = 'open'
+         AND coalesce(f.snoozed_until, f.due_on) < v_local::date
+         AND coalesce(f.assigned_to, c.assigned_to) = v_pref.user_id
+         AND (c.id IS NULL OR c.status NOT IN ('closed', 'lost') OR f.kind = 'check_in')
+    ) THEN CONTINUE; END IF;
+    IF public.notify_enqueue(v_pref.user_id, 'overdue_mine', jsonb_build_object('day', v_local::date::text)) THEN
+      v_count := v_count + 1;
+    END IF;
+    UPDATE public.notification_preferences SET overdue_notified_on = v_local::date WHERE user_id = v_pref.user_id;
+  END LOOP;
+  RETURN v_count;
+END
+$$;
+REVOKE ALL ON FUNCTION public.notify_overdue_follow_ups() FROM PUBLIC, anon, authenticated, service_role;
+
+-- ===========================================================================
+-- 15. complete_follow_up_with_next: the assignee carries over, once only
+-- ===========================================================================
+
+-- Same as section 8 except:
+--   * the next step is assigned to whoever the completed step was assigned
+--     to, or to p_next.assigned_to when the client sends that key (JSON
+--     null = unassigned), and is unassigned when that person is no longer
+--     a member of the workspace (as record_outreach_sent does);
+--   * a follow-up that is already done or skipped is left alone and the
+--     call writes nothing. A replay of the same call finds its next step
+--     and timeline entry already there; a second "Done -> next" that the
+--     app queued after a crash hid the first (new ids) no longer adds a
+--     duplicate next step.
+CREATE OR REPLACE FUNCTION public.complete_follow_up_with_next(p_completed jsonb, p_next jsonb, p_event jsonb)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_owner_id uuid := auth.uid();
+  v_org_id uuid := public.current_org_id();
+  v_status text;
+  v_assignee uuid;
+BEGIN
+  IF v_owner_id IS NULL OR v_org_id IS NULL THEN RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000'; END IF;
+
+  SELECT f.status, f.assigned_to INTO v_status, v_assignee
+    FROM public.follow_ups f
+   WHERE f.id = (p_completed ->> 'id')::uuid AND f.org_id = v_org_id
+   FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Follow-up not found for the authenticated owner' USING ERRCODE = 'P0002'; END IF;
+  IF v_status <> 'open' THEN RETURN; END IF;
+
+  IF p_next ? 'assigned_to' THEN
+    v_assignee := nullif(p_next ->> 'assigned_to', '')::uuid;
+  END IF;
+  IF v_assignee IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM public.org_members m WHERE m.user_id = v_assignee AND m.org_id = v_org_id
+  ) THEN
+    v_assignee := NULL;
+  END IF;
+
+  UPDATE public.follow_ups
+     SET status = p_completed ->> 'status',
+         completed_at = nullif(p_completed ->> 'completed_at', '')::timestamptz,
+         snoozed_until = nullif(p_completed ->> 'snoozed_until', '')::date
+   WHERE id = (p_completed ->> 'id')::uuid AND org_id = v_org_id;
+
+  INSERT INTO public.follow_ups (
+    id, owner_id, partner_id, referral_id, case_id, title, due_on, status,
+    completed_at, note, kind, due_time, waiting_on, snoozed_until, assigned_to
+  ) VALUES (
+    (p_next ->> 'id')::uuid, v_owner_id,
+    nullif(p_next ->> 'partner_id', '')::uuid,
+    nullif(p_next ->> 'referral_id', '')::uuid,
+    nullif(p_next ->> 'case_id', '')::uuid,
+    p_next ->> 'title', (p_next ->> 'due_on')::date,
+    coalesce(p_next ->> 'status', 'open'),
+    nullif(p_next ->> 'completed_at', '')::timestamptz,
+    coalesce(p_next ->> 'note', ''), coalesce(p_next ->> 'kind', 'follow_up'),
+    nullif(p_next ->> 'due_time', '')::time,
+    coalesce(p_next ->> 'waiting_on', ''),
+    nullif(p_next ->> 'snoozed_until', '')::date,
+    v_assignee
+  )
+  ON CONFLICT (id) DO NOTHING;
+
+  IF p_event IS NOT NULL THEN
+    INSERT INTO public.case_events (id, owner_id, case_id, kind, body, occurred_at)
+    VALUES (
+      (p_event ->> 'id')::uuid, v_owner_id,
+      (p_event ->> 'case_id')::uuid,
+      p_event ->> 'kind', coalesce(p_event ->> 'body', ''),
+      coalesce(nullif(p_event ->> 'occurred_at', '')::timestamptz, pg_catalog.now())
+    )
+    ON CONFLICT (id) DO UPDATE SET
+      case_id = EXCLUDED.case_id, kind = EXCLUDED.kind,
+      body = EXCLUDED.body, occurred_at = EXCLUDED.occurred_at
+    WHERE public.case_events.org_id = v_org_id;
+  END IF;
+END
+$$;
+REVOKE ALL ON FUNCTION public.complete_follow_up_with_next(jsonb, jsonb, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.complete_follow_up_with_next(jsonb, jsonb, jsonb) TO authenticated;
+
+-- ===========================================================================
+-- 16. "Take this lead" takes only an unassigned case
+-- ===========================================================================
+
+-- assign_case (20261001140000) overwrites any assignee, so a stale Today
+-- list, or two members tapping Take at once, silently moved a lead a
+-- colleague already had. take_case assigns the caller only while the case
+-- has no assignee and writes "Took this case" on the timeline. When a
+-- colleague already has it: SQLSTATE P0001, message "Already taken by
+-- <display name>", HINT already_taken, DETAIL the assignee's user id, and
+-- nothing changes. When the caller already has it (or this is a replay):
+-- success with nothing written; event_body is that event id's wording if
+-- it exists, else ''. Same return shape as assign_case. assign_case is
+-- unchanged and stays the explicit "assign to" picker.
+CREATE OR REPLACE FUNCTION public.take_case(p_case_id uuid, p_event_id uuid)
+RETURNS TABLE (event_body text, occurred_at timestamptz)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_user uuid := auth.uid();
+  v_org uuid := public.current_org_id();
+  v_current uuid;
+  v_name text;
+  v_taken integer;
+  v_now timestamptz := now();
+BEGIN
+  IF v_user IS NULL OR v_org IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
+  END IF;
+
+  UPDATE public.cases c SET assigned_to = v_user
+   WHERE c.id = p_case_id AND c.org_id = v_org AND c.assigned_to IS NULL;
+  GET DIAGNOSTICS v_taken = ROW_COUNT;
+  IF v_taken = 1 THEN
+    INSERT INTO public.case_events (id, owner_id, org_id, case_id, kind, body, occurred_at)
+    VALUES (coalesce(p_event_id, gen_random_uuid()), v_user, v_org, p_case_id, 'system', 'Took this case', v_now)
+    ON CONFLICT (id) DO NOTHING;
+    RETURN QUERY SELECT 'Took this case'::text, v_now;
+    RETURN;
+  END IF;
+
+  SELECT c.assigned_to INTO v_current FROM public.cases c WHERE c.id = p_case_id AND c.org_id = v_org;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Case not found' USING ERRCODE = 'P0002';
+  END IF;
+  IF v_current = v_user THEN
+    RETURN QUERY
+    SELECT coalesce((SELECT e.body FROM public.case_events e
+                      WHERE e.id = p_event_id AND e.org_id = v_org AND e.case_id = p_case_id), '')::text,
+           coalesce((SELECT e.occurred_at FROM public.case_events e
+                      WHERE e.id = p_event_id AND e.org_id = v_org AND e.case_id = p_case_id), v_now);
+    RETURN;
+  END IF;
+
+  SELECT nullif(btrim(m.display_name), '') INTO v_name
+    FROM public.org_members m WHERE m.user_id = v_current AND m.org_id = v_org;
+  RAISE EXCEPTION 'Already taken by %', coalesce(v_name, 'a teammate')
+    USING ERRCODE = 'P0001', HINT = 'already_taken', DETAIL = v_current::text;
+END
+$$;
+REVOKE ALL ON FUNCTION public.take_case(uuid, uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.take_case(uuid, uuid) TO authenticated;
+
+-- ===========================================================================
+-- 17. Leaving a workspace drops your favorites there
+-- ===========================================================================
+
+-- Same as 20261001140000 except the leaver's favorites in the workspace
+-- they left are deleted too. user_favorites is keyed (user, type, target)
+-- with no workspace, and a favorite left under the old workspace is
+-- invisible to its owner (RLS), so the next toggle of that listing failed
+-- with a duplicate key, and the old practice kept getting the listing's
+-- bed pushes (notify_bed_followers follows favorites by workspace).
+-- Covers remove_org_member and a member joining another practice through
+-- accept_org_invite. A solo owner's favorites move with the workspace
+-- first (org_move_workspace_rows), so none are left to drop.
+CREATE OR REPLACE FUNCTION public.org_members_release_assignments()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.org_id = OLD.org_id THEN
+    RETURN NULL;
+  END IF;
+  UPDATE public.cases SET assigned_to = NULL
+   WHERE org_id = OLD.org_id AND assigned_to = OLD.user_id;
+  UPDATE public.follow_ups SET assigned_to = NULL
+   WHERE org_id = OLD.org_id AND assigned_to = OLD.user_id;
+  DELETE FROM public.user_favorites
+   WHERE org_id = OLD.org_id AND user_id = OLD.user_id;
+  RETURN NULL;
+END
+$$;
+REVOKE ALL ON FUNCTION public.org_members_release_assignments() FROM PUBLIC, anon, authenticated;
+
+-- Favorites already left behind by earlier moves.
+DELETE FROM public.user_favorites f
+ WHERE NOT EXISTS (
+   SELECT 1 FROM public.org_members m WHERE m.user_id = f.user_id AND m.org_id = f.org_id
+ );
+
+-- ===========================================================================
+-- 18. Lead and case creation: a retry with the same ids is a no-op
+-- ===========================================================================
+
+-- Same as 20261001120000 except a retry with the same case id (after a
+-- timeout where the first call had already committed) returns that case
+-- and writes nothing: no second contact, first call, timeline entry or
+-- new-lead push. An id that belongs to another workspace still fails
+-- (duplicate key), as before.
+CREATE OR REPLACE FUNCTION public.create_lead(p_expected_owner_id uuid, p_lead jsonb)
+RETURNS uuid
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_owner_id uuid := auth.uid();
+  v_org_id uuid := public.current_org_id();
+  v_case_id uuid;
+BEGIN
+  IF v_owner_id IS NULL OR v_org_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
+  END IF;
+  IF v_owner_id <> p_expected_owner_id THEN
+    RAISE EXCEPTION 'Authenticated account changed before the lead was saved' USING ERRCODE = '42501';
+  END IF;
+  v_case_id := nullif(p_lead ->> 'id', '')::uuid;
+  IF v_case_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM public.cases c WHERE c.id = v_case_id AND c.org_id = v_org_id
+  ) THEN
+    RETURN v_case_id;
+  END IF;
+  RETURN public.create_lead_internal(v_org_id, v_owner_id, p_lead, 'app');
+END
+$$;
+REVOKE ALL ON FUNCTION public.create_lead(uuid, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.create_lead(uuid, jsonb) TO authenticated;
+
+-- Same as 20260819120000 except the same retry rule: a case id that
+-- already exists in the caller's workspace is returned and nothing is
+-- inserted. Under RLS another workspace's case is invisible here, so its
+-- id still fails on the insert (duplicate key).
+CREATE OR REPLACE FUNCTION public.create_case_bundle(
+  p_expected_owner_id uuid,
+  p_case jsonb,
+  p_contact jsonb DEFAULT NULL,
+  p_follow_up jsonb DEFAULT NULL
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_owner_id uuid := auth.uid();
+  v_case_id uuid := (p_case ->> 'id')::uuid;
+BEGIN
+  IF v_owner_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
+  END IF;
+  IF v_owner_id <> p_expected_owner_id THEN
+    RAISE EXCEPTION 'Authenticated account changed before case creation' USING ERRCODE = '42501';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.cases c WHERE c.id = v_case_id AND c.org_id = public.current_org_id()) THEN
+    RETURN v_case_id;
+  END IF;
+
+  INSERT INTO public.cases (
+    id, owner_id, title, status, summary, payment_status,
+    quoted_amount, paid_amount, match_profile_id,
+    lead_source, lead_source_detail, lost_reason
+  ) VALUES (
+    v_case_id,
+    v_owner_id,
+    p_case ->> 'title',
+    coalesce(p_case ->> 'status', 'inquiry'),
+    coalesce(p_case ->> 'summary', ''),
+    coalesce(p_case ->> 'payment_status', 'none'),
+    nullif(p_case ->> 'quoted_amount', '')::integer,
+    coalesce(nullif(p_case ->> 'paid_amount', '')::integer, 0),
+    nullif(p_case ->> 'match_profile_id', '')::uuid,
+    coalesce(nullif(pg_catalog.btrim(p_case ->> 'lead_source'), ''), 'Unspecified'),
+    coalesce(p_case ->> 'lead_source_detail', ''),
+    coalesce(p_case ->> 'lost_reason', '')
+  );
+
+  IF p_contact IS NOT NULL AND p_contact <> 'null'::jsonb THEN
+    INSERT INTO public.case_contacts (
+      id, owner_id, case_id, name, relationship, phone, email, is_primary, note
+    ) VALUES (
+      (p_contact ->> 'id')::uuid,
+      v_owner_id,
+      v_case_id,
+      p_contact ->> 'name',
+      coalesce(p_contact ->> 'relationship', ''),
+      coalesce(p_contact ->> 'phone', ''),
+      coalesce(p_contact ->> 'email', ''),
+      coalesce((p_contact ->> 'is_primary')::boolean, false),
+      coalesce(p_contact ->> 'note', '')
+    );
+  END IF;
+
+  IF p_follow_up IS NOT NULL AND p_follow_up <> 'null'::jsonb THEN
+    INSERT INTO public.follow_ups (
+      id, owner_id, partner_id, referral_id, case_id, title, due_on,
+      status, completed_at, note, kind, due_time, waiting_on, snoozed_until
+    ) VALUES (
+      (p_follow_up ->> 'id')::uuid,
+      v_owner_id,
+      nullif(p_follow_up ->> 'partner_id', '')::uuid,
+      nullif(p_follow_up ->> 'referral_id', '')::uuid,
+      v_case_id,
+      p_follow_up ->> 'title',
+      (p_follow_up ->> 'due_on')::date,
+      coalesce(p_follow_up ->> 'status', 'open'),
+      nullif(p_follow_up ->> 'completed_at', '')::timestamptz,
+      coalesce(p_follow_up ->> 'note', ''),
+      coalesce(p_follow_up ->> 'kind', 'follow_up'),
+      nullif(p_follow_up ->> 'due_time', '')::time,
+      coalesce(p_follow_up ->> 'waiting_on', ''),
+      nullif(p_follow_up ->> 'snoozed_until', '')::date
+    );
+  END IF;
+
+  RETURN v_case_id;
+END
+$$;
+REVOKE ALL ON FUNCTION public.create_case_bundle(uuid, jsonb, jsonb, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.create_case_bundle(uuid, jsonb, jsonb, jsonb) TO authenticated;
+
+-- ===========================================================================
+-- 19. A VOB answer completes that program's waiting-on steps
+-- ===========================================================================
+
+-- Same as 20261001170000 except an answer also completes the case's open
+-- waiting-on steps for that program (waiting_on = program name, any
+-- letter case), e.g. the step "Done -> still waiting" left in its place.
+CREATE OR REPLACE FUNCTION public.update_vob_status(p_id uuid, p_patch jsonb, p_event_id uuid)
+RETURNS TABLE (status text, answered_at timestamptz, answered_by text, note text, quoted_out_of_pocket integer, event_body text, occurred_at timestamptz)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+#variable_conflict use_column
+DECLARE
+  v_user uuid := auth.uid();
+  v_org uuid := public.current_org_id();
+  v_old public.vob_requests;
+  v_new public.vob_requests;
+  v_status text;
+  v_body text := '';
+  v_now timestamptz := now();
+BEGIN
+  IF v_user IS NULL OR v_org IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
+  END IF;
+  SELECT * INTO v_old FROM public.vob_requests r WHERE r.id = p_id AND r.org_id = v_org;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'VOB request not found in this workspace' USING ERRCODE = 'P0002';
+  END IF;
+  v_status := coalesce(nullif(p_patch ->> 'status', ''), v_old.status);
+  IF v_status NOT IN ('requested', 'pending', 'in_network', 'out_of_network', 'not_accepted') THEN
+    RAISE EXCEPTION 'Unknown VOB status' USING ERRCODE = '22023';
+  END IF;
+
+  UPDATE public.vob_requests r
+     SET status = v_status,
+         answered_at = CASE WHEN v_status IN ('requested', 'pending') THEN NULL
+                            WHEN r.answered_at IS NULL OR r.status <> v_status THEN v_now
+                            ELSE r.answered_at END,
+         answered_by = CASE WHEN p_patch ? 'answered_by' THEN left(btrim(coalesce(p_patch ->> 'answered_by', '')), 120) ELSE r.answered_by END,
+         note = CASE WHEN p_patch ? 'note' THEN left(coalesce(p_patch ->> 'note', ''), 2000) ELSE r.note END,
+         quoted_out_of_pocket = CASE WHEN p_patch ? 'quoted_out_of_pocket' THEN nullif(p_patch ->> 'quoted_out_of_pocket', '')::integer ELSE r.quoted_out_of_pocket END
+   WHERE r.id = p_id AND r.org_id = v_org
+  RETURNING * INTO v_new;
+
+  IF v_new.status <> v_old.status THEN
+    v_body := 'VOB ' || public.vob_status_label(v_new.status) || ': ' || v_new.program_name
+      || CASE WHEN v_new.quoted_out_of_pocket IS NOT NULL AND v_new.status IN ('in_network', 'out_of_network')
+              THEN ', about $' || v_new.quoted_out_of_pocket::text || ' out of pocket' ELSE '' END
+      || CASE WHEN v_new.answered_by <> '' AND v_new.answered_at IS NOT NULL THEN ' (per ' || v_new.answered_by || ')' ELSE '' END;
+    INSERT INTO public.case_events (id, owner_id, org_id, case_id, kind, body, occurred_at)
+    VALUES (coalesce(p_event_id, gen_random_uuid()), v_user, v_org, v_new.case_id, 'system', v_body, v_now)
+    ON CONFLICT (id) DO NOTHING;
+    IF v_new.answered_at IS NOT NULL THEN
+      UPDATE public.follow_ups f SET status = 'done', completed_at = v_now
+       WHERE f.org_id = v_org AND f.status = 'open'
+         AND (f.id = v_new.follow_up_id
+              OR (f.case_id = v_new.case_id AND f.kind = 'waiting_on'
+                  AND lower(btrim(f.waiting_on)) = lower(btrim(v_new.program_name))));
+    END IF;
+  END IF;
+
+  RETURN QUERY SELECT v_new.status, v_new.answered_at, v_new.answered_by, v_new.note, v_new.quoted_out_of_pocket, v_body, v_now;
+END
+$$;
+REVOKE ALL ON FUNCTION public.update_vob_status(uuid, jsonb, uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.update_vob_status(uuid, jsonb, uuid) TO authenticated;
+
+-- ===========================================================================
+-- 20. Realtime, invite and claim codes, and the bed push
+-- ===========================================================================
+
+-- Realtime sends a DELETE event with the old row's key to every subscriber
+-- of the table, whatever its filter, so a member leaving or an account
+-- deletion leaked user ids across workspaces. org_members is the only
+-- table in the publication and the app listens for UPDATE only.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
+    ALTER PUBLICATION supabase_realtime SET (publish = 'insert, update');
+  END IF;
+END
+$$;
+
+-- Same as 20260820033721 except the code is 16 hex characters (was 10).
+CREATE OR REPLACE FUNCTION public.create_org_invite()
+RETURNS TABLE (code text, expires_at timestamptz)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_user uuid := auth.uid();
+  v_org uuid;
+  v_code text;
+  v_expires timestamptz := now() + interval '7 days';
+BEGIN
+  IF v_user IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
+  END IF;
+  SELECT org_id INTO v_org FROM public.org_members WHERE user_id = v_user AND role = 'owner';
+  IF v_org IS NULL THEN
+    RAISE EXCEPTION 'Only the workspace owner can create invites' USING ERRCODE = '42501';
+  END IF;
+  IF NOT public.org_has_entitlement('pro') THEN
+    RAISE EXCEPTION 'Team workspace invites require the Pro plan' USING ERRCODE = '42501';
+  END IF;
+
+  v_code := lower(substr(md5(gen_random_uuid()::text || clock_timestamp()::text), 1, 16));
+  INSERT INTO public.org_invites (org_id, code, invited_by, expires_at)
+  VALUES (v_org, v_code, v_user, v_expires);
+
+  RETURN QUERY SELECT v_code, v_expires;
+END
+$$;
+REVOKE ALL ON FUNCTION public.create_org_invite() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.create_org_invite() TO authenticated;
+
+-- Same as 20260820033721 except the code is 16 hex characters (was 10).
+CREATE OR REPLACE FUNCTION public.create_center_claim_code(p_global_partner_id uuid)
+RETURNS TABLE (code text, expires_at timestamptz)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_user uuid := auth.uid();
+  v_code text;
+  v_expires timestamptz := now() + interval '30 days';
+BEGIN
+  IF v_user IS NULL OR NOT public.is_platform_admin() THEN
+    RAISE EXCEPTION 'Only platform admins can issue claim codes' USING ERRCODE = '42501';
+  END IF;
+  PERFORM 1 FROM public.global_partners WHERE id = p_global_partner_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Directory listing not found' USING ERRCODE = 'P0002';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.center_members WHERE global_partner_id = p_global_partner_id) THEN
+    RAISE EXCEPTION 'Directory listing is already claimed' USING ERRCODE = '22023';
+  END IF;
+
+  UPDATE public.center_claim_codes AS c
+     SET expires_at = now()
+   WHERE c.global_partner_id = p_global_partner_id AND c.claimed_at IS NULL AND c.expires_at > now();
+  v_code := lower(substr(md5(gen_random_uuid()::text || clock_timestamp()::text), 1, 16));
+  INSERT INTO public.center_claim_codes (global_partner_id, code, created_by, expires_at)
+  VALUES (p_global_partner_id, v_code, v_user, v_expires);
+  RETURN QUERY SELECT v_code, v_expires;
+END
+$$;
+REVOKE ALL ON FUNCTION public.create_center_claim_code(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.create_center_claim_code(uuid) TO authenticated;
+
+-- The throttle below looks up recent bed_opened rows per listing.
+CREATE INDEX IF NOT EXISTS notification_outbox_bed_opened_idx
+  ON public.notification_outbox ((data ->> 'global_partner_id'), created_at)
+  WHERE kind = 'bed_opened';
+
+-- Same as 20261001150000 except a listing that already queued a bed_opened
+-- push in the last six hours queues nothing, so a center flipping its
+-- counts back and forth cannot ping its followers over and over.
+CREATE OR REPLACE FUNCTION public.notify_bed_followers(p_global_id uuid, p_except uuid)
+RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_member record;
+  v_count integer := 0;
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM public.notification_outbox o
+     WHERE o.kind = 'bed_opened'
+       AND o.data ->> 'global_partner_id' = p_global_id::text
+       AND o.created_at > now() - interval '6 hours'
+  ) THEN
+    RETURN 0;
+  END IF;
+  FOR v_member IN
+    SELECT DISTINCT m.user_id
+      FROM public.org_members m
+     WHERE m.org_id IN (
+             SELECT f.org_id FROM public.user_favorites f
+              WHERE f.target_type = 'global_partner' AND f.target_id = p_global_id
+             UNION
+             SELECT p.org_id FROM public.partners p WHERE p.global_partner_id = p_global_id
+           )
+  LOOP
+    IF p_except IS NULL OR v_member.user_id <> p_except THEN
+      IF public.notify_enqueue(v_member.user_id, 'bed_opened', jsonb_build_object('global_partner_id', p_global_id)) THEN
+        v_count := v_count + 1;
+      END IF;
+    END IF;
+  END LOOP;
+  RETURN v_count;
+END
+$$;
+REVOKE ALL ON FUNCTION public.notify_bed_followers(uuid, uuid) FROM PUBLIC, anon, authenticated, service_role;
+
+-- ===========================================================================
+-- 21. Intake: a link over its hourly budget keeps the lead, without a push
+-- ===========================================================================
+
+-- The intake function used to refuse every lead once a link passed 30 an
+-- hour, which a flood could use to turn real families away. It now sends
+-- such a lead with suspected_spam = true (and refuses only past a much
+-- higher hard cap). Same as 20261001120000 otherwise: the lead is created
+-- as usual (an immediate-danger answer keeps its flag and summary line),
+-- with a "Possible spam" line in the summary and no new-lead push.
+CREATE OR REPLACE FUNCTION public.create_lead_from_intake(p_token text, p_lead jsonb)
+RETURNS uuid
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_org_id uuid;
+  v_owner_id uuid;
+  v_case_id uuid;
+  v_prev text := coalesce(current_setting('referralfit.lead_push', true), '');
+BEGIN
+  IF coalesce(p_token, '') !~ '^[0-9a-f]{32,64}$' THEN
+    RAISE EXCEPTION 'Unknown intake link' USING ERRCODE = 'P0002';
+  END IF;
+  SELECT id INTO v_org_id FROM public.orgs WHERE intake_token = p_token;
+  IF v_org_id IS NULL THEN
+    RAISE EXCEPTION 'Unknown intake link' USING ERRCODE = 'P0002';
+  END IF;
+  SELECT user_id INTO v_owner_id
+    FROM public.org_members
+   WHERE org_id = v_org_id
+   ORDER BY (role = 'owner') DESC, created_at
+   LIMIT 1;
+  IF v_owner_id IS NULL THEN
+    RAISE EXCEPTION 'Unknown intake link' USING ERRCODE = 'P0002';
+  END IF;
+  IF coalesce(p_lead ->> 'suspected_spam', '') <> 'true' THEN
+    RETURN public.create_lead_internal(v_org_id, v_owner_id, p_lead, 'intake_link');
+  END IF;
+
+  PERFORM set_config('referralfit.lead_push', 'off', true);
+  v_case_id := public.create_lead_internal(v_org_id, v_owner_id,
+    p_lead || jsonb_build_object('note', concat_ws(chr(10),
+      nullif(btrim(coalesce(p_lead ->> 'note', '')), ''),
+      'Possible spam: this intake link received an unusual number of requests in the last hour, so no push was sent. Check the details before calling.')),
+    'intake_link');
+  PERFORM set_config('referralfit.lead_push', v_prev, true);
+  RETURN v_case_id;
+END
+$$;
+REVOKE ALL ON FUNCTION public.create_lead_from_intake(text, jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.create_lead_from_intake(text, jsonb) TO service_role;
+
+-- Same as 20261001140000 except no push while create_lead_from_intake has
+-- switched it off for a possible-spam lead (transaction-local setting).
+CREATE OR REPLACE FUNCTION public.cases_notify_new_lead()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF coalesce(current_setting('referralfit.lead_push', true), '') = 'off' THEN
+    RETURN NULL;
+  END IF;
+  IF NEW.assigned_to IS NOT NULL THEN
+    PERFORM public.notify_enqueue(NEW.assigned_to, 'new_lead', jsonb_build_object('case_id', NEW.id));
+  ELSE
+    PERFORM public.notify_org_members(NEW.org_id, 'new_lead', jsonb_build_object('case_id', NEW.id), auth.uid());
+  END IF;
+  RETURN NULL;
+END
+$$;
+REVOKE ALL ON FUNCTION public.cases_notify_new_lead() FROM PUBLIC, anon, authenticated;
 
 COMMIT;

@@ -50,13 +50,15 @@ function jwtSessionId(accessToken: string): string | null {
 }
 
 // supabase-js's own retryable network failure (AuthRetryableFetchError, status
-// 0) or a plain fetch failure.
+// 0), a plain fetch failure, or a request that missed its deadline
+// (supabase.ts: an AbortError "Network request timed out").
 export function isAuthNetworkError(error: unknown): boolean {
   if (!error) return false;
   const value = error as { name?: unknown; message?: unknown; status?: unknown };
-  if (value.name === 'AuthRetryableFetchError') return true;
+  if (value.name === 'AuthRetryableFetchError' || value.name === 'AbortError') return true;
   const message = String(value.message ?? '').toLowerCase();
-  return message.includes('network request failed') || message.includes('failed to fetch') || message.includes('fetch failed');
+  return message.includes('network request failed') || message.includes('failed to fetch') || message.includes('fetch failed')
+    || message.includes('network request timed out') || message.includes('aborterror');
 }
 
 type StoredSession = {

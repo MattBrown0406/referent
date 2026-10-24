@@ -16,8 +16,11 @@ import {
   deleteCaseIntegration,
   type IntegrationProvider,
   type IntegrationRecordType,
+  invoiceRefundUntracked,
+  normalizeInvoiceStatus,
   parseOptionalPositiveUsdCents,
   saveCaseIntegration,
+  SQUARE_INVOICE_STATUSES,
 } from './business';
 
 type Props = {
@@ -49,6 +52,28 @@ const emptyForm: FormState = {
 
 function friendlyStatus(status: string): string {
   return status.replace(/^document\./, '').replaceAll('_', ' ').toLowerCase();
+}
+
+// A Square invoice's status is picked from Square's own list, never typed, so
+// the dashboard can read it. A legacy typed value ("completed", "PAID") is
+// shown under its Square name; anything else unrecognized stays as it was
+// (offered as its own choice) until someone picks a real one.
+function isSquareInvoice(form: Pick<FormState, 'provider' | 'recordType'>): boolean {
+  return form.provider === 'square' && form.recordType === 'invoice';
+}
+
+function squareStatusChoices(current: string): { value: string; label: string }[] {
+  if (!current || SQUARE_INVOICE_STATUSES.some((option) => option.value === current)) return SQUARE_INVOICE_STATUSES;
+  return [...SQUARE_INVOICE_STATUSES, { value: current, label: friendlyStatus(current) }];
+}
+
+function rowStatusLine(item: CaseIntegration): string {
+  const label = friendlyStatus(item.provider === 'square' && item.recordType === 'invoice' ? normalizeInvoiceStatus(item.status) : item.status);
+  const untracked = item.provider === 'square' && item.recordType === 'invoice' && invoiceRefundUntracked(item.status) ? ' (refund amount not tracked)' : '';
+  // Hand-linked invoices are reminders only: the case's own quote and
+  // payments still count (see revenueForCase in business.ts).
+  const manual = item.provider === 'square' && item.recordType === 'invoice' && !item.lastSyncedAt ? ' · linked by hand' : '';
+  return `${label}${untracked}${manual}`;
 }
 
 function integrationTitle(item: CaseIntegration): string {
@@ -108,7 +133,7 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
       provider: item.provider,
       recordType: item.recordType,
       externalId: item.externalId,
-      status: item.status,
+      status: isSquareInvoice(item) ? normalizeInvoiceStatus(item.status) : item.status,
       amount: item.amountCents == null ? '' : (item.amountCents / 100).toFixed(2),
       dueOn: item.dueOn || '',
       externalUrl: item.externalUrl,
@@ -158,7 +183,7 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
                 <View style={styles.rowCopy}>
                   <Text style={styles.rowTitle}>{integrationTitle(item)}</Text>
                   <Text style={styles.rowMeta}>
-                    {friendlyStatus(item.status)}
+                    {rowStatusLine(item)}
                     {item.amountCents != null ? ` · ${formatMoney(item.amountCents / 100)}` : ''}
                     {item.dueOn ? ` · due ${item.dueOn}` : ''}
                   </Text>
@@ -200,6 +225,7 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
                       ...current,
                       provider,
                       recordType: provider === 'pandadoc' ? 'document' : 'invoice',
+                      status: provider === 'square' ? 'unpaid' : 'linked',
                     } : current)}
                     style={[styles.segment, form.provider === provider && styles.segmentActive, form.id && styles.segmentDisabled]}
                   >
@@ -214,7 +240,11 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
                     key={recordType}
                     disabled={Boolean(form.id)}
                     accessibilityState={{ disabled: Boolean(form.id), selected: form.recordType === recordType }}
-                    onPress={() => setForm((current) => current ? { ...current, recordType: recordType as IntegrationRecordType } : current)}
+                    onPress={() => setForm((current) => current ? {
+                      ...current,
+                      recordType: recordType as IntegrationRecordType,
+                      status: current.provider === 'square' && recordType === 'invoice' ? 'unpaid' : current.recordType === recordType ? current.status : 'linked',
+                    } : current)}
                     style={[styles.segment, form.recordType === recordType && styles.segmentActive, form.id && styles.segmentDisabled]}
                   >
                     <Text style={[styles.segmentText, form.recordType === recordType && styles.segmentTextActive]}>{recordType}</Text>
@@ -233,7 +263,26 @@ export default function CaseIntegrationPanel({ record, integrations, onChanged }
                 style={[styles.input, form.id && styles.inputDisabled]}
               />
               <Text style={styles.label}>CURRENT STATUS</Text>
-              <TextInput value={form.status} onChangeText={(status) => setForm((current) => current ? { ...current, status } : current)} placeholder="sent, completed, unpaid…" placeholderTextColor="#91A09B" autoCapitalize="none" style={styles.input} />
+              {isSquareInvoice(form) ? (
+                <>
+                  <View style={styles.segmentRow} accessibilityRole="radiogroup">
+                    {squareStatusChoices(form.status).map((option) => (
+                      <TouchableOpacity
+                        key={option.value}
+                        accessibilityRole="radio"
+                        accessibilityState={{ selected: form.status === option.value, checked: form.status === option.value }}
+                        onPress={() => setForm((current) => current ? { ...current, status: option.value } : current)}
+                        style={[styles.segment, form.status === option.value && styles.segmentActive]}
+                      >
+                        <Text style={[styles.segmentText, form.status === option.value && styles.segmentTextActive]}>{option.label}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  <Text style={styles.statusHint}>Linked by hand, an invoice is a reminder: the case's own quote and payments still count until Square syncs it.{form.status === 'partially_refunded' ? ' The refund amount is not tracked.' : ''}</Text>
+                </>
+              ) : (
+                <TextInput value={form.status} onChangeText={(status) => setForm((current) => current ? { ...current, status } : current)} placeholder="sent, completed, viewed…" placeholderTextColor="#91A09B" autoCapitalize="none" style={styles.input} />
+              )}
               <Text style={styles.label}>{form.provider === 'pandadoc' ? 'PROPOSED CONTRACT AMOUNT (OPTIONAL)' : 'AMOUNT (OPTIONAL)'}</Text>
               <TextInput
                 accessibilityLabel={form.provider === 'pandadoc' ? 'Proposed contract amount' : 'Amount'}
@@ -301,6 +350,7 @@ const styles = StyleSheet.create({
   segmentDisabled: { opacity: 0.72 },
   segmentText: { color: '#38564F', fontSize: 10, fontWeight: '800', textTransform: 'capitalize' },
   segmentTextActive: { color: '#FFFFFF' },
+  statusHint: { color: '#73827D', fontSize: 9, lineHeight: 13, marginTop: 6 },
   primaryButton: { minHeight: 50, marginTop: 22, borderRadius: 13, backgroundColor: '#1F5A49', alignItems: 'center', justifyContent: 'center' },
   primaryButtonText: { color: '#FFFFFF', fontSize: 13, fontWeight: '900' },
 });

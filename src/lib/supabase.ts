@@ -60,7 +60,111 @@ const ChunkedSecureStoreAdapter = Platform.OS === 'web'
       },
     };
 
+// ─── Request deadlines ──────────────────────────────────────────────────────
+// Without a deadline a request on a network that never answers (Wi-Fi with no
+// internet, a lossy cell) waits for iOS's own ~60 s timeout, and postgrest-js
+// retries a failed GET up to 3 times on top. The offline queue lock and the
+// cache lock are held across those requests, so every save on the device
+// would wait too. Every request therefore gets a deadline; a request that
+// misses it fails as an AbortError ("Network request timed out"), which
+// postgrest-js does not retry and errors.ts classifies as a timeout (network
+// class: reads fall back to the saved copy, queued writes stay queued and the
+// attempt counts toward the transient caps in store.ts).
+//
+// React Native's fetch (whatwg-fetch over XHR) resolves only once the whole
+// body has arrived, so the deadline covers the full transfer there.
+export const REQUEST_TIMEOUT_MS = 15_000;
+// Document uploads and downloads move whole files over a cell connection.
+export const STORAGE_TRANSFER_TIMEOUT_MS = 120_000;
+// Edge Functions with no deadline of their own. A caller that passes one
+// (functions-js `timeout`, e.g. outreach-api's 56 s draft call, arrives here
+// as a signal) keeps exactly its own deadline: nothing shorter is imposed.
+export const FUNCTION_TIMEOUT_MS = 60_000;
+export const REQUEST_TIMEOUT_MESSAGE = 'Network request timed out';
+
+type FetchFn = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+export type RequestTimeoutOptions = {
+  timeoutMs?: number;
+  storageTransferTimeoutMs?: number;
+  functionTimeoutMs?: number;
+};
+
+// The path of a request URL, without parsing it into a URL object (one per
+// request, and React Native's URL polyfill is partial): scheme and host off,
+// query and fragment off.
+function requestPath(input: RequestInfo | URL): string {
+  const raw = typeof input === 'string' ? input : String((input as { url?: unknown }).url ?? (input as URL).href ?? '');
+  return raw.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, '').split(/[?#]/)[0];
+}
+
+// Storage calls that move no file body: signing, listing, moving, copying,
+// object info. Everything else under /storage/v1/object/ is a transfer.
+const STORAGE_METADATA_PATH = /\/storage\/v1\/object\/(?:sign|list|list-v2|move|copy|info)(?:\/|$)/;
+
+// The deadline for one request, or null when the caller's own signal is the
+// deadline (an Edge Function call made with a timeout).
+export function requestDeadlineMs(input: RequestInfo | URL, hasCallerSignal: boolean, options: RequestTimeoutOptions = {}): number | null {
+  const path = requestPath(input);
+  if (path.includes('/functions/v1/')) return hasCallerSignal ? null : options.functionTimeoutMs ?? FUNCTION_TIMEOUT_MS;
+  if (path.includes('/storage/v1/object/') && !STORAGE_METADATA_PATH.test(path)) {
+    return options.storageTransferTimeoutMs ?? STORAGE_TRANSFER_TIMEOUT_MS;
+  }
+  return options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+}
+
+function requestTimeoutError(deadlineMs: number): Error {
+  return Object.assign(new Error(REQUEST_TIMEOUT_MESSAGE), { name: 'AbortError', timedOut: true, timeoutMs: deadlineMs });
+}
+
+// Wrap a fetch with the deadline above. A caller-supplied signal is combined
+// with it (either one aborts the request; a caller's abort is rethrown as
+// is). React Native's AbortController polyfill has no AbortSignal.any, so the
+// two are linked by hand. The returned promise settles at the deadline even
+// if the underlying fetch ignores the abort.
+export function withRequestTimeout(baseFetch: FetchFn, options: RequestTimeoutOptions = {}): FetchFn {
+  return (input, init) => {
+    const callerSignal = init?.signal ?? undefined;
+    const deadlineMs = requestDeadlineMs(input, Boolean(callerSignal), options);
+    if (deadlineMs === null) return baseFetch(input, init);
+    const controller = new AbortController();
+    const onCallerAbort = () => controller.abort();
+    if (callerSignal) {
+      if (callerSignal.aborted) controller.abort();
+      else callerSignal.addEventListener('abort', onCallerAbort);
+    }
+    return new Promise<Response>((resolve, reject) => {
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        reject(requestTimeoutError(deadlineMs));
+      }, deadlineMs);
+      const settle = () => {
+        clearTimeout(timer);
+        callerSignal?.removeEventListener('abort', onCallerAbort);
+      };
+      let pending: Promise<Response>;
+      try {
+        pending = baseFetch(input, { ...init, signal: controller.signal });
+      } catch (error) {
+        settle();
+        reject(error);
+        return;
+      }
+      pending.then(
+        (response) => { settle(); resolve(response); },
+        (error) => { settle(); reject(timedOut ? requestTimeoutError(deadlineMs) : error); },
+      );
+    });
+  };
+}
+
+// Resolved at call time: React Native installs its fetch polyfill at startup.
+const supabaseFetch = withRequestTimeout((input, init) => fetch(input, init));
+
 export const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+  global: { fetch: supabaseFetch },
   auth: {
     storage: ChunkedSecureStoreAdapter,
     autoRefreshToken: true,

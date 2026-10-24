@@ -39,6 +39,11 @@ export type NewLeadDraft = {
 type Props = {
   visible: boolean;
   targetMinutes: number;
+  // A lead that did not save comes back filled in, with why (notice), and
+  // Save reads Retry when the failure was the connection.
+  initialDraft?: NewLeadDraft | null;
+  notice?: string;
+  retry?: boolean;
   onClose: () => void;
   onSave: (draft: NewLeadDraft) => void;
 };
@@ -79,13 +84,16 @@ export function validateLeadDraft(draft: NewLeadDraft): string | null {
   return null;
 }
 
-export default function NewLeadSheet({ visible, targetMinutes, onClose, onSave }: Props) {
+export default function NewLeadSheet({ visible, targetMinutes, initialDraft, notice, retry = false, onClose, onSave }: Props) {
   const [draft, setDraft] = useState<NewLeadDraft>(emptyDraft);
   const phoneRef = useRef<TextInput>(null);
 
   useEffect(() => {
-    if (visible) setDraft(emptyDraft());
+    if (visible) setDraft(initialDraft ? { ...initialDraft } : emptyDraft());
+    // Only on opening: a draft being typed is never replaced.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible]);
+  const saveLabel = retry ? 'Retry' : 'Save';
 
   function patch(changes: Partial<NewLeadDraft>) {
     setDraft((current) => ({ ...current, ...changes }));
@@ -117,11 +125,16 @@ export default function NewLeadSheet({ visible, targetMinutes, onClose, onSave }
               <Text style={styles.headerButtonText}>Cancel</Text>
             </TouchableOpacity>
             <Text style={styles.headerTitle}>New lead</Text>
-            <TouchableOpacity accessibilityRole="button" accessibilityLabel="Save lead" onPress={save} style={styles.headerButton}>
-              <Text style={[styles.headerButtonText, styles.headerSave]}>Save</Text>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={retry ? 'Retry saving lead' : 'Save lead'} onPress={save} style={styles.headerButton}>
+              <Text style={[styles.headerButtonText, styles.headerSave]}>{saveLabel}</Text>
             </TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+            {notice ? (
+              <View style={styles.notice} accessibilityRole="alert">
+                <Text style={styles.noticeText}>{notice}</Text>
+              </View>
+            ) : null}
             <Text style={styles.intro}>
               Name and number are enough. The first call goes on Today with a {targetMinutes}-minute clock; everything else can wait for the case file.
             </Text>
@@ -234,7 +247,7 @@ export default function NewLeadSheet({ visible, targetMinutes, onClose, onSave }
             ) : null}
 
             <TouchableOpacity accessibilityRole="button" onPress={save} style={styles.primaryButton}>
-              <Text style={styles.primaryButtonText}>Save lead</Text>
+              <Text style={styles.primaryButtonText}>{retry ? 'Retry saving lead' : 'Save lead'}</Text>
             </TouchableOpacity>
           </ScrollView>
         </KeyboardAvoidingView>
@@ -271,6 +284,8 @@ const styles = StyleSheet.create({
   danger: { backgroundColor: COLORS.coralPale, borderWidth: 1, borderColor: '#E9C5B8', borderRadius: 12, padding: 12, marginTop: 4 },
   dangerTitle: { fontSize: 13, fontWeight: '800', color: COLORS.coralInk },
   dangerBody: { fontSize: 13, lineHeight: 19, color: COLORS.coralText, marginTop: 4 },
+  notice: { backgroundColor: COLORS.coralPale, borderRadius: 12, padding: 12, marginBottom: 8 },
+  noticeText: { fontSize: 13, lineHeight: 19, color: COLORS.coralText, fontWeight: '600' },
   primaryButton: { minHeight: 52, borderRadius: 14, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', marginTop: 24 },
   primaryButtonText: { color: COLORS.white, fontSize: 16, fontWeight: '800' },
 });

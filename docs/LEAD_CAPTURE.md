@@ -181,19 +181,37 @@ Rate limits (in `supabase/functions/intake/intake.ts`), enforced by
 2. the form is read, the honeypot checked, and the fields validated; a
    honeypot or invalid post stops here and is charged to nothing else;
 3. a submission that will create a lead: 6 per visitor address per hour
-   (`ip:<hmac>`), then 30 per link per hour (`token:<token>`).
+   (`ip:<hmac>`), then a hard cap of 300 per link per hour
+   (`token-hard:<token>`, refused with 429), then the link budget of 30 per
+   hour (`token:<token>`).
 
-Junk posts therefore never spend the practice's 30-an-hour link budget
-(before 2026-10-24 about 30 junk posts could lock a link for an hour), and
-a family that mistypes a few times is not locked out.
+A lead past the 30-an-hour budget (but under the hard cap) is still created,
+so a flood on a practice's link cannot turn a real family away. The function
+sends it with `suspected_spam: true`; `create_lead_from_intake` adds a
+"Possible spam" line to the case summary and queues no new-lead push. An
+"immediate danger" answer keeps its flag and summary line either way
+(20261024120000 section 21).
 
-Known limitation: the visitor address is the first entry of
-`X-Forwarded-For` (then `cf-connecting-ip` / `x-real-ip`). A client can put
-any value in that first entry, so the two per-address buckets slow down
-casual abuse but do not stop a sender that rotates the header. The
-per-link bucket (charged only for leads that would be created) is the
-backstop; a lead flood still needs valid-looking names and phone numbers. Pages carry a strict
+Junk posts therefore never spend the practice's link budget (before
+2026-10-24 about 30 junk posts could lock a link for an hour), and a family
+that mistypes a few times is not locked out.
+
+The visitor address is `cf-connecting-ip`, else the last `X-Forwarded-For`
+hop (added by the nearest proxy), else `x-real-ip`; never the first
+`X-Forwarded-For` entry, which the client writes. The per-address buckets
+slow down casual abuse; the per-link buckets (charged only for leads that
+would be created) are the backstop, and a lead flood still needs
+valid-looking names and phone numbers.
+
+The form has no `action` attribute, so it posts back to the page's own URL
+(hosted: `/functions/v1/intake/<token>`; the function itself sees only
+`/intake/<token>`, so an action built from that path made every hosted
+submit 404). CSP `form-action 'self'` allows it. Pages carry a strict
 Content-Security-Policy, no scripts, `noindex`, and `no-store`.
+
+In-app quick-add (`create_lead`) is replay-safe: a retry with the same case
+id after a timeout returns that case and writes nothing (no second first
+call, timeline entry or push). `create_case_bundle` follows the same rule.
 
 Local checks, matching CI:
 

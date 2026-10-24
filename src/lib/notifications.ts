@@ -126,6 +126,21 @@ export function partnersGoingCold(partners: Partner[], now = new Date()): ColdPa
 // ─── Scheduling ─────────────────────────────────────────────────────────────
 
 const MAX_SCHEDULED = 50; // iOS hard limit is 64 — stay well under it.
+
+// Lock-screen copy is generic on purpose. A reminder shows on a locked phone
+// and in Notification Center, where anyone nearby can read it: no client,
+// family, case, program, or partner name ever goes into a title or body.
+// Counts and clock times are fine. The tap opens the app, which shows the item
+// after unlock. (Server-sent pushes follow the same rule; docs/NOTIFICATIONS.md.)
+export const GENERIC_FOLLOW_UP_BODY = 'A follow-up is due. Open ReferralFit to see it.';
+
+function clockLabel(dueTime: string): string {
+  const [hourRaw, minuteRaw] = dueTime.split(':');
+  const hour24 = Number(hourRaw) || 0;
+  const minute = String(minuteRaw || '00').padStart(2, '0').slice(0, 2);
+  const hour = hour24 % 12 === 0 ? 12 : hour24 % 12;
+  return `${hour}:${minute} ${hour24 >= 12 ? 'PM' : 'AM'}`;
+}
 const RENAG_DAYS = 2;
 const RENAG_OCCURRENCES = 3;
 
@@ -171,9 +186,21 @@ export function followUpIsMine(
   return !assignee || assignee === me;
 }
 
+// A closed or lost case's follow-ups stop reminding (Today hides them too,
+// and the server skips them on close). A placement check-in still reminds:
+// the family's outcome is worth recording after the case itself is done.
+// Mirrors inactiveCaseIds / followUpOnInactiveCase in today.ts.
+function followUpOnClosedCase(followUp: FollowUp, closedCaseIds: ReadonlySet<string>): boolean {
+  return Boolean(followUp.caseId && closedCaseIds.has(followUp.caseId) && followUp.kind !== 'check_in');
+}
+
 // The follow-ups this device should remind about, per the input's scope.
 export function reminderFollowUps(input: NotificationInput, ownerId: string): FollowUp[] {
-  const followUps = (input.followUps || []).filter((followUp) => followUp.status === 'open');
+  const closedCaseIds = new Set((input.cases || [])
+    .filter((record) => record.status === 'closed' || record.status === 'lost')
+    .map((record) => record.id));
+  const followUps = (input.followUps || [])
+    .filter((followUp) => followUp.status === 'open' && !followUpOnClosedCase(followUp, closedCaseIds));
   if (input.scope === 'everyone') return followUps;
   const userId = input.userId || ownerId;
   const assigneeByCase = new Map((input.cases || []).map((record) => [record.id, record.assignedTo]));
@@ -195,9 +222,15 @@ export function followUpsDue(followUps: FollowUp[], now = new Date()): FollowUp[
     .sort((a, b) => (a.snoozedUntil || a.dueOn).localeCompare(b.snoozedUntil || b.dueOn));
 }
 
-export function todayLoad(followUps: FollowUp[], partners: Partner[], now = new Date()): { actions: number; overdueCount: number } {
+export function todayLoad(
+  followUps: FollowUp[],
+  partners: Partner[],
+  now = new Date(),
+  cases: Pick<CaseRecord, 'id' | 'status'>[] = [],
+): { actions: number; overdueCount: number } {
   const today = dateStamp(startOfToday(now));
-  const due = followUpsDue(followUps, now);
+  const closedCaseIds = new Set(cases.filter((record) => record.status === 'closed' || record.status === 'lost').map((record) => record.id));
+  const due = followUpsDue(followUps, now).filter((followUp) => !followUpOnClosedCase(followUp, closedCaseIds));
   // Once a snooze expires, overdue age follows the original due date just like
   // today_actions/buildTodaySections; the snooze controls visibility, not age.
   const overdueCount = due.filter((followUp) => followUp.dueOn < today).length;
@@ -276,7 +309,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
     if (await scheduleIfCurrent(generation, ownerId, {
       content: {
         title: 'Consult in 30 minutes',
-        body: `${followUp.title} · ${followUp.dueTime}`,
+        body: `Consult at ${clockLabel(followUp.dueTime)}`,
         data: { target: 'home', ownerId },
         ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
       },
@@ -291,11 +324,6 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   const openFollowUps = followUps
     .filter((followUp) => followUp.status === 'open' && !(followUp.kind === 'consult' && followUp.dueTime))
     .sort((a, b) => (a.snoozedUntil || a.dueOn).localeCompare(b.snoozedUntil || b.dueOn));
-  const partnerById = new Map(partners.map((partner) => [partner.id, partner]));
-  const followUpBody = (followUp: FollowUp) => {
-    const partnerName = followUp.partnerId ? partnerById.get(followUp.partnerId)?.name : undefined;
-    return partnerName ? `${followUp.title} — ${partnerName}` : followUp.title;
-  };
   // Items whose 9:00 reminder time has already passed (overdue, or due today
   // after 9) would all fire at the next 9:00 at once — one summary instead.
   // Items due later each keep their own reminder on their day.
@@ -313,7 +341,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   if (pastDue.length && remaining > 0 && isScheduleCurrent(generation, ownerId)) {
     const allOverdue = pastDue.every((followUp) => (followUp.snoozedUntil || followUp.dueOn) < todayStamp);
     const body = pastDue.length === 1
-      ? followUpBody(pastDue[0])
+      ? GENERIC_FOLLOW_UP_BODY
       : allOverdue ? `${pastDue.length} overdue follow-ups` : `${pastDue.length} follow-ups due or overdue`;
     if (await scheduleIfCurrent(generation, ownerId, {
       content: {
@@ -329,12 +357,12 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
       },
     })) remaining -= 1;
   }
-  for (const { followUp, when } of upcoming) {
+  for (const { when } of upcoming) {
     if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;
     if (await scheduleIfCurrent(generation, ownerId, {
       content: {
         title: 'Follow-up due',
-        body: followUpBody(followUp),
+        body: GENERIC_FOLLOW_UP_BODY,
         data: { target: 'home', ownerId },
         ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
       },
@@ -379,7 +407,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
       if (await scheduleIfCurrent(generation, ownerId, {
         content: {
           title: 'ReferralFit',
-          body: `Time to reach out to ${partner.name} — it's been ${ageAtDelivery} ${ageAtDelivery === 1 ? 'day' : 'days'}`,
+          body: `Time to reach out to a referral partner — it's been ${ageAtDelivery} ${ageAtDelivery === 1 ? 'day' : 'days'}`,
           data: { target: 'directory', partnerId: partner.id, ownerId },
           ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
         },

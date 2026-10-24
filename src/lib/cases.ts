@@ -2,7 +2,7 @@ import { decode } from 'base64-arraybuffer';
 import * as Crypto from 'expo-crypto';
 import * as FileSystem from 'expo-file-system/legacy';
 
-import { StoreError } from './errors';
+import { LeadTakenError, OfflineError, StoreError, asOfflineError, describeError, withHttpStatus } from './errors';
 import { currentAuthSessionIdentity, type AuthSessionIdentity } from './auth-session';
 import { fetchAllPages } from './paging';
 import { phoneSearchSuffix } from './phone';
@@ -320,39 +320,65 @@ export type CaseFile = {
 
 type CaseAccountFence = AuthSessionIdentity & { orgId: string };
 
+// Every case failure as a readable StoreError. One that never got an answer —
+// offline, timed out, or a passing server failure (5xx, a gateway page) — is
+// an OfflineError instead: nothing was refused, and a write that raised it
+// may or may not have landed, so the caller keeps its draft and offers Retry
+// with the same ids (see createLead). Messages never carry HTML or a stack.
+function caseFailure(error: unknown, status?: number, fallback = 'The case change could not be saved.'): StoreError {
+  if (error instanceof StoreError) return error;
+  const failure = withHttpStatus(error, status);
+  const offline = asOfflineError(failure);
+  if (offline instanceof OfflineError) return offline;
+  const message = (failure as { message?: unknown } | null)?.message;
+  return new StoreError(describeError(typeof message === 'string' && message.trim() ? message : failure, fallback), false);
+}
+
+// With no connection the session cannot be refreshed and nothing may be sent
+// under the identity this device remembers (auth-session.ts): that is an
+// OfflineError, not a sign-out.
 async function currentCaseAccount(): Promise<CaseAccountFence> {
-  const identity = await currentAuthSessionIdentity();
+  const identity = await currentAuthSessionIdentity({ allowOffline: true });
   if (!identity) throw new StoreError('No authenticated account is available for this case operation.', false);
-  const { data: orgId, error } = await supabase.rpc('current_org_id');
-  if (error) throw new StoreError(error.message || 'The active workspace could not be verified.', false);
+  if (identity.offline) throw new OfflineError();
+  const { data: orgId, error, status } = await supabase.rpc('current_org_id');
+  if (error) throw caseFailure(error, status, 'The active workspace could not be verified.');
   if (typeof orgId !== 'string' || !orgId) throw new StoreError('No active workspace is available.', false);
-  return { ...identity, orgId: orgId.toLowerCase() };
+  return { userId: identity.userId, sessionId: identity.sessionId, orgId: orgId.toLowerCase() };
 }
 
 async function assertCaseAccount(expected: CaseAccountFence): Promise<void> {
+  let current: CaseAccountFence;
   try {
-    const current = await currentCaseAccount();
-    if (current.userId === expected.userId && current.sessionId === expected.sessionId
-        && current.orgId === expected.orgId) return;
-  } catch {
+    current = await currentCaseAccount();
+  } catch (error) {
+    // No answer is not a changed account. The operation's outcome is unknown,
+    // which is exactly what an OfflineError says (retry with the same ids).
+    if (error instanceof OfflineError) throw error;
     // Normalize sign-out/session replacement into the same stale-operation error.
+    throw new StoreError('Account changed before the case operation completed.', false);
   }
+  if (current.userId === expected.userId && current.sessionId === expected.sessionId
+      && current.orgId === expected.orgId) return;
   throw new StoreError('Account changed before the case operation completed.', false);
 }
 
 // `operation` receives the acting user (attribution on inserts, storage folder)
 // and the active workspace (org_id scope for reads); both are re-verified after
 // the operation so an account or workspace switch mid-flight is rejected.
+// Whatever the operation throws leaves here as a StoreError (OfflineError when
+// the server was unreachable — reads then fall back to the saved copy).
 async function withStableCaseAccount<T>(operation: (userId: string, orgId: string) => Promise<T>): Promise<T> {
   const fence = await currentCaseAccount();
+  let result: T;
   try {
-    const result = await operation(fence.userId, fence.orgId);
-    await assertCaseAccount(fence);
-    return result;
+    result = await operation(fence.userId, fence.orgId);
   } catch (error) {
     await assertCaseAccount(fence);
-    throw error;
+    throw caseFailure(error);
   }
+  await assertCaseAccount(fence);
+  return result;
 }
 
 // Case files belong to the workspace, not the row creator: every teammate sees
@@ -430,8 +456,7 @@ export async function searchCases(query: string): Promise<CaseSearchResult[]> {
   try {
     [titleRows, nameRows, phoneRows] = await Promise.all([titleHits, nameHits, phoneHits]);
   } catch (error) {
-    if (error instanceof StoreError) throw error;
-    throw new StoreError((error as { message?: string })?.message || 'Case search failed.', false);
+    throw caseFailure(error, undefined, 'Case search failed.');
   }
 
   const results = new Map<string, CaseSearchResult>();
@@ -454,10 +479,10 @@ export async function searchCases(query: string): Promise<CaseSearchResult[]> {
 // The caller applies the optimistic local update first and rolls back on
 // error — no queue means no phantom timeline entries after a rejected write.
 
-async function runOrThrow(execute: () => PromiseLike<{ error: { message: string } | null }>): Promise<void> {
+async function runOrThrow(execute: () => PromiseLike<{ error: { message: string } | null; status?: number }>): Promise<void> {
   await withStableCaseAccount(async () => {
-    const { error } = await execute();
-    if (error) throw new StoreError(error.message, false);
+    const { error, status } = await execute();
+    if (error) throw caseFailure(error, status);
   });
 }
 
@@ -469,6 +494,13 @@ export async function createCase(record: CaseRecord, expectedUserId: string): Pr
 // The case and its initial children are one user action. The matching RPC is a
 // single Postgres transaction, so a failed contact or first-call insert cannot
 // leave a ghost case behind on the server.
+//
+// Failure contract (same as createLead): OfflineError (errors.ts; also a
+// StoreError) = the server was not reached, timed out, or failed in passing;
+// the bundle may or may not exist. Keep the draft and the optimistic rows and
+// offer Retry calling this again with the SAME record / contact / follow-up
+// ids — a repeat of a bundle that already landed is a no-op success on the
+// server. Any other StoreError = refused: roll back and show the message.
 export async function createCaseBundle(
   record: CaseRecord,
   primaryContact: CaseContact | null,
@@ -541,6 +573,15 @@ export function leadFollowUpTitle(caseTitle: string): string {
   return `First call — ${caseTitle}`;
 }
 
+// Failure contract: throws OfflineError (errors.ts; `error instanceof
+// OfflineError`, or isServerUnreachable(error)) when the request could not
+// reach the server, timed out, or hit a passing server failure — including
+// when the device is offline before anything is sent. The lead may or may not
+// have been created. The app keeps the draft (and its optimistic rows) and
+// offers Retry, calling createLead again with the SAME caseId / contactId /
+// followUpId: create_lead treats a repeat of a lead that already landed as a
+// no-op success. Any other StoreError is a refusal (validation, permission):
+// roll back and show error.message.
 export async function createLead(input: NewLeadInput, expectedUserId: string): Promise<void> {
   await runOrThrow(() => supabase.rpc('create_lead', {
     p_expected_owner_id: expectedUserId,
@@ -581,13 +622,13 @@ export async function recordCasePayment(
   note: string,
 ): Promise<RecordedCasePayment> {
   return withStableCaseAccount(async () => {
-    const { data, error } = await supabase.rpc('record_case_payment', {
+    const { data, error, status } = await supabase.rpc('record_case_payment', {
       p_case_id: caseId,
       p_event_id: eventId,
       p_amount: amount,
       p_note: note,
     });
-    if (error) throw new StoreError(error.message, false);
+    if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {
       paid_amount?: unknown;
       payment_status?: unknown;
@@ -617,12 +658,12 @@ export async function updateCasePaymentWithEvent(
     if ('paymentStatus' in patch) rpcPatch.payment_status = patch.paymentStatus;
     if ('quotedAmount' in patch) rpcPatch.quoted_amount = patch.quotedAmount;
     if ('paidAmount' in patch) rpcPatch.paid_amount = patch.paidAmount;
-    const { data, error } = await supabase.rpc('update_case_payment_with_event', {
+    const { data, error, status } = await supabase.rpc('update_case_payment_with_event', {
       p_case_id: caseId,
       p_event_id: eventId,
       p_patch: rpcPatch,
     });
-    if (error) throw new StoreError(error.message, false);
+    if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {
       paid_amount?: unknown;
       payment_status?: unknown;
@@ -660,13 +701,13 @@ export async function updateCaseDetailsWithEvent(
   eventBody: string,
 ): Promise<UpdatedCaseDetails> {
   return withStableCaseAccount(async () => {
-    const { data, error } = await supabase.rpc('update_case_details_with_event', {
+    const { data, error, status } = await supabase.rpc('update_case_details_with_event', {
       p_case_id: caseId,
       p_event_id: eventId,
       p_patch: patch,
       p_event_body: eventBody,
     });
-    if (error) throw new StoreError(error.message, false);
+    if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {
       title?: unknown;
       summary?: unknown;
@@ -707,13 +748,13 @@ export async function updateCaseBusinessDetailsWithEvent(
     if ('leadSource' in patch) rpcPatch.lead_source = patch.leadSource;
     if ('leadSourceDetail' in patch) rpcPatch.lead_source_detail = patch.leadSourceDetail;
     if ('lostReason' in patch) rpcPatch.lost_reason = patch.lostReason;
-    const { data, error } = await supabase.rpc('update_case_business_details_with_event', {
+    const { data, error, status } = await supabase.rpc('update_case_business_details_with_event', {
       p_case_id: caseId,
       p_event_id: eventId,
       p_patch: rpcPatch,
       p_event_body: eventBody,
     });
-    if (error) throw new StoreError(error.message, false);
+    if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {
       lead_source?: unknown;
       lead_source_detail?: unknown;
@@ -738,22 +779,80 @@ export async function updateCaseBusinessDetailsWithEvent(
 
 // Assign (or unassign with null) a case. The server checks membership,
 // writes the timeline entry, and returns its wording so the optimistic row
-// matches. "Take this lead" is this call with the caller's own id.
+// matches. "Take this lead" is takeCase (below), which never takes a case a
+// teammate already holds.
 export type CaseAssignment = { eventBody: string; occurredAt: string };
 
+async function callAssignCase(caseId: string, assignedTo: string | null, eventId: string): Promise<CaseAssignment> {
+  const { data, error, status } = await supabase.rpc('assign_case', {
+    p_case_id: caseId,
+    p_assigned_to: assignedTo,
+    p_event_id: eventId,
+  });
+  if (error) throw caseFailure(error, status);
+  const row = (Array.isArray(data) ? data[0] : data) as { event_body?: unknown; occurred_at?: unknown } | null;
+  if (!row || typeof row.event_body !== 'string' || typeof row.occurred_at !== 'string') {
+    throw new StoreError('The assignment was saved but could not be read back. Refresh the case.', false);
+  }
+  return { eventBody: row.event_body, occurredAt: row.occurred_at };
+}
+
 export async function assignCase(caseId: string, assignedTo: string | null, eventId: string): Promise<CaseAssignment> {
-  return withStableCaseAccount(async () => {
-    const { data, error } = await supabase.rpc('assign_case', {
-      p_case_id: caseId,
-      p_assigned_to: assignedTo,
-      p_event_id: eventId,
-    });
-    if (error) throw new StoreError(error.message, false);
-    const row = (Array.isArray(data) ? data[0] : data) as { event_body?: unknown; occurred_at?: unknown } | null;
-    if (!row || typeof row.event_body !== 'string' || typeof row.occurred_at !== 'string') {
-      throw new StoreError('The assignment was saved but could not be read back. Refresh the case.', false);
+  return withStableCaseAccount(async () => callAssignCase(caseId, assignedTo, eventId));
+}
+
+// take_case refuses a case someone else holds: P0001 "Already taken by
+// <name>", hint 'already_taken', details = the holder's user id.
+function isAlreadyTaken(error: unknown): boolean {
+  const value = error as { code?: unknown; hint?: unknown; message?: unknown } | null;
+  if (!value) return false;
+  return value.hint === 'already_taken' || (value.code === 'P0001' && typeof value.message === 'string' && /already taken by/i.test(value.message));
+}
+
+// The RPC is not on the server yet: PostgREST answers an unknown function with
+// PGRST202 (HTTP 404); Postgres with 42883 (undefined_function).
+function isMissingFunction(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === 'PGRST202' || code === '42883';
+}
+
+// "Take this lead": assigns the case to the signed-in member unless a
+// teammate already holds it (LeadTakenError — not retryable, nothing
+// changed). Taking a case that is already yours, or replaying the same
+// eventId, succeeds without writing anything. `eventBody` is '' when no
+// timeline entry was written: the caller then adds no timeline row. Network-
+// class failures are OfflineError, like every case write (retry with the same
+// eventId is safe).
+export async function takeCase(caseId: string, eventId: string): Promise<CaseAssignment> {
+  return withStableCaseAccount(async (userId, orgId) => {
+    const { data, error, status } = await supabase.rpc('take_case', { p_case_id: caseId, p_event_id: eventId });
+    if (error) {
+      if (isAlreadyTaken(error)) {
+        const details = (error as { details?: unknown }).details;
+        throw new LeadTakenError(error.message || 'Already taken by a teammate', typeof details === 'string' ? details : null);
+      }
+      if (!isMissingFunction(error)) throw caseFailure(error, status);
+      // take_case (migration 20261024120000) is not deployed yet: read who
+      // holds the case, then assign it the way assignCase does. A teammate
+      // taking it between the read and the assign can still win that small
+      // race; it exists only until the migration is applied (take_case checks
+      // and assigns in one statement).
+      const current = await supabase.from('cases').select('assigned_to').eq('id', caseId).eq('org_id', orgId).maybeSingle();
+      if (current.error) throw caseFailure(current.error, current.status);
+      if (!current.data) throw new StoreError('Case not found', false);
+      const holder = typeof current.data.assigned_to === 'string' && current.data.assigned_to ? current.data.assigned_to.toLowerCase() : null;
+      if (holder && holder !== userId.toLowerCase()) throw new LeadTakenError('Already taken by a teammate', holder);
+      if (holder) return { eventBody: '', occurredAt: new Date().toISOString() };
+      return callAssignCase(caseId, userId, eventId);
     }
-    return { eventBody: row.event_body, occurredAt: row.occurred_at };
+    const row = (Array.isArray(data) ? data[0] : data) as { event_body?: unknown; occurred_at?: unknown } | null;
+    if (row && row.event_body !== undefined && row.event_body !== null && typeof row.event_body !== 'string') {
+      throw new StoreError('The case was taken but could not be read back. Refresh the case.', false);
+    }
+    return {
+      eventBody: typeof row?.event_body === 'string' ? row.event_body : '',
+      occurredAt: typeof row?.occurred_at === 'string' && row.occurred_at ? row.occurred_at : new Date().toISOString(),
+    };
   });
 }
 
@@ -845,8 +944,8 @@ export async function saveCaseBenefits(caseId: string, eventId: string, patch: C
     if ('planName' in patch) rpcPatch.plan_name = patch.planName;
     if ('memberIdLast4' in patch) rpcPatch.member_id_last4 = memberIdLast4(patch.memberIdLast4 || '');
     if ('subscriberRelationship' in patch) rpcPatch.subscriber_relationship = patch.subscriberRelationship;
-    const { data, error } = await supabase.rpc('save_case_benefits', { p_case_id: caseId, p_patch: rpcPatch, p_event_id: eventId });
-    if (error) throw new StoreError(error.message, false);
+    const { data, error, status } = await supabase.rpc('save_case_benefits', { p_case_id: caseId, p_patch: rpcPatch, p_event_id: eventId });
+    if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {
       carrier?: unknown; plan_name?: unknown; member_id_last4?: unknown; subscriber_relationship?: unknown; event_body?: unknown; occurred_at?: unknown;
     } | null;
@@ -888,7 +987,7 @@ export type RequestedVob = {
 
 export async function requestVob(input: VobRequestInput): Promise<RequestedVob> {
   return withStableCaseAccount(async () => {
-    const { data, error } = await supabase.rpc('request_vob', {
+    const { data, error, status } = await supabase.rpc('request_vob', {
       p_request: {
         id: input.id,
         case_id: input.caseId,
@@ -900,7 +999,7 @@ export async function requestVob(input: VobRequestInput): Promise<RequestedVob> 
         event_id: input.eventId,
       },
     });
-    if (error) throw new StoreError(error.message, false);
+    if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {
       id?: unknown; program_name?: unknown; global_partner_id?: unknown; requested_at?: unknown; follow_up_id?: unknown; due_on?: unknown; event_body?: unknown;
     } | null;
@@ -933,8 +1032,8 @@ export async function updateVobStatus(id: string, eventId: string, patch: VobSta
     if ('answeredBy' in patch) rpcPatch.answered_by = patch.answeredBy;
     if ('note' in patch) rpcPatch.note = patch.note;
     if ('quotedOutOfPocket' in patch) rpcPatch.quoted_out_of_pocket = patch.quotedOutOfPocket;
-    const { data, error } = await supabase.rpc('update_vob_status', { p_id: id, p_patch: rpcPatch, p_event_id: eventId });
-    if (error) throw new StoreError(error.message, false);
+    const { data, error, status } = await supabase.rpc('update_vob_status', { p_id: id, p_patch: rpcPatch, p_event_id: eventId });
+    if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {
       status?: unknown; answered_at?: unknown; answered_by?: unknown; note?: unknown; quoted_out_of_pocket?: unknown; event_body?: unknown; occurred_at?: unknown;
     } | null;
@@ -959,8 +1058,8 @@ export async function updateVobStatus(id: string, eventId: string, patch: VobSta
 // answer is what programs report about themselves ("per program").
 export async function fetchPartnersForPlan(plan: string, state: string): Promise<PartnerPlanStatus[]> {
   return withStableCaseAccount(async () => {
-    const { data, error } = await supabase.rpc('partners_for_plan', { p_insurance: plan, p_state: state || null });
-    if (error) throw new StoreError(error.message, false);
+    const { data, error, status } = await supabase.rpc('partners_for_plan', { p_insurance: plan, p_state: state || null });
+    if (error) throw caseFailure(error, status);
     const rows = (Array.isArray(data) ? data : []) as { partner_id?: unknown; organization?: unknown; network_status?: unknown; source?: unknown; same_state?: unknown }[];
     return rows.flatMap((row): PartnerPlanStatus[] => {
       if (typeof row.partner_id !== 'string' || typeof row.network_status !== 'string') return [];
@@ -1132,7 +1231,7 @@ export async function uploadCaseFile(input: UploadCaseFileInput): Promise<{ stor
   const { error } = await supabase.storage
     .from(BUCKET)
     .upload(storagePath, decode(base64), { contentType: input.mimeType, upsert: false });
-  if (error) throw new StoreError(error.message, false);
+  if (error) throw caseFailure(error);
   return { storagePath };
   });
 }
@@ -1141,7 +1240,7 @@ export async function uploadCaseFile(input: UploadCaseFileInput): Promise<{ stor
 export async function createCaseFileSignedUrl(storagePath: string): Promise<string> {
   return withStableCaseAccount(async () => {
   const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(storagePath, 60);
-  if (error || !data?.signedUrl) throw new StoreError(error?.message || 'Could not sign the file URL', false);
+  if (error || !data?.signedUrl) throw caseFailure(error ?? { message: 'Could not sign the file URL' }, undefined, 'Could not sign the file URL');
   return data.signedUrl;
   });
 }
@@ -1149,6 +1248,6 @@ export async function createCaseFileSignedUrl(storagePath: string): Promise<stri
 export async function removeCaseFile(storagePath: string): Promise<void> {
   await withStableCaseAccount(async () => {
   const { error } = await supabase.storage.from(BUCKET).remove([storagePath]);
-  if (error) throw new StoreError(error.message, false);
+  if (error) throw caseFailure(error);
   });
 }

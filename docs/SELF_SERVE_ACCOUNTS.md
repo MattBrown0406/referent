@@ -108,7 +108,16 @@ app; `App.tsx` exchanges the tokens in the link for a session and shows
 The link must be opened on a device with the app installed.
 
 **Delete account** (`src/lib/WorkspaceScreen.tsx` → `src/lib/account.ts` →
-`public.delete_own_account()`):
+`public.prepare_account_deletion()` → files → `public.delete_own_account()`):
+
+`prepare_account_deletion()` (20261024120000 section 13) runs before the
+app removes any case-document file. It makes the same checks and raises the
+same errors as `delete_own_account()` (28000 no session, P0002 account gone,
+22023 "Your workspace still has N other member(s)..."), and returns nothing.
+For an owner it first deletes the workspace's unused invites under a lock on
+the workspace row, so no colleague can join between the preflight and the
+deletion; an accept already in flight is waited for and then counted. A
+refusal rolls that back. For a member it changes nothing.
 
 | Who | What happens |
 | --- | --- |

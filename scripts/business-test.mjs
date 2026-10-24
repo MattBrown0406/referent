@@ -75,12 +75,15 @@ const stages = [
   { id: 's4', caseId: 'c2', status: 'placed', enteredAt: '2026-07-12T12:00:00Z' },
   { id: 's5', caseId: 'c3', status: 'lost', enteredAt: '2026-07-21T12:00:00Z' },
 ];
+// Square invoices here came from the webhook (lastSyncedAt set): only those
+// take the place of a case's own quote and payments.
+const SYNCED = '2026-08-01T00:00:00Z';
 const integrations = [
-  { id: 'i1', caseId: 'c1', provider: 'square', recordType: 'invoice', externalId: 'inv1', status: 'partially_paid', amountCents: 100000, paidAmountCents: 50000, currency: 'USD', dueOn: '2026-08-01', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' },
+  { id: 'i1', caseId: 'c1', provider: 'square', recordType: 'invoice', externalId: 'inv1', status: 'partially_paid', amountCents: 100000, paidAmountCents: 50000, currency: 'USD', dueOn: '2026-08-01', externalUrl: '', metadata: {}, lastSyncedAt: SYNCED, updatedAt: '2026-08-01T00:00:00Z' },
   { id: 'i2', caseId: 'c1', provider: 'pandadoc', recordType: 'document', externalId: 'doc1', status: 'document.sent', amountCents: 350000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' },
   // Older still-open proposal for the same case must not be double-counted.
   { id: 'i2-old', caseId: 'c1', provider: 'pandadoc', recordType: 'document', externalId: 'doc0', status: 'document.viewed', amountCents: 250000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-07-31T00:00:00Z' },
-  { id: 'i3', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv2', status: 'paid', amountCents: 200000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' },
+  { id: 'i3', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv2', status: 'paid', amountCents: 200000, currency: 'USD', externalUrl: '', metadata: {}, lastSyncedAt: SYNCED, updatedAt: '2026-08-01T00:00:00Z' },
 ];
 const referrals = [
   { id: 'r1', partnerId: 'p1', direction: 'Outbound', clientLabel: 'A.B.', date: '2026-07-10', outcome: 'Placed', note: '' },
@@ -116,7 +119,7 @@ equal('average days to engaged', result.averageDaysToEngaged, 2.5);
 // Square invoice or PandaDoc document to the same case. Webhooks sync only
 // the connecting owner's row; the teammate's copy goes stale. Each record
 // counts once per case, and the synced copy speaks for it.
-const syncedIntegrations = integrations.map((item) => (item.id === 'i1' ? { ...item, lastSyncedAt: '2026-08-01T00:00:00Z' } : item));
+const syncedIntegrations = integrations;
 const teammateCopies = [
   // Same invoice, same case, linked later by a teammate and never synced.
   { id: 'i1-teammate', caseId: 'c1', provider: 'square', recordType: 'invoice', externalId: ' inv1 ', status: 'unpaid', amountCents: 100000, paidAmountCents: 0, currency: 'USD', dueOn: '2026-08-01', externalUrl: '', metadata: {}, updatedAt: '2026-08-03T00:00:00Z' },
@@ -162,14 +165,50 @@ equal('distinct records, cases, record types and providers all stay', pick([
 // corrected $12,000 one sent. The case's quote is $12,000, not $27,000.
 {
   const reissued = [
-    { id: 'x1', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv-wrong', status: 'CANCELED', amountCents: 1500000, paidAmountCents: null, currency: 'USD', dueOn: '2026-07-15', externalUrl: '', metadata: {}, updatedAt: '2026-07-14T00:00:00Z' },
-    { id: 'x2', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv-right', status: 'unpaid', amountCents: 1200000, paidAmountCents: 0, currency: 'USD', dueOn: '2026-09-15', externalUrl: '', metadata: {}, updatedAt: '2026-07-15T00:00:00Z' },
+    { id: 'x1', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv-wrong', status: 'CANCELED', amountCents: 1500000, paidAmountCents: null, currency: 'USD', dueOn: '2026-07-15', externalUrl: '', metadata: {}, lastSyncedAt: SYNCED, updatedAt: '2026-07-14T00:00:00Z' },
+    { id: 'x2', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv-right', status: 'unpaid', amountCents: 1200000, paidAmountCents: 0, currency: 'USD', dueOn: '2026-09-15', externalUrl: '', metadata: {}, lastSyncedAt: SYNCED, updatedAt: '2026-07-15T00:00:00Z' },
   ];
   const canceled = business.computeBusinessDashboard([cases[1]], [], { stages, integrations: reissued }, 90, new Date(2026, 7, 6, 12));
   equal('a canceled invoice counts toward neither quoted, collected nor outstanding', [canceled.quotedRevenue, canceled.collectedRevenue, canceled.outstandingRevenue, canceled.sources[0].quoted, canceled.openInvoices], [12000, 0, 12000, 12000, 1]);
   // A refund still shows what was billed, with nothing collected or owed.
   const refunded = business.computeBusinessDashboard([cases[1]], [], { stages, integrations: [{ ...reissued[1], status: 'refunded', paidAmountCents: 1200000 }] }, 90, new Date(2026, 7, 6, 12));
   equal('a refunded invoice is quoted, not collected, not outstanding', [refunded.quotedRevenue, refunded.collectedRevenue, refunded.outstandingRevenue], [12000, 0, 0]);
+}
+
+// ─── Who speaks for a case's money ─────────────────────────────────────────
+// An invoice linked by hand is a reminder, not a record from Square: the
+// case's own quote and payments still count. Only a webhook-synced invoice
+// (lastSyncedAt) takes their place.
+{
+  const now = new Date(2026, 7, 6, 12);
+  const record = makeCase({ id: 'm1', status: 'engaged', quotedAmount: 9000, paidAmount: 4000, createdAt: '2026-07-01T12:00:00Z' });
+  const invoice = { id: 'm-inv', caseId: 'm1', provider: 'square', recordType: 'invoice', externalId: 'inv-m', status: 'paid', amountCents: 100000, paidAmountCents: null, currency: 'USD', dueOn: '2026-07-20', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' };
+  const money = (items, cases = [record]) => {
+    const result = business.computeBusinessDashboard(cases, [], { stages: [], integrations: items }, 90, now);
+    return [result.quotedRevenue, result.collectedRevenue, result.outstandingRevenue];
+  };
+  equal('a hand-linked "paid" invoice does not replace the case totals', money([invoice]), [9000, 4000, 5000]);
+  equal('a synced invoice does', money([{ ...invoice, lastSyncedAt: SYNCED }]), [1000, 1000, 0]);
+  equal('a legacy "completed" counts as paid', money([{ ...invoice, status: 'completed', lastSyncedAt: SYNCED }]), [1000, 1000, 0]);
+  equal('status case and spacing do not matter', money([{ ...invoice, status: 'PAID', lastSyncedAt: SYNCED }]), [1000, 1000, 0]);
+  equal('a draft is neither quoted nor outstanding', money([{ ...invoice, status: 'DRAFT', paidAmountCents: 0, lastSyncedAt: SYNCED }, { ...invoice, id: 'm-inv2', externalId: 'inv-m2', status: 'unpaid', amountCents: 300000, paidAmountCents: 0, lastSyncedAt: SYNCED }]), [3000, 0, 3000]);
+  const partial = business.computeBusinessDashboard([record], [], { stages: [], integrations: [{ ...invoice, status: 'partially_refunded', paidAmountCents: 100000, lastSyncedAt: SYNCED }] }, 90, now);
+  equal('a partially refunded invoice is finished: nothing outstanding, not open, not overdue', [partial.quotedRevenue, partial.collectedRevenue, partial.outstandingRevenue, partial.openInvoices, partial.overdueInvoices], [1000, 1000, 0, 0, 0]);
+  equal('and its refund is labelled as not tracked', partial.refundsNotTracked, 1);
+  equal('nothing else is labelled', business.computeBusinessDashboard([record], [], { stages: [], integrations: [{ ...invoice, lastSyncedAt: SYNCED }] }, 90, now).refundsNotTracked, 0);
+  equal('open / not open', ['unpaid', 'partially_paid', 'scheduled', 'paid', 'Partially Refunded', 'refunded', 'cancelled', 'draft', 'completed'].map(business.invoiceIsOpen), [true, true, true, false, false, false, false, false, false]);
+  equal('normalized statuses', ['Completed', 'CANCELLED', 'Partially paid', 'partially-refunded'].map(business.normalizeInvoiceStatus), ['paid', 'canceled', 'partially_paid', 'partially_refunded']);
+  equal('the picker offers Square\'s statuses', business.SQUARE_INVOICE_STATUSES.map((option) => option.value), ['unpaid', 'partially_paid', 'paid', 'partially_refunded', 'refunded', 'canceled', 'draft']);
+  // A lost case owes nothing; its quote stays in Quoted.
+  const lost = { ...record, id: 'm2', status: 'lost' };
+  equal('a lost case contributes nothing to outstanding (case totals)', money([], [lost]), [9000, 4000, 0]);
+  equal('a lost case contributes nothing to outstanding (synced invoice)', money([{ ...invoice, caseId: 'm2', status: 'unpaid', paidAmountCents: 0, lastSyncedAt: SYNCED }], [lost]), [1000, 0, 0]);
+  const panel = readFileSync(path.join(repoRoot, 'src/lib/CaseIntegrationPanel.tsx'), 'utf8');
+  equal('the panel picks a Square invoice status from the list instead of typing it', [
+    /squareStatusChoices\(form\.status\)\.map/.test(panel),
+    /isSquareInvoice\(form\) \? \(/.test(panel),
+    /refund amount not tracked/.test(panel),
+  ], [true, true, true]);
 }
 
 // ─── Speed to lead ──────────────────────────────────────────────────────────

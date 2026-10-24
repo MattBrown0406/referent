@@ -210,7 +210,7 @@ check('the saved case list falls back only when the server is unreachable',
 // or reopened offline must move yesterday's "today" items to OVERDUE.
 check('Today re-sorts when the local day changes',
   /\}, \[followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings\.leadResponseTargetMinutes, todayStamp\]\);/.test(appSource)
-  && /todayLoad\(followUps, partners\), \[followUps, partners, todayStamp\]\)/.test(appSource)
+  && /todayLoad\(followUps, partners, new Date\(\), cases\), \[followUps, partners, cases, todayStamp\]\)/.test(appSource)
   && /AppState\.addEventListener\('change', \(state\) => \{\s*if \(state !== 'active'\) return;\s*sync\(\);\s*scheduleMidnight\(\);/.test(appSource)
   && /timer = setTimeout\(\(\) => \{ sync\(\); scheduleMidnight\(\); \}/.test(appSource));
 check('Today has pull-to-refresh on its list',
@@ -265,6 +265,54 @@ eq('sections without leads are unchanged', [leadSections.overdue.length, leadSec
 eq('minutesWaiting counts whole minutes and never goes negative', [today.minutesWaiting(minutesAgo(20), NOW), today.minutesWaiting(minutesAgo(-5), NOW)], [20, 0]);
 eq('formatWaiting', [4, 59, 60, 75, 1439, 1500, 3000].map(today.formatWaiting), ['4m', '59m', '1h 0m', '1h 15m', '23h 59m', '1d 1h', '2d 2h']);
 for (const c of leadCards) console.log(`    ${today.formatWaiting(today.minutesWaiting(c.lead.arrivedAt, NOW)).padEnd(7)} ${c.lead.immediateDanger ? '⚠ ' : '  '}${c.title}  — ${c.subtitle}`);
+
+// A snoozed lead leaves NEW LEADS until its snooze date, and does not show
+// under TODAY or OVERDUE meanwhile; once the date comes it is back in NEW LEADS.
+{
+  const snoozedLeadFollowUps = leadFollowUps.map((item) => (item.id === 'f-lead-1' ? { ...item, snoozedUntil: '2026-07-25' } : item));
+  const snoozedCards = today.newLeadCards(leadCases, leadContacts, snoozedLeadFollowUps, 15, NOW);
+  eq('a snoozed lead is not in NEW LEADS', snoozedCards.map((c) => c.id), ['f-lead-2', 'f-lead-3']);
+  const snoozedSections = today.buildTodaySections(snoozedLeadFollowUps, due, NOW, contextFor, snoozedCards);
+  check('nor under TODAY or OVERDUE while snoozed', !snoozedSections.today.concat(snoozedSections.overdue).some((c) => c.id === 'f-lead-1'));
+  const nextDay = new Date(2026, 6, 25, 9, 0, 0);
+  check('it comes back to NEW LEADS on the snooze date', today.newLeadCards(leadCases, leadContacts, snoozedLeadFollowUps, 15, nextDay).some((c) => c.id === 'f-lead-1'));
+  check('a snooze that already passed changes nothing', today.newLeadCards(leadCases, leadContacts, leadFollowUps.map((item) => (item.id === 'f-lead-1' ? { ...item, snoozedUntil: '2026-07-20' } : item)), 15, NOW).some((c) => c.id === 'f-lead-1'));
+}
+
+// ─── Closed and lost cases leave Today ──────────────────────────────────────
+// Their follow-ups no longer show (or remind; notifications-test.mjs). A
+// placement check-in on a closed case still shows: the outcome is still due.
+console.log('\n── Closed and lost cases ──');
+{
+  const statusCases = [
+    { id: 'c-closed', status: 'closed' }, { id: 'c-lost', status: 'lost' }, { id: 'c-open', status: 'engaged' },
+  ];
+  const inactive = today.inactiveCaseIds(statusCases);
+  eq('inactiveCaseIds: closed and lost only', [...inactive].sort(), ['c-closed', 'c-lost']);
+  const caseFollowUps = [
+    fu({ id: 'x-closed', title: 'Closed case call', caseId: 'c-closed' }),
+    fu({ id: 'x-lost-overdue', title: 'Lost case overdue', caseId: 'c-lost', dueOn: '2026-07-20' }),
+    fu({ id: 'x-check-in', title: 'Check-in', caseId: 'c-closed', kind: 'check_in', referralId: 'r-9' }),
+    fu({ id: 'x-open', title: 'Open case call', caseId: 'c-open' }),
+    fu({ id: 'x-partner', title: 'Partner only', partnerId: 'p-1' }),
+  ];
+  const filtered = today.buildTodaySections(caseFollowUps, [], NOW, contextFor, [], inactive);
+  eq('TODAY keeps the open case, the partner item, and the check-in', filtered.today.map((c) => c.id).sort(), ['x-check-in', 'x-open', 'x-partner']);
+  eq('OVERDUE drops the lost case', filtered.overdue.map((c) => c.id), []);
+  eq('without case statuses nothing is dropped (old callers)', today.buildTodaySections(caseFollowUps, [], NOW, contextFor).today.length + today.buildTodaySections(caseFollowUps, [], NOW, contextFor).overdue.length, 5);
+  check('App passes the closed and lost cases to Today',
+    /buildTodaySections\(followUps, partnersDueToday\(partners, now, partnerSnoozes\), now, followUpContext, leads, inactiveCaseIds\(cases\)\)/.test(appSource));
+}
+
+// ─── The admit question follows the referral, not the packet ────────────────
+// An outbound referral with no admit answer yet asks "did they admit?" when
+// its check is done, whether it went out by packet or by Assign & refer.
+check('admit question gated on direction Outbound and admitted == null',
+  /referralAwaitingAnswer: Boolean\(referral && referral\.direction === 'Outbound' && referral\.admitted == null\)/.test(appSource)
+  && !/referralAwaitingAnswer: Boolean\(referral\?\.packetSentAt/.test(appSource));
+check('Today context lookups use Maps, not a find per card',
+  /function followUpContext\(followUp: FollowUp\) \{\s*const partner = followUp\.partnerId \? partnerById\.get\(followUp\.partnerId\)/.test(appSource));
+check('Done → Next step keeps the assignee', /caseId: followUp\.caseId,[\s\S]{0,200}assignedTo: followUp\.assignedTo,[\s\S]{0,40}kind: stepForm\.kind/.test(appSource));
 
 // ─── Mine / Everyone (team basics) ──────────────────────────────────────────
 const scopeFollowUps = [

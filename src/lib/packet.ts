@@ -41,6 +41,20 @@ export function disclosureLine(partner: Pick<Partner, 'financialRelationship' | 
   return `Disclosure: our practice has a financial relationship with this program (${financialRelationshipLabel(partner.financialRelationship).toLowerCase()}${note ? `: ${note}` : ''}). It played no part in this recommendation, which is based on fit alone. You are free to choose any program.`;
 }
 
+// The packet text is editable before it is shared. For a program with a
+// disclosed financial relationship (EKRA), the disclosure must still go out:
+// when the edited text no longer contains it word for word, it is appended
+// to the end. `added` tells the composer to say it was put back.
+export function withDisclosure(
+  text: string,
+  partner: Pick<Partner, 'financialRelationship' | 'financialRelationshipNote'>,
+): { text: string; added: boolean } {
+  const line = disclosureLine(partner);
+  if (!line || text.includes(line)) return { text, added: false };
+  const body = text.replace(/\s+$/, '');
+  return { text: body ? `${body}\n\n${line}` : line, added: true };
+}
+
 // De-identification heuristic (per brief): two or more capitalized words
 // looks like a full name. Used to show a gentle inline reminder in the
 // compose preview — advisory only, never blocks.

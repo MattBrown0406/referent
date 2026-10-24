@@ -101,6 +101,9 @@ the listing, except the person who set it. The kind is **opt-in and off by
 default** (`notification_preferences.bed_opened`); the copy is generic,
 "A program you follow has a bed open today.", and the payload carries only
 the listing id. Open -> still open, and anything -> 0, queue nothing.
+A listing that already queued a `bed_opened` push in the last six hours
+queues nothing more (20261024120000 section 20), so counts flipped back and
+forth do not ping followers over and over.
 Details in `NOTIFICATIONS.md`.
 
 ## Apply the migration
