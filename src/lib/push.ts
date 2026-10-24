@@ -213,6 +213,38 @@ async function registrationOwner(userId?: string): Promise<string | null> {
   }
 }
 
+// A sign-out we did not start (the session was revoked or expired on the
+// server, or forceLocalSignOut) never ran unregisterThisDevice. Mark every
+// registration still on this device for unregister at the next sign-in on it
+// (refreshPushRegistration — same account, or any other account).
+export async function markRegistrationsForUnregister(): Promise<void> {
+  registeredToken = null;
+  registeredUserId = null;
+  let keys: readonly string[];
+  try {
+    keys = await AsyncStorage.getAllKeys();
+  } catch {
+    return;
+  }
+  for (const key of keys) {
+    if (!key.startsWith(PUSH_REGISTRATION_KEY_PREFIX)) continue;
+    const record = await readStoredRegistration(key.slice(PUSH_REGISTRATION_KEY_PREFIX.length));
+    if (record && !record.pendingUnregister) await writeStoredRegistration(record.userId, record.token, true);
+  }
+}
+
+let signOutWatchInstalled = false;
+function watchSignOut(): void {
+  if (signOutWatchInstalled) return;
+  const auth = supabase.auth as unknown as { onAuthStateChange?: (callback: (event: string) => void) => unknown };
+  if (typeof auth.onAuthStateChange !== 'function') return;
+  signOutWatchInstalled = true;
+  auth.onAuthStateChange((event) => {
+    if (event === 'SIGNED_OUT') void markRegistrationsForUnregister();
+  });
+}
+watchSignOut();
+
 export type PushRegistration = { ok: true; token: string } | { ok: false; reason: string };
 
 // Why a device cannot register, in plain words. None of these is an error

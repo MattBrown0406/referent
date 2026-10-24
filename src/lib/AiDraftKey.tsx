@@ -44,7 +44,7 @@ export function AiKeyDisclosure() {
       <Text style={styles.body}>For each draft, ReferralFit sends Anthropic only:</Text>
       {SHARED_WITH_ANTHROPIC.map((line) => <Text key={line} style={styles.bullet}>•  {line}</Text>)}
       <Text style={styles.body}>
-        Never phone numbers, email addresses, case notes, documents, or your client’s name. Anthropic does not train its models on API data. Your key stays in this phone’s keychain; ReferralFit’s server passes it to Anthropic with each draft and never stores it.
+        Never phone numbers, email addresses, last names, case titles, case notes, or documents. Anthropic does not train its models on API data. Your key stays in this phone’s keychain; ReferralFit’s server passes it to Anthropic with each draft and never stores it.
       </Text>
       <Text style={styles.body}>
         If your practice needs a business associate agreement for this, set it up with Anthropic on your own account.

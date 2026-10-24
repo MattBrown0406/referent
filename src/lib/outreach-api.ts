@@ -11,6 +11,7 @@ import {
   type DraftRequestBody,
   type OutreachDraft,
 } from './outreach';
+import { beginOverlay } from './overlay';
 import { supabase } from './supabase';
 
 // ─── AI drafts (the draft-follow-up Edge Function) ──────────────────────────
@@ -193,8 +194,13 @@ export async function sendTextMessage(phone: string, body: string): Promise<Send
   if (sms) {
     try {
       if (await sms.isAvailableAsync()) {
-        const { result } = await sms.sendSMSAsync([digits], body);
-        return result;
+        const endOverlay = beginOverlay();
+        try {
+          const { result } = await sms.sendSMSAsync([digits], body);
+          return result;
+        } finally {
+          endOverlay();
+        }
       }
     } catch {
       // Fall through to the Messages link.
@@ -208,7 +214,13 @@ export async function sendEmailMessage(email: string, subject: string, body: str
   if (mail) {
     try {
       if (await mail.isAvailableAsync()) {
-        const { status } = await mail.composeAsync({ recipients: [email.trim()], subject, body });
+        const endOverlay = beginOverlay();
+        let status: string;
+        try {
+          ({ status } = await mail.composeAsync({ recipients: [email.trim()], subject, body }));
+        } finally {
+          endOverlay();
+        }
         if (status === 'sent') return 'sent';
         // Saved as a draft is not sent; nothing is logged.
         if (status === 'cancelled' || status === 'saved') return 'cancelled';

@@ -79,16 +79,19 @@ statuses also carry a `message` the app can show as is.
 | `status` | Extra keys | Meaning |
 | --- | --- | --- |
 | `created` | | No duplicate; a new active, verified listing owned by the workspace. |
-| `updated` | | The workspace already owned a listing; it was updated and re-verified. Status untouched (an admin-archived profile stays archived). |
+| `updated` | | The workspace already owned a listing; it was updated and re-verified. Status untouched. |
 | `updated_pending_review` | `review_id`, `held_fields` (any of `"name"`, `"phone"`, `"website"`), `message` | Updated, but the new organization/name, phone or website matches **another** listing. Those identity fields keep their live values; everything else in the save landed. An `identity_edit` review request holds the change. |
-| `conflict` | `review_id`, `message` | The duplicate is **owned by another workspace**, so a claim could never be approved. The caller's profile is created owned but `pending` (hidden from the directory) with a `profile_conflict` review request. Saving again returns `conflict` while the review is open. `listing_id` is the caller's own new profile. |
+| `conflict` | `review_id`, `message` | Either the phone/website duplicate is **owned by another workspace** (a claim could never be approved), or there is no phone/website duplicate but another non-archived listing has the **same name** (`directory_name_key`). The caller's profile is created owned but `pending` (hidden from the directory) with a `profile_conflict` review request. Saving again returns `conflict` while the review is open. `listing_id` is the caller's own new profile. |
+| `resubmitted_for_review` | `review_id`, `message` | The workspace saved its own profile while it was **archived** (for example after an admin declined a conflict). The save lands, the profile goes back to `pending` (hidden) and a `resubmitted_profile` review request is filed. Later saves return `resubmitted_for_review` while it is open. Before 2026-10-24 an archived profile returned `updated` and stayed archived forever. |
 | `claim_requested` | `request_id`, `message` | A duplicate exists that no workspace owns (it may be center-claimed). A `center_claim_requests` row was recorded (or the open one returned). **Nothing on the listing changed**; a platform admin decides. `listing_id` is returned only when the caller may see that listing (it is active, or the caller's workspace submitted or created it); otherwise it is `null`. |
 
 Messages, verbatim:
 
 - `updated_pending_review`: "Your other changes are live. The new name, phone number, or website matches another directory listing, so ReferralFit will review it first. Your current details stay up until then."
-- `conflict` (first save): "Another practice already manages a directory listing with this phone number or website. Your profile is saved and ReferralFit will review it before it appears in the directory."
-- `conflict` (later saves): "Your profile is saved and waits for ReferralFit to review it before it appears in the directory."
+- `conflict` (first save, phone/website owned elsewhere): "Another practice already manages a directory listing with this phone number or website. Your profile is saved and ReferralFit will review it before it appears in the directory."
+- `conflict` (first save, same name): "Another directory listing already uses this name. Your profile is saved and ReferralFit will review it before it appears in the directory."
+- `conflict` and `resubmitted_for_review` (later saves): "Your profile is saved and waits for ReferralFit to review it before it appears in the directory."
+- `resubmitted_for_review` (first save): "Your profile was not approved for the directory earlier. It is saved and sent to ReferralFit for review again, and it stays hidden until then."
 - `claim_requested`: "A directory listing with this phone number or website already exists. ReferralFit will review your request to manage it; nothing changes until then."
 
 `claimed` (automatic takeover) was removed on 2026-10-24. Older app builds
@@ -130,8 +133,19 @@ propagates to linked partners until an admin approves. A later identity
 change that collides with nothing goes live and withdraws the held one.
 Platform admins, service code and the SQL editor are never held.
 
+The held name is not searchable either: the trigger rebuilds `search_tsv`
+from the live values it keeps.
+
 This closes the "rename your claimed listing to a competitor and copy its
-phone" path. Suggestions never auto-link to a claimed listing at all
+phone" path.
+
+Matching uses one normalization everywhere (`directory_phone_digits`,
+`directory_website_domain`, which also fill the stored `phone_digits` /
+`website_domain` columns; existing rows were re-normalized by the
+migration): phone = digits only, an 11-digit number starting with 1 drops
+the 1 (so "+1 541 555 0100" matches "541-555-0100"); website = host only,
+lowercased, without the scheme (any case), a leading `www.`, the port, path,
+query or fragment. Suggestions never auto-link to a claimed listing at all
 (`docs/DIRECTORY_SUBMISSIONS.md`).
 
 ### Joining a team
@@ -181,6 +195,7 @@ SELECT public.resolve_directory_review_request('<id>', false);  -- decline
 | --- | --- | --- |
 | `identity_edit` | applies `proposed` (organization, name, phone, website) | nothing changes |
 | `profile_conflict` | the pending profile goes live and verified | the pending profile is archived |
+| `resubmitted_profile` | the profile goes live and verified | the profile is archived again |
 | `orphaned_profile` | the listing stays live and unowned | the listing is archived |
 
 The requesting workspace (and, for a center, the requesting account) can
@@ -274,6 +289,10 @@ only backfills `verified_at` on listings that already have a center claim.
   the directory yet; nothing can detect that. It no longer captures other
   practices' partners (suggestions never link to claimed listings), and the
   real program's own profile then lands as a `conflict` for the admin.
-- A profile created with only a name that matches another listing (no
-  shared phone or website) is still created live.
+- **Existence oracle.** The status alone (`claim_requested` / `conflict`)
+  tells the caller that *some* listing uses a phone number, website or name
+  they typed, even when `listing_id` is withheld. Nothing about that
+  listing is returned, and each probe files a request the admin can see,
+  but a determined owner can learn that a phone number is listed. Accepted
+  as is (2026-10-24).
 - Approving a claim request does not apply the submitted payload.

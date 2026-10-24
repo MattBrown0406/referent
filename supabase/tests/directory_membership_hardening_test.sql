@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(91);
+SELECT plan(103);
 
 -- Actors (suffix d7)
 --   ad  platform admin
@@ -28,6 +28,7 @@ VALUES
   ('b2000000-0000-0000-0000-0000000000d7', 'dr@northstar.example'),
   ('b3000000-0000-0000-0000-0000000000d7', 'owner@fresh-practice.example'),
   ('b4000000-0000-0000-0000-0000000000d7', 'owner@second-practice.example'),
+  ('b5000000-0000-0000-0000-0000000000d7', 'owner@name-twin.example'),
   ('a3000000-0000-0000-0000-0000000000d7', 'second-solo@solo-two.example'),
   ('c1000000-0000-0000-0000-0000000000d7', 'admissions@attacker.example'),
   ('c2000000-0000-0000-0000-0000000000d7', 'owner@submitting-practice.example'),
@@ -46,6 +47,7 @@ SELECT set_config('test.org_t', org_id::text, true) FROM public.org_members WHER
 SELECT set_config('test.org_o1', org_id::text, true) FROM public.org_members WHERE user_id = 'b1000000-0000-0000-0000-0000000000d7';
 SELECT set_config('test.org_o3', org_id::text, true) FROM public.org_members WHERE user_id = 'b3000000-0000-0000-0000-0000000000d7';
 SELECT set_config('test.org_o4', org_id::text, true) FROM public.org_members WHERE user_id = 'b4000000-0000-0000-0000-0000000000d7';
+SELECT set_config('test.org_o5', org_id::text, true) FROM public.org_members WHERE user_id = 'b5000000-0000-0000-0000-0000000000d7';
 SELECT set_config('test.org_s2', org_id::text, true) FROM public.org_members WHERE user_id = 'a3000000-0000-0000-0000-0000000000d7';
 SELECT set_config('test.org_p1', org_id::text, true) FROM public.org_members WHERE user_id = 'c2000000-0000-0000-0000-0000000000d7';
 
@@ -207,6 +209,62 @@ SELECT is(
   '(541) 555-0820',
   'an approved identity edit is applied'
 );
+
+-- Round 3, item 1: a first profile with only the NAME of another listing
+-- (no shared phone or website) is held as a conflict too.
+SELECT set_config('request.jwt.claim.sub', 'b5000000-0000-0000-0000-0000000000d7', true);
+SELECT set_config('test.twin', public.upsert_org_directory_profile(
+  '{"name":"Twin","organization":"The North Star Family Therapy","types":["Therapist"],"phone":"(503) 555-0999"}'::jsonb)::text, true);
+SELECT is(
+  (current_setting('test.twin')::jsonb ->> 'status') || '|' || (current_setting('test.twin')::jsonb ->> 'message'),
+  'conflict|Another directory listing already uses this name. Your profile is saved and ReferralFit will review it before it appears in the directory.',
+  'a profile named like an existing listing waits for review'
+);
+SELECT ok(
+  (SELECT status = 'pending' AND verified_at IS NULL AND owner_org_id = current_setting('test.org_o5')::uuid
+     FROM public.global_partners WHERE id = (current_setting('test.twin')::jsonb ->> 'listing_id')::uuid),
+  'it is owned but hidden'
+);
+
+-- Round 3, item 4: declined, then saved again: back to review, not stuck.
+SELECT set_config('request.jwt.claim.sub', 'ad000000-0000-0000-0000-0000000000d7', true);
+SELECT is(
+  public.resolve_directory_review_request((current_setting('test.twin')::jsonb ->> 'review_id')::uuid, false),
+  'rejected',
+  'the admin declines the name twin'
+);
+SELECT set_config('request.jwt.claim.sub', 'b5000000-0000-0000-0000-0000000000d7', true);
+SELECT set_config('test.resub', public.upsert_org_directory_profile(
+  '{"name":"Twin","organization":"North Star Counseling of Salem","types":["Therapist"],"phone":"(503) 555-0999"}'::jsonb)::text, true);
+SELECT is(
+  (current_setting('test.resub')::jsonb ->> 'status') || '|' || (current_setting('test.resub')::jsonb ->> 'message'),
+  'resubmitted_for_review|Your profile was not approved for the directory earlier. It is saved and sent to ReferralFit for review again, and it stays hidden until then.',
+  'saving an archived profile sends it back for review'
+);
+SELECT ok(
+  (SELECT status = 'pending' AND organization = 'North Star Counseling of Salem'
+     FROM public.global_partners WHERE id = (current_setting('test.twin')::jsonb ->> 'listing_id')::uuid)
+  AND (SELECT kind = 'resubmitted_profile' AND status = 'pending'
+         FROM public.directory_review_requests WHERE id = (current_setting('test.resub')::jsonb ->> 'review_id')::uuid),
+  'the profile is pending again with a resubmission review'
+);
+SELECT is(
+  public.upsert_org_directory_profile(
+    '{"name":"Twin","organization":"North Star Counseling of Salem","types":["Therapist"],"phone":"(503) 555-0999","city":"Salem"}'::jsonb) ->> 'status',
+  'resubmitted_for_review',
+  'later saves report the open resubmission'
+);
+SELECT set_config('request.jwt.claim.sub', 'ad000000-0000-0000-0000-0000000000d7', true);
+SELECT is(
+  public.resolve_directory_review_request((current_setting('test.resub')::jsonb ->> 'review_id')::uuid, true),
+  'approved',
+  'the admin approves the resubmission'
+);
+SELECT is(
+  (SELECT status FROM public.global_partners WHERE id = (current_setting('test.twin')::jsonb ->> 'listing_id')::uuid),
+  'active',
+  'and the profile goes live'
+);
 SELECT set_config('request.jwt.claim.sub', 'b3000000-0000-0000-0000-0000000000d7', true);
 SELECT throws_ok(
   $$ SELECT public.upsert_org_directory_profile('{"name":"x","organization":"y","types":["Detox"],"owner_org_id":"x"}'::jsonb) $$,
@@ -332,6 +390,38 @@ SELECT ok(
   'a center cannot take another listing''s name without review, and sees its request'
 );
 RESET ROLE;
+SELECT ok(
+  (SELECT NOT (search_tsv @@ to_tsquery('simple', 'summit')) AND search_tsv @@ to_tsquery('simple', 'attacker')
+          AND search_tsv @@ to_tsquery('simple', 'center')
+     FROM public.global_partners WHERE id = 'd3000000-0000-0000-0000-0000000000d7'),
+  'the held name is not searchable; the live name and the applied edits are'
+);
+
+-- Round 3, item 3: normalization for duplicate detection.
+SELECT ok(
+  public.directory_website_domain('Https://WWW.Example.com:8443/intake?x=1') = 'example.com'
+  AND public.directory_website_domain('HTTP://www.example.com') = 'example.com'
+  AND public.directory_website_domain('example.com/#top') = 'example.com'
+  AND public.directory_website_domain('/just/a/path') = ''
+  AND public.directory_phone_digits('+1 (541) 555-0100') = '5415550100'
+  AND public.directory_phone_digits('541-555-0100') = '5415550100'
+  AND public.directory_phone_digits('011 44 20 7946 0958') = '011442079460958',
+  'scheme case, www, port, path and a leading US country code no longer defeat matching'
+);
+INSERT INTO public.global_partners (id, name, organization, types, phone, website, status)
+VALUES ('db000000-0000-0000-0000-0000000000d7', 'Admissions', 'Normalized Recovery', ARRAY['Inpatient'], '+1 541 555 0960', 'HTTPS://WWW.UpperCase.example/', 'active');
+SELECT is(
+  (SELECT phone_digits || '|' || website_domain FROM public.global_partners WHERE id = 'db000000-0000-0000-0000-0000000000d7'),
+  '5415550960|uppercase.example',
+  'stored phone digits and domain use the same normalization'
+);
+SELECT is(
+  (SELECT count(*)::integer FROM public.global_partners
+    WHERE phone_digits IS DISTINCT FROM public.directory_phone_digits(phone)
+       OR website_domain IS DISTINCT FROM public.directory_website_domain(website)),
+  0,
+  'every stored listing is normalized the same way'
+);
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Finding 3: a solo practitioner with benefits and a shared listing joins

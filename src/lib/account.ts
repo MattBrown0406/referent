@@ -1,7 +1,8 @@
+import { forceLocalSignOut } from './auth-session';
 import { RejectedWritesError, StoreError, describeError } from './errors';
 import { fetchCurrentOrgId } from './org';
 import { fetchAllPages } from './paging';
-import { prepareForWorkspaceChange, rejectedWriteCount, waitingWriteCount } from './store';
+import { forgetWorkspaceBinding, prepareForWorkspaceChange, rejectedWriteCount, waitingWriteCount } from './store';
 import { supabase } from './supabase';
 
 // Self-serve account deletion (App Store guideline 5.1.1(v)).
@@ -80,5 +81,10 @@ export async function deleteOwnAccount({ userId, removeWorkspaceFiles }: DeleteO
   }
   const { error } = await supabase.rpc('delete_own_account');
   if (error) throw new StoreError(describeError(error, 'Could not delete the account.'), false);
-  await supabase.auth.signOut({ scope: 'local' });
+  // The server-side account is gone; nothing local should outlive it.
+  await forgetWorkspaceBinding(userId).catch(() => undefined);
+  const { error: signOutError } = await supabase.auth.signOut({ scope: 'local' });
+  // signOut() first refreshes the session; with an expired token and no
+  // connection it fails and leaves the session on the device. Remove it here.
+  if (signOutError) await forceLocalSignOut();
 }

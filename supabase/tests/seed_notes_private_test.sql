@@ -34,26 +34,30 @@ SELECT set_config('test.org_p1', org_id::text, true) FROM public.org_members WHE
 SELECT set_config('test.org_p2', org_id::text, true) FROM public.org_members WHERE user_id = 'b2000000-0000-0000-0000-0000000000f1';
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- A. Backslash-free helpers are equivalent to the original expressions
+-- A. Backslash-free helpers (normalization tightened by 20261024120000:
+--    a leading US country code is dropped, the scheme is stripped in any
+--    case and with surrounding whitespace, and the port goes too)
 -- ═══════════════════════════════════════════════════════════════════════════
 
 SELECT is(
   (SELECT count(*)::integer
-     FROM (VALUES ('(541) 555-0100'), ('541.555.0100 ext 4'), (''), (NULL), ('+1 541-555-0100'), ('abc'), (' 5 4 1 ')) AS t(v)
-    WHERE public.directory_phone_digits(v) IS DISTINCT FROM regexp_replace(coalesce(v, ''), '\D', '', 'g')),
+     FROM (VALUES ('(541) 555-0100', '5415550100'), ('541.555.0100 ext 4', '54155501004'), ('', ''), (NULL, ''),
+                  ('+1 541-555-0100', '5415550100'), ('abc', ''), (' 5 4 1 ', '541')) AS t(v, want)
+    WHERE public.directory_phone_digits(v) IS DISTINCT FROM want),
   0,
-  'directory_phone_digits gives the same answer as the original backslash-D expression'
+  'directory_phone_digits keeps digits only and drops a leading US 1 from an 11-digit number'
 );
 
 SELECT is(
   (SELECT count(*)::integer
-     FROM (VALUES ('https://www.seedranch.example/admissions'), ('HTTP://Example.ORG'), ('  https://example.org?x=1'),
-                  ('www.example.org/path'), ('example.org#frag'), (''), (NULL), ('/just/a/path'), ('?query'), ('www.'),
-                  ('https://'), ('  http://www.a.b.c:8080/x'), ('wwwexample.org'), (E'\thttps://tab.example')) AS t(v)
-    WHERE public.directory_website_domain(v) IS DISTINCT FROM
-          lower(regexp_replace(regexp_replace(coalesce(v, ''), '^\s*https?://', ''), '^(www\.)?([^/?#]+).*$', '\2'))),
+     FROM (VALUES ('https://www.seedranch.example/admissions', 'seedranch.example'), ('HTTP://Example.ORG', 'example.org'),
+                  ('  https://example.org?x=1', 'example.org'), ('www.example.org/path', 'example.org'),
+                  ('example.org#frag', 'example.org'), ('', ''), (NULL, ''), ('/just/a/path', ''), ('?query', ''),
+                  ('www.', ''), ('https://', ''), ('  http://www.a.b.c:8080/x', 'a.b.c'), ('wwwexample.org', 'wwwexample.org'),
+                  (E'\thttps://tab.example', 'tab.example'), ('Https://WWW.Mixed.Example', 'mixed.example')) AS t(v, want)
+    WHERE public.directory_website_domain(v) IS DISTINCT FROM want),
   0,
-  'directory_website_domain gives the same answer as the original backslash expression'
+  'directory_website_domain returns the lowercased host without scheme, www, port, or path'
 );
 
 SELECT ok(

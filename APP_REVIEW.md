@@ -95,7 +95,7 @@ the app never collects payment details.
 
 ## 3. Notes for the reviewer (App Review Information → Notes)
 
-Current text for 1.0.3 (8). Fill in the demo password from App Store Connect;
+Current text for 1.0.4 (2). Fill in the demo password from App Store Connect;
 never write it here.
 
 > ReferralFit is a free B2B tool for addiction-intervention practices. It is

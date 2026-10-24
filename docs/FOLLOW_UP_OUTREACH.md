@@ -108,7 +108,8 @@ app builds (`buildDraftRequest`) and the function re-validates
 - the practitioner's optional note (500 characters).
 
 It never contains phone numbers, email addresses, last names, case titles,
-case summaries, timeline notes, documents, or the client's name. Neither the
+case summaries, timeline notes, or documents (when the recipient is the
+client, only their first name goes, as for anyone). Neither the
 request nor the draft is stored or logged; `outreach_drafts` keeps only who
 drafted, which channel, which case or partner, and when (for the daily cap).
 
@@ -128,8 +129,10 @@ screen says so.
 
 ## Deploy
 
-Both are live in production as of 2026-10-23 (migration applied and
-recorded; function deployed). The order matters for any future environment:
+The migration is live in production as of 2026-10-23. The function was
+first deployed the same day in a version that read the key from a header;
+the app now sends it in the body, so deploy the function from the merged
+commit before testers use a build with this change. The order matters for any future environment:
 the migration first, because a build with this feature records every send
 with `record_outreach_sent`. There is no Anthropic secret to set on the
 server.

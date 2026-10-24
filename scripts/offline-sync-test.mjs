@@ -176,8 +176,15 @@ exports.supabase = {
   auth: {
     storage,
     storageKey: '${STORAGE_KEY}',
-    async signOut() { s.signedOut = true; return { error: null }; },
-    async _removeSession() { if (s.noRemoveSession) throw new Error('gone'); s.storage.delete('${STORAGE_KEY}'); s.authEvents = s.authEvents || []; s.authEvents.push('SIGNED_OUT'); },
+    async signOut() { s.signedOut = true; return { error: s.signOutError || null }; },
+    async _removeSession() {
+      if (s.noRemoveSession) throw new Error('gone');
+      s.storage.delete('${STORAGE_KEY}');
+      s.authEvents = s.authEvents || [];
+      s.authEvents.push('SIGNED_OUT');
+      for (const listener of s.authListeners || []) listener('SIGNED_OUT', null);
+    },
+    onAuthStateChange(callback) { (s.authListeners = s.authListeners || []).push(callback); return { data: { subscription: { unsubscribe() {} } } }; },
     getSession() {
       s.getSessionCalls += 1;
       if (s.auth === 'hang') return new Promise(() => {});
@@ -770,7 +777,7 @@ await check('transient server failures keep the queue intact; deterministic refu
   assert.equal(store.isTransientServerError({ message: 'Internal Server Error', httpStatus: 503 }), true);
 });
 
-await check('a "transient" failure that lasts over a day and 25 tries is set aside', async () => {
+await check('a "transient" failure is set aside after 25 tries over 2 hours, or 5 tries over 72 hours', async () => {
   await freshAccount();
   state.offline = true;
   await store.createPartner(partner('13131313-1313-4131-8131-131313131313', 'Stuck'), U);
@@ -779,11 +786,33 @@ await check('a "transient" failure that lasts over a day and 25 tries is set asi
   assert.equal(await store.flushWriteQueue(U), 0);
   const envelope = JSON.parse(state.asyncStorage.get(queueKey));
   const [key] = Object.keys(envelope.transientWaits);
-  envelope.transientWaits[key] = { first: new Date(Date.now() - 2 * 86400000).toISOString(), attempts: store.MAX_TRANSIENT_ATTEMPTS - 1 };
+  envelope.transientWaits[key] = { first: new Date(Date.now() - 3 * 3600000).toISOString(), attempts: store.MAX_TRANSIENT_ATTEMPTS - 1 };
   state.asyncStorage.set(queueKey, JSON.stringify(envelope));
   await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
   const [entry] = await store.listRejectedWrites(U);
   assert.match(entry.reason, /kept failing/);
+
+  // A rarely opened app: 5 tries spanning 3 days is enough.
+  await freshAccount();
+  state.offline = true;
+  await store.createPartner(partner('13131313-1313-4131-8131-131313131314', 'Rarely opened'), U);
+  state.offline = false;
+  state.failOn = (b) => (b.op === 'upsert') ? { message: 'Service Unavailable', httpStatus: 503 } : null;
+  assert.equal(await store.flushWriteQueue(U), 0);
+  const rare = JSON.parse(state.asyncStorage.get(queueKey));
+  const [rareKey] = Object.keys(rare.transientWaits);
+  rare.transientWaits[rareKey] = { first: new Date(Date.now() - 73 * 3600000).toISOString(), attempts: store.LONG_TRANSIENT_ATTEMPTS - 1 };
+  state.asyncStorage.set(queueKey, JSON.stringify(rare));
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
+  // A few failures within minutes never set anything aside.
+  await freshAccount();
+  state.offline = true;
+  await store.createPartner(partner('13131313-1313-4131-8131-131313131315', 'Blip'), U);
+  state.offline = false;
+  state.failOn = (b) => (b.op === 'upsert') ? { message: 'Service Unavailable', httpStatus: 503 } : null;
+  for (let i = 0; i < 30; i += 1) assert.equal(await store.flushWriteQueue(U), 0);
+  assert.equal(await store.rejectedWriteCount(U), 0, '30 quick failures are still a blip');
+  state.failOn = null;
 });
 
 // ─── Round 2: a change waiting on a missing parent does not hold up others ──
@@ -855,6 +884,148 @@ await check('forceLocalSignOut removes the persisted session offline', async () 
   state.offline = false;
 });
 
+// ─── Round 3: retried inserts land before later edits ───────────────────────
+
+await check('an offline edit of a refused insert joins it; retry lands the insert, then the edit', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const X = 'abababab-abab-4bab-8bab-abababababab';
+  goOfflineExpired();
+  await store.createPartner(partner(X, 'Hope House'), U);
+  await store.persistCache(snapOf({ partners: [partner(X, 'Hope House')] }), U);
+  signIn();
+  state.offline = false;
+  let refuse = true;
+  state.failOn = (b) => (refuse && b.table === 'partners' && b.op === 'upsert') ? { message: 'violates check constraint', code: '23514' } : null;
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
+  goOfflineExpired();
+  await store.updatePartner(partner(X, 'Hope House', { note: 'call Tues' }), U);
+  assert.equal(await store.pendingWriteCount(U), 0, 'the offline edit joins the refused insert, not the live queue');
+  const [entry] = await store.listRejectedWrites(U);
+  assert.equal(entry.heldChanges, 1);
+  refuse = false;
+  await store.retryRejectedWrite(U, entry.id); // offline: requeued in order
+  signIn();
+  state.offline = false;
+  state.failOn = null;
+  assert.equal(await store.flushWriteQueue(U), 2);
+  assert.equal(state.db.partners.find((row) => row.id === X)?.note, 'call Tues');
+});
+
+await check('an edit left in the queue by an interrupted flush cannot hold its retried insert behind it', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const F = 'fafafafa-fafa-4afa-8afa-fafafafafafa';
+  state.offline = true;
+  await store.createFollowUp(followUp(F, { title: 'Call the family' }), U);
+  await store.persistCache(snapOf({ followUps: [followUp(F, { title: 'Call the family' })] }), U);
+  await store.createPartner(partner('dadadada-dada-4ada-8ada-dadadadadada', 'Unrelated program'), U);
+  await store.updateFollowUp(followUp(F, { title: 'Call the family', note: 'ask about insurance' }), U);
+  state.offline = false;
+  let refuse = true;
+  let orgCalls = 0;
+  state.failOn = (b) => {
+    if (refuse && b.table === 'follow_ups' && b.op === 'upsert') return { message: 'The assignee must be a member of this workspace', code: '22023' };
+    if (b.op === 'rpc' && b.table === 'current_org_id' && ++orgCalls === 2) return { message: 'TypeError: Network request failed', code: '' };
+    return null;
+  };
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
+  assert.deepEqual(JSON.parse(state.asyncStorage.get(queueKey)).ops.map((op) => op.kind), ['partner.insert', 'follow_up.update']);
+  refuse = false;
+  const [entry] = await store.listRejectedWrites(U);
+  await store.retryRejectedWrite(U, entry.id);
+  assert.equal(state.db.follow_ups.find((row) => row.id === F)?.note, 'ask about insurance');
+  assert.equal(await store.pendingWriteCount(U), 0);
+  assert.equal(await store.rejectedWriteCount(U), 0);
+  // And with the edit ahead of its insert in the queue, the insert still runs first.
+  await freshAccount();
+  const G = 'fbfbfbfb-fbfb-4bfb-8bfb-fbfbfbfbfbfb';
+  state.offline = true;
+  await store.updateFollowUp(followUp(G, { note: 'edit first' }), U);
+  await store.createFollowUp(followUp(G), U);
+  state.offline = false;
+  assert.equal(await store.flushWriteQueue(U), 2);
+  assert.equal(state.db.follow_ups.find((row) => row.id === G)?.note, 'edit first');
+});
+
+// ─── Round 3: a failed join leaves the device bound ─────────────────────────
+
+await check('a join that fails after the pre-join sync leaves the device saving normally', async () => {
+  await freshAccount();
+  const P = 'cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd';
+  state.db.partners.push({ id: P, name: 'Hope House', organization: '', types: ['Inpatient'], org_id: ORG, created_at: new Date().toISOString() });
+  const { snapshot } = await store.hydrate(U);
+  await store.prepareForWorkspaceChange(U);
+  // acceptWorkspaceInvite fails here (bad code); nothing re-binds.
+  await store.updatePartner({ ...snapshot.partners[0], note: 'a' }, U);
+  assert.equal(state.db.partners.find((row) => row.id === P).note, 'a', 'online saves still work');
+  await store.persistCache(snapshot, U);
+  state.offline = true;
+  await store.updatePartner({ ...snapshot.partners[0], note: 'offline note' }, U);
+  assert.equal(await store.pendingWriteCount(U), 1);
+  state.offline = false;
+  assert.equal(await store.bindLocalWorkspace(U, ORG), false, 'same workspace: nothing wiped');
+  await store.hydrate(U);
+  assert.equal(state.db.partners.find((row) => row.id === P).note, 'offline note');
+
+  // A binding that is merely missing never wipes queued edits.
+  state.offline = true;
+  await store.updatePartner({ ...snapshot.partners[0], note: 'queued while unbound' }, U);
+  state.offline = false;
+  state.asyncStorage.delete(`referralfit-workspace-v1:${U}`);
+  assert.equal(await store.bindLocalWorkspace(U, ORG), true);
+  assert.equal(await store.pendingWriteCount(U), 1, 'the queued edit survives');
+  await store.flushWriteQueue(U);
+  assert.equal(state.db.partners.find((row) => row.id === P).note, 'queued while unbound');
+  // A positively different workspace still wipes everything.
+  state.offline = true;
+  await store.updatePartner({ ...snapshot.partners[0], note: 'old workspace' }, U);
+  state.offline = false;
+  assert.equal(await store.bindLocalWorkspace(U, '33333333-3333-4333-8333-333333333397'), true);
+  assert.equal(await store.pendingWriteCount(U), 0);
+});
+
+// ─── Round 3: queued edits are not reverted by a refresh ────────────────────
+
+await check('a completion held by a passing server failure stays done through a refresh', async () => {
+  await freshAccount();
+  const F = 'efefefef-efef-4fef-8fef-efefefefefef';
+  state.db.follow_ups.push({ id: F, title: 'Call mom', due_on: '2026-10-23', status: 'open', org_id: ORG, created_at: new Date().toISOString(), kind: 'follow_up' });
+  let snap = (await store.hydrate(U)).snapshot;
+  state.failOn = (b) => (b.op === 'rpc' && b.table === 'complete_follow_up_with_next') ? { message: 'canceling statement due to statement timeout', code: '57014' } : null;
+  const N1 = 'e1e1e1e1-e1e1-4e1e-8e1e-e1e1e1e1e1e1';
+  const done = followUp(F, { title: 'Call mom', status: 'done', completedAt: new Date().toISOString() });
+  await store.completeFollowUpWithNext(done, followUp(N1, { title: 'Call mom again', dueOn: '2026-10-26' }), null, U);
+  await store.persistCache({ ...snap, followUps: [done, followUp(N1, { title: 'Call mom again', dueOn: '2026-10-26' })] }, U);
+  assert.equal(await store.pendingWriteCount(U), 1);
+  assert.equal(await store.flushWriteQueue(U), 0);
+  snap = await store.refreshSnapshot(U);
+  assert.equal(snap.followUps.find((row) => row.id === F)?.status, 'done', 'the queued completion is still shown');
+  assert.ok(snap.followUps.some((row) => row.id === N1));
+  state.failOn = null;
+  await store.flushWriteQueue(U);
+  assert.deepEqual(state.rpcCalls.filter((call) => call.name === 'complete_follow_up_with_next').map((call) => call.args.p_next.id), [N1], 'sent once');
+
+  // A pending match deletion keeps the match hidden; a pending edit shows the device's copy.
+  await freshAccount();
+  const M = '3c3c3c3c-3c3c-4c3c-8c3c-3c3c3c3c3c3c';
+  const P = '3d3d3d3d-3d3d-4d3d-8d3d-3d3d3d3d3d3d';
+  state.db.match_profiles.push(matchRow(M));
+  state.db.partners.push({ id: P, name: 'Shared', organization: '', types: ['Inpatient'], note: 'server', org_id: ORG, created_at: new Date().toISOString() });
+  snap = (await store.hydrate(U)).snapshot;
+  state.offline = true;
+  await store.deleteMatchProfile(M, U);
+  const edited = { ...snap.partners[0], note: 'device' };
+  await store.updatePartner(edited, U);
+  await store.persistCache({ ...snap, referralMatches: [], partners: [edited] }, U);
+  state.offline = false;
+  state.failOn = (b) => (b.op !== 'select' && b.op !== 'rpc') ? { message: 'Service Unavailable', httpStatus: 503 } : null;
+  snap = await store.refreshSnapshot(U);
+  assert.equal(snap.referralMatches.length, 0, 'deleted on this device: stays hidden');
+  assert.equal(snap.partners[0].note, 'device');
+  state.failOn = null;
+});
+
 // ─── account.ts: every document is removed, past the 1,000-row cap ──────────
 
 {
@@ -864,6 +1035,7 @@ await check('forceLocalSignOut removes the persisted session offline', async () 
   writeFileSync(path.join(accountDir, 'paging.js'), "module.exports = require('../paging.js');");
   writeFileSync(path.join(accountDir, 'supabase.js'), "module.exports = require('../supabase.js');");
   writeFileSync(path.join(accountDir, 'org.js'), `exports.fetchCurrentOrgId = async () => '${ORG}';`);
+  writeFileSync(path.join(accountDir, 'auth-session.js'), 'exports.forceLocalSignOut = async () => { globalThis.__offlineSyncState.forcedSignOut = (globalThis.__offlineSyncState.forcedSignOut || 0) + 1; };');
   writeFileSync(path.join(accountDir, 'store.js'), `
 const { RejectedWritesError } = require('../errors.js');
 const s = globalThis.__offlineSyncState;
@@ -873,6 +1045,7 @@ exports.prepareForWorkspaceChange = async (userId, options) => {
 };
 exports.rejectedWriteCount = async () => (s.refuseFirstPrepare ? 1 : 0);
 exports.waitingWriteCount = async () => (s.waitingOnPrepare ? 1 : 0);
+exports.forgetWorkspaceBinding = async (userId) => { s.forgotBinding = userId; };
 `);
   const account = require(path.join(accountDir, 'account.js'));
   await check('account deletion removes every case document, paged', async () => {
@@ -898,6 +1071,15 @@ exports.waitingWriteCount = async () => (s.waitingOnPrepare ? 1 : 0);
     await account.deleteOwnAccount({ userId: U, removeWorkspaceFiles: false });
     assert.deepEqual(state.prepared, [{ userId: U, options: undefined }, { userId: U, options: { discardRejected: true } }]);
     state.refuseFirstPrepare = false;
+  });
+  await check('account deletion removes the local session even when signOut fails offline', async () => {
+    state.prepared = [];
+    state.forcedSignOut = 0;
+    state.signOutError = { name: 'AuthRetryableFetchError', message: 'Network request failed' };
+    await account.deleteOwnAccount({ userId: U, removeWorkspaceFiles: false });
+    assert.equal(state.forcedSignOut, 1);
+    assert.equal(state.forgotBinding, U, 'the workspace binding goes with the account');
+    state.signOutError = null;
   });
   await check('account deletion is not blocked by changes waiting on a record that never arrives', async () => {
     state.prepared = [];
@@ -1017,6 +1199,20 @@ exports.waitingWriteCount = async () => (s.waitingOnPrepare ? 1 : 0);
     ], 'claimed from the old account, then released');
     assert.equal(state.asyncStorage.has(`referralfit-push-registration-v1:${U}`), false);
     signIn();
+  });
+  // ─── Round 3: push registrations survive a sign-out we did not start ───────
+
+  await check('a revoked-session sign-out marks the device registration for unregister', async () => {
+    resetDb();
+    state.asyncStorage.clear();
+    signIn();
+    state.authListeners = [];
+    const push = freshPush();
+    await push.registerThisDevice(U);
+    for (const listener of state.authListeners || []) listener('SIGNED_OUT', null); // e.g. refresh token revoked
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.match(state.asyncStorage.get(`referralfit-push-registration-v1:${U}`), /"pendingUnregister":true/);
+    state.authListeners = [];
   });
 }
 

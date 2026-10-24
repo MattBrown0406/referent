@@ -554,9 +554,13 @@ function newHoldSets(): HoldSets {
   return { writes: new Map(), creates: new Map() };
 }
 
+// A row an op CREATES is held only by another held op that creates it too —
+// never by a held edit of it: that edit is waiting for exactly this insert
+// (e.g. an edit queued ahead of a retried insert), so the insert must run.
 function holderOf(rows: OpRows, sets: HoldSets): string | undefined {
+  const creates = new Set(rows.creates);
   for (const key of rows.writes) {
-    const holder = sets.writes.get(key) ?? sets.creates.get(key);
+    const holder = creates.has(key) ? sets.creates.get(key) : sets.writes.get(key) ?? sets.creates.get(key);
     if (holder) return holder;
   }
   for (const key of rows.parents) {
@@ -890,10 +894,21 @@ function classifyWriteFailure(error: unknown): FailureKind {
 
 export const MAX_PARENT_WAIT_ATTEMPTS = 12;
 export const MAX_PARENT_WAIT_MS = 7 * 24 * 60 * 60 * 1000;
-// A "passing" failure that keeps happening for a day and 25 tries is not
-// passing: set it aside so the queue cannot be blocked forever.
+// A "passing" failure that keeps happening is not passing: the op is set
+// aside (retry/discard from the review list) so it cannot block the queue
+// forever. Bound: 25 failed tries spanning at least 2 hours (an active user
+// flushes on every save/foreground), OR — for an app opened rarely — 5 tries
+// spanning at least 72 hours. A single blip, or an outage of a few minutes
+// across many saves, never sets anything aside.
 export const MAX_TRANSIENT_ATTEMPTS = 25;
-export const MIN_TRANSIENT_WAIT_MS = 24 * 60 * 60 * 1000;
+export const MIN_TRANSIENT_WAIT_MS = 2 * 60 * 60 * 1000;
+export const LONG_TRANSIENT_ATTEMPTS = 5;
+export const LONG_TRANSIENT_WAIT_MS = 72 * 60 * 60 * 1000;
+
+function transientCapped(wait: OpWait, waitedMs: number): boolean {
+  return (wait.attempts >= MAX_TRANSIENT_ATTEMPTS && waitedMs >= MIN_TRANSIENT_WAIT_MS)
+    || (wait.attempts >= LONG_TRANSIENT_ATTEMPTS && waitedMs >= LONG_TRANSIENT_WAIT_MS);
+}
 
 function bumpWait(waits: Record<string, OpWait>, key: string, now = Date.now()): { wait: OpWait; waitedMs: number } {
   const previous = waits[key];
@@ -951,8 +966,8 @@ async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
   // Returns true when the flush must stop here (the op stays where it is).
   const passingFailure = async (op: QueueOp, error: unknown): Promise<boolean> => {
     const { wait, waitedMs } = bumpWait(waits.transientWaits, queueOpKey(op));
-    if (wait.attempts >= MAX_TRANSIENT_ATTEMPTS && waitedMs >= MIN_TRANSIENT_WAIT_MS) {
-      await setAside(op, error, `The server kept failing on this change for over a day (${describeError(error)}).`);
+    if (transientCapped(wait, waitedMs)) {
+      await setAside(op, error, `The server kept failing on this change (${wait.attempts} tries; ${describeError(error)}).`);
       return false;
     }
     return true;
@@ -1198,7 +1213,7 @@ export async function discardAllRejectedWrites(expectedUserId: string): Promise<
   });
 }
 
-// Put a refused change (and what it holds, in order) back at the end of the
+// Put a refused change (and what it holds, in order) back at the front of the
 // live queue and flush. Returns the number of ops applied; throws
 // RejectedWritesError (and lists it again) if the server still refuses it.
 // Offline it simply stays queued.
@@ -1212,7 +1227,10 @@ export async function retryRejectedWrite(expectedUserId: string, rejectedId: str
     const state = await readQueueStateUnlocked(fence.userId);
     await assertSessionFence(fence);
     // Live queue first, then out of the rejected list: never in neither.
-    await writeQueueUnlocked(fence.userId, [...state.ops, ...entry.ops], state);
+    // Ahead of the queue: a later edit of the same row may already be queued
+    // (made offline, or before an interrupted flush reached it), and creates
+    // must precede edits of the rows they create.
+    await writeQueueUnlocked(fence.userId, [...entry.ops, ...state.ops], state);
     await writeRejectedUnlocked(fence.userId, entries.filter((item) => item.id !== rejectedId));
     await assertSessionFence(fence, true);
   });
@@ -1230,6 +1248,12 @@ export type WorkspaceChangeOptions = {
 // auth user. Flush the old workspace queue, refuse to cross the boundary while
 // anything remains unsynced, then remove the account-scoped cache so hydrate()
 // cannot interpret old-workspace rows as new unsynced local records.
+//
+// The workspace binding is deliberately KEPT: if the join then fails (a
+// mistyped or expired code, no signal) the device is still correctly bound to
+// the workspace the server reports and keeps saving normally. After a
+// successful join the next bindLocalWorkspace sees the server's new workspace
+// differ from this binding and switches over (wiping again).
 export async function prepareForWorkspaceChange(expectedUserId: string, options: WorkspaceChangeOptions = {}): Promise<void> {
   const fence = await sessionFence(expectedUserId);
   if (fence.offline) throw new StoreError('Connect to the internet so this device can sync its changes, then try again.', false);
@@ -1266,7 +1290,6 @@ export async function prepareForWorkspaceChange(expectedUserId: string, options:
           accountStorageKey(CACHE_KEY_PREFIX, fence.userId),
           accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
           accountStorageKey(REJECTED_KEY_PREFIX, fence.userId),
-          accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId),
           ...await caseCacheKeys(fence.userId),
         ]);
       } catch (error) {
@@ -1275,6 +1298,19 @@ export async function prepareForWorkspaceChange(expectedUserId: string, options:
       await assertSessionFence(fence);
     });
   });
+}
+
+// After the account itself is deleted on the server: drop the last
+// account-scoped key (the workspace binding) prepareForWorkspaceChange keeps.
+export async function forgetWorkspaceBinding(expectedUserId: string): Promise<void> {
+  const fence = await sessionFence(expectedUserId);
+  await withCacheLock(async () => withQueueLock(async () => {
+    try {
+      await AsyncStorage.removeItem(accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId));
+    } catch (error) {
+      throw persistenceError('cache', error);
+    }
+  }));
 }
 
 // The workspace this account's local cache and queue were last bound to, or
@@ -1303,7 +1339,12 @@ export async function isOfflineSession(expectedUserId: string): Promise<boolean>
 }
 
 // Bind account-local cache/queue data to the authoritative server workspace.
-// A missing marker is treated as untrusted legacy state and quarantined too.
+// A binding that positively names another workspace wipes everything local
+// (cache, queue, rejected list, case copies). A MISSING binding is treated as
+// untrusted for the saved copies only (they are re-read from the server); the
+// queue and rejected list are kept — they hold the user's unsynced edits, and
+// every queued op is still checked against the server's workspace before it
+// is sent (assertWorkspaceFence), so nothing can land in the wrong tenant.
 export async function bindLocalWorkspace(expectedUserId: string, orgId: string): Promise<boolean> {
   if (!isUuid(orgId)) throw new StoreError('A valid workspace is required before loading offline data.', false);
   const fence = await sessionFence(expectedUserId);
@@ -1318,12 +1359,13 @@ export async function bindLocalWorkspace(expectedUserId: string, orgId: string):
     }
     const changed = previous?.toLowerCase() !== orgId.toLowerCase();
     if (changed) {
+      const differs = Boolean(previous);
       try {
         await AsyncStorage.multiRemove([
           accountStorageKey(CACHE_KEY_PREFIX, fence.userId),
-          accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
-          accountStorageKey(REJECTED_KEY_PREFIX, fence.userId),
           ...await caseCacheKeys(fence.userId),
+          // Unsynced edits are dropped only for a positively different workspace.
+          ...(differs ? [accountStorageKey(QUEUE_KEY_PREFIX, fence.userId), accountStorageKey(REJECTED_KEY_PREFIX, fence.userId)] : []),
         ]);
         await AsyncStorage.setItem(workspaceKey, orgId.toLowerCase());
       } catch (error) {
@@ -2034,7 +2076,7 @@ async function fetchExistingIds(table: ProbedTable, ids: string[]): Promise<Set<
 // Ids of rows that a change still waiting on this device would create: every
 // op in the live queue and in the rejected list (a refused change keeps its
 // row visible until the user retries or discards it).
-type PendingRows = {
+type TableIds = {
   partners: Set<string>;
   referrals: Set<string>;
   matches: Set<string>;
@@ -2042,37 +2084,35 @@ type PendingRows = {
   followUps: Set<string>;
 };
 
-function rowIdOf(row: Record<string, unknown> | null | undefined): string | null {
-  const id = row?.id;
-  return typeof id === 'string' && id ? id.toLowerCase() : null;
+// What changes still waiting on this device (live queue or rejected list) do
+// to each table: rows they create, rows they write (create, edit, complete),
+// and match profiles they delete.
+type PendingRows = TableIds & { written: TableIds; deletedMatches: Set<string> };
+
+const SNAPSHOT_TABLE: Record<string, keyof TableIds> = {
+  partners: 'partners',
+  referrals: 'referrals',
+  match_profiles: 'matches',
+  touches: 'touches',
+  follow_ups: 'followUps',
+};
+
+function emptyTableIds(): TableIds {
+  return { partners: new Set(), referrals: new Set(), matches: new Set(), touches: new Set(), followUps: new Set() };
 }
 
 function pendingCreatedRows(ops: QueueOp[]): PendingRows {
-  const pending: PendingRows = { partners: new Set(), referrals: new Set(), matches: new Set(), touches: new Set(), followUps: new Set() };
-  const add = (set: Set<string>, row: Record<string, unknown> | null | undefined) => {
-    const id = rowIdOf(row);
-    if (id) set.add(id);
+  const pending: PendingRows = { ...emptyTableIds(), written: emptyTableIds(), deletedMatches: new Set() };
+  const add = (target: TableIds, key: string) => {
+    const split = key.indexOf(':');
+    const field = SNAPSHOT_TABLE[key.slice(0, split)];
+    if (field) target[field].add(key.slice(split + 1));
   };
   for (const op of ops) {
-    switch (op.kind) {
-      case 'partner.insert': add(pending.partners, op.row); break;
-      case 'referral.insert': add(pending.referrals, op.row); break;
-      case 'match.insert': add(pending.matches, op.row); break;
-      case 'touch.insert': add(pending.touches, op.row); break;
-      case 'follow_up.insert': add(pending.followUps, op.row); break;
-      case 'follow_up.complete_next': add(pending.followUps, op.next); break;
-      case 'match.save_case': add(pending.matches, op.match); break;
-      case 'referral.assign_match': add(pending.referrals, op.referral); add(pending.matches, op.match); break;
-      case 'packet.finalize':
-        add(pending.referrals, op.referral);
-        add(pending.matches, op.match);
-        add(pending.touches, op.touch);
-        add(pending.followUps, op.followUp);
-        break;
-      case 'contact.log_activity': add(pending.touches, op.touch); break;
-      case 'outreach.sent': add(pending.followUps, op.next); add(pending.touches, op.touch); break;
-      default: break;
-    }
+    const rows = opRows(op);
+    for (const key of rows.creates) add(pending, key);
+    for (const key of rows.writes) add(pending.written, key);
+    if (op.kind === 'match.delete') pending.deletedMatches.add(op.id.toLowerCase());
   }
   return pending;
 }
@@ -2094,46 +2134,63 @@ function isPendingRow(set: Set<string>, id: string): boolean {
 // Merge rows that exist only in this account's local cache into a freshly
 // fetched server snapshot.
 //
+// Rows a change still waiting on this device writes (`pending.written`: live
+// queue or rejected list — e.g. a completion held by a passing server failure)
+// show the device's version, not the server's: otherwise the queued edit
+// would vanish from screen and from the saved copy, and redoing it would send
+// it twice. A pending match deletion keeps the match hidden.
+//
 // A row the cache has and the server load lacks is one of three things: a
 // local row that has not reached the server yet, a row saved online while
 // this load was in flight, or a row someone deleted on the server (a
-// teammate, another device). Rows a change still waiting on this device
-// creates (`pending`: live queue or rejected list) are kept. The others are
-// looked up by id: a row the server has was written after the load began and
-// is kept; a row it does not have was deleted and is dropped from the saved
-// copy — re-inserting it would undo the deletion. Nothing is queued here; the
-// op that creates a pending row is already durable.
+// teammate, another device). Rows a pending change creates are kept. The
+// others are looked up by id: a row the server has was written after the load
+// began and is kept; a row it does not have was deleted and is dropped from
+// the saved copy — re-inserting it would undo the deletion. Nothing is queued
+// here; the op behind a pending row is already durable.
 //
 // Follow-ups load open rows only, so a cached one can be missing because it
 // was completed:
-//   - cached rows that are not open are never candidates;
+//   - cached rows that are not open are never candidates (unless a pending
+//     change writes them);
 //   - cached open rows the remote load lacks are looked up by id on the server.
-//     A row the server has wins (kept if still open, dropped if completed). An
-//     id the server does not know survives only while a pending op creates it.
+//     A row the server has wins (kept if still open, dropped if completed)
+//     unless a pending change writes it. An id the server does not know
+//     survives only while a pending op creates it.
 async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null, pending: PendingRows): Promise<{ snapshot: Snapshot }> {
   if (!local) return { snapshot: remote };
-  const keepUnsynced = async <T extends { id: string }>(table: ProbedTable, r: T[], l: T[], created: Set<string>): Promise<T[]> => {
+  const keepUnsynced = async <T extends { id: string }>(
+    table: ProbedTable, r: T[], l: T[], created: Set<string>, written: Set<string>, deleted?: Set<string>,
+  ): Promise<T[]> => {
+    const localById = new Map(l.map((x) => [x.id, x]));
+    const fromServer = r
+      .filter((x) => !(deleted && isPendingRow(deleted, x.id)))
+      .map((x) => (isPendingRow(written, x.id) && localById.has(x.id) ? localById.get(x.id) as T : x));
     const have = new Set(r.map((x) => x.id));
     const extra = l.filter((x) => x.id && !have.has(x.id));
     const unsure = extra.filter((x) => !isPendingRow(created, x.id));
     const onServer = unsure.length ? await fetchExistingIds(table, unsure.map((x) => x.id)) : new Set<string>();
-    return [...r, ...extra.filter((x) => isPendingRow(created, x.id) || onServer.has(x.id))];
+    return [...fromServer, ...extra.filter((x) => isPendingRow(created, x.id) || onServer.has(x.id))];
   };
 
+  const localFollowUps = new Map(local.followUps.map((row) => [row.id, row]));
+  const devicesCopy = (id: string) => (isPendingRow(pending.written.followUps, id) ? localFollowUps.get(id) : undefined);
   const remoteFollowUpIds = new Set(remote.followUps.map((row) => row.id));
   const openCandidates = local.followUps.filter((row) => row.id && row.status === 'open' && !remoteFollowUpIds.has(row.id));
   const serverCopies = openCandidates.length ? await fetchFollowUpsById(openCandidates.map((row) => row.id)) : [];
   const serverById = new Map(serverCopies.map((row) => [row.id, row]));
+  const heldLocally = local.followUps.filter((row) => row.id && row.status !== 'open' && !remoteFollowUpIds.has(row.id) && devicesCopy(row.id));
   return {
     snapshot: {
-      partners: await keepUnsynced('partners', remote.partners, local.partners, pending.partners),
-      referrals: await keepUnsynced('referrals', remote.referrals, local.referrals, pending.referrals),
-      referralMatches: await keepUnsynced('match_profiles', remote.referralMatches, local.referralMatches, pending.matches),
-      touches: await keepUnsynced('touches', remote.touches, local.touches, pending.touches),
+      partners: await keepUnsynced('partners', remote.partners, local.partners, pending.partners, pending.written.partners),
+      referrals: await keepUnsynced('referrals', remote.referrals, local.referrals, pending.referrals, pending.written.referrals),
+      referralMatches: await keepUnsynced('match_profiles', remote.referralMatches, local.referralMatches, pending.matches, pending.written.matches, pending.deletedMatches),
+      touches: await keepUnsynced('touches', remote.touches, local.touches, pending.touches, pending.written.touches),
       followUps: [
-        ...remote.followUps,
-        ...serverCopies.filter((row) => row.status === 'open').map(mapFollowUpRow),
+        ...remote.followUps.map((row) => devicesCopy(row.id) ?? row),
+        ...serverCopies.filter((row) => row.status === 'open' || devicesCopy(row.id)).map((row) => devicesCopy(row.id) ?? mapFollowUpRow(row)),
         ...openCandidates.filter((row) => !serverById.has(row.id) && isPendingRow(pending.followUps, row.id)),
+        ...heldLocally,
       ],
       scorecards: remote.scorecards,
     },
@@ -2300,11 +2357,18 @@ async function runOrQueue(
   execute: (userId: string, orgId: string) => PromiseLike<WriteResponse>,
 ): Promise<void> {
   const fence = await sessionFence(expectedUserId);
+  const rows = opRows(op);
   if (fence.offline) {
-    await enqueueOp(fence, op);
+    // Same rule as online: a change to a record whose earlier change was
+    // refused joins it in the rejected list rather than the live queue.
+    await withQueueLock(async () => {
+      const rejected = await openRejectedList(fence);
+      const holder = holderOf(rows, rejected.sets);
+      if (holder) await rejected.attach(holder, bindQueueOp(op, fence.userId));
+      else await enqueueOpUnlocked(fence, op);
+    });
     return;
   }
-  const rows = opRows(op);
   await withQueueLock(async () => {
     let stopped = false;
     if ((await readQueueUnlocked(fence.userId)).length) {

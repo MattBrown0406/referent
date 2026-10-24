@@ -73,6 +73,7 @@ import { bedForFromPopulation, bedsCadenceLine, bedsLine, type BedFor } from './
 import { supabase } from './src/lib/supabase';
 import { forceLocalSignOut, isAuthNetworkError, offlineSessionFallback, resolveLaunchSession } from './src/lib/auth-session';
 import { describeError, RejectedWritesError } from './src/lib/errors';
+import { beginOverlay, overlayOpen } from './src/lib/overlay';
 import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
@@ -683,6 +684,7 @@ function DropdownField({
   icon: IconName;
 }) {
   const [open, setOpen] = useState(false);
+  useEffect(() => (open ? beginOverlay() : undefined), [open]);
   const selected = options.find((option) => option.value === value) || options[0];
   return (
     <View style={styles.dropdownField}>
@@ -754,6 +756,7 @@ function MultiSelectDropdown({
   selectedNoun?: string;
 }) {
   const [open, setOpen] = useState(false);
+  useEffect(() => (open ? beginOverlay() : undefined), [open]);
   const [draftValues, setDraftValues] = useState<string[]>(values);
   const summary = values.length === 0
     ? emptyLabel
@@ -1177,6 +1180,12 @@ export default function App() {
   const anySheetOpenRef = useRef(false);
   // The packet composer is closing (its nested confirm first, then itself).
   const packetClosingRef = useRef(false);
+  // Each composer close gets a token; a rollback cancels a pending close.
+  const packetCloseTokenRef = useRef(0);
+  // When a notification asked to open something, and the case list as of the
+  // latest render (the tap handler runs outside render).
+  const pendingNotificationAtRef = useRef(0);
+  const latestCasesRef = useRef<CaseRecord[]>([]);
   activeUserIdRef.current = activeUserId;
 
   const refreshBusiness = useCallback(async () => {
@@ -1322,6 +1331,9 @@ export default function App() {
 
   const resetAccountState = useCallback(() => {
     setOutreach(null);
+    setPacketSendConfirm(false);
+    packetClosingRef.current = false;
+    packetCloseTokenRef.current += 1;
     setRejectedWrites(0);
     setRejectedList(null);
     setMembers([]);
@@ -1667,6 +1679,9 @@ export default function App() {
     const generation = authGenerationRef.current;
     const stillCurrent = () => generation === authGenerationRef.current && activeUserIdRef.current === userId;
     const run = (async (): Promise<'ok' | 'offline'> => {
+      // Taken before the flush: a change saved any time after this point means
+      // what this refresh reads may be older than the screen.
+      const serialBeforeRead = localChangeSerialRef.current;
       try {
         // Keep the flush → refresh ordering: queued writes land before the
         // snapshot that would otherwise re-queue them is read back.
@@ -1684,7 +1699,6 @@ export default function App() {
       if (!stillCurrent()) return 'ok';
       setRejectedWrites(refreshedStatus ? refreshedStatus.waiting + refreshedStatus.rejected : 0);
       if (!stillCurrent()) return 'ok';
-      const serialBeforeRead = localChangeSerialRef.current;
       const changedMeanwhile = () => localChangeSerialRef.current !== serialBeforeRead || Boolean(mutationActiveRef.current);
       const refreshed = await refreshSnapshot(userId);
       if (!stillCurrent()) return 'ok';
@@ -1835,21 +1849,41 @@ export default function App() {
   // Whatever sheet is up closes first; the target opens once it is gone.
   const notificationTapRef = useRef<(...args: Parameters<Parameters<typeof subscribeToNotificationResponses>[0]>) => void>(() => undefined);
   notificationTapRef.current = (target, partnerId, caseId) => {
-    closeAllSheets(() => {
-      // Server-sent pushes carry only ids; the item opens once it has loaded.
-      if (target === 'case') {
-        setTab('home');
-        if (caseId) setPendingNotificationCaseId(caseId);
+    const userId = activeUserIdRef.current;
+    const generation = authGenerationRef.current;
+    // A compose sheet, share sheet, or picker over a sheet must finish first:
+    // closing the sheet under it would leave that sheet frozen.
+    const whenClear = (tries: number) => {
+      if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation) return;
+      if (overlayOpen() && tries < 240) {
+        setTimeout(() => whenClear(tries + 1), 500);
         return;
       }
-      if (target === 'workspace') {
-        setTab('home');
-        setShowWorkspace(true);
-        return;
-      }
-      setTab(target);
-      if (partnerId) setPendingNotificationPartnerId(partnerId);
-    });
+      closeAllSheets(() => {
+        // Server-sent pushes carry only ids; the item opens once it has loaded.
+        if (target === 'case') {
+          setTab('home');
+          if (caseId) {
+            pendingNotificationAtRef.current = Date.now();
+            setPendingNotificationCaseId(caseId);
+            // A lead that arrived since the last refresh is not on this phone yet.
+            if (!latestCasesRef.current.some((item) => item.id === caseId)) void refreshFromServer('pull').catch(() => undefined);
+          }
+          return;
+        }
+        if (target === 'workspace') {
+          setTab('home');
+          setShowWorkspace(true);
+          return;
+        }
+        setTab(target);
+        if (partnerId) {
+          pendingNotificationAtRef.current = Date.now();
+          setPendingNotificationPartnerId(partnerId);
+        }
+      });
+    };
+    whenClear(0);
   };
   useEffect(() => {
     if (!session?.user?.id) return undefined;
@@ -1860,6 +1894,12 @@ export default function App() {
 
   useEffect(() => {
     if (!pendingNotificationCaseId) return;
+    // A tap's case opens only onto a clear screen and within a minute; after
+    // that the user has moved on and it would hijack whatever they opened.
+    if (Date.now() - pendingNotificationAtRef.current > 60_000 || anySheetOpenRef.current) {
+      setPendingNotificationCaseId(null);
+      return;
+    }
     if (!cases.some((item) => item.id === pendingNotificationCaseId)) return;
     openCaseById(pendingNotificationCaseId);
     setPendingNotificationCaseId(null);
@@ -1868,6 +1908,10 @@ export default function App() {
 
   useEffect(() => {
     if (!pendingNotificationPartnerId) return;
+    if (Date.now() - pendingNotificationAtRef.current > 60_000 || anySheetOpenRef.current) {
+      setPendingNotificationPartnerId(null);
+      return;
+    }
     const partner = partners.find((item) => item.id === pendingNotificationPartnerId);
     if (!partner) return;
     setSelectedPartner(partner);
@@ -2387,11 +2431,13 @@ export default function App() {
 
   async function sharePacketText() {
     if (!packetTarget || packetClosingRef.current) return;
+    const endOverlay = beginOverlay();
     try {
       const result = await Share.share({
         title: `Placement recommendation — ${packetTarget.match.clientLabel}`,
         message: packetText,
       });
+      endOverlay();
       // Honest platform note: on iOS, UIActivityViewController does not
       // reliably distinguish "shared" from "dismissed" — dismissing the sheet
       // can resolve with activityType null and no error, and some share
@@ -2401,12 +2447,15 @@ export default function App() {
         setPacketSendConfirm(true);
       }
     } catch {
+      endOverlay();
       Alert.alert('Unable to share', 'The share sheet could not be opened. Please try again.');
     }
   }
 
   function closePacketComposer() {
+    const token = ++packetCloseTokenRef.current;
     const finish = () => {
+      if (packetCloseTokenRef.current !== token) return; // cancelled by a rollback
       setPacketSendConfirm(false);
       setPacketTarget(null);
       setPacketAudience('family');
@@ -2418,7 +2467,7 @@ export default function App() {
       // before the composer itself can close, or the composer stays frozen.
       packetClosingRef.current = true;
       setPacketSendConfirm(false);
-      afterSheetCloses(finish, { ifScreenBusy: 'ignore' });
+      afterSheetCloses(finish, { ifScreenBusy: 'ignore', stillWanted: () => packetCloseTokenRef.current === token });
       return;
     }
     finish();
@@ -2578,8 +2627,12 @@ export default function App() {
         setMatchPopulation(previousMatchUi.matchPopulation);
         setMatchLocationPreference(previousMatchUi.matchLocationPreference);
         setTab(previousMatchUi.tab);
-        setPacketTarget(previousMatchUi.packetTarget);
-        setPacketSendConfirm(previousMatchUi.packetSendConfirm);
+        // Cancel a composer close still in progress, and reopen the composer
+        // (never its nested confirm) once the screen is clear.
+        packetCloseTokenRef.current += 1;
+        packetClosingRef.current = false;
+        setPacketSendConfirm(false);
+        afterSheetCloses(() => setPacketTarget((current) => current ?? previousMatchUi.packetTarget));
         setPacketAudience(previousMatchUi.packetAudience);
         setPacketText(previousMatchUi.packetText);
       },
@@ -3523,6 +3576,7 @@ export default function App() {
     || (typeof session?.user?.user_metadata?.display_name === 'string' ? session.user.user_metadata.display_name : '')
     || '';
   latestSnapshotRef.current = { partners, referrals, referralMatches, touches, followUps, scorecards };
+  latestCasesRef.current = cases;
   anySheetOpenRef.current = Boolean(
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
     || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory
@@ -5263,8 +5317,10 @@ export default function App() {
       if (activeUserIdRef.current === userId) Alert.alert(action === 'retry' ? 'Still not saved' : 'Could not discard', describeError(error));
     }
     try {
+      const serialBeforeRead = localChangeSerialRef.current;
       const snapshot = await refreshSnapshot(userId);
-      if (snapshot && activeUserIdRef.current === userId) applySnapshot(snapshot, false);
+      // Never paint a read over a change saved while it was in flight.
+      if (snapshot && activeUserIdRef.current === userId && localChangeSerialRef.current === serialBeforeRead && !mutationActiveRef.current) applySnapshot(snapshot, false);
     } catch {
       // The next refresh catches up.
     }
@@ -7132,7 +7188,7 @@ export default function App() {
     if (fromWorkspace) {
       // Let the Workspace sheet finish dismissing before presenting another.
       setShowWorkspace(false);
-      setTimeout(() => { if (activeUserIdRef.current === userId) setShowOrgProfile(true); }, 400);
+      afterSheetCloses(() => setShowOrgProfile(true));
     } else {
       setShowOrgProfile(true);
     }
@@ -7142,7 +7198,7 @@ export default function App() {
     setShowOrgProfile(false);
     if (orgProfileReturnToWorkspaceRef.current) {
       orgProfileReturnToWorkspaceRef.current = false;
-      setTimeout(() => setShowWorkspace(true), 400);
+      afterSheetCloses(() => setShowWorkspace(true));
     } else {
       afterSheetCloses(showDeferredNotificationPrompt, { ifScreenBusy: 'wait' });
     }
@@ -7190,7 +7246,7 @@ export default function App() {
       const say = (title: string, body: string) => afterSheetCloses(() => Alert.alert(title, body), { ifScreenBusy: 'ignore' });
       if (result.status === 'claim_requested') {
         say('We found an existing listing', result.message || 'A directory listing already matches your phone number or website. ReferralFit will review your request to manage it; nothing changes until then.');
-      } else if (result.status === 'conflict') {
+      } else if (result.status === 'conflict' || result.status === 'resubmitted_for_review') {
         say('Saved for review', result.message || 'Your profile is saved and waits for ReferralFit to review it before it appears in the directory.');
       } else if (result.status === 'updated_pending_review') {
         say('Saved — part of it is in review', result.message || 'Your other changes are live. The new name, phone number, or website matches another directory listing, so ReferralFit will review it first.');
@@ -8466,7 +8522,7 @@ export default function App() {
         onRefresh={() => { void refreshBusiness(); }}
         onOpenCase={(caseId) => {
           setShowBusinessDashboard(false);
-          setTimeout(() => openCase(caseId), 350);
+          afterSheetCloses(() => openCase(caseId));
         }}
       />
       <GlobalDirectoryScreen
@@ -8478,13 +8534,17 @@ export default function App() {
         onClose={() => setShowGlobalDirectory(false)}
         onImported={(importedPartner, _globalId, initiatingUserId) => {
           if (activeUserIdRef.current !== initiatingUserId) return;
+          const serialBeforeRead = localChangeSerialRef.current;
           void refreshSnapshot(initiatingUserId)
             .then((snapshot) => {
-              if (snapshot && activeUserIdRef.current === initiatingUserId) {
-                applySnapshot(snapshot, false);
-                // Follow-up timeline: an imported program gets its first step too.
-                if (snapshot.partners.some((item) => item.id === importedPartner.id)) scheduleFirstPartnerFollowUp(importedPartner.id);
-              }
+              if (!snapshot || activeUserIdRef.current !== initiatingUserId) return;
+              // A change saved while this read was in flight wins; the next
+              // refresh brings the imported program in instead.
+              if (localChangeSerialRef.current === serialBeforeRead && !mutationActiveRef.current) applySnapshot(snapshot, false);
+              else setPartners((current) => current.some((item) => item.id === importedPartner.id) ? current : [importedPartner, ...current]);
+              // Follow-up timeline: an imported program gets its first step too
+              // (it waits until the program is on screen).
+              if (snapshot.partners.some((item) => item.id === importedPartner.id)) scheduleFirstPartnerFollowUp(importedPartner.id);
             })
             .catch((error) => {
               if (activeUserIdRef.current === initiatingUserId) {

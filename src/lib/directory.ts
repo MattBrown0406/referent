@@ -548,7 +548,7 @@ export type OrgDirectoryProfileState = {
 
 // 'claimed' comes only from a server that predates migration 20261024120000
 // (collisions now always go to ReferralFit review).
-export type UpsertOrgDirectoryProfileStatus = 'created' | 'updated' | 'updated_pending_review' | 'conflict' | 'claim_requested' | 'claimed';
+export type UpsertOrgDirectoryProfileStatus = 'created' | 'updated' | 'updated_pending_review' | 'conflict' | 'resubmitted_for_review' | 'claim_requested' | 'claimed';
 
 export type UpsertOrgDirectoryProfileResult = {
   status: UpsertOrgDirectoryProfileStatus;
@@ -558,7 +558,7 @@ export type UpsertOrgDirectoryProfileResult = {
   message?: string;
 };
 
-const PROFILE_STATUSES: UpsertOrgDirectoryProfileStatus[] = ['created', 'updated', 'updated_pending_review', 'conflict', 'claim_requested', 'claimed'];
+const PROFILE_STATUSES: UpsertOrgDirectoryProfileStatus[] = ['created', 'updated', 'updated_pending_review', 'conflict', 'resubmitted_for_review', 'claim_requested', 'claimed'];
 
 export async function fetchOrgDirectoryProfile(): Promise<OrgDirectoryProfileState> {
   const [orgResult, roleResult] = await Promise.all([

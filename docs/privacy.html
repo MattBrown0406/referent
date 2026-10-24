@@ -37,7 +37,7 @@
 <h2>Permissions</h2>
 <ul>
   <li><strong>Photo library / camera</strong> — requested only when you attach a document to a case file. Attachments are uploaded to a private storage bucket accessible only to your workspace.</li>
-  <li><strong>Notifications</strong> — used for on-device reminders (daily briefing, follow-up cadences, consult alerts) and, in workspaces with teammates, push notifications about work assigned to you or overdue. Push notifications carry only a generic message, never client details.</li>
+  <li><strong>Notifications</strong> — used for on-device reminders (daily briefing, follow-up cadences, consult alerts) and push notifications about new leads, work assigned to you, overdue items, and decisions on your directory submissions, which you can turn off in the App. Push notifications carry only a generic message, never client details.</li>
 </ul>
 
 <h2>How we use information</h2>
@@ -45,7 +45,7 @@
 
 <h2>AI-drafted follow-ups</h2>
 <p>The App can draft a follow-up text, email, or call script for you. This is optional. It uses your own Anthropic API key (Anthropic is the maker of the Claude AI model), which you add in the App; drafts run on, and are billed to, your own Anthropic account under Anthropic's terms. Your key is stored only in your device's secure keychain. It is sent with each draft request to our server, which passes it to Anthropic for that request and never stores or logs it.</p>
-<p>To write a draft, the App sends Anthropic only: the recipient's first name and relationship (or a referral partner's organization name and type), your first name and practice name, the case stage, how many times you have reached out, and any note you type for that draft. It never sends phone numbers, email addresses, case notes, documents, or client names. Anthropic does not use API data to train its models. Drafts are not stored by us. You review and edit every draft and send it yourself from your device's Messages, Mail, or phone app; the App logs that you sent it and schedules your next follow-up.</p>
+<p>To write a draft, the App sends Anthropic only: the recipient's first name and relationship (or a referral partner's organization name and type), your first name and practice name, the case stage, how many times you have reached out, and any note you type for that draft. It never sends phone numbers, email addresses, last names, case titles, case notes, or documents. Anthropic does not use API data to train its models. Drafts are not stored by us. You review and edit every draft and send it yourself from your device's Messages, Mail, or phone app; the App logs that you sent it and schedules your next follow-up.</p>
 
 <h2>Shared directory and aggregate statistics</h2>
 <p>The shared directory contains business listings of treatment programs (not personal data about clients). Usage statistics shown on listings (for example, how many practices refer to a program) are aggregated across workspaces and are only disclosed when at least five distinct practices have contributed, so no individual practice, professional, or client can be identified. Treatment programs cannot pay for placement or ranking.</p>

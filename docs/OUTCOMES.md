@@ -142,6 +142,12 @@ A brand-new practice therefore contributes to the network about two months
 after it signs up and starts recording work regularly; its own screens are
 unchanged.
 
+**Expect blanks at first.** Until at least five workspaces clear this bar
+for a listing (60 days old, activity on 10+ days, 3+ cases or 5+
+referrals), that listing's network figures stay hidden (`disclosed =
+false`), and benchmark network metrics stay `null` until five established
+paid benchmark workspaces qualify. That is expected, not a fault.
+
 ## Matching
 
 See `docs/MATCHING.md`, "Track record". In short: family experience stays

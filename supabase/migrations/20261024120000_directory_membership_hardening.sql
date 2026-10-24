@@ -62,9 +62,11 @@ BEGIN;
 --   orphaned_profile  a solo workspace joined a practice that already owns
 --                     a profile. The joiner's listing stays live, unowned,
 --                     until the admin keeps or archives it.
+--   resubmitted_profile  the owner saved its archived profile; it is
+--                     pending (hidden) again until the admin decides.
 CREATE TABLE public.directory_review_requests (
   id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  kind               text NOT NULL CHECK (kind IN ('identity_edit', 'profile_conflict', 'orphaned_profile')),
+  kind               text NOT NULL CHECK (kind IN ('identity_edit', 'profile_conflict', 'orphaned_profile', 'resubmitted_profile')),
   global_partner_id  uuid NOT NULL REFERENCES public.global_partners(id) ON DELETE CASCADE,
   related_listing_id uuid REFERENCES public.global_partners(id) ON DELETE SET NULL,
   org_id             uuid REFERENCES public.orgs(id) ON DELETE SET NULL,
@@ -119,9 +121,10 @@ REVOKE ALL ON FUNCTION public.list_directory_review_requests() FROM PUBLIC, anon
 GRANT EXECUTE ON FUNCTION public.list_directory_review_requests() TO authenticated;
 
 -- Approve or decline. identity_edit: approve applies the proposed values.
--- profile_conflict: approve makes the new profile live and verified,
--- decline archives it. orphaned_profile: approve keeps the listing live and
--- unowned, decline archives it. Returns 'approved' or 'rejected'.
+-- profile_conflict / resubmitted_profile: approve makes the profile live and
+-- verified, decline archives it. orphaned_profile: approve keeps the
+-- listing live and unowned, decline archives it. Returns 'approved' or
+-- 'rejected'.
 CREATE OR REPLACE FUNCTION public.resolve_directory_review_request(p_request_id uuid, p_approve boolean)
 RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER
@@ -151,7 +154,7 @@ BEGIN
            phone = coalesce(v_req.proposed ->> 'phone', g.phone),
            website = CASE WHEN v_req.proposed ? 'website' THEN v_req.proposed ->> 'website' ELSE g.website END
      WHERE g.id = v_req.global_partner_id;
-  ELSIF v_req.kind = 'profile_conflict' THEN
+  ELSIF v_req.kind IN ('profile_conflict', 'resubmitted_profile') THEN
     UPDATE public.global_partners
        SET status = CASE WHEN p_approve THEN 'active' ELSE 'archived' END,
            verified_at = CASE WHEN p_approve THEN now() ELSE NULL END
@@ -318,33 +321,66 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.org_directory_claim_request(public.global_partners, uuid, uuid, jsonb, text) FROM PUBLIC, anon, authenticated;
 
--- Internal. The duplicate is owned by another workspace, so a claim could
--- never be approved. The caller's profile is created owned but pending
--- (hidden) and a profile_conflict review request is filed.
-CREATE OR REPLACE FUNCTION public.org_directory_profile_conflict(p_match public.global_partners, p_row public.global_partners, p_org uuid, p_user uuid)
+-- Internal. The caller's first profile collides with p_match: on phone or
+-- website with a listing another workspace owns (p_reason 'contact'; a
+-- claim could never be approved), or on name with any listing (p_reason
+-- 'name'). The profile is created owned but pending (hidden) and a
+-- profile_conflict review request is filed.
+CREATE OR REPLACE FUNCTION public.org_directory_profile_conflict(p_match public.global_partners, p_row public.global_partners, p_org uuid, p_user uuid, p_reason text)
 RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public
 AS $$
 DECLARE
   v_new uuid := public.org_directory_profile_save(NULL, p_row, p_org, p_user, false);
+  v_other text := CASE WHEN p_match.status = 'active'
+                       THEN '"' || coalesce(nullif(p_match.organization, ''), p_match.name) || '"' ELSE 'a listing' END;
   v_review uuid;
 BEGIN
   INSERT INTO public.directory_review_requests (kind, global_partner_id, related_listing_id, org_id, requested_by, note)
   VALUES ('profile_conflict', v_new, p_match.id, p_org, p_user,
-          left(format('%s shares a phone number or website with %s, which another workspace manages',
-                      p_row.organization,
-                      CASE WHEN p_match.status = 'active' THEN '"' || coalesce(nullif(p_match.organization, ''), p_match.name) || '"'
-                           ELSE 'a listing' END), 2000))
+          left(CASE WHEN p_reason = 'name'
+                    THEN format('%s has the same name as %s', p_row.organization, v_other)
+                    ELSE format('%s shares a phone number or website with %s, which another workspace manages', p_row.organization, v_other) END, 2000))
   RETURNING id INTO v_review;
   RETURN jsonb_build_object('status', 'conflict', 'listing_id', v_new, 'review_id', v_review,
-    'message', 'Another practice already manages a directory listing with this phone number or website. Your profile is saved and ReferralFit will review it before it appears in the directory.');
+    'message', CASE WHEN p_reason = 'name'
+      THEN 'Another directory listing already uses this name. Your profile is saved and ReferralFit will review it before it appears in the directory.'
+      ELSE 'Another practice already manages a directory listing with this phone number or website. Your profile is saved and ReferralFit will review it before it appears in the directory.' END);
 END
 $$;
-REVOKE ALL ON FUNCTION public.org_directory_profile_conflict(public.global_partners, public.global_partners, uuid, uuid) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.org_directory_profile_conflict(public.global_partners, public.global_partners, uuid, uuid, text) FROM PUBLIC, anon, authenticated;
 
--- Internal. The answer after the owner updated their own profile: conflict
--- or updated_pending_review while a review request is open, else updated.
+
+-- Internal. The owner saved a profile an admin had archived: it goes back
+-- to pending (hidden) with a resubmitted_profile review request.
+CREATE OR REPLACE FUNCTION public.org_directory_profile_resubmit(p_listing uuid, p_org uuid, p_user uuid)
+RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_prev_pub text := coalesce(current_setting('referralfit.seed_publish', true), '');
+  v_review uuid;
+BEGIN
+  -- The verification guard pins status for non-admin writers; this is the
+  -- sanctioned definer path, like the seed publish.
+  PERFORM set_config('referralfit.seed_publish', 'on', true);
+  UPDATE public.global_partners SET status = 'pending', verified_at = NULL WHERE id = p_listing;
+  PERFORM set_config('referralfit.seed_publish', v_prev_pub, true);
+  INSERT INTO public.directory_review_requests (kind, global_partner_id, org_id, requested_by, note)
+  VALUES ('resubmitted_profile', p_listing, p_org, p_user, 'The owner saved this profile after it was archived; it is hidden until reviewed.')
+  ON CONFLICT DO NOTHING
+  RETURNING id INTO v_review;
+  RETURN jsonb_build_object('status', 'resubmitted_for_review', 'listing_id', p_listing, 'review_id', v_review,
+    'message', 'Your profile was not approved for the directory earlier. It is saved and sent to ReferralFit for review again, and it stays hidden until then.');
+END
+$$;
+REVOKE ALL ON FUNCTION public.org_directory_profile_resubmit(uuid, uuid, uuid) FROM PUBLIC, anon, authenticated;
+
+-- Internal. The answer after the owner updated their own profile: conflict,
+-- resubmitted_for_review or updated_pending_review while a review request
+-- is open, else updated.
 CREATE OR REPLACE FUNCTION public.org_directory_profile_update_result(p_listing uuid)
 RETURNS jsonb
 LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -354,10 +390,12 @@ DECLARE
   v_review public.directory_review_requests%ROWTYPE;
 BEGIN
   SELECT * INTO v_review FROM public.directory_review_requests
-   WHERE global_partner_id = p_listing AND status = 'pending' AND kind IN ('identity_edit', 'profile_conflict')
-   ORDER BY (kind = 'profile_conflict') DESC LIMIT 1;
-  IF v_review.kind = 'profile_conflict' THEN
-    RETURN jsonb_build_object('status', 'conflict', 'listing_id', p_listing, 'review_id', v_review.id,
+   WHERE global_partner_id = p_listing AND status = 'pending'
+     AND kind IN ('identity_edit', 'profile_conflict', 'resubmitted_profile')
+   ORDER BY (kind <> 'identity_edit') DESC LIMIT 1;
+  IF v_review.kind IN ('profile_conflict', 'resubmitted_profile') THEN
+    RETURN jsonb_build_object('status', CASE WHEN v_review.kind = 'profile_conflict' THEN 'conflict' ELSE 'resubmitted_for_review' END,
+      'listing_id', p_listing, 'review_id', v_review.id,
       'message', 'Your profile is saved and waits for ReferralFit to review it before it appears in the directory.');
   ELSIF v_review.kind = 'identity_edit' THEN
     RETURN jsonb_build_object('status', 'updated_pending_review', 'listing_id', p_listing, 'review_id', v_review.id,
@@ -369,8 +407,8 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.org_directory_profile_update_result(uuid) FROM PUBLIC, anon, authenticated;
 
--- {status, listing_id, ...}; status is created, updated,
--- updated_pending_review, conflict or claim_requested (docs/DIRECTORY_OWNERSHIP.md).
+-- {status, listing_id, ...}; status is created, updated, updated_pending_review,
+-- conflict, resubmitted_for_review or claim_requested (docs/DIRECTORY_OWNERSHIP.md).
 -- The automatic takeover ('claimed') is gone.
 CREATE OR REPLACE FUNCTION public.upsert_org_directory_profile(p_payload jsonb)
 RETURNS jsonb
@@ -382,6 +420,7 @@ DECLARE
   v_org uuid := public.current_org_id();
   v_row public.global_partners;
   v_own uuid;
+  v_own_status text;
   v_match public.global_partners%ROWTYPE;
   v_domain text;
   v_digits text;
@@ -394,9 +433,12 @@ BEGIN
   END IF;
   v_row := public.org_directory_profile_row(p_payload);
 
-  SELECT id INTO v_own FROM public.global_partners WHERE owner_org_id = v_org;
+  SELECT id, status INTO v_own, v_own_status FROM public.global_partners WHERE owner_org_id = v_org;
   IF v_own IS NOT NULL THEN
     PERFORM public.org_directory_profile_save(v_own, v_row, v_org, v_user, true);
+    IF v_own_status = 'archived' THEN
+      RETURN public.org_directory_profile_resubmit(v_own, v_org, v_user);
+    END IF;
     RETURN public.org_directory_profile_update_result(v_own);
   END IF;
 
@@ -410,11 +452,17 @@ BEGIN
    LIMIT 1;
 
   IF v_match.id IS NULL THEN
+    -- Same name as an existing listing (but no shared phone or website):
+    -- review before it can appear as a second verified program.
+    v_match := public.directory_listing_named(v_row.organization);
+    IF v_match.id IS NOT NULL THEN
+      RETURN public.org_directory_profile_conflict(v_match, v_row, v_org, v_user, 'name');
+    END IF;
     v_own := public.org_directory_profile_save(NULL, v_row, v_org, v_user, true);
     RETURN jsonb_build_object('status', 'created', 'listing_id', v_own);
   END IF;
   IF v_match.owner_org_id IS NOT NULL THEN
-    RETURN public.org_directory_profile_conflict(v_match, v_row, v_org, v_user);
+    RETURN public.org_directory_profile_conflict(v_match, v_row, v_org, v_user, 'contact');
   END IF;
 
   -- listing_id only when the caller may see that listing anyway.
@@ -431,6 +479,92 @@ GRANT EXECUTE ON FUNCTION public.upsert_org_directory_profile(jsonb) TO authenti
 -- ===========================================================================
 -- 2. Submissions link to an existing listing only on a name match too
 -- ===========================================================================
+
+-- Normalization used for duplicate detection (redefines 20260930190000).
+-- Phone: digits only; an 11-digit number starting with 1 (US country code)
+-- drops the 1, so "+1 541 555 0100" matches "541-555-0100".
+CREATE OR REPLACE FUNCTION public.directory_phone_digits(p_phone text)
+RETURNS text
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT CASE WHEN length(d) = 11 AND left(d, 1) = '1' THEN substr(d, 2) ELSE d END
+    FROM (SELECT regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g') AS d) AS x
+$$;
+REVOKE ALL ON FUNCTION public.directory_phone_digits(text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.directory_phone_digits(text) TO authenticated, service_role;
+
+-- Website: the host only, lowercased, without the scheme (any case), a
+-- leading "www.", a path, query, fragment or port:
+-- "Https://WWW.Example.com:8443/intake?x=1" -> "example.com". No host -> ''.
+CREATE OR REPLACE FUNCTION public.directory_website_domain(p_website text)
+RETURNS text
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT regexp_replace(regexp_replace(
+           split_part(split_part(split_part(
+             regexp_replace(lower(btrim(coalesce(p_website, ''), ' ' || chr(9) || chr(10) || chr(13))), '^[a-z][a-z0-9+.-]*://', ''),
+           '/', 1), '?', 1), '#', 1),
+         ':[0-9]*$', ''), '^www[.]', '')
+$$;
+REVOKE ALL ON FUNCTION public.directory_website_domain(text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.directory_website_domain(text) TO authenticated, service_role;
+
+-- The search document, shared by derive_columns and the identity hold.
+CREATE OR REPLACE FUNCTION public.global_partner_search_tsv(p_name text, p_organization text, p_city text, p_state text, p_description text)
+RETURNS tsvector
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT to_tsvector('simple',
+    coalesce(p_name, '') || ' ' || coalesce(p_organization, '') || ' ' ||
+    coalesce(p_city, '') || ' ' || coalesce(p_state, '') || ' ' || coalesce(p_description, ''))
+$$;
+REVOKE ALL ON FUNCTION public.global_partner_search_tsv(text, text, text, text, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.global_partner_search_tsv(text, text, text, text, text) TO authenticated, service_role;
+
+-- Same as 20260907120000, through the helpers above.
+CREATE OR REPLACE FUNCTION public.global_partners_derive_columns()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+  NEW.phone_digits := public.directory_phone_digits(NEW.phone);
+  NEW.website_domain := public.directory_website_domain(NEW.website);
+  NEW.search_tsv := public.global_partner_search_tsv(NEW.name, NEW.organization, NEW.city, NEW.state, NEW.description);
+  RETURN NEW;
+END
+$$;
+REVOKE ALL ON FUNCTION public.global_partners_derive_columns() FROM PUBLIC, anon, authenticated;
+
+-- Re-normalize the stored columns. No unique index covers them today; a row
+-- that would break one anyway is left as it was and counted.
+DO $$
+DECLARE
+  v_row record;
+  v_changed integer := 0;
+  v_skipped integer := 0;
+BEGIN
+  FOR v_row IN
+    SELECT id FROM public.global_partners
+     WHERE phone_digits IS DISTINCT FROM public.directory_phone_digits(phone)
+        OR website_domain IS DISTINCT FROM public.directory_website_domain(website)
+  LOOP
+    BEGIN
+      UPDATE public.global_partners
+         SET phone_digits = public.directory_phone_digits(phone),
+             website_domain = public.directory_website_domain(website)
+       WHERE id = v_row.id;
+      v_changed := v_changed + 1;
+    EXCEPTION WHEN unique_violation THEN
+      v_skipped := v_skipped + 1;
+    END;
+  END LOOP;
+  RAISE NOTICE 'directory_membership_hardening: re-normalized % listing(s), % left as they were (unique index)', v_changed, v_skipped;
+END
+$$;
 
 -- Lowercase letters and digits only, without a leading "the":
 -- "The Meadows, LLC" -> "meadowsllc".
@@ -463,6 +597,22 @@ AS $$
 $$;
 REVOKE ALL ON FUNCTION public.directory_names_match(text, text) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.directory_names_match(text, text) TO authenticated;
+
+-- Internal. Any non-archived listing whose organization (or name) has the
+-- same name key as p_organization; NULL fields when there is none.
+CREATE OR REPLACE FUNCTION public.directory_listing_named(p_organization text)
+RETURNS public.global_partners
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT g.* FROM public.global_partners g
+   WHERE g.status <> 'archived'
+     AND public.directory_name_key(p_organization) <> ''
+     AND public.directory_name_key(coalesce(nullif(btrim(g.organization), ''), g.name)) = public.directory_name_key(p_organization)
+   ORDER BY (g.status = 'active') DESC, g.created_at
+   LIMIT 1
+$$;
+REVOKE ALL ON FUNCTION public.directory_listing_named(text) FROM PUBLIC, anon, authenticated;
 
 -- The listing a submitted partner may link to. All of:
 --   * not archived, and NOT claimed (no owner workspace, no center
@@ -638,6 +788,8 @@ BEGIN
   NEW.website := OLD.website;
   NEW.phone_digits := OLD.phone_digits;
   NEW.website_domain := OLD.website_domain;
+  -- derive_columns already indexed the held name; index the live one.
+  NEW.search_tsv := public.global_partner_search_tsv(NEW.name, NEW.organization, NEW.city, NEW.state, NEW.description);
   RETURN NEW;
 END
 $$;
