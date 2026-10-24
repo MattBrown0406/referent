@@ -406,6 +406,11 @@ check('a new lead\'s caller gets the same relationship in the app as on the serv
   assert.ok(/ELSE 'family member'/.test(fn) && app.includes("?? 'family member'"), 'both fall back to "family member"');
   assert.ok(fn.includes("'^(my|her|his|their|our|the)[[:space:]]+'") && app.includes('/^(my|her|his|their|our|the)\\s+/'), 'both drop "my", "her", ... first');
   assert.ok(/public\.lead_caller_relationship\(v_lead ->> 'about_relationship'\)/.test(sql), 'the saved lead contact uses it');
+  // Someone calling about themselves is the case subject, never a worried
+  // family member, in both the app's template and the draft function.
+  const selfRow = appTable.find((row) => row.endsWith('=>self')) ?? '';
+  for (const word of ['self', 'myself', 'me']) assert.ok(selfRow.includes(`'${word}'`), `"${word}" stays self`);
+  assert.equal(outreach.isCaseSubject('self'), true);
 });
 
 console.log(`\nAll ${passed} outreach checks passed.`);

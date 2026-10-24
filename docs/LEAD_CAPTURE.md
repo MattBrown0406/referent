@@ -15,8 +15,9 @@ Two doors into the same place:
    name, phone, optional email, who they are calling about (relationship and
    first name only), lead source, and one safety choice. Saving creates the
    case (status inquiry), the caller as primary contact (with their own side
-   of the relationship: calling about a son makes them "parent";
-   `lead_caller_relationship()`, "family member" when unsure), a **first-call**
+   of the relationship: calling about a son makes them "parent", about
+   themselves "self"; `lead_caller_relationship()`, "family member" when
+   unsure), a **first-call**
    follow-up due today at now + the workspace's first-call target, and a
    system timeline entry, in one transaction (`create_lead`).
 2. **The intake link** (hosted form). Each workspace has an opaque token on

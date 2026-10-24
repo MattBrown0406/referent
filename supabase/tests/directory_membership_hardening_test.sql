@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(142);
+SELECT plan(144);
 
 -- Actors (suffix d7)
 --   ad  platform admin
@@ -1386,6 +1386,27 @@ SELECT is(
 SELECT ok(
   (SELECT title LIKE '%son Jake' FROM public.cases WHERE id = '1e100000-0000-0000-0000-0000000000d7'),
   'the case title still says who the lead is about'
+);
+-- Someone calling about themselves is the case subject ("self"), not a
+-- worried family member.
+SELECT is(
+  ARRAY[
+    public.lead_caller_relationship('self'), public.lead_caller_relationship(' Myself'),
+    public.lead_caller_relationship('ME'), public.lead_caller_relationship('my self'),
+    public.lead_caller_relationship('herself')
+  ],
+  ARRAY['self', 'self', 'self', 'self', 'self'],
+  'a caller calling about themselves stays self'
+);
+SET LOCAL ROLE authenticated;
+SELECT public.create_lead('1e000000-0000-0000-0000-0000000000d7', jsonb_build_object(
+  'id', '1e300000-0000-0000-0000-0000000000d7', 'contact_id', '1e400000-0000-0000-0000-0000000000d7',
+  'caller_name', 'Jake Rivera', 'phone', '5415550143', 'about_relationship', 'Myself'));
+RESET ROLE;
+SELECT is(
+  (SELECT relationship FROM public.case_contacts WHERE id = '1e400000-0000-0000-0000-0000000000d7'),
+  'self',
+  'a self-referred caller is saved as self'
 );
 SELECT set_config('request.jwt.claim.sub', '', true);
 

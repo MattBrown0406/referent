@@ -517,7 +517,9 @@ export function leadCaseTitle(input: Pick<NewLeadInput, 'callerName' | 'aboutRel
 // about: son" makes the caller a parent. Mirrors lead_caller_relationship()
 // in the migration, so the optimistic contact reads like the saved one.
 // Anything not listed is "family member"; the practitioner can edit it.
+// Someone calling about themselves stays "self" (the case subject).
 const CALLER_RELATIONSHIP: [string[], string][] = [
+  [['self', 'myself', 'me', 'himself', 'herself', 'themself', 'themselves'], 'self'],
   [['son', 'daughter', 'child', 'kid', 'boy', 'girl'], 'parent'],
   [['stepson', 'stepdaughter', 'stepchild'], 'stepparent'],
   [['grandson', 'granddaughter', 'grandchild'], 'grandparent'],

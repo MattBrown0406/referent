@@ -2113,6 +2113,8 @@ GRANT UPDATE (name, lead_response_target_minutes) ON public.orgs TO authenticate
 -- lead's contact used to be saved with the loved one's relationship, so the
 -- case file and AI drafts called the caller "son". Common words are turned
 -- around; anything else is "family member" (the practitioner can edit it).
+-- Someone calling about themselves stays "self", the case subject, so no
+-- draft writes to them as a worried family member.
 -- The case title keeps "son Jake". The app mirrors this in
 -- leadCallerRelationship (src/lib/cases.ts).
 CREATE OR REPLACE FUNCTION public.lead_caller_relationship(p_about text)
@@ -2122,6 +2124,7 @@ SET search_path = pg_catalog
 AS $$
   SELECT CASE
     WHEN v = '' THEN ''
+    WHEN v IN ('self', 'myself', 'me', 'himself', 'herself', 'themself', 'themselves') THEN 'self'
     WHEN v IN ('son', 'daughter', 'child', 'kid', 'boy', 'girl') THEN 'parent'
     WHEN v IN ('stepson', 'stepdaughter', 'stepchild') THEN 'stepparent'
     WHEN v IN ('grandson', 'granddaughter', 'grandchild') THEN 'grandparent'
