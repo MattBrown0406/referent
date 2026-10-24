@@ -124,7 +124,10 @@ GRANT EXECUTE ON FUNCTION public.list_directory_review_requests() TO authenticat
 -- profile_conflict / resubmitted_profile: approve makes the profile live and
 -- verified, decline archives it. orphaned_profile: approve keeps the
 -- listing live and unowned, decline archives it. Returns 'approved' or
--- 'rejected'.
+-- 'rejected'. A listing merged into another (merged_into) is never made
+-- live again: such a profile_conflict or resubmitted_profile can only be
+-- declined. The listing is locked before the request, the order a
+-- claimant's save uses, so the two cannot deadlock.
 CREATE OR REPLACE FUNCTION public.resolve_directory_review_request(p_request_id uuid, p_approve boolean)
 RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER
@@ -132,6 +135,7 @@ SET search_path = public
 AS $$
 DECLARE
   v_req public.directory_review_requests%ROWTYPE;
+  v_merged uuid;
 BEGIN
   IF auth.uid() IS NOT NULL AND NOT public.is_platform_admin() THEN
     RAISE EXCEPTION 'Platform admin required' USING ERRCODE = '42501';
@@ -139,12 +143,18 @@ BEGIN
   IF p_approve IS NULL THEN
     RAISE EXCEPTION 'Choose approve or decline' USING ERRCODE = '22023';
   END IF;
+  SELECT g.merged_into INTO v_merged FROM public.global_partners g
+   WHERE g.id = (SELECT r.global_partner_id FROM public.directory_review_requests r WHERE r.id = p_request_id)
+   FOR UPDATE;
   SELECT * INTO v_req FROM public.directory_review_requests WHERE id = p_request_id FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'Review request not found' USING ERRCODE = 'P0002';
   END IF;
   IF v_req.status <> 'pending' THEN
     RAISE EXCEPTION 'Review request was already %', v_req.status USING ERRCODE = '22023';
+  END IF;
+  IF p_approve AND v_merged IS NOT NULL AND v_req.kind IN ('profile_conflict', 'resubmitted_profile') THEN
+    RAISE EXCEPTION 'This listing was merged into another; decline the request instead' USING ERRCODE = '22023';
   END IF;
 
   IF v_req.kind = 'identity_edit' AND p_approve THEN
@@ -172,6 +182,57 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.resolve_directory_review_request(uuid, boolean) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.resolve_directory_review_request(uuid, boolean) TO authenticated;
+
+-- Same as 20260928170000, except that a listing merged into another
+-- (merged_into) is never claimed back to live: reject the claim instead.
+CREATE OR REPLACE FUNCTION public.approve_center_claim_request(p_request_id uuid)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_req public.center_claim_requests%ROWTYPE;
+  v_owner uuid;
+  v_merged uuid;
+  v_prev_pub text := coalesce(current_setting('referralfit.seed_publish', true), '');
+BEGIN
+  IF auth.uid() IS NOT NULL AND NOT public.is_platform_admin() THEN
+    RAISE EXCEPTION 'Platform admin required' USING ERRCODE = '42501';
+  END IF;
+  SELECT * INTO v_req FROM public.center_claim_requests WHERE id = p_request_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Claim request not found' USING ERRCODE = 'P0002'; END IF;
+  IF v_req.status <> 'pending' THEN
+    RAISE EXCEPTION 'Claim request was already %', v_req.status USING ERRCODE = '22023';
+  END IF;
+  SELECT owner_org_id, merged_into INTO v_owner, v_merged FROM public.global_partners WHERE id = v_req.global_partner_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Directory listing not found' USING ERRCODE = 'P0002'; END IF;
+  IF v_merged IS NOT NULL THEN
+    RAISE EXCEPTION 'This listing was merged into another; reject the claim instead' USING ERRCODE = '22023';
+  END IF;
+  IF v_owner IS NOT NULL AND v_owner <> v_req.org_id THEN
+    RAISE EXCEPTION 'Directory listing is owned by another workspace' USING ERRCODE = '22023';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.global_partners WHERE owner_org_id = v_req.org_id AND id <> v_req.global_partner_id) THEN
+    RAISE EXCEPTION 'That workspace already owns a different listing' USING ERRCODE = '22023';
+  END IF;
+
+  PERFORM set_config('referralfit.seed_publish', 'on', true);
+  UPDATE public.global_partners
+     SET owner_org_id = v_req.org_id,
+         status = 'active',
+         verified_at = now()
+   WHERE id = v_req.global_partner_id;
+  PERFORM set_config('referralfit.seed_publish', v_prev_pub, true);
+
+  UPDATE public.center_claim_requests
+     SET status = 'approved', resolved_at = now(), resolved_by = auth.uid()
+   WHERE id = v_req.id;
+  RETURN v_req.global_partner_id;
+END
+$$;
+REVOKE ALL ON FUNCTION public.approve_center_claim_request(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.approve_center_claim_request(uuid) TO authenticated;
 
 -- ===========================================================================
 -- 1. Directory profiles: duplicates always go to admin review
@@ -796,7 +857,9 @@ REVOKE ALL ON FUNCTION public.directory_identity_collision(uuid, text, text) FRO
 -- Internal. Keeps the listing's pending identity_edit in step with one
 -- claimant write: groups that just went live (p_applied) leave the held
 -- proposal, groups just held (p_held, p_hits) are merged in, and a proposal
--- left empty is withdrawn.
+-- left empty is withdrawn. The note and related_listing_id always describe
+-- what is still held: the related listing is the one the first held group
+-- (name, phone, website) collides with.
 CREATE OR REPLACE FUNCTION public.directory_identity_queue(p_listing uuid, p_org uuid, p_held jsonb, p_hits text[], p_applied text[], p_related uuid)
 RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER
@@ -811,7 +874,9 @@ BEGIN
   IF cardinality(v_drop) > 0 THEN
     UPDATE public.directory_review_requests
        SET proposed = proposed - v_drop,
-           collisions = ARRAY(SELECT c FROM unnest(collisions) AS c WHERE NOT (c = ANY (p_applied)))
+           collisions = ARRAY(SELECT c FROM unnest(collisions) AS c WHERE NOT (c = ANY (p_applied))),
+           note = 'Matches another listing on: '
+                  || array_to_string(ARRAY(SELECT c FROM unnest(collisions) AS c WHERE NOT (c = ANY (p_applied))), ', ')
      WHERE kind = 'identity_edit' AND global_partner_id = p_listing AND status = 'pending';
   END IF;
   IF cardinality(p_hits) > 0 THEN
@@ -828,20 +893,23 @@ BEGIN
   END IF;
   UPDATE public.directory_review_requests SET status = 'withdrawn', resolved_at = now()
    WHERE kind = 'identity_edit' AND global_partner_id = p_listing AND status = 'pending' AND proposed = '{}'::jsonb;
+  UPDATE public.directory_review_requests r
+     SET related_listing_id = coalesce(
+           public.directory_identity_collision(p_listing, 'name',
+             public.directory_name_key(coalesce(nullif(btrim(r.proposed ->> 'organization'), ''), r.proposed ->> 'name'))),
+           public.directory_identity_collision(p_listing, 'phone', public.directory_phone_digits(r.proposed ->> 'phone')),
+           public.directory_identity_collision(p_listing, 'website', public.directory_website_domain(r.proposed ->> 'website')),
+           r.related_listing_id)
+   WHERE r.kind = 'identity_edit' AND r.global_partner_id = p_listing AND r.status = 'pending';
 END
 $$;
 REVOKE ALL ON FUNCTION public.directory_identity_queue(uuid, uuid, jsonb, text[], text[], uuid) FROM PUBLIC, anon, authenticated;
 
--- A claimant (owner workspace member or center account) may edit its
--- listing freely, except that a changed identity value another listing
--- already uses is held, one group at a time: organization + contact name
--- (same name key), phone (same digits), website (same domain). A held group
--- keeps its live values and goes to the review queue as an identity_edit;
--- every other change in the same write, including the other groups, goes
--- live. Propagation sends nothing held. A held group that is later changed
--- to a non-colliding value goes live and leaves the queue. Admins, service
--- code and the SQL editor (no auth.uid()) are not held. Runs after
--- global_partners_derive_columns.
+-- Holds a claimant's identity change that another listing already uses,
+-- per group: organization + contact name, phone, website. Only a held
+-- group keeps its live values (queued as an identity_edit); in a held name
+-- group a field sent unchanged keeps its held value. Admins and server
+-- code are never held. Runs after derive_columns (DIRECTORY_OWNERSHIP.md).
 CREATE OR REPLACE FUNCTION public.global_partners_hold_colliding_edits()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
@@ -851,9 +919,10 @@ DECLARE
   v_hits text[] := '{}';
   v_applied text[] := '{}';
   v_held jsonb := '{}'::jsonb;
+  v_prev jsonb;
   v_related uuid;
   v_hit uuid;
-  v_key text := public.directory_name_key(coalesce(nullif(btrim(NEW.organization), ''), NEW.name));
+  v_key text;
 BEGIN
   IF auth.uid() IS NULL OR public.is_platform_admin()
      OR (NEW.organization, NEW.name, NEW.phone, NEW.website) IS NOT DISTINCT FROM (OLD.organization, OLD.name, OLD.phone, OLD.website)
@@ -862,6 +931,13 @@ BEGIN
   END IF;
 
   IF (NEW.organization, NEW.name) IS DISTINCT FROM (OLD.organization, OLD.name) THEN
+    SELECT r.proposed INTO v_prev FROM public.directory_review_requests r
+     WHERE r.kind = 'identity_edit' AND r.global_partner_id = OLD.id AND r.status = 'pending' AND r.proposed ? 'organization';
+    IF v_prev IS NOT NULL THEN
+      IF NEW.organization IS NOT DISTINCT FROM OLD.organization THEN NEW.organization := v_prev ->> 'organization'; END IF;
+      IF NEW.name IS NOT DISTINCT FROM OLD.name THEN NEW.name := v_prev ->> 'name'; END IF;
+    END IF;
+    v_key := public.directory_name_key(coalesce(nullif(btrim(NEW.organization), ''), NEW.name));
     v_hit := CASE WHEN v_key <> public.directory_name_key(coalesce(nullif(btrim(OLD.organization), ''), OLD.name))
                   THEN public.directory_identity_collision(OLD.id, 'name', v_key) END;
     IF v_hit IS NOT NULL THEN
@@ -902,8 +978,8 @@ BEGIN
   END IF;
 
   PERFORM public.directory_identity_queue(OLD.id, OLD.owner_org_id, v_held, v_hits, v_applied, v_related);
-  IF 'name' = ANY (v_hits) THEN
-    -- derive_columns already indexed the held name; index the live one.
+  IF 'name' = ANY (v_hits || v_applied) THEN
+    -- derive_columns indexed the submitted name; index the one that stays.
     NEW.search_tsv := public.global_partner_search_tsv(NEW.name, NEW.organization, NEW.city, NEW.state, NEW.description);
   END IF;
   RETURN NEW;
@@ -1225,7 +1301,9 @@ REVOKE ALL ON FUNCTION public.org_move_workspace_rows(uuid, uuid) FROM PUBLIC, a
 -- Internal. The directory side of a solo workspace joining p_to:
 --   * its own profile (owner_org_id) goes to the team when the team owns
 --     none; otherwise it is left unowned but live and an orphaned_profile
---     review request (visible to the team) tells the admin;
+--     review request (visible to the team) tells the admin. A profile
+--     ReferralFit merged into another listing (merged_into) is only
+--     released, so the team is never stuck with it;
 --   * listings it submitted (suggested_by_org_id) now count as the team's;
 --   * its pending claim requests move (a duplicate of one the team already
 --     has is dropped);
@@ -1239,6 +1317,7 @@ AS $$
 DECLARE
   v_listing uuid;
 BEGIN
+  UPDATE public.global_partners SET owner_org_id = NULL WHERE owner_org_id = p_from AND merged_into IS NOT NULL;
   SELECT id INTO v_listing FROM public.global_partners WHERE owner_org_id = p_from;
   IF v_listing IS NOT NULL THEN
     IF NOT EXISTS (SELECT 1 FROM public.global_partners WHERE owner_org_id = p_to) THEN

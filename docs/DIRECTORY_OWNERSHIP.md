@@ -131,13 +131,23 @@ digits or website domain is **already used by another non-archived
 listing**, the trigger `global_partners_hold_colliding_edits` keeps the
 live value of **that group only** (organization + contact name together,
 phone, or website), merges it into the listing's open `identity_edit`
-review request (`proposed` holds exactly the held groups,
-`related_listing_id` the listing it collided with), and lets everything
-else through, including the other identity groups. Nothing held propagates
-to linked partners until an admin approves; declining never undoes what
-already went live. Changing a held group again to a value that collides
-with nothing puts it live and takes it out of the request (an emptied
-request is withdrawn).
+review request (`proposed` holds exactly the held groups), and lets
+everything else through, including the other identity groups. Nothing held
+propagates to linked partners until an admin approves; declining never
+undoes what already went live. Changing a held group again to a value that
+collides with nothing puts it live and takes it out of the request (an
+emptied request is withdrawn). After every claimant write, `collisions`,
+`note` and `related_listing_id` describe only what is still held;
+`related_listing_id` is the listing the first held group (name, then
+phone, then website) collides with.
+
+The app and the portal show the **live** values in their forms, so a field
+sent back unchanged is not a change. Within a held name group this means
+the untouched field keeps its held value: editing only the contact name
+while a rename is held keeps the rename and holds the new contact name with
+it (one group, reviewed together). Sending a group back at its live value
+does not withdraw a held change; changing it to another non-colliding value
+does.
 Platform admins, service code and the SQL editor are never held.
 
 The held name is not searchable either: the trigger rebuilds `search_tsv`
@@ -163,7 +173,9 @@ workspace's directory state moves with them:
 - their profile (`owner_org_id`) becomes the team's when the team has
   none; when the team already owns one, the joiner's profile is left
   **live and unowned** and an `orphaned_profile` review request (visible
-  to the team) asks the admin to keep or archive it;
+  to the team) asks the admin to keep or archive it. A profile ReferralFit
+  merged into another listing (`merged_into`) is only released (unowned,
+  still archived, nothing queued), so the team can still create its own;
 - listings they submitted (`suggested_by_org_id`) count as the team's;
 - their pending claim requests move to the team (a duplicate of one the
   team already has is dropped);
@@ -200,14 +212,19 @@ SELECT public.resolve_directory_review_request('<id>', false);  -- decline
 
 | kind | approve | decline |
 | --- | --- | --- |
-| `identity_edit` | applies `proposed` (organization, name, phone, website) | nothing changes |
+| `identity_edit` | applies `proposed` (only the held groups) | nothing changes |
 | `profile_conflict` | the pending profile goes live and verified | the pending profile is archived |
 | `resubmitted_profile` | the profile goes live and verified | the profile is archived again |
+| `orphaned_profile` | the listing stays live and unowned | the listing is archived |
 
 A `resubmitted_profile` row names what the profile still collides with, if
 anything: `collisions` and `related_listing_id` (same phone, website or
 name as another non-archived listing) and a sentence in `note`.
-| `orphaned_profile` | the listing stays live and unowned | the listing is archived |
+
+A listing merged into another (`merge_global_partners` sets `merged_into`)
+is never made live again: approving a `profile_conflict` or
+`resubmitted_profile` for it fails with "This listing was merged into
+another; decline the request instead".
 
 The requesting workspace (and, for a center, the requesting account) can
 read its own rows to show "under review".
@@ -241,8 +258,10 @@ SELECT public.approve_center_claim_request('<request id>');
 ```
 
 Fails with a clear message when the listing already belongs to another
-workspace or the requesting workspace already owns a different listing. A
-center account may remain attached to the same listing; both are claimants.
+workspace, the requesting workspace already owns a different listing, or
+(since 20261024120000) the listing was merged into another ("This listing
+was merged into another; reject the claim instead"). A center account may
+remain attached to the same listing; both are claimants.
 
 Reject:
 

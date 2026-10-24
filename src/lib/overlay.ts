@@ -1,8 +1,8 @@
 // Something the app does not draw itself is on screen over a sheet: the
 // Messages or Mail compose sheet, the share sheet, or a dropdown picker.
-// While one is up, closing the sheet underneath would freeze it (iOS only
-// dismisses the topmost presentation), so navigation that closes sheets —
-// a notification tap — waits for it to finish first.
+// While one is up, presenting another sheet fails and leaves it frozen (iOS
+// presents only from the topmost view controller), so notification taps and
+// timed sheet opens wait for it to finish first.
 
 let openCount = 0;
 

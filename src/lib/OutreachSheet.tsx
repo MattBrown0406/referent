@@ -39,6 +39,7 @@ import {
   fetchPracticeName,
   getAnthropicKey,
   placeCall,
+  releaseComposeOverlay,
   requestOutreachDraft,
   sendEmailMessage,
   sendTextMessage,
@@ -142,6 +143,12 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
   const recipients = request?.recipients ?? [];
   const recipient = recipients.find((item) => item.key === recipientKey) || recipients[0] || null;
   const draft = drafts[channel];
+
+  // Closed (or gone): no Messages / Mail sheet can still be up over it.
+  useEffect(() => {
+    if (!request) releaseComposeOverlay();
+  }, [request]);
+  useEffect(() => releaseComposeOverlay, []);
 
   // Fresh state every time the sheet opens for a new request.
   useEffect(() => {

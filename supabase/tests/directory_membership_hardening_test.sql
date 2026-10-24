@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(109);
+SELECT plan(122);
 
 -- Actors (suffix d7)
 --   ad  platform admin
@@ -987,6 +987,160 @@ SELECT is(
   'a match created by finalize_match_packet keeps its requirements'
 );
 RESET ROLE;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Round 5: held identity groups and merged listings
+-- ═══════════════════════════════════════════════════════════════════════════
+
+SELECT set_config('request.jwt.claim.sub', '', true);
+INSERT INTO auth.users (id, email)
+VALUES
+  ('b6000000-0000-0000-0000-0000000000d7', 'owner@round-five.example'),
+  ('b7000000-0000-0000-0000-0000000000d7', 'owner@merged-twin.example'),
+  ('a4000000-0000-0000-0000-0000000000d7', 'solo@merged-solo.example'),
+  ('a5000000-0000-0000-0000-0000000000d7', 'owner@new-team.example');
+SELECT set_config('test.org_r5', org_id::text, true) FROM public.org_members WHERE user_id = 'b6000000-0000-0000-0000-0000000000d7';
+SELECT set_config('test.org_a4', org_id::text, true) FROM public.org_members WHERE user_id = 'a4000000-0000-0000-0000-0000000000d7';
+INSERT INTO public.global_partners (id, name, organization, types, phone, status, verified_at)
+VALUES ('de000000-0000-0000-0000-0000000000d7', 'Admissions', 'Lantern Ridge Recovery', ARRAY['Inpatient'], '(541) 555-1901', 'active', now()),
+       ('df000000-0000-0000-0000-0000000000d7', 'Admissions', 'Beacon Point Detox', ARRAY['Detox'], '(541) 555-1902', 'active', now());
+
+-- The forms show live values: a contact-name edit sends the live
+-- organization, which must not drop the held rename.
+SELECT set_config('request.jwt.claim.sub', 'b6000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT public.upsert_org_directory_profile('{"name":"Rae","organization":"Round Five Practice","types":["Interventionist"],"phone":"541-555-1910"}'::jsonb);
+SELECT public.upsert_org_directory_profile('{"name":"Rae","organization":"Lantern Ridge Recovery","types":["Interventionist"],"phone":"541-555-1910"}'::jsonb);
+SELECT set_config('test.r5_contact', public.upsert_org_directory_profile(
+  '{"name":"Rae Lynn","organization":"Round Five Practice","types":["Interventionist"],"phone":"541-555-1910"}'::jsonb)::text, true);
+SELECT is(
+  (current_setting('test.r5_contact')::jsonb ->> 'status') || '|' || (current_setting('test.r5_contact')::jsonb -> 'held_fields')::text,
+  'updated_pending_review|["name"]',
+  'editing only the contact name keeps a held rename held'
+);
+RESET ROLE;
+SELECT ok(
+  (SELECT organization = 'Round Five Practice' AND name = 'Rae' FROM public.global_partners WHERE owner_org_id = current_setting('test.org_r5')::uuid)
+  AND (SELECT status = 'pending' AND proposed = '{"organization": "Lantern Ridge Recovery", "name": "Rae Lynn"}'::jsonb
+              AND related_listing_id = 'de000000-0000-0000-0000-0000000000d7'
+         FROM public.directory_review_requests WHERE id = (current_setting('test.r5_contact')::jsonb ->> 'review_id')::uuid),
+  'the rename and the new contact name wait together; the live pair stays'
+);
+
+-- A phone held against a second listing, then the name group goes live:
+-- the request then describes only the phone and the listing it matches.
+SELECT set_config('request.jwt.claim.sub', 'b6000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT public.upsert_org_directory_profile('{"name":"Rae","organization":"Round Five Practice","types":["Interventionist"],"phone":"(541) 555-1902"}'::jsonb);
+SELECT set_config('test.r5_named', public.upsert_org_directory_profile(
+  '{"name":"Rae","organization":"Round Five Recovery","types":["Interventionist"],"phone":"541-555-1910"}'::jsonb)::text, true);
+SELECT is(
+  (current_setting('test.r5_named')::jsonb ->> 'status') || '|' || (current_setting('test.r5_named')::jsonb -> 'held_fields')::text,
+  'updated_pending_review|["phone"]',
+  'a non-colliding rename goes live while the held phone keeps waiting'
+);
+RESET ROLE;
+SELECT ok(
+  (SELECT organization = 'Round Five Recovery' AND name = 'Rae Lynn' AND phone = '541-555-1910'
+          AND search_tsv @@ to_tsquery('simple', 'lynn')
+     FROM public.global_partners WHERE owner_org_id = current_setting('test.org_r5')::uuid)
+  AND (SELECT proposed = '{"phone": "(541) 555-1902"}'::jsonb AND collisions = ARRAY['phone']
+              AND note = 'Matches another listing on: phone' AND related_listing_id = 'df000000-0000-0000-0000-0000000000d7'
+         FROM public.directory_review_requests WHERE id = (current_setting('test.r5_named')::jsonb ->> 'review_id')::uuid),
+  'the rename lands with the held contact name; note and related listing now describe the phone only'
+);
+
+-- A solo profile ReferralFit merged away is not handed to the team.
+SELECT set_config('request.jwt.claim.sub', 'a4000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT public.upsert_org_directory_profile('{"name":"Mo","organization":"Merged Solo Practice","types":["Interventionist"],"phone":"541-555-1920"}'::jsonb);
+RESET ROLE;
+SELECT set_config('test.r5_solo_listing', id::text, true) FROM public.global_partners WHERE owner_org_id = current_setting('test.org_a4')::uuid;
+SELECT set_config('request.jwt.claim.sub', 'ad000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT public.merge_global_partners('de000000-0000-0000-0000-0000000000d7', current_setting('test.r5_solo_listing')::uuid);
+SELECT set_config('request.jwt.claim.sub', 'a5000000-0000-0000-0000-0000000000d7', true);
+SELECT set_config('test.invite3', code, true) FROM public.create_org_invite();
+SELECT set_config('request.jwt.claim.sub', 'a4000000-0000-0000-0000-0000000000d7', true);
+SELECT lives_ok(
+  $$ SELECT public.accept_org_invite(current_setting('test.invite3')) $$,
+  'a solo practitioner whose profile was merged away joins a team'
+);
+SET CONSTRAINTS ALL IMMEDIATE;
+SELECT set_config('request.jwt.claim.sub', 'a5000000-0000-0000-0000-0000000000d7', true);
+SELECT is(
+  public.upsert_org_directory_profile('{"name":"Nia","organization":"New Team Practice","types":["Interventionist"],"phone":"541-555-1930"}'::jsonb) ->> 'status',
+  'created',
+  'the team''s first profile is created, not reported as merged'
+);
+RESET ROLE;
+SELECT ok(
+  (SELECT owner_org_id IS NULL AND status = 'archived' AND merged_into = 'de000000-0000-0000-0000-0000000000d7'
+     FROM public.global_partners WHERE id = current_setting('test.r5_solo_listing')::uuid)
+  AND NOT EXISTS (SELECT 1 FROM public.directory_review_requests WHERE global_partner_id = current_setting('test.r5_solo_listing')::uuid),
+  'the merged profile is released, still archived, with nothing queued'
+);
+
+-- A resubmission left pending while the admin merged the listing cannot
+-- bring it back to life.
+SELECT set_config('request.jwt.claim.sub', 'b7000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT set_config('test.r5_twin', public.upsert_org_directory_profile(
+  '{"name":"Kai","organization":"Beacon Point Detox","types":["Detox"],"phone":"541-555-1940"}'::jsonb)::text, true);
+SELECT set_config('request.jwt.claim.sub', 'ad000000-0000-0000-0000-0000000000d7', true);
+SELECT public.resolve_directory_review_request((current_setting('test.r5_twin')::jsonb ->> 'review_id')::uuid, false);
+SELECT set_config('request.jwt.claim.sub', 'b7000000-0000-0000-0000-0000000000d7', true);
+SELECT set_config('test.r5_resub', public.upsert_org_directory_profile(
+  '{"name":"Kai","organization":"Beacon Point Detox","types":["Detox"],"phone":"541-555-1940","city":"Bend"}'::jsonb)::text, true);
+SELECT set_config('request.jwt.claim.sub', 'ad000000-0000-0000-0000-0000000000d7', true);
+SELECT public.merge_global_partners('df000000-0000-0000-0000-0000000000d7', (current_setting('test.r5_twin')::jsonb ->> 'listing_id')::uuid);
+SELECT throws_ok(
+  $$ SELECT public.resolve_directory_review_request((current_setting('test.r5_resub')::jsonb ->> 'review_id')::uuid, true) $$,
+  '22023',
+  'This listing was merged into another; decline the request instead',
+  'a pending resubmission of a listing merged since cannot be approved'
+);
+SELECT is(
+  public.resolve_directory_review_request((current_setting('test.r5_resub')::jsonb ->> 'review_id')::uuid, false),
+  'rejected',
+  'it can still be declined'
+);
+RESET ROLE;
+SELECT is(
+  (SELECT status FROM public.global_partners WHERE id = (current_setting('test.r5_twin')::jsonb ->> 'listing_id')::uuid),
+  'archived',
+  'and the merged listing stays archived'
+);
+
+-- The same for a claim request left pending across a merge.
+SELECT set_config('request.jwt.claim.sub', '', true);
+INSERT INTO auth.users (id, email) VALUES ('b8000000-0000-0000-0000-0000000000d7', 'owner@late-claim.example');
+INSERT INTO public.global_partners (id, name, organization, types, phone, status, verified_at)
+VALUES ('dc000000-0000-0000-0000-0000000000d7', 'Admissions', 'Late Claim Recovery', ARRAY['Inpatient'], '(541) 555-1950', 'active', now());
+SELECT set_config('request.jwt.claim.sub', 'b8000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT set_config('test.r5_claim', public.upsert_org_directory_profile(
+  '{"name":"Lee","organization":"Late Claim Recovery","types":["Inpatient"],"phone":"541-555-1950"}'::jsonb)::text, true);
+SELECT set_config('request.jwt.claim.sub', 'ad000000-0000-0000-0000-0000000000d7', true);
+SELECT public.merge_global_partners('de000000-0000-0000-0000-0000000000d7', 'dc000000-0000-0000-0000-0000000000d7');
+SELECT throws_ok(
+  $$ SELECT public.approve_center_claim_request((current_setting('test.r5_claim')::jsonb ->> 'request_id')::uuid) $$,
+  '22023',
+  'This listing was merged into another; reject the claim instead',
+  'a pending claim on a listing merged since cannot be approved'
+);
+RESET ROLE;
+SELECT ok(
+  (SELECT status = 'archived' AND owner_org_id IS NULL FROM public.global_partners WHERE id = 'dc000000-0000-0000-0000-0000000000d7')
+  AND current_setting('test.r5_claim')::jsonb ->> 'status' = 'claim_requested',
+  'the claimed-then-merged listing stays archived and unowned'
+);
+SELECT ok(
+  position('FROM public.global_partners g' in pg_get_functiondef('public.resolve_directory_review_request(uuid, boolean)'::regprocedure)) > 0
+  AND position('FROM public.global_partners g' in pg_get_functiondef('public.resolve_directory_review_request(uuid, boolean)'::regprocedure))
+    < position('FROM public.directory_review_requests WHERE id = p_request_id FOR UPDATE' in pg_get_functiondef('public.resolve_directory_review_request(uuid, boolean)'::regprocedure)),
+  'resolving locks the listing before the request, the order a claimant save uses'
+);
 
 SELECT * FROM finish();
 ROLLBACK;

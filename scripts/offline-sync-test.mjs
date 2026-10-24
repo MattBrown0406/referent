@@ -1134,6 +1134,141 @@ await check('an assignment (which upserts its match) waits behind an earlier ref
   assert.equal(row.assigned_partner_id, P, 'the edit, then the assignment');
 });
 
+// ─── Round 5: queues left by 1.0.4 (1), and changes that span two rows ──────
+
+await check('a 1.0.4 (1) queue (ops with no opId) flushes, and its repeated equal edits all survive a refusal', async () => {
+  await freshAccount();
+  const X = 'a5a5a5a5-a5a5-4a5a-8a5a-a5a5a5a5a5a5';
+  state.db.partners.push({ id: X, name: 'Hope House', organization: 'Org', favorite: false, org_id: ORG, created_at: new Date().toISOString() });
+  // 1.0.4 (1) queued full-row patches and no opId: favorite on, off, on gives
+  // a first and third op that are byte-identical.
+  const legacy = (favorite) => ({ kind: 'partner.update', id: X, patch: { name: 'Hope House', organization: 'Org', note: '', favorite } });
+  const legacyQueue = JSON.stringify({ version: 2, userId: U, ops: [legacy(true), legacy(false), legacy(true)] });
+  state.asyncStorage.set(queueKey, legacyQueue);
+  assert.equal(await store.flushWriteQueue(U), 3, 'an upgraded tester’s queue still flushes');
+  assert.equal(state.db.partners.find((row) => row.id === X).favorite, true);
+
+  state.asyncStorage.set(queueKey, legacyQueue);
+  let refuse = true;
+  state.failOn = (b) => (refuse && b.table === 'partners' && b.op === 'update') ? { message: 'violates check constraint', code: '23514' } : null;
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
+  const entry = JSON.parse(state.asyncStorage.get(rejectedKey)).entries[0];
+  assert.deepEqual(entry.ops.map((op) => op.patch.favorite), [true, false, true], 'the third edit is not mistaken for the first');
+  assert.equal(new Set(entry.ops.map((op) => op.opId)).size, 3, 'each old op gets its own opId before it can be set aside');
+  // A crash between the two durable writes is still recognised (by opId).
+  const envelope = JSON.parse(state.asyncStorage.get(queueKey) || '{"ops":[]}');
+  state.asyncStorage.set(queueKey, JSON.stringify({ version: 2, userId: U, ops: [...(envelope.ops || []), entry.ops[2]] }));
+  await store.flushWriteQueue(U).catch(() => undefined);
+  assert.equal(JSON.parse(state.asyncStorage.get(rejectedKey)).entries[0].ops.length, 3);
+  refuse = false;
+  const [item] = await store.listRejectedWrites(U);
+  await store.retryRejectedWrite(U, item.id);
+  assert.equal(state.db.partners.find((row) => row.id === X).favorite, true, 'the user’s last edit wins');
+});
+
+for (const mode of ['offline', 'online']) {
+  await check(`a new change (${mode}) held by a refusal through one row queues behind an older edit of its other row`, async () => {
+    await freshAccount();
+    const P = '5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a';
+    const R = '5b5b5b5b-5b5b-45b5-85b5-5b5b5b5b5b5b';
+    const M = '5c5c5c5c-5c5c-45c5-85c5-5c5c5c5c5c5c';
+    const T = '5d5d5d5d-5d5d-45d5-85d5-5d5d5d5d5d5d';
+    const F = '5e5e5e5e-5e5e-45e5-85e5-5e5e5e5e5e5e';
+    state.db.partners.push({ id: P, name: 'Program', organization: '', types: ['Inpatient'], created_at: new Date().toISOString(), org_id: ORG });
+    state.db.referrals.push({ id: R, partner_id: P, direction: 'outbound', referred_on: '2026-10-20', client_label: 'Family', outcome: 'Pending', note: '', packet_sent_at: null, match_profile_id: null, created_at: new Date().toISOString(), org_id: ORG });
+    state.db.match_profiles.push(matchRow(M, { assigned_partner_id: P, referral_id: R }));
+    const { snapshot } = await store.hydrate(U);
+    const match = snapshot.referralMatches.find((item) => item.id === M);
+    const referral = snapshot.referrals.find((item) => item.id === R);
+    state.offline = true;
+    await store.updateMatchProfile({ ...match, clientLabel: 'Renamed' }, U);
+    state.offline = false;
+    let refuseMatch = true;
+    let blip = false;
+    state.rpcResults = {
+      finalize_match_packet: (args) => {
+        Object.assign(state.db.referrals.find((row) => row.id === args.p_referral.id), args.p_referral);
+        return { data: null, error: null };
+      },
+    };
+    state.failOn = (b) => {
+      if (refuseMatch && b.table === 'match_profiles' && b.op === 'update') return { message: 'violates check constraint', code: '23514' };
+      if (blip && b.table === 'referrals' && b.op === 'update') return { message: 'Service Unavailable', httpStatus: 503 };
+      return null;
+    };
+    try {
+      await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError); // the match edit is set aside
+      state.offline = true;
+      await store.updateReferralPacketStamp(R, '2026-10-21T10:00:00.000Z', M, U); // an older stamp, queued
+      if (mode === 'offline') goOfflineExpired(); else { state.offline = false; blip = true; }
+      const sentAt = '2026-10-22T10:00:00.000Z';
+      await store.finalizeMatchPacket(
+        { ...referral, packetSentAt: sentAt, matchProfileId: M },
+        { ...match, clientLabel: 'Renamed', status: 'Referred' },
+        { id: T, partnerId: P, kind: 'email', note: 'Packet sent', occurredAt: sentAt },
+        followUp(F, { referralId: R }),
+        null,
+        U,
+      );
+      const listed = () => JSON.parse(state.asyncStorage.get(rejectedKey)).entries[0].ops.map((op) => op.kind);
+      assert.deepEqual(listed(), ['match.update'], 'the packet waits behind the older stamp of its referral, not inside the refused group ahead of it');
+      if (mode === 'offline') signIn();
+      state.offline = false;
+      blip = false;
+      await store.flushWriteQueue(U).catch(() => undefined);
+      assert.deepEqual(listed(), ['match.update', 'packet.finalize']);
+      refuseMatch = false;
+      const [item] = await store.listRejectedWrites(U);
+      await store.retryRejectedWrite(U, item.id);
+      assert.equal(state.db.referrals.find((row) => row.id === R).packet_sent_at, sentAt, 'the newer packet is not overwritten by the older stamp');
+    } finally {
+      state.rpcResults = null;
+    }
+  });
+}
+
+await check('a flush cut off after an upsert waits keeps it ahead of a later edit of the row it creates', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const P = '6a6a6a6a-6a6a-46a6-86a6-6a6a6a6a6a6a';
+  const R = '6b6b6b6b-6b6b-46b6-86b6-6b6b6b6b6b6b';
+  const M = '6c6c6c6c-6c6c-46c6-86c6-6c6c6c6c6c6c';
+  const T = '6d6d6d6d-6d6d-46d6-86d6-6d6d6d6d6d6d';
+  const F = '6e6e6e6e-6e6e-46e6-86e6-6e6e6e6e6e6e';
+  const match = { id: M, clientLabel: 'Family', levelOfCare: 'Inpatient', state: 'OR', insurance: 'Cash pay', networkPreferences: [], therapies: [], status: 'Referred', assignedPartnerId: P, referralId: R };
+  state.offline = true;
+  // The packet (which upserts referral, match, touch and follow-up) is queued
+  // ahead of its program's insert, so its first try finds the program missing.
+  await store.finalizeMatchPacket(
+    { id: R, partnerId: P, direction: 'Outbound', date: '2026-10-23', clientLabel: 'Family', outcome: 'Pending', note: '' },
+    match, { id: T, partnerId: P, kind: 'email', note: '', occurredAt: new Date().toISOString() }, followUp(F, { referralId: R }), null, U,
+  );
+  await store.createPartner(partner('6f6f6f6f-6f6f-46f6-86f6-6f6f6f6f6f6f', 'Unrelated'), U);
+  await store.updateMatchProfile({ ...match, clientLabel: 'Renamed' }, U);
+  await store.createPartner(partner(P, 'Program, later in the queue'), U);
+  state.offline = false;
+  let orgCalls = 0;
+  state.rpcResults = {
+    finalize_match_packet: (args) => {
+      if (!state.db.partners.some((row) => row.id === P)) return { data: null, error: { message: 'violates foreign key constraint', code: '23503' } };
+      state.db.referrals.push({ org_id: ORG, ...args.p_referral });
+      state.db.match_profiles.push({ org_id: ORG, ...args.p_match });
+      return { data: null, error: null };
+    },
+  };
+  // The connection drops right after the packet's first try.
+  state.failOn = (b) => (b.op === 'rpc' && b.table === 'current_org_id' && ++orgCalls === 2) ? { message: 'TypeError: Network request failed', code: '' } : null;
+  try {
+    assert.equal(await store.flushWriteQueue(U), 0);
+    assert.deepEqual(JSON.parse(state.asyncStorage.get(queueKey)).ops.map((op) => op.kind), ['packet.finalize', 'partner.insert', 'match.update', 'partner.insert'], 'the waiting packet keeps its place');
+    assert.equal(await store.flushWriteQueue(U), 4, 'the program, then the packet, then the edit of its match');
+    assert.equal(state.db.match_profiles.find((row) => row.id === M).client_label, 'Renamed');
+    assert.deepEqual(await store.syncStatus(U), { pending: 0, waiting: 0, rejected: 0 });
+  } finally {
+    state.rpcResults = null;
+  }
+});
+
 // ─── account.ts: every document is removed, past the 1,000-row cap ──────────
 
 {

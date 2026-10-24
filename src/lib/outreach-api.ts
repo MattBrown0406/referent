@@ -187,6 +187,26 @@ async function openUrl(url: string): Promise<boolean> {
   }
 }
 
+// Messages reports back only through its delegate, so if iOS ever lets the
+// compose sheet go without calling it, sendSMSAsync never settles and the
+// overlay would block every later sheet. The follow-up sheet releases it when
+// it closes: the user reaching that sheet means the compose sheet is gone.
+let releasePendingCompose: (() => void) | null = null;
+
+function beginComposeOverlay(): () => void {
+  const endOverlay = beginOverlay();
+  const end = () => {
+    endOverlay();
+    if (releasePendingCompose === end) releasePendingCompose = null;
+  };
+  releasePendingCompose = end;
+  return end;
+}
+
+export function releaseComposeOverlay() {
+  releasePendingCompose?.();
+}
+
 export async function sendTextMessage(phone: string, body: string): Promise<SendResult> {
   const digits = digitsForPhone(phone);
   if (!digits) return 'failed';
@@ -194,7 +214,7 @@ export async function sendTextMessage(phone: string, body: string): Promise<Send
   if (sms) {
     try {
       if (await sms.isAvailableAsync()) {
-        const endOverlay = beginOverlay();
+        const endOverlay = beginComposeOverlay();
         try {
           const { result } = await sms.sendSMSAsync([digits], body);
           return result;
@@ -214,7 +234,7 @@ export async function sendEmailMessage(email: string, subject: string, body: str
   if (mail) {
     try {
       if (await mail.isAvailableAsync()) {
-        const endOverlay = beginOverlay();
+        const endOverlay = beginComposeOverlay();
         let status: string;
         try {
           ({ status } = await mail.composeAsync({ recipients: [email.trim()], subject, body }));

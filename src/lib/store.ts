@@ -344,8 +344,9 @@ type QueueOpBody =
 // opId: a unique id given to every op when it is queued (bindQueueOp), so two
 // identical edits (favorite on → off → on) stay two ops. It is only ever used
 // to recognise the SAME op twice (a crash between two durable writes), never
-// to merge ops by content. Ops queued by older builds have none and are
-// recognised by their content instead.
+// to merge ops by content. Ops queued by 1.0.4 (1) have none: the first flush
+// gives each one its own (flushQueueUnlocked) before any can be set aside.
+// Only an op that still has none is recognised by its content.
 type QueueOp = QueueOpBody & { opId?: string };
 
 function opIdentity(op: QueueOp): string {
@@ -446,8 +447,8 @@ function sanitizeWaits(value: unknown): Record<string, OpWait> {
   return waits;
 }
 
-// Stable identity of a queued op for its retry bookkeeping (identical ops
-// share one entry, which is what we want).
+// Stable identity of a queued op for its retry bookkeeping. It hashes the
+// whole op, opId included, so every op has its own entry.
 function queueOpKey(op: QueueOp): string {
   return uuidFromLegacyId(JSON.stringify(op));
 }
@@ -644,19 +645,26 @@ function rejectedHoldSets(entries: RejectedEntry[]): HoldSets {
 // refused entry it must wait with, if any. When an older op in the live queue
 // is (or will be, once a flush reaches it) held by that same entry, the new op
 // must queue behind it rather than join the entry directly — otherwise it
-// would be listed (and retried) ahead of the older edit.
+// would be listed (and retried) ahead of the older edit. The same goes when
+// an older queued op touches any OTHER row of the new op (a packet held
+// through its match, with an older stamp of its referral queued): joining the
+// entry now, the new op would hold that row too, the flush would then attach
+// the older edit behind it, and a retry would replay the older edit last.
 function placeNewOp(rows: OpRows, rejectedSets: HoldSets, queue: QueueOp[]): { holder?: string; behindQueue: boolean } {
   const combined: HoldSets = { writes: new Map(rejectedSets.writes), creates: new Map(rejectedSets.creates) };
+  const queuedSets = newHoldSets();
   const heldInQueue = new Set<string>();
   for (const queued of queue) {
     const queuedRows = opRows(queued);
+    hold(queuedRows, queuedSets, queueOpKey(queued));
     const holder = holderOf(queuedRows, combined);
     if (!holder) continue;
     heldInQueue.add(holder);
     hold(queuedRows, combined, holder);
   }
   const holder = holderOf(rows, combined);
-  return holder ? { holder, behindQueue: heldInQueue.has(holder) } : { behindQueue: false };
+  if (!holder) return { behindQueue: false };
+  return { holder, behindQueue: heldInQueue.has(holder) || holderOf(rows, queuedSets) !== undefined };
 }
 
 // In-memory view of the rejected list for one locked operation. Every change
@@ -970,8 +978,8 @@ type FlushOutcome = {
 // is consistent after every op.
 //   - lost connection / passing server failure: stop, keep everything;
 //   - missing parent row (FK, or an update that matched nothing): keep it in
-//     the queue and retry it after the rest — with every later op on the same
-//     row or needing a row it creates held right behind it;
+//     the queue (in its place) and retry it after the rest — with every later
+//     op on the same row or needing a row it creates held right behind it;
 //   - refused by the server: set aside in the rejected list together with
 //     every later op it holds, and carry on with the rest.
 async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
@@ -981,6 +989,15 @@ async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
   const outcome: FlushOutcome = { flushed: 0, rejected: [], remaining: ops.length, stopped: null };
   if (!ops.length) return outcome;
   if (fence.offline) return { ...outcome, stopped: 'offline' };
+  // 1.0.4 (1) queued ops without an opId, and its full-row patches make a
+  // repeated edit (favorite on → off → on) byte-identical to the first one.
+  // Give each its own opId, durably, before any op can be set aside — matched
+  // by content, the third would be taken for the first and dropped.
+  if (ops.some((op) => !(typeof op.opId === 'string' && op.opId))) {
+    ops = ops.map((op) => (typeof op.opId === 'string' && op.opId ? op : { ...op, opId: newUuid() }));
+    await assertSessionFence(fence);
+    await writeQueueUnlocked(fence.userId, ops, waits);
+  }
   const rejected = await openRejectedList(fence);
 
   // Server workspace check before each op; null = no connection / passing failure.
@@ -1037,7 +1054,7 @@ async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
           deferred.push(head);
           hold(rows, deferredSets, queueOpKey(head));
         } else if (kind === 'transient' && await passingFailure(head, error)) {
-          await writeQueueUnlocked(fence.userId, [...ops, ...deferred], waits);
+          await writeQueueUnlocked(fence.userId, [...deferred, ...ops], waits);
           return { ...outcome, stopped: 'transient' };
         } else if (kind === 'refused') {
           await setAside(head, error);
@@ -1046,7 +1063,12 @@ async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
     }
     await assertSessionFence(fence);
     ops = rest;
-    await writeQueueUnlocked(fence.userId, [...ops, ...deferred], waits);
+    // On disk the waiting ops keep their place AHEAD of the rest: a flush that
+    // stops (or the app being killed) before reaching a later edit of a row a
+    // waiting op creates must not leave that edit in front of it — the edit
+    // would then match nothing, wait, and hold its own create (an upsert
+    // inside a packet / assignment / save) behind it for good.
+    await writeQueueUnlocked(fence.userId, [...deferred, ...ops], waits);
     outcome.remaining = ops.length + deferred.length;
   }
 

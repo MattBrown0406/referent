@@ -2274,12 +2274,15 @@ export default function App() {
   function afterSheetCloses(open: () => void, options: { ifScreenBusy?: 'skip' | 'wait' | 'ignore'; stillWanted?: () => boolean } = {}) {
     const userId = activeUserIdRef.current;
     const generation = authGenerationRef.current;
-    const attempt = (tries: number) => {
+    const attempt = (tries: number, settling = false) => {
       setTimeout(() => {
         if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation) return;
         if (options.stillWanted && !options.stillWanted()) return;
-        if (options.ifScreenBusy !== 'ignore' && (anySheetOpenRef.current || overlayOpen())) {
-          if (options.ifScreenBusy === 'wait' && tries < 50) attempt(tries + 1);
+        const busy = anySheetOpenRef.current || overlayOpen();
+        if (options.ifScreenBusy !== 'ignore' && (busy || settling)) {
+          // 'wait': once the screen is clear, give whatever just closed one
+          // more delay to finish animating away before presenting.
+          if (options.ifScreenBusy === 'wait' && tries < 50) attempt(tries + 1, busy);
           return;
         }
         open();
@@ -4866,12 +4869,17 @@ export default function App() {
   }
 
   async function sharePartner(partner: Partner) {
+    // From a Directory card no sheet is under the share sheet, so only this
+    // keeps a notification tap or timed sheet from presenting over it.
+    const endOverlay = beginOverlay();
     try {
       await Share.share({
         title: `${partner.organization} referral contact`,
         message: partnerShareMessage(partner),
       });
+      endOverlay();
     } catch {
+      endOverlay();
       Alert.alert('Unable to share', 'The share sheet could not be opened. Please try again.');
     }
   }
