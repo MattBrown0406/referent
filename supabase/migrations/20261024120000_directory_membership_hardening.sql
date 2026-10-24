@@ -353,7 +353,10 @@ REVOKE ALL ON FUNCTION public.org_directory_profile_conflict(public.global_partn
 
 
 -- Internal. The owner saved a profile an admin had archived: it goes back
--- to pending (hidden) with a resubmitted_profile review request.
+-- to pending (hidden) with a resubmitted_profile review request that names
+-- what it still collides with, if anything (same phone, website or name as
+-- another non-archived listing). A listing an admin merged into another
+-- (merged_into) is never resubmitted.
 CREATE OR REPLACE FUNCTION public.org_directory_profile_resubmit(p_listing uuid, p_org uuid, p_user uuid)
 RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER
@@ -361,15 +364,38 @@ SET search_path = public
 AS $$
 DECLARE
   v_prev_pub text := coalesce(current_setting('referralfit.seed_publish', true), '');
+  g public.global_partners%ROWTYPE;
+  v_related uuid;
+  v_on text;
   v_review uuid;
 BEGIN
+  SELECT * INTO g FROM public.global_partners WHERE id = p_listing;
+  IF g.merged_into IS NOT NULL THEN
+    RETURN jsonb_build_object('status', 'merged', 'listing_id', p_listing, 'merged_into', g.merged_into,
+      'message', 'ReferralFit merged this profile into another directory listing, so it cannot be sent for review again. Contact ReferralFit to manage the combined listing.');
+  END IF;
+  v_related := public.directory_identity_collision(p_listing, 'phone', g.phone_digits);
+  v_on := CASE WHEN v_related IS NOT NULL THEN 'phone' END;
+  IF v_related IS NULL THEN
+    v_related := public.directory_identity_collision(p_listing, 'website', g.website_domain);
+    v_on := CASE WHEN v_related IS NOT NULL THEN 'website' END;
+  END IF;
+  IF v_related IS NULL THEN
+    v_related := public.directory_identity_collision(p_listing, 'name',
+      public.directory_name_key(coalesce(nullif(btrim(g.organization), ''), g.name)));
+    v_on := CASE WHEN v_related IS NOT NULL THEN 'name' END;
+  END IF;
+
   -- The verification guard pins status for non-admin writers; this is the
   -- sanctioned definer path, like the seed publish.
   PERFORM set_config('referralfit.seed_publish', 'on', true);
   UPDATE public.global_partners SET status = 'pending', verified_at = NULL WHERE id = p_listing;
   PERFORM set_config('referralfit.seed_publish', v_prev_pub, true);
-  INSERT INTO public.directory_review_requests (kind, global_partner_id, org_id, requested_by, note)
-  VALUES ('resubmitted_profile', p_listing, p_org, p_user, 'The owner saved this profile after it was archived; it is hidden until reviewed.')
+  INSERT INTO public.directory_review_requests (kind, global_partner_id, related_listing_id, org_id, requested_by, collisions, note)
+  VALUES ('resubmitted_profile', p_listing, v_related, p_org, p_user, CASE WHEN v_on IS NULL THEN '{}'::text[] ELSE ARRAY[v_on] END,
+          'The owner saved this profile after it was archived; it is hidden until reviewed. '
+          || CASE WHEN v_on IS NULL THEN 'It matches no other listing now.'
+                  ELSE 'It still matches another listing on: ' || v_on || '.' END)
   ON CONFLICT DO NOTHING
   RETURNING id INTO v_review;
   RETURN jsonb_build_object('status', 'resubmitted_for_review', 'listing_id', p_listing, 'review_id', v_review,
@@ -388,6 +414,8 @@ SET search_path = public
 AS $$
 DECLARE
   v_review public.directory_review_requests%ROWTYPE;
+  v_fields text[];
+  v_text text;
 BEGIN
   SELECT * INTO v_review FROM public.directory_review_requests
    WHERE global_partner_id = p_listing AND status = 'pending'
@@ -398,9 +426,18 @@ BEGIN
       'listing_id', p_listing, 'review_id', v_review.id,
       'message', 'Your profile is saved and waits for ReferralFit to review it before it appears in the directory.');
   ELSIF v_review.kind = 'identity_edit' THEN
+    v_fields := ARRAY(SELECT CASE c WHEN 'phone' THEN 'phone number' ELSE c END
+                        FROM unnest(v_review.collisions) WITH ORDINALITY AS t(c, n) ORDER BY n);
+    v_text := CASE WHEN cardinality(v_fields) <= 1 THEN coalesce(v_fields[1], 'details')
+                   ELSE array_to_string(v_fields[1:cardinality(v_fields) - 1], ', ') || ' and ' || v_fields[cardinality(v_fields)] END;
     RETURN jsonb_build_object('status', 'updated_pending_review', 'listing_id', p_listing, 'review_id', v_review.id,
       'held_fields', to_jsonb(v_review.collisions),
-      'message', 'Your other changes are live. The new name, phone number, or website matches another directory listing, so ReferralFit will review it first. Your current details stay up until then.');
+      'message', 'Your other changes are live. The new ' || v_text
+                 || CASE WHEN cardinality(v_fields) > 1 THEN ' match' ELSE ' matches' END
+                 || ' another directory listing, so ReferralFit will review '
+                 || CASE WHEN cardinality(v_fields) > 1 THEN 'those changes' ELSE 'that change' END
+                 || ' first. Until then your current ' || v_text
+                 || CASE WHEN cardinality(v_fields) > 1 THEN ' stay' ELSE ' stays' END || ' up.');
   END IF;
   RETURN jsonb_build_object('status', 'updated', 'listing_id', p_listing);
 END
@@ -408,7 +445,8 @@ $$;
 REVOKE ALL ON FUNCTION public.org_directory_profile_update_result(uuid) FROM PUBLIC, anon, authenticated;
 
 -- {status, listing_id, ...}; status is created, updated, updated_pending_review,
--- conflict, resubmitted_for_review or claim_requested (docs/DIRECTORY_OWNERSHIP.md).
+-- conflict, resubmitted_for_review, merged or claim_requested
+-- (docs/DIRECTORY_OWNERSHIP.md).
 -- The automatic takeover ('claimed') is gone.
 CREATE OR REPLACE FUNCTION public.upsert_org_directory_profile(p_payload jsonb)
 RETURNS jsonb
@@ -435,6 +473,9 @@ BEGIN
 
   SELECT id, status INTO v_own, v_own_status FROM public.global_partners WHERE owner_org_id = v_org;
   IF v_own IS NOT NULL THEN
+    IF v_own_status = 'archived' AND EXISTS (SELECT 1 FROM public.global_partners WHERE id = v_own AND merged_into IS NOT NULL) THEN
+      RETURN public.org_directory_profile_resubmit(v_own, v_org, v_user);
+    END IF;
     PERFORM public.org_directory_profile_save(v_own, v_row, v_org, v_user, true);
     IF v_own_status = 'archived' THEN
       RETURN public.org_directory_profile_resubmit(v_own, v_org, v_user);
@@ -732,14 +773,75 @@ $$;
 REVOKE ALL ON FUNCTION public.suggest_global_listing(uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.suggest_global_listing(uuid) TO authenticated;
 
+-- Internal. The first other non-archived listing that already uses this
+-- identity value: p_kind 'name' (name key), 'phone' (phone digits) or
+-- 'website' (domain). NULL when none, or when p_value is blank.
+CREATE OR REPLACE FUNCTION public.directory_identity_collision(p_listing uuid, p_kind text, p_value text)
+RETURNS uuid
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT g.id FROM public.global_partners g
+   WHERE coalesce(p_value, '') <> '' AND g.id <> p_listing AND g.status <> 'archived'
+     AND CASE p_kind
+           WHEN 'name' THEN public.directory_name_key(coalesce(nullif(btrim(g.organization), ''), g.name)) = p_value
+           WHEN 'phone' THEN g.phone_digits = p_value
+           WHEN 'website' THEN g.website_domain = p_value
+           ELSE false END
+   ORDER BY (g.status = 'active') DESC, g.created_at
+   LIMIT 1
+$$;
+REVOKE ALL ON FUNCTION public.directory_identity_collision(uuid, text, text) FROM PUBLIC, anon, authenticated;
+
+-- Internal. Keeps the listing's pending identity_edit in step with one
+-- claimant write: groups that just went live (p_applied) leave the held
+-- proposal, groups just held (p_held, p_hits) are merged in, and a proposal
+-- left empty is withdrawn.
+CREATE OR REPLACE FUNCTION public.directory_identity_queue(p_listing uuid, p_org uuid, p_held jsonb, p_hits text[], p_applied text[], p_related uuid)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_drop text[] := '{}';
+BEGIN
+  IF 'name' = ANY (p_applied) THEN v_drop := v_drop || ARRAY['organization', 'name']; END IF;
+  IF 'phone' = ANY (p_applied) THEN v_drop := v_drop || ARRAY['phone']; END IF;
+  IF 'website' = ANY (p_applied) THEN v_drop := v_drop || ARRAY['website']; END IF;
+  IF cardinality(v_drop) > 0 THEN
+    UPDATE public.directory_review_requests
+       SET proposed = proposed - v_drop,
+           collisions = ARRAY(SELECT c FROM unnest(collisions) AS c WHERE NOT (c = ANY (p_applied)))
+     WHERE kind = 'identity_edit' AND global_partner_id = p_listing AND status = 'pending';
+  END IF;
+  IF cardinality(p_hits) > 0 THEN
+    INSERT INTO public.directory_review_requests AS r (kind, global_partner_id, related_listing_id, org_id, requested_by, proposed, collisions, note)
+    VALUES ('identity_edit', p_listing, p_related, p_org, auth.uid(), p_held, p_hits,
+            'Matches another listing on: ' || array_to_string(p_hits, ', '))
+    ON CONFLICT (kind, global_partner_id) WHERE status = 'pending'
+    DO UPDATE SET proposed = r.proposed || EXCLUDED.proposed,
+                  collisions = ARRAY(SELECT DISTINCT c FROM unnest(r.collisions || EXCLUDED.collisions) AS c ORDER BY c),
+                  note = 'Matches another listing on: '
+                         || array_to_string(ARRAY(SELECT DISTINCT c FROM unnest(r.collisions || EXCLUDED.collisions) AS c ORDER BY c), ', '),
+                  related_listing_id = EXCLUDED.related_listing_id,
+                  requested_by = EXCLUDED.requested_by, org_id = EXCLUDED.org_id, created_at = now();
+  END IF;
+  UPDATE public.directory_review_requests SET status = 'withdrawn', resolved_at = now()
+   WHERE kind = 'identity_edit' AND global_partner_id = p_listing AND status = 'pending' AND proposed = '{}'::jsonb;
+END
+$$;
+REVOKE ALL ON FUNCTION public.directory_identity_queue(uuid, uuid, jsonb, text[], text[], uuid) FROM PUBLIC, anon, authenticated;
+
 -- A claimant (owner workspace member or center account) may edit its
--- listing freely, except that a new organization / name, phone, or website
--- that another listing already uses (same name key, phone digits, or
--- website domain) is held: the live values stay, the change goes to the
--- review queue as an identity_edit, and propagation sends nothing to linked
--- partners until a platform admin approves. A later non-colliding identity
--- change withdraws the held one. Admins, service code and the SQL editor
--- (no auth.uid()) are not held. Runs after global_partners_derive_columns.
+-- listing freely, except that a changed identity value another listing
+-- already uses is held, one group at a time: organization + contact name
+-- (same name key), phone (same digits), website (same domain). A held group
+-- keeps its live values and goes to the review queue as an identity_edit;
+-- every other change in the same write, including the other groups, goes
+-- live. Propagation sends nothing held. A held group that is later changed
+-- to a non-colliding value goes live and leaves the queue. Admins, service
+-- code and the SQL editor (no auth.uid()) are not held. Runs after
+-- global_partners_derive_columns.
 CREATE OR REPLACE FUNCTION public.global_partners_hold_colliding_edits()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
@@ -747,6 +849,10 @@ SET search_path = public
 AS $$
 DECLARE
   v_hits text[] := '{}';
+  v_applied text[] := '{}';
+  v_held jsonb := '{}'::jsonb;
+  v_related uuid;
+  v_hit uuid;
   v_key text := public.directory_name_key(coalesce(nullif(btrim(NEW.organization), ''), NEW.name));
 BEGIN
   IF auth.uid() IS NULL OR public.is_platform_admin()
@@ -754,42 +860,52 @@ BEGIN
      OR NOT public.global_listing_is_claimed(OLD.id) THEN
     RETURN NEW;
   END IF;
-  IF v_key <> '' AND v_key <> public.directory_name_key(coalesce(nullif(btrim(OLD.organization), ''), OLD.name))
-     AND EXISTS (SELECT 1 FROM public.global_partners g WHERE g.id <> OLD.id AND g.status <> 'archived'
-                   AND public.directory_name_key(coalesce(nullif(btrim(g.organization), ''), g.name)) = v_key) THEN
-    v_hits := array_append(v_hits, 'name');
+
+  IF (NEW.organization, NEW.name) IS DISTINCT FROM (OLD.organization, OLD.name) THEN
+    v_hit := CASE WHEN v_key <> public.directory_name_key(coalesce(nullif(btrim(OLD.organization), ''), OLD.name))
+                  THEN public.directory_identity_collision(OLD.id, 'name', v_key) END;
+    IF v_hit IS NOT NULL THEN
+      v_hits := v_hits || ARRAY['name'];
+      v_held := v_held || jsonb_build_object('organization', NEW.organization, 'name', NEW.name);
+      v_related := coalesce(v_related, v_hit);
+      NEW.organization := OLD.organization;
+      NEW.name := OLD.name;
+    ELSE
+      v_applied := v_applied || ARRAY['name'];
+    END IF;
   END IF;
-  IF NEW.phone_digits <> '' AND NEW.phone_digits <> OLD.phone_digits
-     AND EXISTS (SELECT 1 FROM public.global_partners g WHERE g.id <> OLD.id AND g.status <> 'archived' AND g.phone_digits = NEW.phone_digits) THEN
-    v_hits := array_append(v_hits, 'phone');
+  IF NEW.phone IS DISTINCT FROM OLD.phone THEN
+    v_hit := CASE WHEN NEW.phone_digits <> OLD.phone_digits
+                  THEN public.directory_identity_collision(OLD.id, 'phone', NEW.phone_digits) END;
+    IF v_hit IS NOT NULL THEN
+      v_hits := v_hits || ARRAY['phone'];
+      v_held := v_held || jsonb_build_object('phone', NEW.phone);
+      v_related := coalesce(v_related, v_hit);
+      NEW.phone := OLD.phone;
+      NEW.phone_digits := OLD.phone_digits;
+    ELSE
+      v_applied := v_applied || ARRAY['phone'];
+    END IF;
   END IF;
-  IF NEW.website_domain <> '' AND NEW.website_domain <> OLD.website_domain
-     AND EXISTS (SELECT 1 FROM public.global_partners g WHERE g.id <> OLD.id AND g.status <> 'archived' AND g.website_domain = NEW.website_domain) THEN
-    v_hits := array_append(v_hits, 'website');
+  IF NEW.website IS DISTINCT FROM OLD.website THEN
+    v_hit := CASE WHEN NEW.website_domain <> OLD.website_domain
+                  THEN public.directory_identity_collision(OLD.id, 'website', NEW.website_domain) END;
+    IF v_hit IS NOT NULL THEN
+      v_hits := v_hits || ARRAY['website'];
+      v_held := v_held || jsonb_build_object('website', NEW.website);
+      v_related := coalesce(v_related, v_hit);
+      NEW.website := OLD.website;
+      NEW.website_domain := OLD.website_domain;
+    ELSE
+      v_applied := v_applied || ARRAY['website'];
+    END IF;
   END IF;
 
-  IF cardinality(v_hits) = 0 THEN
-    UPDATE public.directory_review_requests SET status = 'withdrawn', resolved_at = now()
-     WHERE kind = 'identity_edit' AND global_partner_id = OLD.id AND status = 'pending';
-    RETURN NEW;
+  PERFORM public.directory_identity_queue(OLD.id, OLD.owner_org_id, v_held, v_hits, v_applied, v_related);
+  IF 'name' = ANY (v_hits) THEN
+    -- derive_columns already indexed the held name; index the live one.
+    NEW.search_tsv := public.global_partner_search_tsv(NEW.name, NEW.organization, NEW.city, NEW.state, NEW.description);
   END IF;
-
-  INSERT INTO public.directory_review_requests (kind, global_partner_id, org_id, requested_by, proposed, collisions, note)
-  VALUES ('identity_edit', OLD.id, OLD.owner_org_id, auth.uid(),
-          jsonb_build_object('organization', NEW.organization, 'name', NEW.name, 'phone', NEW.phone, 'website', NEW.website),
-          v_hits, 'Matches another listing on: ' || array_to_string(v_hits, ', '))
-  ON CONFLICT (kind, global_partner_id) WHERE status = 'pending'
-  DO UPDATE SET proposed = EXCLUDED.proposed, collisions = EXCLUDED.collisions, note = EXCLUDED.note,
-                requested_by = EXCLUDED.requested_by, org_id = EXCLUDED.org_id, created_at = now();
-
-  NEW.organization := OLD.organization;
-  NEW.name := OLD.name;
-  NEW.phone := OLD.phone;
-  NEW.website := OLD.website;
-  NEW.phone_digits := OLD.phone_digits;
-  NEW.website_domain := OLD.website_domain;
-  -- derive_columns already indexed the held name; index the live one.
-  NEW.search_tsv := public.global_partner_search_tsv(NEW.name, NEW.organization, NEW.city, NEW.state, NEW.description);
   RETURN NEW;
 END
 $$;

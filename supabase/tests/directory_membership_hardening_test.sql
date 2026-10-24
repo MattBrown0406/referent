@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(103);
+SELECT plan(109);
 
 -- Actors (suffix d7)
 --   ad  platform admin
@@ -210,6 +210,37 @@ SELECT is(
   'an approved identity edit is applied'
 );
 
+-- Round 4: only the colliding group is held. A colliding rename plus a new
+-- phone in one save: the phone goes live, the name waits.
+SELECT set_config('request.jwt.claim.sub', 'b3000000-0000-0000-0000-0000000000d7', true);
+SELECT set_config('test.mixed', public.upsert_org_directory_profile(
+  '{"name":"Fresh Owner","organization":"North Star Family Therapy","types":["Interventionist"],"phone":"(541) 555-0832","city":"Bend"}'::jsonb)::text, true);
+SELECT is(
+  (current_setting('test.mixed')::jsonb ->> 'status') || '|' || (current_setting('test.mixed')::jsonb -> 'held_fields')::text
+    || '|' || (current_setting('test.mixed')::jsonb ->> 'message'),
+  'updated_pending_review|["name"]|Your other changes are live. The new name matches another directory listing, so ReferralFit will review that change first. Until then your current name stays up.',
+  'a colliding rename is held and the message names exactly what is held'
+);
+SELECT ok(
+  (SELECT organization = 'Fresh Practice' AND phone = '(541) 555-0832' AND phone_digits = '5415550832'
+     FROM public.global_partners WHERE owner_org_id = current_setting('test.org_o3')::uuid)
+  AND (SELECT proposed = '{"organization": "North Star Family Therapy", "name": "Fresh Owner"}'::jsonb
+              AND collisions = ARRAY['name'] AND related_listing_id = 'd2000000-0000-0000-0000-0000000000d7'
+         FROM public.directory_review_requests WHERE id = (current_setting('test.mixed')::jsonb ->> 'review_id')::uuid),
+  'the new phone is live; only the name is proposed, with the listing it collides with'
+);
+SELECT set_config('request.jwt.claim.sub', 'ad000000-0000-0000-0000-0000000000d7', true);
+SELECT is(
+  public.resolve_directory_review_request((current_setting('test.mixed')::jsonb ->> 'review_id')::uuid, false),
+  'rejected',
+  'the admin declines the held rename'
+);
+SELECT is(
+  (SELECT organization || '|' || phone FROM public.global_partners WHERE owner_org_id = current_setting('test.org_o3')::uuid),
+  'Fresh Practice|(541) 555-0832',
+  'declining the rename never undoes the phone change that went live'
+);
+
 -- Round 3, item 1: a first profile with only the NAME of another listing
 -- (no shared phone or website) is held as a conflict too.
 SELECT set_config('request.jwt.claim.sub', 'b5000000-0000-0000-0000-0000000000d7', true);
@@ -244,9 +275,10 @@ SELECT is(
 SELECT ok(
   (SELECT status = 'pending' AND organization = 'North Star Counseling of Salem'
      FROM public.global_partners WHERE id = (current_setting('test.twin')::jsonb ->> 'listing_id')::uuid)
-  AND (SELECT kind = 'resubmitted_profile' AND status = 'pending'
+  AND (SELECT kind = 'resubmitted_profile' AND status = 'pending' AND related_listing_id IS NULL
+              AND note LIKE '%matches no other listing now%'
          FROM public.directory_review_requests WHERE id = (current_setting('test.resub')::jsonb ->> 'review_id')::uuid),
-  'the profile is pending again with a resubmission review'
+  'the profile is pending again with a resubmission review that says what it collides with (nothing)'
 );
 SELECT is(
   public.upsert_org_directory_profile(
@@ -264,6 +296,27 @@ SELECT is(
   (SELECT status FROM public.global_partners WHERE id = (current_setting('test.twin')::jsonb ->> 'listing_id')::uuid),
   'active',
   'and the profile goes live'
+);
+
+-- Round 4: a profile an admin merged into another listing is never resubmitted.
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', '', true);
+UPDATE public.global_partners
+   SET status = 'archived', merged_into = (SELECT id FROM public.global_partners WHERE owner_org_id = current_setting('test.org_o3')::uuid)
+ WHERE owner_org_id = current_setting('test.org_o4')::uuid;
+SELECT set_config('request.jwt.claim.sub', 'b4000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT is(
+  public.upsert_org_directory_profile(
+    '{"name":"Copy","organization":"Second Practice","types":["Interventionist"],"phone":"541.555.0831","city":"Portland"}'::jsonb) ->> 'status',
+  'merged',
+  'saving a merged-away profile reports merged'
+);
+SELECT ok(
+  (SELECT status = 'archived' AND city = 'Salem' FROM public.global_partners WHERE owner_org_id = current_setting('test.org_o4')::uuid)
+  AND NOT EXISTS (SELECT 1 FROM public.directory_review_requests
+                   WHERE kind = 'resubmitted_profile' AND org_id = current_setting('test.org_o4')::uuid),
+  'and it stays archived, unchanged, with no resubmission'
 );
 SELECT set_config('request.jwt.claim.sub', 'b3000000-0000-0000-0000-0000000000d7', true);
 SELECT throws_ok(

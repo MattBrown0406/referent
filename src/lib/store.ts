@@ -320,7 +320,7 @@ function persistenceError(area: 'cache' | 'offline queue', error: unknown): Stor
 
 // ─── Offline write queue (account-scoped, serialized FIFO) ──────────────────
 
-type QueueOp =
+type QueueOpBody =
   | { kind: 'partner.insert'; row: Record<string, unknown> }
   | { kind: 'partner.update'; id: string; patch: Record<string, unknown> }
   | { kind: 'referral.insert'; row: Record<string, unknown> }
@@ -340,6 +340,17 @@ type QueueOp =
   | { kind: 'referral.update'; id: string; patch: Record<string, unknown> }
   | { kind: 'placement.insert'; row: Record<string, unknown> }
   | { kind: 'referral.record_outcome'; referralId: string; outcome: Record<string, unknown>; completed: Record<string, unknown> | null };
+
+// opId: a unique id given to every op when it is queued (bindQueueOp), so two
+// identical edits (favorite on → off → on) stay two ops. It is only ever used
+// to recognise the SAME op twice (a crash between two durable writes), never
+// to merge ops by content. Ops queued by older builds have none and are
+// recognised by their content instead.
+type QueueOp = QueueOpBody & { opId?: string };
+
+function opIdentity(op: QueueOp): string {
+  return typeof op.opId === 'string' && op.opId ? `id:${op.opId}` : `json:${JSON.stringify(op)}`;
+}
 
 // Per-op retry bookkeeping, keyed by queueOpKey(op): parentWaits for ops the
 // server refused only because a row they need does not exist (yet), and
@@ -493,23 +504,28 @@ const FK_PARENT_TABLES: Record<string, string> = {
   match_profile_id: 'match_profiles',
 };
 
-type OpRows = { creates: string[]; writes: string[]; parents: string[] };
+// creates: rows the op may create (plain inserts, and the upserts inside
+// save_case / assign_match / finalize_packet). inserts: rows a plain insert
+// creates — only those may run ahead of a held edit of the same row (that edit
+// is waiting for them); everything else keeps FIFO order per row.
+type OpRows = { creates: string[]; inserts: string[]; writes: string[]; parents: string[] };
 
 function rowKey(table: string, id: unknown): string | null {
   return typeof id === 'string' && id ? `${table}:${id.toLowerCase()}` : null;
 }
 
 function opRows(op: QueueOp): OpRows {
-  const rows: OpRows = { creates: [], writes: [], parents: [] };
+  const rows: OpRows = { creates: [], inserts: [], writes: [], parents: [] };
   const add = (list: string[], key: string | null) => { if (key) list.push(key); };
   const parentsOf = (row: Record<string, unknown> | null | undefined) => {
     if (!row) return;
     for (const [column, table] of Object.entries(FK_PARENT_TABLES)) add(rows.parents, rowKey(table, row[column]));
   };
-  const create = (table: string, row: Record<string, unknown> | null | undefined) => {
+  const create = (table: string, row: Record<string, unknown> | null | undefined, plainInsert = false) => {
     if (!row) return;
     const key = rowKey(table, row.id);
     add(rows.creates, key);
+    if (plainInsert) add(rows.inserts, key);
     add(rows.writes, key);
     parentsOf(row);
   };
@@ -518,12 +534,12 @@ function opRows(op: QueueOp): OpRows {
     parentsOf(patch);
   };
   switch (op.kind) {
-    case 'partner.insert': create('partners', op.row); break;
-    case 'referral.insert': create('referrals', op.row); break;
-    case 'match.insert': create('match_profiles', op.row); break;
-    case 'touch.insert': create('touches', op.row); break;
-    case 'follow_up.insert': create('follow_ups', op.row); break;
-    case 'placement.insert': create('placement_decisions', op.row); break;
+    case 'partner.insert': create('partners', op.row, true); break;
+    case 'referral.insert': create('referrals', op.row, true); break;
+    case 'match.insert': create('match_profiles', op.row, true); break;
+    case 'touch.insert': create('touches', op.row, true); break;
+    case 'follow_up.insert': create('follow_ups', op.row, true); break;
+    case 'placement.insert': create('placement_decisions', op.row, true); break;
     case 'partner.update': write('partners', op.id, op.patch); break;
     case 'match.update': write('match_profiles', op.id, op.patch); break;
     case 'follow_up.update': write('follow_ups', op.id, op.patch); break;
@@ -554,13 +570,14 @@ function newHoldSets(): HoldSets {
   return { writes: new Map(), creates: new Map() };
 }
 
-// A row an op CREATES is held only by another held op that creates it too —
-// never by a held edit of it: that edit is waiting for exactly this insert
-// (e.g. an edit queued ahead of a retried insert), so the insert must run.
+// A row a plain INSERT creates is held only by another held op that creates
+// it too — never by a held edit of it: that edit is waiting for exactly this
+// insert (e.g. an edit queued ahead of a retried insert), so the insert must
+// run. Every other op on a held row waits behind it (FIFO per row).
 function holderOf(rows: OpRows, sets: HoldSets): string | undefined {
-  const creates = new Set(rows.creates);
+  const inserts = new Set(rows.inserts);
   for (const key of rows.writes) {
-    const holder = creates.has(key) ? sets.creates.get(key) : sets.writes.get(key) ?? sets.creates.get(key);
+    const holder = inserts.has(key) ? sets.creates.get(key) : sets.writes.get(key) ?? sets.creates.get(key);
     if (holder) return holder;
   }
   for (const key of rows.parents) {
@@ -623,6 +640,25 @@ function rejectedHoldSets(entries: RejectedEntry[]): HoldSets {
   return sets;
 }
 
+// Where a NEW change goes relative to the refused changes: `holder` is the
+// refused entry it must wait with, if any. When an older op in the live queue
+// is (or will be, once a flush reaches it) held by that same entry, the new op
+// must queue behind it rather than join the entry directly — otherwise it
+// would be listed (and retried) ahead of the older edit.
+function placeNewOp(rows: OpRows, rejectedSets: HoldSets, queue: QueueOp[]): { holder?: string; behindQueue: boolean } {
+  const combined: HoldSets = { writes: new Map(rejectedSets.writes), creates: new Map(rejectedSets.creates) };
+  const heldInQueue = new Set<string>();
+  for (const queued of queue) {
+    const queuedRows = opRows(queued);
+    const holder = holderOf(queuedRows, combined);
+    if (!holder) continue;
+    heldInQueue.add(holder);
+    hold(queuedRows, combined, holder);
+  }
+  const holder = holderOf(rows, combined);
+  return holder ? { holder, behindQueue: heldInQueue.has(holder) } : { behindQueue: false };
+}
+
 // In-memory view of the rejected list for one locked operation. Every change
 // is written through BEFORE the caller removes the op from the live queue: a
 // crash in between leaves it in both places (replayed once more, listed once
@@ -646,8 +682,8 @@ async function openRejectedList(fence: SessionFence): Promise<RejectedList> {
     entries,
     sets,
     async reject(op, reason, code) {
-      const serialized = JSON.stringify(op);
-      const existing = entries.find((entry) => JSON.stringify(entry.ops[0]) === serialized);
+      const identity = opIdentity(op);
+      const existing = entries.find((entry) => entry.ops.some((item) => opIdentity(item) === identity));
       if (existing) return existing;
       const entry: RejectedEntry = { id: newUuid(), ops: [op], reason, ...(code ? { code } : {}), rejectedAt: new Date().toISOString() };
       entries.push(entry);
@@ -658,8 +694,10 @@ async function openRejectedList(fence: SessionFence): Promise<RejectedList> {
     async attach(entryId, op) {
       const entry = entries.find((item) => item.id === entryId);
       if (!entry) return;
-      const serialized = JSON.stringify(op);
-      if (!entry.ops.some((item) => JSON.stringify(item) === serialized)) entry.ops.push(op);
+      // The same op (same opId) is never listed twice; equal-looking edits are
+      // distinct changes and all kept, in order.
+      const identity = opIdentity(op);
+      if (!entries.some((item) => item.ops.some((held) => opIdentity(held) === identity))) entry.ops.push(op);
       hold(opRows(op), sets, entry.id);
       await save();
     },
@@ -724,8 +762,9 @@ function rejectedWritesError(entries: RejectedEntry[]): RejectedWritesError {
 }
 
 function bindQueueOp(op: QueueOp, userId: string): QueueOp {
-  if ('row' in op) return { ...op, row: { ...op.row, owner_id: userId } } as QueueOp;
-  return op;
+  const opId = typeof op.opId === 'string' && op.opId ? op.opId : newUuid();
+  if ('row' in op) return { ...op, opId, row: { ...op.row, owner_id: userId } } as QueueOp;
+  return { ...op, opId };
 }
 
 // A queued insert is replayed with ON CONFLICT (id) DO NOTHING: replaying it
@@ -2363,8 +2402,8 @@ async function runOrQueue(
     // refused joins it in the rejected list rather than the live queue.
     await withQueueLock(async () => {
       const rejected = await openRejectedList(fence);
-      const holder = holderOf(rows, rejected.sets);
-      if (holder) await rejected.attach(holder, bindQueueOp(op, fence.userId));
+      const place = placeNewOp(rows, rejected.sets, await readQueueUnlocked(fence.userId));
+      if (place.holder && !place.behindQueue) await rejected.attach(place.holder, bindQueueOp(op, fence.userId));
       else await enqueueOpUnlocked(fence, op);
     });
     return;
@@ -2377,12 +2416,13 @@ async function runOrQueue(
       stopped = (await flushQueueUnlocked(fence)).stopped !== null;
     }
     const rejected = await openRejectedList(fence);
-    const rejectedHolder = holderOf(rows, rejected.sets);
-    if (rejectedHolder) {
-      await rejected.attach(rejectedHolder, bindQueueOp(op, fence.userId));
+    const remaining = await readQueueUnlocked(fence.userId);
+    const place = placeNewOp(rows, rejected.sets, remaining);
+    if (place.holder) {
+      if (place.behindQueue) await enqueueOpUnlocked(fence, op);
+      else await rejected.attach(place.holder, bindQueueOp(op, fence.userId));
       return;
     }
-    const remaining = await readQueueUnlocked(fence.userId);
     if (remaining.length) {
       const waitingSets = newHoldSets();
       for (const queued of remaining) hold(opRows(queued), waitingSets, queueOpKey(queued));

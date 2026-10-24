@@ -1026,6 +1026,114 @@ await check('a completion held by a passing server failure stays done through a 
   state.failOn = null;
 });
 
+// ─── Round 4: held edits keep every change, in order ───────────────────────
+
+await check('repeated equal edits (on → off → on) held behind a refusal all survive, and retry ends at the last', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const X = 'abababab-abab-4bab-8bab-abababababa1';
+  const base = partner(X, 'Hope House', { favorite: false });
+  await store.createPartner(base, U);
+  await store.persistCache(snapOf({ partners: [base] }), U);
+  state.offline = true;
+  for (const favorite of [true, false, true]) {
+    const next = partner(X, 'Hope House', { favorite });
+    await store.updatePartner(next, U);
+    state.offline = false;
+    await store.persistCache(snapOf({ partners: [next] }), U);
+    state.offline = true;
+  }
+  const queued = JSON.parse(state.asyncStorage.get(queueKey)).ops;
+  assert.equal(new Set(queued.map((op) => op.opId)).size, 3, 'every queued op has its own opId');
+  state.offline = false;
+  let refuse = true;
+  state.failOn = (b) => (refuse && b.table === 'partners' && b.op === 'update') ? { message: 'violates check constraint', code: '23514' } : null;
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
+  const entry = JSON.parse(state.asyncStorage.get(rejectedKey)).entries[0];
+  assert.deepEqual(entry.ops.map((op) => op.patch.favorite), [true, false, true]);
+  // A crash between the two durable writes leaves an op in both places: it is
+  // recognised by its opId and never listed twice.
+  const envelope = JSON.parse(state.asyncStorage.get(queueKey) || '{"version":2,"userId":"","ops":[]}');
+  state.asyncStorage.set(queueKey, JSON.stringify({ version: 2, userId: U, ops: [...(envelope.ops || []), entry.ops[2]] }));
+  await store.flushWriteQueue(U).catch(() => undefined);
+  assert.equal(JSON.parse(state.asyncStorage.get(rejectedKey)).entries[0].ops.length, 3);
+  refuse = false;
+  const [item] = await store.listRejectedWrites(U);
+  await store.retryRejectedWrite(U, item.id);
+  assert.equal(state.db.partners.find((row) => row.id === X).favorite, true, 'the user’s last edit wins');
+});
+
+for (const mode of ['offline', 'online']) {
+  await check(`a new edit (${mode}) never jumps ahead of an older queued edit of the same refused row`, async () => {
+    await freshAccount();
+    await store.hydrate(U);
+    const X = 'abababab-abab-4bab-8bab-abababababa2';
+    const F = 'cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdc2';
+    const base = partner(X, 'Hope House', { note: 'v0' });
+    await store.createPartner(base, U);
+    await store.persistCache(snapOf({ partners: [base] }), U);
+    state.offline = true;
+    let next = partner(X, 'Hope House', { note: 'v1' });
+    await store.updatePartner(next, U);
+    state.offline = false; await store.persistCache(snapOf({ partners: [next] }), U); state.offline = true;
+    await store.createFollowUp(followUp(F), U);
+    next = partner(X, 'Hope House', { note: 'v2' });
+    await store.updatePartner(next, U);
+    state.offline = false; await store.persistCache(snapOf({ partners: [next] }), U);
+    let refuse = true;
+    let blip = true;
+    state.failOn = (b) => {
+      if (refuse && b.table === 'partners' && b.op === 'update') return { message: 'violates check constraint', code: '23514' };
+      if (blip && b.table === 'follow_ups' && b.op === 'upsert') return { message: 'Service Unavailable', httpStatus: 503 };
+      return null;
+    };
+    await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError); // stops at the 503, before v2
+    if (mode === 'offline') goOfflineExpired();
+    await store.updatePartner(partner(X, 'Hope House', { note: 'v3' }), U);
+    assert.deepEqual(JSON.parse(state.asyncStorage.get(rejectedKey)).entries[0].ops.map((op) => op.patch.note), ['v1'], 'v3 waits behind v2, not ahead of it');
+    if (mode === 'offline') { signIn(); state.offline = false; }
+    blip = false;
+    await store.flushWriteQueue(U).catch(() => undefined);
+    assert.deepEqual(JSON.parse(state.asyncStorage.get(rejectedKey)).entries[0].ops.map((op) => op.patch.note), ['v1', 'v2', 'v3']);
+    refuse = false;
+    const [item] = await store.listRejectedWrites(U);
+    await store.retryRejectedWrite(U, item.id);
+    assert.equal(state.db.partners.find((row) => row.id === X).note, 'v3');
+  });
+}
+
+await check('an assignment (which upserts its match) waits behind an earlier refused edit of that match', async () => {
+  await freshAccount();
+  const M = '4e4e4e4e-4e4e-4e4e-8e4e-4e4e4e4e4e4e';
+  const P = '4f4f4f4f-4f4f-4f4f-8f4f-4f4f4f4f4f4f';
+  const R = '4d4d4d4d-4d4d-4d4d-8d4d-4d4d4d4d4d4d';
+  state.db.match_profiles.push(matchRow(M));
+  state.db.partners.push({ id: P, name: 'Program', organization: '', types: ['Inpatient'], created_at: new Date().toISOString(), org_id: ORG });
+  const { snapshot } = await store.hydrate(U);
+  const match = snapshot.referralMatches[0];
+  state.offline = true;
+  await store.updateMatchProfile({ ...match, clientLabel: 'Renamed' }, U);
+  state.offline = false;
+  state.failOn = (b) => (b.table === 'match_profiles' && b.op === 'update') ? { message: 'violates check constraint', code: '23514' } : null;
+  await assert.rejects(store.flushWriteQueue(U), errors.RejectedWritesError);
+  state.rpcCalls = [];
+  await store.assignMatchReferral(
+    { id: R, partnerId: P, direction: 'Outbound', date: '2026-10-23', clientLabel: 'Family', outcome: 'Pending', note: '' },
+    { ...match, clientLabel: 'Renamed', status: 'Referred', assignedPartnerId: P, referralId: R },
+    U,
+  );
+  assert.equal(state.rpcCalls.some((call) => call.name === 'assign_match_referral'), false, 'held: FIFO per row');
+  const [item] = await store.listRejectedWrites(U);
+  assert.equal(item.heldChanges, 1);
+  state.failOn = null;
+  state.log = [];
+  await store.retryRejectedWrite(U, item.id);
+  assert.deepEqual(state.log.filter((line) => /match_profiles|assign_match/.test(line)), ['update match_profiles', 'rpc assign_match_referral'], 'the edit, then the assignment');
+  const row = state.db.match_profiles.find((item2) => item2.id === M);
+  assert.equal(row.client_label, 'Renamed');
+  assert.equal(row.assigned_partner_id, P, 'the edit, then the assignment');
+});
+
 // ─── account.ts: every document is removed, past the 1,000-row cap ──────────
 
 {

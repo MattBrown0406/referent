@@ -101,8 +101,11 @@ function heldFieldsText(held: HeldEdit): string {
   return `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`;
 }
 
+// The server holds only the colliding group(s) and applies everything else
+// in the same save, so this names exactly what is waiting.
 function heldNotice(held: HeldEdit): string {
-  return `Listing saved, except the new ${heldFieldsText(held)}: another directory listing already uses it, so ReferralFit will review that change first. Your current details stay up until then; everything else you changed is live.`;
+  const several = held.collisions.length > 1;
+  return `Listing saved, except the new ${heldFieldsText(held)}: another directory listing already uses ${several ? 'them' : 'it'}, so ReferralFit will review ${several ? 'those changes' : 'that change'} first. Until then your current ${heldFieldsText(held)} ${several ? 'stay' : 'stays'} up; everything else you changed is live.`;
 }
 
 type BedsStatus = {

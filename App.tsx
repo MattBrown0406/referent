@@ -1331,6 +1331,7 @@ export default function App() {
 
   const resetAccountState = useCallback(() => {
     setOutreach(null);
+    setPendingNav(null);
     setPacketSendConfirm(false);
     packetClosingRef.current = false;
     packetCloseTokenRef.current += 1;
@@ -1844,29 +1845,42 @@ export default function App() {
     void persistCaseFile(activeCaseId, { events: caseEvents, documents: caseDocuments }, caseFileSource.userId).catch(() => undefined);
   }, [activeCaseId, caseEvents, caseDocuments, caseFileSource]);
 
-  // Tapping a notification jumps to the relevant tab and, for cadence nudges,
-  // opens the named partner once that account's directory has hydrated.
-  // Whatever sheet is up closes first; the target opens once it is gone.
+  // Tapping a notification opens the case, partner, or Workspace it is about
+  // — but never by closing what the user has open. If a sheet, a compose or
+  // share sheet, or a picker is up, the tap waits (up to 10 minutes) until the
+  // user closes it, then opens its target. Nothing is dismissed for them, so
+  // no sheet can be left frozen half-closed.
+  const [pendingNav, setPendingNav] = useState<{ target: Parameters<Parameters<typeof subscribeToNotificationResponses>[0]>[0]; partnerId?: string; caseId?: string; at: number } | null>(null);
   const notificationTapRef = useRef<(...args: Parameters<Parameters<typeof subscribeToNotificationResponses>[0]>) => void>(() => undefined);
   notificationTapRef.current = (target, partnerId, caseId) => {
-    const userId = activeUserIdRef.current;
-    const generation = authGenerationRef.current;
-    // A compose sheet, share sheet, or picker over a sheet must finish first:
-    // closing the sheet under it would leave that sheet frozen.
-    const whenClear = (tries: number) => {
-      if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation) return;
-      if (overlayOpen() && tries < 240) {
-        setTimeout(() => whenClear(tries + 1), 500);
+    setPendingNav({ target, partnerId, caseId, at: Date.now() });
+    // A lead that arrived since the last refresh is not on this phone yet.
+    if (target === 'case' && caseId && !latestCasesRef.current.some((item) => item.id === caseId)) {
+      void refreshFromServer('pull').catch(() => undefined);
+    }
+  };
+  useEffect(() => {
+    if (!pendingNav) return undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let clearSince = 0;
+    const check = () => {
+      if (Date.now() - pendingNav.at > 10 * 60_000) {
+        setPendingNav(null);
         return;
       }
-      closeAllSheets(() => {
-        // Server-sent pushes carry only ids; the item opens once it has loaded.
+      if (anySheetOpenRef.current || overlayOpen()) {
+        clearSince = 0;
+      } else if (!clearSince) {
+        // The screen just cleared; let any closing sheet finish animating.
+        clearSince = Date.now();
+      } else if (Date.now() - clearSince >= SHEET_SWAP_MS) {
+        const { target, partnerId, caseId } = pendingNav;
+        setPendingNav(null);
         if (target === 'case') {
           setTab('home');
           if (caseId) {
             pendingNotificationAtRef.current = Date.now();
             setPendingNotificationCaseId(caseId);
-            // A lead that arrived since the last refresh is not on this phone yet.
             if (!latestCasesRef.current.some((item) => item.id === caseId)) void refreshFromServer('pull').catch(() => undefined);
           }
           return;
@@ -1881,10 +1895,14 @@ export default function App() {
           pendingNotificationAtRef.current = Date.now();
           setPendingNotificationPartnerId(partnerId);
         }
-      });
+        return;
+      }
+      timer = setTimeout(check, 300);
     };
-    whenClear(0);
-  };
+    check();
+    return () => { if (timer) clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingNav]);
   useEffect(() => {
     if (!session?.user?.id) return undefined;
     // Through a ref, so the handler always sees this render's state (the
@@ -2245,46 +2263,6 @@ export default function App() {
     setShowAddReferral(true);
   }
 
-  // Closes every sheet a notification tap could land on top of, then runs
-  // `then`. Two steps: sheets nested inside another sheet close first, and
-  // their parents once that has finished — iOS cannot dismiss a sheet while
-  // the one it presented is still on screen (it would stay frozen).
-  function closeAllSheets(then: () => void) {
-    const userId = activeUserIdRef.current;
-    const generation = authGenerationRef.current;
-    const stillCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
-    setOutreach(null);
-    setTouchPartner(null);
-    setPacketSendConfirm(false);
-    setTimeout(() => {
-      if (!stillCurrent()) return;
-      closeCase();
-      setSelectedPartner(null);
-      setShowAddPartner(false);
-      setShowAddReferral(false);
-      setPacketTarget(null);
-      packetClosingRef.current = false;
-      setOutcomeFollowUp(null);
-      setShowNewCase(false);
-      setShowNewLead(false);
-      setShowOrgProfile(false);
-      setShowBusinessDashboard(false);
-      setShowGlobalDirectory(false);
-      setShowWorkspace(false);
-      setDoneCard(null);
-      setNextStepCard(null);
-      setSnoozeCard(null);
-      setShowQuickAdd(false);
-      setContactPick(null);
-      setTodayQuickNote(null);
-      setRejectedList(null);
-      setProfilePromptVisible(false);
-      setNotifPrePromptVisible(false);
-      setWelcomeVisible(false);
-      afterSheetCloses(then, { ifScreenBusy: 'wait' });
-    }, SHEET_SWAP_MS);
-  }
-
   // iOS shows one sheet at a time from a screen: presenting the next while the
   // last is still animating away fails silently, and React Native then thinks
   // it is showing, so that sheet stays stuck until restart. Close first, then
@@ -2300,7 +2278,7 @@ export default function App() {
       setTimeout(() => {
         if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation) return;
         if (options.stillWanted && !options.stillWanted()) return;
-        if (options.ifScreenBusy !== 'ignore' && anySheetOpenRef.current) {
+        if (options.ifScreenBusy !== 'ignore' && (anySheetOpenRef.current || overlayOpen())) {
           if (options.ifScreenBusy === 'wait' && tries < 50) attempt(tries + 1);
           return;
         }
@@ -5328,7 +5306,8 @@ export default function App() {
       const [rejected, waiting] = await Promise.all([listRejectedWrites(userId).catch(() => []), listWaitingWrites(userId).catch(() => [])]);
       const list = [...rejected, ...waiting];
       setRejectedWrites(list.length);
-      setRejectedList(list.length ? list : null);
+      // Only refresh the sheet if it is still open; never reopen it.
+      setRejectedList((current) => (current && list.length ? list : null));
     }
     setRejectedBusy(false);
   }
@@ -7206,6 +7185,10 @@ export default function App() {
 
   async function saveOrgProfile() {
     if (orgProfileSaving) return;
+    if (parseWholeDollars(orgProfileForm.monthlyCost) === undefined) {
+      Alert.alert('Check the cost', WHOLE_DOLLARS_HINT);
+      return;
+    }
     if (!orgProfileForm.name.trim() || !orgProfileForm.organization.trim()) {
       Alert.alert('A little more detail', 'Add a contact name and your practice or program name first.');
       return;
@@ -7246,6 +7229,8 @@ export default function App() {
       const say = (title: string, body: string) => afterSheetCloses(() => Alert.alert(title, body), { ifScreenBusy: 'ignore' });
       if (result.status === 'claim_requested') {
         say('We found an existing listing', result.message || 'A directory listing already matches your phone number or website. ReferralFit will review your request to manage it; nothing changes until then.');
+      } else if (result.status === 'merged') {
+        say('Profile merged', result.message || 'ReferralFit merged this profile into another directory listing. Contact ReferralFit to manage the combined listing.');
       } else if (result.status === 'conflict' || result.status === 'resubmitted_for_review') {
         say('Saved for review', result.message || 'Your profile is saved and waits for ReferralFit to review it before it appears in the directory.');
       } else if (result.status === 'updated_pending_review') {
