@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -125,6 +125,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   const [notify, setNotify] = useState<PreferencesState | null>(null);
   const [notifyError, setNotifyError] = useState('');
   const [notifyNote, setNotifyNote] = useState('');
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -316,6 +318,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
     void run(async () => {
       const invite = await createWorkspaceInvite();
       await load();
+      // Closed while the code was being made: a share sheet presented from a
+      // closing screen never appears and never settles, which would leave
+      // every button here disabled. The code is listed above for next time.
+      if (!visibleRef.current) return;
       await Share.share({
         message: `Join my ${workspace?.name || 'ReferralFit'} workspace on ReferralFit. In the app, open Workspace → Join a practice and enter the code: ${invite.code} (${inviteExpiryLabel(invite.expiresAt)}).`,
       }).catch(() => undefined);
@@ -389,7 +395,9 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
             </TouchableOpacity>
           </View>
         ) : workspace ? (
-          <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+          // The join code and AI key fields sit low on a long page: keep the
+          // focused one above the keyboard (as the review queue does).
+          <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Practice name</Text>
               {editingName !== null ? (

@@ -59,6 +59,34 @@ Deno.test('parseDraftRequest drops fields the model must never see', () => {
   }
 });
 
+Deno.test('a first name with an @ or a digit is an address or number and never reaches the model', () => {
+  for (const firstName of ['ana@example.test', '541-555-0142', '+15415550142']) {
+    const parsed = parseDraftRequest(caseRequest({
+      recipient: { firstName: 'Ana', relationship: 'mother' },
+      sender: { firstName, practiceName: 'Freedom Interventions' },
+    }));
+    assertEquals(parsed.sender.firstName, '', firstName);
+    assert(!buildUserPrompt(parsed).includes(firstName));
+    assertThrows(() => parseDraftRequest(caseRequest({ recipient: { firstName, relationship: 'mother' } })), DraftRequestError, undefined, firstName);
+  }
+  assertEquals(parseDraftRequest(caseRequest({ recipient: { firstName: 'Ana-María', relationship: 'mother' } })).recipient.firstName, 'Ana-María');
+});
+
+Deno.test('a draft to the case subject is written to them, never as the worried family', () => {
+  const prompt = buildUserPrompt(parseDraftRequest(caseRequest({
+    recipient: { firstName: 'Jake', relationship: 'Subject' },
+    situation: { stage: 'intervention', attempt: 1, purpose: 'follow_up' },
+  })));
+  assertStringIncludes(prompt, 'Jake, the person this case is about, not a family member');
+  assertStringIncludes(prompt, 'Never mention their family');
+  assert(!prompt.includes('intervention is being planned'), 'the case stage is not shared for a message to the subject');
+  assert(!prompt.includes('family member who contacted the practice'));
+  const referrer = buildUserPrompt(parseDraftRequest(caseRequest({ recipient: { firstName: 'Lee', relationship: 'referent' } })));
+  assertStringIncludes(referrer, 'Lee, a professional who referred this family to the practice');
+  const family = buildUserPrompt(parseDraftRequest(caseRequest()));
+  assertStringIncludes(family, 'They are a family member who contacted the practice.');
+});
+
 Deno.test('parseDraftRequest rejects what it cannot use', () => {
   assertThrows(() => parseDraftRequest(caseRequest({ channel: 'fax' })), DraftRequestError);
   assertThrows(() => parseDraftRequest(caseRequest({ target: { kind: 'case', caseId: 'not-a-uuid' } })), DraftRequestError);

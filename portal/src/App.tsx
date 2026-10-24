@@ -306,7 +306,12 @@ export default function App() {
 
   useEffect(() => {
     if (session) void loadListing();
-    else { setListing(null); setForm(null); setImportCount(null); setBeds(null); setBedHistory([]); }
+    else {
+      // Nothing from the previous account (its held edit, its last notice)
+      // may show for the next one on a shared browser.
+      setListing(null); setForm(null); setImportCount(null); setBeds(null); setBedHistory([]);
+      setHeldEdit(null); setNotice('');
+    }
   }, [session, loadListing]);
 
   async function submitAuth(event: React.FormEvent) {

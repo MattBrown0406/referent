@@ -157,6 +157,21 @@ equal('distinct records, cases, record types and providers all stay', pick([
   row({ id: '5', provider: 'pandadoc', recordType: 'document' }),
 ]), ['1', '2', '3', '4', '5']);
 
+// ─── A canceled invoice is not quoted revenue ──────────────────────────────
+// The family was invoiced $15,000 by mistake, the invoice was canceled and a
+// corrected $12,000 one sent. The case's quote is $12,000, not $27,000.
+{
+  const reissued = [
+    { id: 'x1', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv-wrong', status: 'CANCELED', amountCents: 1500000, paidAmountCents: null, currency: 'USD', dueOn: '2026-07-15', externalUrl: '', metadata: {}, updatedAt: '2026-07-14T00:00:00Z' },
+    { id: 'x2', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv-right', status: 'unpaid', amountCents: 1200000, paidAmountCents: 0, currency: 'USD', dueOn: '2026-09-15', externalUrl: '', metadata: {}, updatedAt: '2026-07-15T00:00:00Z' },
+  ];
+  const canceled = business.computeBusinessDashboard([cases[1]], [], { stages, integrations: reissued }, 90, new Date(2026, 7, 6, 12));
+  equal('a canceled invoice counts toward neither quoted, collected nor outstanding', [canceled.quotedRevenue, canceled.collectedRevenue, canceled.outstandingRevenue, canceled.sources[0].quoted, canceled.openInvoices], [12000, 0, 12000, 12000, 1]);
+  // A refund still shows what was billed, with nothing collected or owed.
+  const refunded = business.computeBusinessDashboard([cases[1]], [], { stages, integrations: [{ ...reissued[1], status: 'refunded', paidAmountCents: 1200000 }] }, 90, new Date(2026, 7, 6, 12));
+  equal('a refunded invoice is quoted, not collected, not outstanding', [refunded.quotedRevenue, refunded.collectedRevenue, refunded.outstandingRevenue], [12000, 0, 0]);
+}
+
 // ─── Speed to lead ──────────────────────────────────────────────────────────
 // A lead is a case with leadCapturedAt; its clock stops at firstTouchAt. The
 // fixture mirrors supabase/tests/lead_capture_test.sql section 7.

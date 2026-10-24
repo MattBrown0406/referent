@@ -58,7 +58,10 @@ function stateName(code: string): string {
 }
 
 // 3-5 concrete "why this fits" bullets from the actual match dimensions.
-export function buildFitReasons(matchProfile: ReferralMatch, partner: Partner, fit: PacketFitInput): string[] {
+// The family's budget stays between the practitioner and the family: the
+// program's copy never mentions it (it would tell the program the most the
+// family can pay, and the family never agreed to share it).
+export function buildFitReasons(matchProfile: ReferralMatch, partner: Partner, fit: PacketFitInput, audience: PacketAudience = 'family'): string[] {
   const reasons: string[] = [];
   if (matchProfile.levelOfCare !== 'Any type') {
     reasons.push(`Provides ${matchProfile.levelOfCare} level of care`);
@@ -67,7 +70,7 @@ export function buildFitReasons(matchProfile: ReferralMatch, partner: Partner, f
     // 0 is how a cost that was never entered is stored: say so, never "$0 —
     // within budget". A budget of 0 is no budget, as in the ranking.
     const monthlyCost = knownMonthlyCostForPartner(partner);
-    const budget = matchProfile.maxBudget && matchProfile.maxBudget > 0 ? matchProfile.maxBudget : null;
+    const budget = audience === 'family' && matchProfile.maxBudget && matchProfile.maxBudget > 0 ? matchProfile.maxBudget : null;
     if (monthlyCost == null) reasons.push('Monthly cash cost not on file — confirm it with the program');
     else if (budget != null && monthlyCost <= budget) reasons.push(`Monthly cash cost is ${formatMoney(monthlyCost)} — within the ${formatMoney(budget)} budget`);
     else reasons.push(`Monthly cash cost: ${formatMoney(monthlyCost)}`);
@@ -107,7 +110,7 @@ export function buildPacket(matchProfile: ReferralMatch, partner: Partner, fitRe
       ? `- Home state: ${stateName(matchProfile.state)}`
       : `- Location: ${stateName(matchProfile.state)}`,
     `- Payment: ${matchProfile.insurance}`,
-    matchProfile.insurance === 'Cash pay' && matchProfile.maxBudget != null
+    audience === 'family' && matchProfile.insurance === 'Cash pay' && matchProfile.maxBudget != null && matchProfile.maxBudget > 0
       ? `- Budget: up to ${formatMoney(matchProfile.maxBudget)}`
       : '',
     matchProfile.population && matchProfile.population !== 'Any' ? `- Client: ${matchProfile.population}` : '',

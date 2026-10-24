@@ -99,6 +99,10 @@ export type PartnerScorecard = {
   medianDaysToAdmit?: number | null;
   stillEnrolled?: number;
   network?: NetworkTrackRecord;
+  // How many outbound referrals avgFamilyExperience averages over (a non-admit
+  // is never rated). Counted from the loaded referrals; absent on cached cards
+  // from older builds, where matching falls back to the decided cases.
+  ratedCases?: number;
 };
 
 // Patch for the v2 outcome-enrichment columns on referrals (admitted,
@@ -295,14 +299,18 @@ async function assertWorkspaceFence(fence: SessionFence): Promise<string> {
 // asked when it can be reached (and wins on a mismatch); with no connection
 // the binding last verified on this device stands — exactly the binding an
 // offline launch reads the caches under — so offline edits still reach the
-// cache instead of failing every save.
+// cache instead of failing every save. A passing server failure (5xx, a
+// gateway page) counts as no answer too: the change it could not send is
+// queued, and its saved copy must still be written, or a relaunch during the
+// outage would show the old copy and invite the user to make it twice.
 async function assertCacheWorkspaceFence(fence: SessionFence): Promise<string> {
   const storedOrg = await readBindingUnlocked(fence.userId);
   if (!storedOrg) throw new StoreError('This device has no verified workspace for offline data yet. Reconnect and reload.', false);
   if (!fence.offline) {
     const result = await supabase.rpc('current_org_id');
     if (result.error) {
-      if (!isNetworkError(result.error)) {
+      const failure = failureOf(result);
+      if (!isNetworkError(failure) && !isTransientServerError(failure)) {
         throw new StoreError(`The active workspace could not be verified: ${describeError(result.error)}`, false);
       }
     } else if (typeof result.data !== 'string' || result.data.toLowerCase() !== storedOrg) {
@@ -1362,12 +1370,21 @@ export async function prepareForWorkspaceChange(expectedUserId: string, options:
 }
 
 // After the account itself is deleted on the server: drop the last
-// account-scoped key (the workspace binding) prepareForWorkspaceChange keeps.
+// account-scoped key (the workspace binding) prepareForWorkspaceChange keeps,
+// and every saved copy again — a refresh or save that finished while the
+// deletion ran (document removal can take a while) may have written one
+// back, and nothing of a deleted account may stay on the device.
 export async function forgetWorkspaceBinding(expectedUserId: string): Promise<void> {
   const fence = await sessionFence(expectedUserId);
   await withCacheLock(async () => withQueueLock(async () => {
     try {
-      await AsyncStorage.removeItem(accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId));
+      await AsyncStorage.multiRemove([
+        accountStorageKey(CACHE_KEY_PREFIX, fence.userId),
+        accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
+        accountStorageKey(REJECTED_KEY_PREFIX, fence.userId),
+        ...await caseCacheKeys(fence.userId),
+        accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId),
+      ]);
     } catch (error) {
       throw persistenceError('cache', error);
     }
@@ -2287,9 +2304,17 @@ async function fetchSnapshot(): Promise<Snapshot> {
   const listingByPartner = new Map<string, string>();
   for (const row of partnerRows) if (row.global_partner_id) listingByPartner.set(row.id, row.global_partner_id as string);
 
+  // partner_scorecard reports the family-experience average but not how many
+  // ratings it covers; the ranking needs that count, and the view averages
+  // exactly the outbound rated referrals loaded here (same RLS rows).
+  const ratedByPartner = new Map<string, number>();
+  for (const row of referralRows) {
+    if (row.direction === 'outbound' && row.family_experience != null) ratedByPartner.set(row.partner_id, (ratedByPartner.get(row.partner_id) ?? 0) + 1);
+  }
+
   const scorecards: Record<string, PartnerScorecard> = {};
   for (const row of scorecardRows) {
-    const card = mapScorecardRow(row);
+    const card = { ...mapScorecardRow(row), ratedCases: ratedByPartner.get(row.partner_id) ?? 0 };
     const listingId = listingByPartner.get(row.partner_id);
     const network = listingId ? networkByListing.get(listingId) : undefined;
     scorecards[row.partner_id] = network ? { ...card, network } : card;

@@ -1125,6 +1125,10 @@ export default function App() {
   const [todayScopeChoice, setTodayScopeChoice] = useState<TodayScope | null>(null);
   const [pendingNotificationCaseId, setPendingNotificationCaseId] = useState<string | null>(null);
   const [nowTick, setNowTick] = useState(() => new Date());
+  // The local day Today is sorted against (due today vs overdue). It moves at
+  // midnight and on every return to the foreground, so a list left open
+  // overnight, or reopened offline the next morning, is never a day behind.
+  const [todayStamp, setTodayStamp] = useState(localDateStamp);
   const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
   const [directorySubmitBusy, setDirectorySubmitBusy] = useState(false);
@@ -1384,6 +1388,20 @@ export default function App() {
     setShowBusinessDashboard(false);
     setShowWorkspace(false);
     setShowGlobalDirectory(false);
+    // Forms and prompts close too. Left open, they come back on their own
+    // once the reload finishes (beside any prompt it raises), and the
+    // directory-profile form would publish the previous workspace's listing.
+    setShowAddPartner(false);
+    setEditingPartnerId(null);
+    setShowAddReferral(false);
+    setActiveReferralMatchId(null);
+    setShowOrgProfile(false);
+    setOrgProfileExisting(null);
+    setOrgProfileForm(makeEmptyOrgProfileForm());
+    orgProfileReturnToWorkspaceRef.current = false;
+    setWelcomeVisible(false);
+    setProfilePromptVisible(false);
+    setPendingPlacement(null);
     setBusinessData({ stages: [], integrations: [] });
     setBusinessLoading(false);
     setBusinessError('');
@@ -1928,6 +1946,17 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingNotificationCaseId, cases]);
 
+  // The open profile follows the partner list: after a refresh it shows a
+  // teammate's change, and Edit starts from it instead of writing the older
+  // copy back over it.
+  useEffect(() => {
+    setSelectedPartner((current) => {
+      if (!current) return current;
+      const fresh = partners.find((item) => item.id === current.id);
+      return fresh && fresh !== current ? fresh : current;
+    });
+  }, [partners]);
+
   useEffect(() => {
     if (!pendingNotificationPartnerId) return;
     if (Date.now() - pendingNotificationAtRef.current > 60_000 || anySheetOpenRef.current) {
@@ -2252,6 +2281,10 @@ export default function App() {
   async function openMatchedReferral(partnerId: string) {
     const referralMatch = await saveCurrentReferralMatch();
     if (!referralMatch) return;
+    // The save can take a few seconds. A sheet opened meanwhile (a match
+    // card's profile) means the user moved on: presenting over it, or as it
+    // closes, would freeze the new sheet. The match itself is saved.
+    if (anySheetOpenRef.current || overlayOpen()) return;
     setPendingPlacement({ matchProfileId: referralMatch.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
     setPlacementReason(null);
     setPlacementReasonNote('');
@@ -2263,7 +2296,6 @@ export default function App() {
       clientLabel: referralMatch.clientLabel,
       outcome: 'Introduced',
     });
-    setSelectedPartner(null);
     setShowAddReferral(true);
   }
 
@@ -2349,6 +2381,8 @@ export default function App() {
   async function openPacketComposer(partner: Partner, score: ProgramScore) {
     const matchProfile = await currentOrSavedMatch();
     if (!matchProfile) return;
+    // As in openMatchedReferral: never present over a sheet opened during the save.
+    if (anySheetOpenRef.current || overlayOpen()) return;
     setPendingPlacement({ matchProfileId: matchProfile.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
     setPlacementReason(null);
     setPlacementReasonNote('');
@@ -2356,7 +2390,6 @@ export default function App() {
     setPacketTarget({ partner, match: matchProfile, assignOnSend: true });
     setPacketAudience('family');
     setPacketText(buildPacket(matchProfile, partner, reasons, 'family'));
-    setSelectedPartner(null);
   }
 
   // From a Referred profile (assigned partner): the assignment already
@@ -2376,7 +2409,7 @@ export default function App() {
     if (!packetTarget) return;
     setPacketAudience(audience);
     const fitInput = fitInputForMatch(packetTarget.match, packetTarget.partner);
-    setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput), audience));
+    setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput, audience), audience));
   }
 
   // The placement record for an assignment made from a match: what was
@@ -2660,6 +2693,17 @@ export default function App() {
     setCaseEvents([]);
     setCaseDocuments([]);
     setDocView(null);
+    // An editor left over from another case file (a late rollback) must
+    // never open over this one: it would save to this case.
+    setCaseContactForm(null);
+    setCaseEditForm(null);
+    setCaseBusinessForm(null);
+    setCasePaymentForm(null);
+    setCaseNextStepCaseId(null);
+    setQuickNoteContact(null);
+    setBenefitsForm(null);
+    setVobForm(null);
+    setVobAnswerForm(null);
     setCaseFileSource(null);
     setTimelineDraft('');
     setTimelineKind('note');
@@ -3474,6 +3518,7 @@ export default function App() {
     };
     const previous = cases;
     const next = previous.map((item) => (item.id === activeCase.id ? updated : item));
+    const paymentCaseId = activeCase.id;
     let confirmedPayment: Awaited<ReturnType<typeof recordCasePayment>> | null = null;
     setCases(next);
     setCasePaymentForm(null);
@@ -3484,7 +3529,9 @@ export default function App() {
       { partners, referrals, referralMatches, touches, followUps, scorecards },
       () => {
         setCases(previous);
-        setCasePaymentForm(paymentForm);
+        // Reopened only over its own case file: shown in another one, Save
+        // would record this payment on the wrong family.
+        if (activeCaseIdRef.current === paymentCaseId) setCasePaymentForm(paymentForm);
         setCaseEvents((current) => current.filter((item) => item.id !== event.id));
       },
       'The additional payment', next, previous,
@@ -3913,9 +3960,8 @@ export default function App() {
     Alert.alert('Delete document?', `"${document.label}" will be permanently removed.`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete', style: 'destructive', onPress: async () => {
-        const previousDocs = caseDocuments;
         const linkedEventIds = caseEvents.filter((event) => event.documentId === document.id).map((event) => event.id);
-        setCaseDocuments(caseDocuments.filter((item) => item.id !== document.id));
+        setCaseDocuments((current) => current.filter((item) => item.id !== document.id));
         try {
           await deleteDocumentRow(document.id);
           try {
@@ -3929,7 +3975,12 @@ export default function App() {
             throw storageError;
           }
         } catch (error) {
-          failCaseChange(`The document could not be deleted: ${(error as Error).message}`, () => setCaseDocuments(previousDocs));
+          // Put the document back only into its own case file: another one
+          // may be open by now, and its saved copy would take this list.
+          failCaseChange(`The document could not be deleted: ${(error as Error).message}`, () => {
+            if (activeCaseIdRef.current !== document.caseId) return;
+            setCaseDocuments((current) => (current.some((item) => item.id === document.id) ? current : [...current, document]));
+          });
         }
       } },
     ]);
@@ -4001,12 +4052,33 @@ export default function App() {
     };
   }
 
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const sync = () => setTodayStamp(localDateStamp());
+    const scheduleMidnight = () => {
+      if (timer) clearTimeout(timer);
+      const now = new Date();
+      const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 5);
+      timer = setTimeout(() => { sync(); scheduleMidnight(); }, Math.max(1000, next.getTime() - now.getTime()));
+    };
+    scheduleMidnight();
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') return;
+      sync();
+      scheduleMidnight();
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      subscription.remove();
+    };
+  }, []);
+
   const allTodaySections = useMemo(() => {
     const now = new Date();
     const leads = newLeadCards(cases, allCaseContacts, followUps, leadSettings.leadResponseTargetMinutes, now);
     return buildTodaySections(followUps, partnersDueToday(partners, now, partnerSnoozes), now, followUpContext, leads);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings.leadResponseTargetMinutes]);
+  }, [followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings.leadResponseTargetMinutes, todayStamp]);
 
   // Mine / Everyone. Only a workspace with staff has the choice; "Mine"
   // keeps what is assigned to me and anything nobody has taken yet, so an
@@ -4031,17 +4103,27 @@ export default function App() {
   // returns its wording so the optimistic row matches; a failure rolls the
   // case back and says so.
   async function assignCaseTo(caseId: string, assignedTo: string | null) {
-    if (!cases.some((item) => item.id === caseId)) return;
-    const previousCases = cases;
+    const record = cases.find((item) => item.id === caseId);
+    if (!record) return;
+    const previousAssignee = record.assignedTo;
+    const userId = activeUserIdRef.current;
+    const generation = authGenerationRef.current;
+    const stillCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
+    // A refresh that read the server before this lands must not paint over it.
+    localChangeSerialRef.current += 1;
     setCases((current) => current.map((item) => (item.id === caseId ? { ...item, assignedTo: assignedTo || undefined } : item)));
     const eventId = makeId('e');
     try {
       const saved = await assignCase(caseId, assignedTo, eventId);
-      if (activeCaseId === caseId) {
+      if (!stillCurrent()) return;
+      if (activeCaseIdRef.current === caseId) {
         applyCaseEvent({ id: eventId, caseId, kind: 'system', body: saved.eventBody, occurredAt: saved.occurredAt, actorId: activeUserId.toLowerCase() });
       }
     } catch (error) {
-      setCases(previousCases);
+      // Undo this one assignment only, and only in the account and workspace
+      // it was made in: the list on screen may be newer, or someone else's.
+      if (!stillCurrent()) return;
+      setCases((current) => current.map((item) => (item.id === caseId ? { ...item, assignedTo: previousAssignee } : item)));
       Alert.alert('Assignment not saved', (error as Error).message);
     }
   }
@@ -4190,7 +4272,8 @@ export default function App() {
     );
   }
 
-  const todayCounts = useMemo(() => todayLoad(followUps, partners), [followUps, partners]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const todayCounts = useMemo(() => todayLoad(followUps, partners), [followUps, partners, todayStamp]);
 
   function openCaseById(caseId: string) {
     if (activeCaseId === caseId) return;
@@ -4966,14 +5049,18 @@ export default function App() {
     setPartnerForm(makeEmptyPartnerForm());
     setShowAddPartner(false);
     setEditingPartnerId(null);
-    afterSheetCloses(() => setSelectedPartner((current) => current ?? partner), {
+    // Opens with the partner as it stands then: a save refused meanwhile
+    // has already put the earlier version back.
+    afterSheetCloses(() => setSelectedPartner((current) => current ?? latestSnapshotRef.current?.partners.find((item) => item.id === partner.id) ?? partner), {
       stillWanted: () => Boolean(latestSnapshotRef.current?.partners.some((item) => item.id === partner.id)),
     });
     void settleOptimisticWrite(
       () => existing ? updatePartner(partner, activeUserId) : createPartner(partner, activeUserId),
       { partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards },
       { partners, referrals, referralMatches, touches, followUps, scorecards },
-      () => { setPartners(partners); setSelectedPartner(existing || null); },
+      // A refusal reverts the profile only while it shows this partner. It
+      // never opens one: the form may still be closing, or another sheet up.
+      () => { setPartners(partners); setSelectedPartner((current) => (current?.id === partner.id ? existing || null : current)); },
       'The partner',
     ).then((saved) => {
       // Follow-up timeline: a new partner's first follow-up is due a day out.
@@ -4995,33 +5082,39 @@ export default function App() {
       return;
     }
     const userId = activeUserId;
+    // The workspace can change under the same account while this is in
+    // flight; the generation tells the two apart.
+    const generation = authGenerationRef.current;
+    const stillCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
     setDirectorySubmitBusy(true);
     try {
       const result = await submitPartnerToDirectory(partner.id);
-      if (activeUserIdRef.current !== userId) return;
+      if (!stillCurrent()) return;
       if (!result.linked) {
         Alert.alert('Already in your list', 'Another entry in your list is already linked to this directory listing, so this one stays in your list only.');
         return;
       }
-      const updated: Partner = {
-        ...partner,
+      // Only the link fields change, applied to the list as it stands now:
+      // anything saved or refreshed during the request is kept.
+      const link: Pick<Partner, 'globalPartnerId' | 'globalListingStatus' | 'directoryRejectedAt' | 'directoryReviewNote'> = {
         globalPartnerId: result.listingId,
         globalListingStatus: result.status,
         directoryRejectedAt: undefined,
         directoryReviewNote: undefined,
       };
-      const nextPartners = partners.map((item) => item.id === updated.id ? { ...item, ...updated } : item);
+      const base = latestSnapshotRef.current ?? { partners, referrals, referralMatches, touches, followUps, scorecards };
+      const nextPartners = base.partners.map((item) => item.id === partner.id ? { ...item, ...link } : item);
       setPartners(nextPartners);
-      setSelectedPartner((current) => current?.id === updated.id ? updated : current);
-      await syncDerived({ partners: nextPartners, referrals, referralMatches, touches, followUps, scorecards }).catch(() => undefined);
-      if (activeUserIdRef.current !== userId) return;
+      setSelectedPartner((current) => current?.id === partner.id ? { ...current, ...link } : current);
+      await syncDerived({ ...base, partners: nextPartners }, latestCasesRef.current).catch(() => undefined);
+      if (!stillCurrent()) return;
       if (result.status === 'pending') {
         Alert.alert('Sent for review', 'ReferralFit will review this listing before it appears in the shared directory. It stays in your list either way, and your relationship notes are not shared.');
       } else {
         Alert.alert('Already in the directory', 'This one was already listed, so your entry is now linked to that listing.');
       }
     } catch (error) {
-      if (activeUserIdRef.current === userId) {
+      if (stillCurrent()) {
         Alert.alert('Not submitted yet', isNetworkError(error)
           ? 'You appear to be offline. It is saved to your list; submit it once you are connected.'
           : (error as Error).message);
@@ -5118,7 +5211,9 @@ export default function App() {
       () => {
         setPartners(partners); setReferrals(referrals); setReferralMatches(referralMatches);
         setReferralForm(previousReferralUi.referralForm);
-        setShowAddReferral(previousReferralUi.showAddReferral);
+        // The form reopens once its sheet has finished closing and nothing
+        // else is up (presenting during the dismissal freezes it on iOS).
+        if (previousReferralUi.showAddReferral) afterSheetCloses(() => setShowAddReferral(true));
         setActiveReferralMatchId(previousReferralUi.activeReferralMatchId);
         setTab(previousReferralUi.tab);
         setSelectedMatchId(previousReferralUi.selectedMatchId);
@@ -7179,6 +7274,8 @@ export default function App() {
 
   async function openOrgProfileForm(fromWorkspace: boolean) {
     const userId = activeUserIdRef.current;
+    // Same account in another workspace is a different listing.
+    const generation = authGenerationRef.current;
     let existing: OrgDirectoryProfile | null = null;
     try {
       existing = (await fetchOrgDirectoryProfile()).profile;
@@ -7186,7 +7283,7 @@ export default function App() {
       Alert.alert('Could not load your profile', (error as Error).message);
       return;
     }
-    if (activeUserIdRef.current !== userId) return;
+    if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation) return;
     setOrgProfileExisting(existing);
     setOrgProfileForm(existing ? orgProfileFormFromListing(existing) : makeEmptyOrgProfileForm());
     orgProfileReturnToWorkspaceRef.current = fromWorkspace;
@@ -7194,6 +7291,9 @@ export default function App() {
       // Let the Workspace sheet finish dismissing before presenting another.
       setShowWorkspace(false);
       afterSheetCloses(() => setShowOrgProfile(true));
+    } else if (anySheetOpenRef.current || overlayOpen()) {
+      // Something opened while the profile loaded: present once it is gone.
+      afterSheetCloses(() => setShowOrgProfile(true), { ifScreenBusy: 'wait' });
     } else {
       setShowOrgProfile(true);
     }
@@ -7781,6 +7881,9 @@ export default function App() {
     if (!packetSendConfirm || !packetTarget) return null;
     return (
       <Modal visible transparent animationType="fade" onRequestClose={() => setPacketSendConfirm(false)}>
+        {/* The "Other" reason field and the Sent button sit at the bottom:
+            keep them above the keyboard, as the other bottom sheets do. */}
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <Pressable style={styles.dropdownOverlay} onPress={() => setPacketSendConfirm(false)}>
           <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
             <View style={styles.dropdownSheetHandle} />
@@ -7803,6 +7906,7 @@ export default function App() {
             </ScrollView>
           </Pressable>
         </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
     );
   }

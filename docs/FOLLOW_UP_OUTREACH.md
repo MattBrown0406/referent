@@ -109,7 +109,13 @@ app builds (`buildDraftRequest`) and the function re-validates
 
 It never contains phone numbers, email addresses, last names, case titles,
 case summaries, timeline notes, or documents (when the recipient is the
-client, only their first name goes, as for anyone). Neither the
+client, only their first name goes, as for anyone). `firstName` drops
+credentials after a comma ("Dana Holt, LCSW" → Dana), and a name field that
+holds an email address, a phone number, or "Jake's mom" sends no name at all;
+the function refuses any first name with an `@` or a digit as well. A contact
+whose relationship is "subject" (the person the family is worried about) gets
+a draft written to them directly, with no case stage and no mention of their
+family or any plan; a "referent" gets one written to a referring professional. Neither the
 request nor the draft is stored or logged; `outreach_drafts` keeps only who
 drafted, which channel, which case or partner, and when (for the daily cap).
 
@@ -163,6 +169,31 @@ statement under 3,700 characters, wrapped in `BEGIN ... COMMIT`.
    ```
 
    All three should be `true`.
+
+### 1b. Apply the key-check cap
+
+`supabase/migrations/20261024130000_outreach_key_check_cap.sql` caps key
+checks (`{"action":"verify"}`) at 20 per user per day, so the function cannot
+be used to test keys in bulk. It adds one service-only table
+(`outreach_key_checks`) and two functions (`outreach_key_check_daily_limit`,
+`claim_outreach_key_check`), and is transit-safe in the same way. The function
+tolerates it not being applied yet (it then checks keys without the cap), so
+it can be pasted before or after the deploy.
+
+1. SQL Editor: paste the whole file, Run.
+2. Record it:
+
+   ```sql
+   INSERT INTO supabase_migrations.schema_migrations (version, name)
+   VALUES ('20261024130000', 'outreach_key_check_cap');
+   ```
+
+3. Verify (should be `true`):
+
+   ```sql
+   SELECT to_regclass('public.outreach_key_checks') IS NOT NULL
+      AND NOT has_function_privilege('authenticated', 'public.claim_outreach_key_check(uuid)', 'EXECUTE') AS key_check_cap_ready;
+   ```
 
 ### 2. Deploy the function
 
@@ -224,12 +255,13 @@ the user's own Anthropic account, so nothing is sold.
 | Anthropic does not accept the key / key lacks permission or the model | 401 `key_invalid` / 403 `key_forbidden` |
 | Anthropic rejects the request (usually the account; logged by status and type) | 400 `key_rejected` |
 | The user's Anthropic account is rate-limited | 429 `key_rate_limited` |
-| `{"action":"verify"}` with a working key | 200 `{ ok: true }` (no draft, no cap) |
+| `{"action":"verify"}` with a working key | 200 `{ ok: true }` (no draft; counts toward the key-check cap) |
+| 20 key checks in the last 24 hours (per user) | 429 `check_limit` |
 | Unreadable body, unknown channel, bad id, no recipient name | 400 `bad_request` |
 | Case or partner not in the caller's workspace | 404 `not_found` |
 | Caller has no workspace | 403 `forbidden` |
 | 200 drafts in the last 24 hours (per user) | 429 `daily_limit` |
-| Anthropic busy or erroring / timed out | 503 `busy` / 504 `timeout` |
+| Anthropic busy or erroring / timed out (each call, retries and any `retry-after` wait included, is cut off at 48 s for a draft and 20 s for a key check, inside the app's 56 s wait and iOS's one-minute request timeout) | 503 `busy` / 504 `timeout` |
 | Model declined | 422 `refused` |
 | Unusable draft (empty, placeholder, malformed) | 502 `bad_output` |
 | Success | 200 `{ draft, remaining }` |
@@ -250,8 +282,8 @@ only keeps the function from being used as a general proxy.
   48-hour rhythm across daylight-saving changes, which step a send closes,
   the minimal draft request, the fallback drafts, composer URLs.
 - `deno test --node-modules-dir=none supabase/functions/draft-follow-up/`
-  (in CI): key-header validation, request validation and minimization, the
-  prompt, the output schema, output validation.
+  (in CI): key validation (the key arrives in the body), request validation
+  and minimization, the prompt, the output schema, output validation.
 - `supabase/tests/follow_up_outreach_test.sql` (pgTAP, in CI): privileges,
   the workspace fence and daily cap, and `record_outreach_sent` (complete +
   log + next, replay safety, guards, other-workspace isolation).

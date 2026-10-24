@@ -353,6 +353,37 @@ const ids = (ranked) => ranked.map((score) => score.partner.id);
 }
 
 {
+  // The family-experience average counts as the referrals it covers, not as
+  // every decided case: non-admits are never rated and the stars are
+  // optional. Weighted by decided cases, one 5-star family among twenty
+  // admits lifted a program over one with twenty families averaging 4.6.
+  const cards = {
+    'one-rating': { admits: 20, nonAdmits: 0, avgFamilyExperience: 5.0, ratedCases: 1 },
+    'twenty-ratings': { admits: 20, nonAdmits: 0, avgFamilyExperience: 4.6, ratedCases: 20 },
+    n1: { admits: 8, nonAdmits: 4, avgFamilyExperience: 4.0, ratedCases: 8 },
+    n2: { admits: 6, nonAdmits: 3, avgFamilyExperience: 3.8, ratedCases: 5 },
+  };
+  for (const id of ['r-1', 'r-2', 'r-3']) {
+    assert.deepEqual(ids(rankPrograms(profile({ id, insurance: 'Cash pay' }), [partner({ id: 'one-rating' }), partner({ id: 'twenty-ratings' })], cards)), ['twenty-ratings', 'one-rating'],
+      'twenty 4.6s outrank a single 5-star, however many unrated admits sit beside it');
+  }
+  const prior = trackRecordPrior(cards);
+  // One 1-star among twenty unrated admits is one family, not twenty.
+  const oneBad = trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: 1, ratedCases: 1 }, prior).score;
+  const allBad = trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: 1, ratedCases: 20 }, prior).score;
+  assert.ok(oneBad > allBad + 1, `one bad rating (${oneBad}) must not score like twenty (${allBad})`);
+  // With no ratings at all the experience signal sits on the prior.
+  const unrated = trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: null, ratedCases: 0 }, prior).score;
+  assert.equal(trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: 5, ratedCases: 0 }, prior).score, unrated);
+  // A card cached by an older build (no count) reads as before: every decided case.
+  assert.equal(trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: 4.6 }, prior).score, trackRecordScore(cards['twenty-ratings'], prior).score);
+  // The workspace prior weighs each average by its ratings too.
+  const priorOldWeights = trackRecordPrior(Object.fromEntries(Object.entries(cards).map(([key, value]) => [key, { ...value, ratedCases: undefined }])));
+  assert.ok(Math.abs(prior.experience - ((1 * 1 + 20 * 0.9 + 8 * 0.75 + 5 * 0.7) / 34)) < 1e-9);
+  assert.ok(priorOldWeights.experience > prior.experience, 'the single 5-star no longer counts twenty times in the prior');
+}
+
+{
   // Bad evidence never beats no evidence (reviewer's case): in a workspace
   // with a good record, a program whose only referral was a 1-star
   // non-admit used to score 9.3 and outrank a never-used program at 7.5.
@@ -499,6 +530,28 @@ const ids = (ranked) => ranked.map((score) => score.partner.id);
   assert.equal(regionFitForPartner({ state: 'OR', locationPreference: 'Away from home' }, inCA), true);
   assert.equal(regionFitForPartner({ state: 'OR', locationPreference: 'Close to family' }, inCA), false);
   assert.equal(regionFitForPartner({ state: 'OR' }, inCA), false);
+  // A program with no state on file (the partner form saves a blank as '—',
+  // and the field is free text) is neither close nor away. It used to read as
+  // "another state": full points under Away from home, level with a program
+  // confirmed out of state, and a packet line saying it was outside the
+  // family's state.
+  const prior = trackRecordPrior(noCards);
+  for (const state of ['—', '', 'OREGON', 'XX']) {
+    const unknownState = partner({ id: `unknown-${state}`, state, regions: ['Nationwide'] });
+    for (const locationPreference of ['Away from home', 'Close to family']) {
+      const scored = scoreProgram(profile({ state: 'OR', locationPreference }), unknownState, undefined, prior);
+      assert.equal(scored.sameState, null, `state ${JSON.stringify(state)} is unknown, not another state`);
+      assert.equal(scored.components.location, 0, `an unknown state never earns the ${locationPreference} points`);
+      assert.equal(scored.eligible, true, 'an unknown state does not hide a nationwide program');
+    }
+    assert.equal(scoreProgram(profile({ state: 'OR', locationPreference: 'No preference' }), unknownState, undefined, prior).components.location, 10);
+    assert.equal(scoreProgram(profile({ state: 'ANY', locationPreference: 'Away from home' }), unknownState, undefined, prior).components.location, 5);
+  }
+  const awayRanked = rankPrograms(profile({ state: 'OR', locationPreference: 'Away from home' }), [partner({ id: 'no-state', state: '—' }), inCA], noCards);
+  assert.deepEqual(ids(awayRanked), ['in-ca', 'no-state'], 'a confirmed out-of-state program outranks one whose state is not on file');
+  // The state is matched as a code, whatever its case or spacing.
+  assert.equal(regionFitForPartner({ state: 'OR', locationPreference: 'Close to family' }, partner({ state: ' or ' })), true);
+  assert.equal(scoreProgram(profile({ state: 'OR', locationPreference: 'Close to family' }), partner({ state: 'or' }), undefined, prior).components.location, 10);
 }
 
 // ─── (i) a cash cost not on file is unknown, never free ────────────────────

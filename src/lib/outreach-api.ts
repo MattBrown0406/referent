@@ -45,6 +45,10 @@ async function functionErrorBody(error: unknown): Promise<FunctionErrorBody> {
 
 const OFFLINE_MESSAGE = 'No connection. Write this one yourself, or try again when you are back online.';
 const KEY_CODES = ['key_required', 'key_invalid', 'key_forbidden'];
+// The function answers within about 50 seconds (its Anthropic deadline);
+// stop waiting just after that, before iOS's own one-minute request timeout
+// would surface as "no connection".
+const DRAFT_CLIENT_TIMEOUT_MS = 56_000;
 
 // The user's own Anthropic key rides along in the request body on every call
 // (never a header: platform request logs can record headers); the function
@@ -52,12 +56,16 @@ const KEY_CODES = ['key_required', 'key_invalid', 'key_forbidden'];
 async function invokeDraftFunction(body: Record<string, unknown>, apiKey: string): Promise<unknown> {
   let result: Awaited<ReturnType<typeof supabase.functions.invoke>>;
   try {
-    result = await supabase.functions.invoke('draft-follow-up', { body: { ...body, anthropicKey: apiKey } });
+    result = await supabase.functions.invoke('draft-follow-up', { body: { ...body, anthropicKey: apiKey }, timeout: DRAFT_CLIENT_TIMEOUT_MS });
   } catch {
     throw new DraftUnavailableError(OFFLINE_MESSAGE, 'offline');
   }
   if (result.error) {
     const name = (result.error as { name?: string }).name || '';
+    const cause = (result.error as { context?: { name?: unknown } }).context;
+    if (name === 'FunctionsFetchError' && cause?.name === 'AbortError') {
+      throw new DraftUnavailableError('The draft took too long. Write this one yourself, or try again.', 'unavailable');
+    }
     if (name === 'FunctionsFetchError' || name === 'FunctionsRelayError') throw new DraftUnavailableError(OFFLINE_MESSAGE, 'offline');
     const payload = await functionErrorBody(result.error);
     const code = payload.error?.code || '';
@@ -133,6 +141,8 @@ export async function getAnthropicKey(userId: string): Promise<string | null> {
 
 export async function saveAnthropicKey(userId: string, apiKey: string): Promise<void> {
   if (!aiKeysSupported) throw new Error('AI drafts need the iPhone app.');
+  // Never a key with no account in its name: nothing could read it back or remove it.
+  if (!userId) throw new Error('Sign in again, then add your key.');
   await SecureStore.setItemAsync(keyName(userId), apiKey, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
 }
 

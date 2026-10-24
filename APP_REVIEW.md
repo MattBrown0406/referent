@@ -130,8 +130,8 @@ never write it here.
 > FOLLOW UP / AI DRAFTS (optional): the Follow up button (Today, a case, or a
 > partner) gives a ready draft to edit and send from the iPhone's own Messages
 > or Mail; it works without any setup. "Draft with AI" is optional and uses
-> the practice's own Anthropic API key, which the user adds in the app and
-> under their own Anthropic account. ReferralFit sells nothing and receives no
+> the practice's own Anthropic API key, which the user creates under their
+> own Anthropic account and adds in the app. ReferralFit sells nothing and receives no
 > payment for it. Before a key is added, the app explains exactly what is
 > sent to Anthropic. Trying "Draft with AI" needs your own Anthropic key;
 > every other part of Follow up works without one.

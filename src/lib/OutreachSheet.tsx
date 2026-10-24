@@ -138,17 +138,29 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
   stageRef.current = stage;
   const recordingRef = useRef(false); // …or log the same send twice
   const sentAtRef = useRef<Date | null>(null);
+  // A send resolves only when Messages or Mail closes, possibly minutes
+  // later: it logs through the app's current handler (its state, not the
+  // copy from when Send was tapped), and not at all once the sheet is gone
+  // (closed with its case or partner, or the account changed).
+  const onSentRef = useRef(onSent);
+  onSentRef.current = onSent;
 
   const target = request?.target ?? null;
   const recipients = request?.recipients ?? [];
   const recipient = recipients.find((item) => item.key === recipientKey) || recipients[0] || null;
   const draft = drafts[channel];
+  // Who and how the sheet is set to now, for a draft that comes back after a change.
+  const selectionRef = useRef('');
+  selectionRef.current = `${recipient?.key ?? ''}|${channel}`;
 
   // Closed (or gone): no Messages / Mail sheet can still be up over it.
   useEffect(() => {
     if (!request) releaseComposeOverlay();
   }, [request]);
-  useEffect(() => releaseComposeOverlay, []);
+  useEffect(() => () => {
+    openGeneration.current += 1; // nothing still in flight lands on (or logs from) a closed sheet
+    releaseComposeOverlay();
+  }, []);
 
   // Fresh state every time the sheet opens for a new request.
   useEffect(() => {
@@ -237,6 +249,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
       return;
     }
     const forChannel = channel;
+    const forSelection = `${recipient.key}|${forChannel}`;
     setDrafting(true);
     setDraftNotice('');
     try {
@@ -253,6 +266,12 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
       }), apiKey);
       if (openGeneration.current !== generation) return;
       if (aiDraft.channel !== forChannel) throw new DraftUnavailableError('The draft came back for the wrong channel. Try again.', 'unavailable');
+      // Written for someone (or some channel) the sheet is no longer set to:
+      // never shown under another recipient's name.
+      if (selectionRef.current !== forSelection) {
+        setDraftNotice('You changed who or how while it was drafting, so that draft was set aside. Draft again for this one.');
+        return;
+      }
       updateDraft(aiDraft);
       if (remaining !== null && remaining <= 5) setDraftNotice(`${remaining} AI ${remaining === 1 ? 'draft' : 'drafts'} left today.`);
     } catch (error) {
@@ -280,7 +299,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
     setStage('saving');
     let next: FollowUp | null;
     try {
-      next = await onSent({
+      next = await onSentRef.current({
         target: request.target,
         recipient,
         channel,
@@ -316,6 +335,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
     }
     sendingRef.current = true;
     setSending(true);
+    const generation = openGeneration.current;
     const startedAt = new Date();
     let result;
     try {
@@ -326,6 +346,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
       sendingRef.current = false;
       setSending(false);
     }
+    if (openGeneration.current !== generation) return; // the sheet closed (or the account changed) meanwhile
     sentAtRef.current = startedAt;
     if (result === 'failed') {
       Alert.alert('Unable to open', channel === 'email' ? 'This device has no way to send email. Nothing was logged.' : channel === 'text' ? 'This device cannot send texts. Nothing was logged.' : 'This device cannot place calls. Nothing was logged.');

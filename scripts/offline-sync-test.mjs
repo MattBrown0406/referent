@@ -213,6 +213,7 @@ for (const [rel, out] of [
   ['src/lib/errors.ts', 'errors.js'],
   ['src/lib/paging.ts', 'paging.js'],
   ['src/lib/case-cache.ts', 'case-cache.js'],
+  ['src/lib/org.ts', 'org.js'],
 ]) transpile(rel, out);
 
 const Module = require('node:module');
@@ -226,6 +227,7 @@ Module._resolveFilename = function (request, parent, ...rest) {
 const errors = require(path.join(tmpDir, 'errors.js'));
 const auth = require(path.join(tmpDir, 'auth-session.js'));
 const store = require(path.join(tmpDir, 'store.js'));
+const org = require(path.join(tmpDir, 'org.js'));
 
 let passed = 0;
 async function check(name, fn) {
@@ -483,6 +485,86 @@ await check('persistCache with no connection (valid token) uses the verified bin
   state.org = '33333333-3333-4333-8333-333333333399';
   await assert.rejects(store.persistCache(relaunch.snapshot, U), /active workspace changed/);
   state.org = ORG;
+});
+
+await check('a server outage (5xx) queues the change AND saves its copy, so a relaunch shows it', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const T = '77777777-7777-4777-8777-77777777777a';
+  const P = '77777777-7777-4777-8777-77777777777b';
+  state.db.partners.push({ id: P, name: 'Hope House', organization: 'Org', types: ['Inpatient'], created_at: new Date().toISOString(), org_id: ORG });
+  // The gateway answers every request with an HTML 503 page.
+  state.failOn = () => ({ message: '<html><body>503 Service Unavailable</body></html>', code: '' });
+  const touch = { id: T, partnerId: P, kind: 'call', note: 'Logged during the outage', occurredAt: new Date().toISOString() };
+  await store.createTouch(touch, U);
+  assert.equal(await store.pendingWriteCount(U), 1, 'the touch is queued');
+  // Before: the cache fence treated the 503 as a refusal and the save failed.
+  await store.persistCache({ partners: [], referrals: [], referralMatches: [], touches: [touch], followUps: [], scorecards: {} }, U);
+  const relaunch = await store.hydrate(U);
+  assert.equal(relaunch.source, 'cache');
+  assert.deepEqual(relaunch.snapshot.touches.map((row) => row.id), [T], 'the queued touch is on screen after a relaunch, not missing (and redone)');
+  // A non-transient refusal of the workspace check still blocks the save.
+  state.failOn = (b) => (b.op === 'rpc' && b.table === 'current_org_id' ? { message: 'permission denied', code: '42501' } : null);
+  await assert.rejects(store.persistCache(relaunch.snapshot, U), /could not be verified/);
+  state.failOn = null;
+  await store.hydrate(U);
+  assert.equal(state.db.touches.filter((row) => row.id === T).length, 1, 'the touch lands once when the server recovers');
+});
+
+await check('scorecards carry how many referrals the family-experience average covers', async () => {
+  await freshAccount();
+  const P = '77777777-7777-4777-8777-77777777777d';
+  const Q = '77777777-7777-4777-8777-77777777777e';
+  const referral = (id, partnerId, direction, familyExperience) => ({ id, partner_id: partnerId, direction, referred_on: '2026-10-01', client_label: '', outcome: 'Placed', note: '', admitted: true, admitted_on: null, family_experience: familyExperience, outcome_note: '', packet_sent_at: null, match_profile_id: null, case_id: null, org_id: ORG });
+  state.db.referrals.push(
+    referral('88888888-8888-4888-8888-000000000001', P, 'outbound', 5),
+    referral('88888888-8888-4888-8888-000000000002', P, 'outbound', null),
+    referral('88888888-8888-4888-8888-000000000003', P, 'outbound', null),
+    referral('88888888-8888-4888-8888-000000000004', P, 'inbound', 2), // a referral they sent us is never counted
+  );
+  state.db.partner_scorecard.push(
+    { partner_id: P, referrals_sent: 3, admits: 3, non_admits: 0, avg_family_experience: 5, last_referral_on: '2026-10-01' },
+    { partner_id: Q, referrals_sent: 0, admits: 0, non_admits: 0, avg_family_experience: null, last_referral_on: null },
+  );
+  const { snapshot } = await store.hydrate(U);
+  assert.equal(snapshot.scorecards[P].ratedCases, 1, 'one rated outbound referral, not three decided ones');
+  assert.equal(snapshot.scorecards[Q].ratedCases, 0);
+});
+
+await check('a server outage reads as offline at launch, so the saved copy opens; a refusal does not', async () => {
+  await freshAccount();
+  assert.equal(await org.fetchCurrentOrgId(), ORG);
+  for (const failure of [
+    { message: '<html><body>503 Service Unavailable</body></html>', code: '' },
+    { message: 'upstream connect error or disconnect/reset before headers', code: '' },
+    { message: 'Could not connect to the database', code: 'PGRST000' },
+  ]) {
+    state.failOn = (b) => (b.op === 'rpc' && b.table === 'current_org_id' ? failure : null);
+    const error = await org.fetchCurrentOrgId().catch((caught) => caught);
+    assert.ok(store.isNetworkError(error), `${failure.message} falls back like no signal (the launch reads the bound workspace)`);
+  }
+  state.failOn = null;
+  state.offline = true;
+  assert.ok(store.isNetworkError(await org.fetchCurrentOrgId().catch((caught) => caught)));
+  state.offline = false;
+  state.failOn = (b) => (b.op === 'rpc' && b.table === 'current_org_id' ? { message: 'permission denied for function current_org_id', code: '42501' } : null);
+  const refused = await org.fetchCurrentOrgId().catch((caught) => caught);
+  assert.ok(refused instanceof errors.StoreError && !store.isNetworkError(refused), 'a real refusal still surfaces');
+  assert.match(refused.message, /permission denied/);
+  state.failOn = null;
+});
+
+await check('after account deletion nothing of the account stays on the device, even a copy saved mid-deletion', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const P = '77777777-7777-4777-8777-77777777777c';
+  await store.prepareForWorkspaceChange(U);
+  // A refresh or save that finished while the deletion ran writes copies back.
+  await store.persistCache({ partners: [partner(P, 'Client-adjacent program')], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} }, U);
+  await store.persistCaseList({ cases: [], contacts: [] }, U);
+  assert.ok([...state.asyncStorage.keys()].some((key) => key.startsWith('referralfit-cache-v2:')));
+  await store.forgetWorkspaceBinding(U);
+  assert.deepEqual([...state.asyncStorage.keys()].filter((key) => key.toLowerCase().includes(U)), [], 'cache, case copies, queue, rejected list and binding are all gone');
 });
 
 // ─── store.ts: a teammate's deletion is not undone ──────────────────────────

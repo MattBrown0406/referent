@@ -126,4 +126,31 @@ for (const name of ['sharePacketText', 'sharePartner']) {
   );
 }
 
+// A rollback or a late result never presents a sheet on its own (iOS may be
+// mid-dismissal, or another sheet is up), and never puts back data from
+// another case file, account, or workspace.
+assert.match(source, /setSelectedPartner\(\(current\) => \(current\?\.id === partner\.id \? existing \|\| null : current\)\)/, 'a refused partner save reverts the profile only while it shows that partner');
+assert.doesNotMatch(source, /setSelectedPartner\(existing \|\| null\)/, 'a refused partner save must not open the profile');
+assert.match(source, /if \(previousReferralUi\.showAddReferral\) afterSheetCloses\(\(\) => setShowAddReferral\(true\)\)/, 'a refused referral reopens its form only after the sheet has closed');
+assert.doesNotMatch(source, /setShowAddReferral\(previousReferralUi\.showAddReferral\)/, 'a refused referral must not re-present its form during the dismissal');
+for (const name of ['openMatchedReferral', 'openPacketComposer']) {
+  const body = source.slice(source.indexOf(`async function ${name}(`), source.indexOf('\n  }\n', source.indexOf(`async function ${name}(`)));
+  assert.match(body, /await (saveCurrentReferralMatch|currentOrSavedMatch)\(\);[\s\S]{0,400}?if \(anySheetOpenRef\.current \|\| overlayOpen\(\)\) return;/, `${name} must not present over a sheet opened during its save`);
+  assert.doesNotMatch(body, /setSelectedPartner\(null\)/, `${name} must not close one sheet and present another in the same frame`);
+}
+assert.match(source, /if \(activeCaseIdRef\.current === paymentCaseId\) setCasePaymentForm\(paymentForm\)/, 'an unconfirmed payment reopens only over its own case file');
+assert.match(source, /function openCase\(caseId: string\) \{[\s\S]{0,1200}setCasePaymentForm\(null\);[\s\S]{0,400}setVobAnswerForm\(null\);[\s\S]{0,200}loadCaseList\(userId\)/, 'opening a case file clears editors left from another case');
+assert.doesNotMatch(source, /setCases\(previousCases\);\s*Alert\.alert\('Assignment not saved'/, 'a failed assignment must not restore a stale whole case list');
+assert.match(source, /if \(!stillCurrent\(\)\) return;\s*setCases\(\(current\) => current\.map\(\(item\) => \(item\.id === caseId \? \{ \.\.\.item, assignedTo: previousAssignee \} : item\)\)\)/, 'a failed assignment reverts that case only, in its own account and workspace');
+assert.doesNotMatch(source, /setCaseDocuments\(previousDocs\)/, 'a failed document delete must not paint one case file\'s documents into another');
+assert.match(source, /async function submitPartnerForDirectory\(partner: Partner\) \{[\s\S]{0,900}const stillCurrent = \(\) => activeUserIdRef\.current === userId && authGenerationRef\.current === generation;/, 'a directory submission result is dropped after a workspace change');
+assert.doesNotMatch(source, /const nextPartners = partners\.map\(\(item\) => item\.id === updated\.id/, 'a directory submission applies only its link fields to the current list');
+const resetSource = source.slice(source.indexOf('const resetAccountState = useCallback('), source.indexOf('}, [applySnapshot]);', source.indexOf('const resetAccountState = useCallback(')));
+for (const call of ['setShowAddPartner(false)', 'setShowAddReferral(false)', 'setShowOrgProfile(false)', 'setOrgProfileForm(makeEmptyOrgProfileForm())', 'setWelcomeVisible(false)', 'setProfilePromptVisible(false)']) {
+  assert.ok(resetSource.includes(call), `resetAccountState must close ${call}`);
+}
+assert.match(source, /setSelectedPartner\(\(current\) => \{\s*if \(!current\) return current;\s*const fresh = partners\.find\(\(item\) => item\.id === current\.id\);\s*return fresh && fresh !== current \? fresh : current;\s*\}\);\s*\}, \[partners\]\);/, 'the open partner profile follows the partner list, so Edit never writes an older copy back');
+const workspaceScreenSource = await readFile(new URL('../src/lib/WorkspaceScreen.tsx', import.meta.url), 'utf8');
+assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!visibleRef\.current\) return;\s*await Share\.share\(/, 'the invite share sheet is never presented from a closed Workspace screen');
+
 console.log('optimistic mutation serialization/dependency invariants: ok');

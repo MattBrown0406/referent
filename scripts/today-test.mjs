@@ -205,6 +205,14 @@ check('hydration seeds contacts through the cache-aware case loader',
   /const load = await loadCaseList\(userId\);[\s\S]{0,700}setAllCaseContacts\(activeContacts\)/.test(appSource));
 check('the saved case list falls back only when the server is unreachable',
   /remote = await fetchCaseList\(\);\s*\} catch \(error\) \{\s*if \(!isNetworkError\(error\)\) throw error;/.test(storeSource));
+// The sections are rebuilt when the local day changes (midnight, or a return
+// to the foreground), not only when data changes: an app left open overnight
+// or reopened offline must move yesterday's "today" items to OVERDUE.
+check('Today re-sorts when the local day changes',
+  /\}, \[followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings\.leadResponseTargetMinutes, todayStamp\]\);/.test(appSource)
+  && /todayLoad\(followUps, partners\), \[followUps, partners, todayStamp\]\)/.test(appSource)
+  && /AppState\.addEventListener\('change', \(state\) => \{\s*if \(state !== 'active'\) return;\s*sync\(\);\s*scheduleMidnight\(\);/.test(appSource)
+  && /timer = setTimeout\(\(\) => \{ sync\(\); scheduleMidnight\(\); \}/.test(appSource));
 check('Today has pull-to-refresh on its list',
   /function HomeScreen\(\) \{[\s\S]{0,900}<ScrollView[^>]*refreshControl=\{renderRefreshControl\(\)\}/.test(appSource));
 

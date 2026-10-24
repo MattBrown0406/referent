@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(122);
+SELECT plan(131);
 
 -- Actors (suffix d7)
 --   ad  platform admin
@@ -1150,6 +1150,121 @@ SELECT ok(
     < position('FROM public.directory_review_requests WHERE id = p_request_id FOR UPDATE' in pg_get_functiondef('public.resolve_directory_review_request(uuid, boolean)'::regprocedure)),
   'resolving locks the listing before the request, the order a claimant save uses'
 );
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Round 7: moving or releasing a listing keeps its verification; a joiner's
+-- inactive entitlement never extends the team's; grants match the migrations
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- now() is fixed for the whole test transaction, so the verified dates are
+-- set in the past: a re-stamp would show as a change.
+SELECT set_config('request.jwt.claim.sub', '', true);
+INSERT INTO auth.users (id, email) VALUES
+  ('a6000000-0000-0000-0000-0000000000d7', 'solo@verify-join.example'),
+  ('a7000000-0000-0000-0000-0000000000d7', 'owner@verify-team.example'),
+  ('a8000000-0000-0000-0000-0000000000d7', 'leaving@verify-delete.example');
+SELECT set_config('test.org_a6', org_id::text, true) FROM public.org_members WHERE user_id = 'a6000000-0000-0000-0000-0000000000d7';
+SELECT set_config('test.org_a7', org_id::text, true) FROM public.org_members WHERE user_id = 'a7000000-0000-0000-0000-0000000000d7';
+SELECT set_config('test.org_a8', org_id::text, true) FROM public.org_members WHERE user_id = 'a8000000-0000-0000-0000-0000000000d7';
+-- Programs these solo workspaces submitted and ReferralFit approved.
+INSERT INTO public.global_partners (id, name, organization, types, phone, status, verified_at, suggested_by_org_id)
+VALUES ('dd000000-0000-0000-0000-0000000000d7', 'Intake', 'Approved Submission Recovery', ARRAY['Detox'], '(541) 555-1961',
+        'active', '2026-08-15 12:00:00+00', current_setting('test.org_a6')::uuid),
+       ('d6100000-0000-0000-0000-0000000000d7', 'Intake', 'Approved Before Leaving', ARRAY['Detox'], '(541) 555-1962',
+        'active', '2026-08-20 12:00:00+00', current_setting('test.org_a8')::uuid),
+       ('d6200000-0000-0000-0000-0000000000d7', 'Intake', 'Approved Third Program', ARRAY['Detox'], '(541) 555-1963',
+        'active', '2026-08-25 12:00:00+00', current_setting('test.org_a8')::uuid);
+-- The team's pro plan runs out in a month; the joiner's pro comp was
+-- switched off but still carries a far-off date.
+INSERT INTO public.org_entitlements (org_id, entitlement, active, source, expires_at)
+VALUES (current_setting('test.org_a7')::uuid, 'pro', true, 'manual', now() + interval '30 days'),
+       (current_setting('test.org_a6')::uuid, 'pro', false, 'manual', now() + interval '2 years');
+
+SELECT set_config('request.jwt.claim.sub', 'a6000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT public.upsert_org_directory_profile('{"name":"Jo","organization":"Verify Join Practice","types":["Interventionist"],"phone":"541-555-1964"}'::jsonb);
+SELECT set_config('request.jwt.claim.sub', 'a7000000-0000-0000-0000-0000000000d7', true);
+SELECT set_config('test.invite7', code, true) FROM public.create_org_invite();
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', '', true);
+UPDATE public.global_partners SET verified_at = '2026-09-01 12:00:00+00' WHERE owner_org_id = current_setting('test.org_a6')::uuid;
+SELECT set_config('test.r7_profile', id::text, true) FROM public.global_partners WHERE owner_org_id = current_setting('test.org_a6')::uuid;
+
+SELECT set_config('request.jwt.claim.sub', 'a6000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT lives_ok(
+  $$ SELECT public.accept_org_invite(current_setting('test.invite7')) $$,
+  'a solo practitioner with an approved submission and a profile joins a team'
+);
+RESET ROLE;
+SET CONSTRAINTS ALL IMMEDIATE;
+SELECT ok(
+  (SELECT status = 'active' AND verified_at = '2026-08-15 12:00:00+00'::timestamptz
+          AND suggested_by_org_id = current_setting('test.org_a7')::uuid
+     FROM public.global_partners WHERE id = 'dd000000-0000-0000-0000-0000000000d7'),
+  'the approved submission moves to the team and stays live and verified as it was'
+);
+SELECT ok(
+  (SELECT owner_org_id = current_setting('test.org_a7')::uuid AND status = 'active'
+          AND verified_at = '2026-09-01 12:00:00+00'::timestamptz
+     FROM public.global_partners WHERE id = current_setting('test.r7_profile')::uuid),
+  'the profile handed to the team keeps its verification date'
+);
+SELECT ok(
+  (SELECT active AND expires_at = now() + interval '30 days'
+     FROM public.org_entitlements WHERE org_id = current_setting('test.org_a7')::uuid AND entitlement = 'pro'),
+  'a joiner''s switched-off entitlement never extends the team''s expiry'
+);
+
+SELECT set_config('request.jwt.claim.sub', 'a8000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT lives_ok($$ SELECT public.delete_own_account() $$, 'a solo practitioner with approved submissions deletes their account');
+RESET ROLE;
+SELECT ok(
+  (SELECT status = 'active' AND verified_at = '2026-08-20 12:00:00+00'::timestamptz AND suggested_by_org_id IS NULL
+     FROM public.global_partners WHERE id = 'd6100000-0000-0000-0000-0000000000d7'),
+  'the approved submission stays live and verified, no longer attributed'
+);
+
+-- Any other non-admin write still pins the status and clears verification,
+-- even when it also changes an ownership pointer.
+SELECT set_config('request.jwt.claim.sub', 'e1000000-0000-0000-0000-0000000000d7', true);
+UPDATE public.global_partners SET suggested_by_org_id = current_setting('test.org_a7')::uuid, description = 'Edited', status = 'archived'
+ WHERE id = 'd6200000-0000-0000-0000-0000000000d7';
+SELECT set_config('request.jwt.claim.sub', '', true);
+SELECT ok(
+  (SELECT status = 'active' AND verified_at IS NULL AND description = 'Edited'
+     FROM public.global_partners WHERE id = 'd6200000-0000-0000-0000-0000000000d7'),
+  'a content edit by a non-claimant still loses verification and cannot change the status'
+);
+
+-- What authenticated holds, whatever default ACL the database applies.
+SELECT ok(
+  NOT has_table_privilege('authenticated', 'public.orgs', 'UPDATE')
+  AND has_column_privilege('authenticated', 'public.orgs', 'name', 'UPDATE')
+  AND has_column_privilege('authenticated', 'public.orgs', 'lead_response_target_minutes', 'UPDATE')
+  AND NOT has_column_privilege('authenticated', 'public.orgs', 'intake_token', 'UPDATE')
+  AND NOT has_column_privilege('authenticated', 'public.orgs', 'intake_token_rotated_at', 'UPDATE')
+  AND NOT has_column_privilege('authenticated', 'public.orgs', 'created_by', 'UPDATE')
+  AND NOT EXISTS (
+    SELECT 1
+      FROM unnest(ARRAY['public.orgs', 'public.org_members', 'public.org_invites', 'public.org_entitlements',
+                        'public.org_revenuecat_grants', 'public.platform_admins', 'public.center_members',
+                        'public.center_claim_codes', 'public.center_claim_requests', 'public.case_stage_history']) AS t(name)
+     CROSS JOIN unnest(ARRAY['INSERT', 'UPDATE', 'DELETE']) AS p(priv)
+     WHERE has_table_privilege('authenticated', t.name, p.priv)),
+  'authenticated writes only the columns and tables the migrations grant'
+);
+SELECT set_config('request.jwt.claim.sub', 'a7000000-0000-0000-0000-0000000000d7', true);
+SET LOCAL ROLE authenticated;
+SELECT throws_ok(
+  $$ UPDATE public.orgs SET intake_token = repeat('a', 32) WHERE id = (SELECT public.current_org_id()) $$,
+  '42501',
+  NULL,
+  'a workspace owner cannot set the intake token directly'
+);
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', '', true);
 
 SELECT * FROM finish();
 ROLLBACK;

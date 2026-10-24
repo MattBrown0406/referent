@@ -399,8 +399,11 @@ function revenueForCase(record: CaseRecord, integrations: CaseIntegration[]): Ca
 
   return squareInvoices.reduce<CaseRevenue>((totals, invoice) => {
     const status = invoice.status.toLowerCase();
+    // A canceled invoice was withdrawn before it was paid: it is not a quote
+    // any more. Counted, a corrected reissue doubled the case's quoted revenue.
+    if (status === 'canceled' || status === 'cancelled') return totals;
     const quoted = (invoice.amountCents || 0) / 100;
-    const reversed = ['canceled', 'cancelled', 'refunded'].includes(status);
+    const reversed = status === 'refunded';
     const collected = reversed ? 0 : (invoice.paidAmountCents == null
       ? (status === 'paid' ? quoted : 0)
       : Math.min(invoice.paidAmountCents / 100, quoted));

@@ -1,4 +1,4 @@
-import { partnerTypes } from '../data';
+import { partnerTypes, stateOptions } from '../data';
 import type {
   ClientPopulation,
   InsuranceNetworkPreference,
@@ -254,24 +254,38 @@ export function stateIsSearchArea(profile: Pick<ReferralMatch, 'state' | 'locati
   return Boolean(profile.state) && profile.state !== 'ANY' && profile.locationPreference !== 'Away from home';
 }
 
+/**
+ * The program's state as a two-letter code, or null when none is on file.
+ * The partner form stores a blank state as '—' and accepts free text, so
+ * anything that is not a US state code is unknown, never "another state".
+ */
+export function knownPartnerState(partner: Pick<Partner, 'state'>): string | null {
+  const code = (partner.state || '').trim().toUpperCase();
+  return stateOptions.some((state) => state.code === code) ? code : null;
+}
+
 export function regionFitForPartner(profile: Pick<ReferralMatch, 'state' | 'locationPreference'>, partner: Partner): boolean {
   if (!stateIsSearchArea(profile)) return true;
-  return partner.state === profile.state || partner.regions.includes('Nationwide');
+  return knownPartnerState(partner) === profile.state || partner.regions.includes('Nationwide');
 }
 
 /**
  * Distance proxy: the only location data on both sides is the state, so
  * "close" means the program is in the client's state and "away" means it is
  * not. With no client state there is nothing to compare, so the score is
- * neutral (half). Under "Away from home" every state is searched, so this
- * score is what puts out-of-state programs first.
+ * neutral (half). A program with no state on file is neither close nor away
+ * (sameState null): it earns none of the points, so an unknown is never read
+ * as the preference met. Under "Away from home" every state is searched, so
+ * this score is what puts out-of-state programs first.
  */
 export function locationScore(profile: Pick<ReferralMatch, 'state' | 'locationPreference'>, partner: Partner): { score: number; sameState: boolean | null } {
   const preference: LocationPreference = profile.locationPreference || 'No preference';
   const known = Boolean(profile.state) && profile.state !== 'ANY';
-  const sameState = known ? partner.state === profile.state : null;
+  const partnerState = knownPartnerState(partner);
+  const sameState = known && partnerState ? partnerState === profile.state : null;
   if (preference === 'No preference') return { score: WEIGHT_LOCATION, sameState };
-  if (sameState === null) return { score: WEIGHT_LOCATION / 2, sameState };
+  if (!known) return { score: WEIGHT_LOCATION / 2, sameState };
+  if (sameState === null) return { score: 0, sameState };
   const wanted = preference === 'Close to family' ? sameState : !sameState;
   return { score: wanted ? WEIGHT_LOCATION : 0, sameState };
 }
@@ -283,6 +297,12 @@ export type TrackRecord = {
   admits: number;
   nonAdmits: number;
   avgFamilyExperience: number | null; // 1-5
+  /**
+   * How many referrals avgFamilyExperience averages over. Only admitted
+   * referrals are rated, and the stars are optional, so this can be far below
+   * the decided cases. Absent (an older cached card): the decided cases.
+   */
+  ratedCases?: number;
   /** Admitted referrals whose completed flag has been answered (outcomes loop). */
   decidedPlacements?: number;
   /** completed / decidedPlacements, 0-1; null until something is decided. */
@@ -321,6 +341,19 @@ function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
 
+/**
+ * The weight of a card's family-experience average: the referrals it covers,
+ * never more than the decided cases. Weighted by every decided case instead,
+ * one rating among twenty unrated cases (non-admits are never rated) counted
+ * as twenty: a single 5-star family lifted a program over twenty 4.6s, and a
+ * single 1-star sank it as if every family had said so.
+ */
+function ratedWeight(card: TrackRecord, decided: number): number {
+  if (card.avgFamilyExperience == null) return 0;
+  const rated = typeof card.ratedCases === 'number' && Number.isFinite(card.ratedCases) ? card.ratedCases : decided;
+  return Math.max(0, Math.min(decided, rated));
+}
+
 /** Case-weighted averages across this workspace; the prior every program is shrunk toward. */
 export function trackRecordPrior(scorecards: Record<string, TrackRecord | undefined>): TrackRecordPrior {
   let decidedTotal = 0;
@@ -335,9 +368,10 @@ export function trackRecordPrior(scorecards: Record<string, TrackRecord | undefi
     if (decided <= 0) continue;
     decidedTotal += decided;
     admitsTotal += card.admits;
-    if (card.avgFamilyExperience != null) {
-      experienceWeight += decided;
-      experienceTotal += decided * normaliseExperience(card.avgFamilyExperience);
+    const rated = ratedWeight(card, decided);
+    if (card.avgFamilyExperience != null && rated > 0) {
+      experienceWeight += rated;
+      experienceTotal += rated * normaliseExperience(card.avgFamilyExperience);
     }
     const placements = card.decidedPlacements ?? 0;
     if (placements > 0 && card.completionRate != null) {
@@ -399,8 +433,9 @@ export function trackRecordScore(card: TrackRecord | undefined, prior: TrackReco
   if (!card || !(decided > 0)) return { score: priorTrackRecordScore(p), decidedCases: 0 };
   const k = TRACK_RECORD_PRIOR_CASES;
   const admitRate = (card.admits + k * p.admitRate) / (decided + k);
-  const experienceRaw = card.avgFamilyExperience != null ? normaliseExperience(card.avgFamilyExperience) : p.experience;
-  const experience = (decided * experienceRaw + k * p.experience) / (decided + k);
+  const rated = ratedWeight(card, decided);
+  const experienceRaw = rated > 0 && card.avgFamilyExperience != null ? normaliseExperience(card.avgFamilyExperience) : p.experience;
+  const experience = (rated * experienceRaw + k * p.experience) / (rated + k);
   // Completion is weighted by decided placements, which can only be a subset
   // of decided cases; with none decided it sits exactly on the prior.
   const placements = Math.max(0, Math.min(decided, card.decidedPlacements ?? 0));

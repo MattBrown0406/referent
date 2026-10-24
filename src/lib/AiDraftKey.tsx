@@ -31,7 +31,7 @@ const COLORS = {
 const SHARED_WITH_ANTHROPIC = [
   'the recipient’s first name, and their relationship (or the partner’s organization and type)',
   'your first name and your practice’s name',
-  'the case stage and how many times you have reached out',
+  'the case stage, how many times you have reached out, and how and how long ago you last did',
   'anything you type in “Anything to mention?”',
 ];
 

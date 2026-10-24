@@ -106,6 +106,14 @@ function cleanMultiline(value: unknown, max: number): string {
     .trim();
 }
 
+// A first name never has an @ or a digit in it; a "name" that does is an
+// email address or a phone number that landed in the name field, and it
+// never reaches the model.
+function cleanFirstName(value: unknown): string {
+  const name = clean(value, LIMITS.name);
+  return /[@\d]/.test(name) ? '' : name;
+}
+
 function boundedInt(value: unknown, min: number, max: number): number | null {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
   return Math.min(max, Math.max(min, Math.round(value)));
@@ -134,7 +142,7 @@ export function parseDraftRequest(body: unknown): DraftRequest {
 
   const recipientInput = record(input.recipient);
   const recipient = {
-    firstName: clean(recipientInput.firstName, LIMITS.name),
+    firstName: cleanFirstName(recipientInput.firstName),
     relationship: clean(recipientInput.relationship, LIMITS.relationship),
     organization: target.kind === 'partner' ? clean(recipientInput.organization, LIMITS.organization) : '',
   };
@@ -144,7 +152,7 @@ export function parseDraftRequest(body: unknown): DraftRequest {
 
   const senderInput = record(input.sender);
   const sender = {
-    firstName: clean(senderInput.firstName, LIMITS.name),
+    firstName: cleanFirstName(senderInput.firstName),
     practiceName: clean(senderInput.practiceName, LIMITS.practiceName),
   };
 
@@ -222,6 +230,9 @@ const PURPOSE_LABELS: Record<FollowUpPurpose, string> = {
   none: 'a follow-up',
 };
 
+const SUBJECT_RELATIONSHIP = /^(the )?(subject|client|patient|self|loved one|identified (patient|person)|ip)$/i;
+const REFERRER_RELATIONSHIP = /^(the )?(referent|referrer|referral source|referring (professional|provider|therapist))$/i;
+
 function lastContactPhrase(days: number | null, channel: OutreachChannel | ''): string {
   if (days === null) return '';
   const via = channel ? ` by ${channel === 'text' ? 'text' : channel === 'email' ? 'email' : 'phone'}` : '';
@@ -243,9 +254,22 @@ export function buildUserPrompt(request: DraftRequest): string {
   }
 
   if (request.target.kind === 'case') {
-    const who = recipient.firstName || 'the family member';
-    lines.push(`Recipient: ${who}${recipient.relationship ? `, the ${recipient.relationship} of the person they are worried about` : ''}. They are a family member who contacted the practice.`);
-    if (situation.stage) lines.push(`Where things stand: ${STAGE_LABELS[situation.stage]}.`);
+    // A case contact is usually family, but the app also suggests "subject"
+    // (the person the family is worried about) and "referent". Writing to
+    // the subject as if they were the worried family member could tell them
+    // their family contacted the practice.
+    // The case stage stays out of a message to the subject: "the intervention
+    // is being planned" is exactly what must not reach them.
+    const subject = SUBJECT_RELATIONSHIP.test(recipient.relationship);
+    if (subject) {
+      lines.push(`Recipient: ${recipient.firstName || 'the person'}, the person this case is about, not a family member. Write to them directly and gently. Never mention their family, that anyone else contacted the practice, or any plan for them.`);
+    } else if (REFERRER_RELATIONSHIP.test(recipient.relationship)) {
+      lines.push(`Recipient: ${recipient.firstName || 'the contact'}, a professional who referred this family to the practice.`);
+    } else {
+      const who = recipient.firstName || 'the family member';
+      lines.push(`Recipient: ${who}${recipient.relationship ? `, the ${recipient.relationship} of the person they are worried about` : ''}. They are a family member who contacted the practice.`);
+    }
+    if (situation.stage && !subject) lines.push(`Where things stand: ${STAGE_LABELS[situation.stage]}.`);
   } else {
     const who = [recipient.firstName, recipient.relationship].filter(Boolean).join(', ');
     const org = recipient.organization ? ` at ${recipient.organization}` : '';

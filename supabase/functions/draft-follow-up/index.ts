@@ -42,6 +42,14 @@ import {
 
 const MODEL = 'claude-opus-5-5';
 
+// The phone gives up on a request after about a minute (iOS's default; the
+// app also stops waiting at DRAFT_CLIENT_TIMEOUT_MS in outreach-api.ts). Every
+// Anthropic call, retries and any retry-after wait included, ends inside
+// these budgets so the answer always reaches the app instead of a timeout it
+// reads as "no connection" while the cap is spent and the user is billed.
+const DRAFT_DEADLINE_MS = 48_000;
+const VERIFY_DEADLINE_MS = 20_000;
+
 const CORS_HEADERS = {
   'access-control-allow-origin': '*',
   'access-control-allow-headers': 'authorization, x-client-info, apikey, content-type',
@@ -74,7 +82,10 @@ function bearerToken(request: Request): string | null {
 // What went wrong on the Anthropic side, in words the practitioner can act
 // on. Errors are told apart by the SDK's typed classes, most specific first;
 // only the status code is ever logged (never the key or the request).
-function anthropicFailure(error: unknown): Response {
+function anthropicFailure(error: unknown, deadline: AbortSignal): Response {
+  if (deadline.aborted || error instanceof Anthropic.APIUserAbortError || error instanceof Anthropic.APIConnectionTimeoutError) {
+    return failure(504, 'timeout', 'Anthropic took too long to answer. Try again.');
+  }
   if (error instanceof Anthropic.AuthenticationError) {
     return failure(401, 'key_invalid', 'Anthropic did not accept this API key. Check it, or create a new key in the Anthropic Console.');
   }
@@ -89,9 +100,6 @@ function anthropicFailure(error: unknown): Response {
     // same from here, so it is logged — status and error type only.
     console.error('Anthropic rejected the request', error.status, (error.error as { error?: { type?: string } } | undefined)?.error?.type ?? '');
     return failure(400, 'key_rejected', 'Anthropic turned the request down. Check your account in the Anthropic Console, then try again.');
-  }
-  if (error instanceof Anthropic.APIConnectionTimeoutError) {
-    return failure(504, 'timeout', 'The draft took too long. Try again.');
   }
   if (error instanceof Anthropic.APIError) {
     console.error('Anthropic request failed', error.status);
@@ -133,13 +141,27 @@ Deno.serve(async (request) => {
 
   const anthropic = new Anthropic({ apiKey, timeout: 45_000, maxRetries: 1 });
 
-  // Key check: one free model-list call, no draft, no cap.
+  // Key check: one free model-list call, no draft, under its own daily cap
+  // (so this function is never a way to test other people's keys in bulk).
   if (body && typeof body === 'object' && (body as { action?: unknown }).action === 'verify') {
+    const { error: checkError } = await supabase.rpc('claim_outreach_key_check', { p_user_id: userId });
+    if (checkError) {
+      if (checkError.code === '54000') {
+        return failure(429, 'check_limit', 'You have checked keys too many times today. Try again tomorrow.');
+      }
+      if (checkError.code === '42501') return failure(403, 'forbidden', 'Join a workspace before adding a key.');
+      // Not set up yet (20261024130000 not applied): check without the cap.
+      if (checkError.code !== 'PGRST202' && checkError.code !== '42883') {
+        console.error('claim_outreach_key_check failed', checkError.code);
+        return failure(500, 'server_error', 'Key checks are unavailable right now.');
+      }
+    }
+    const deadline = AbortSignal.timeout(VERIFY_DEADLINE_MS);
     try {
-      await anthropic.models.list({ limit: 1 });
+      await anthropic.models.list({ limit: 1 }, { signal: deadline });
       return reply({ ok: true });
     } catch (error) {
-      return anthropicFailure(error);
+      return anthropicFailure(error, deadline);
     }
   }
 
@@ -168,6 +190,7 @@ Deno.serve(async (request) => {
   }
 
   let response;
+  const deadline = AbortSignal.timeout(DRAFT_DEADLINE_MS);
   try {
     response = await anthropic.beta.messages.create({
       model: MODEL,
@@ -180,9 +203,9 @@ Deno.serve(async (request) => {
       },
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: buildUserPrompt(draftRequest) }],
-    });
+    }, { signal: deadline });
   } catch (error) {
-    return anthropicFailure(error);
+    return anthropicFailure(error, deadline);
   }
 
   if (response.stop_reason === 'refusal') {

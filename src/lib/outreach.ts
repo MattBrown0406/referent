@@ -96,20 +96,46 @@ export function partnerRecipient(partner: Pick<Partner, 'id' | 'name' | 'phone' 
   return { key: partner.id, name: partner.name.trim(), relationship: '', phone: partner.phone.trim(), email: partner.email.trim() };
 }
 
-// "Dr. Jane Smith" → "Jane"; "Rivera, Ana" → "Ana"; "Mrs. Rivera" → "" (an
-// honorific and one name is a surname). Only a first name ever leaves the
-// device for drafting.
+const HONORIFIC = /^(dr|mr|mrs|ms|mx|miss|rev|fr|sr|prof)\.?$/i;
+
+// What follows a name after a comma ("Dana Holt, LCSW", "Jane Doe, PhD,
+// LADC", "John Smith, Jr.") is a credential or suffix, not a given name.
+const CREDENTIALS = new Set([
+  'jr', 'sr', 'ii', 'iii', 'iv', 'esq',
+  'md', 'do', 'phd', 'psyd', 'edd', 'dsw', 'dnp', 'rn', 'np', 'pa', 'aprn', 'pmhnp', 'fnp', 'bsn', 'msn', 'lpn',
+  'lcsw', 'lmsw', 'licsw', 'lisw', 'csw', 'msw', 'bsw', 'lmft', 'mft', 'lpc', 'lpcc', 'lcpc', 'lmhc', 'lpca', 'ncc',
+  'ladc', 'lcadc', 'cadc', 'caadc', 'casac', 'cac', 'mac', 'ccs', 'csac', 'lcdc', 'cdca', 'cip', 'cai', 'ccip', 'bri',
+  'cprs', 'cps', 'prs', 'crc', 'ma', 'ms', 'mba', 'med', 'mph', 'mpa', 'ba', 'bs',
+]);
+
+function isCredentials(part: string): boolean {
+  const words = part.split(/\s+/).filter(Boolean);
+  return words.length > 0 && words.every((word) => CREDENTIALS.has(word.replace(/\./g, '').toLowerCase()));
+}
+
+// "Dr. Jane Smith" → "Jane"; "Rivera, Ana" → "Ana"; "Dana Holt, LCSW" →
+// "Dana"; "Mrs. Rivera" → "" (an honorific and one name is a surname). A name
+// field holding an email address, a phone number, or "Jake's mom" gives ""
+// (the loved one's name is not the recipient's), and a sign-up handle like
+// "jane.smith" gives "jane". Only a first name ever leaves the device for
+// drafting.
 export function firstName(name: string): string {
-  const trimmed = name.trim();
-  if (!trimmed) return '';
-  const comma = trimmed.indexOf(',');
-  const afterComma = comma > 0 ? trimmed.slice(comma + 1).trim() : '';
-  const given = afterComma || (comma > 0 ? trimmed.slice(0, comma) : trimmed);
-  const words = given.split(/\s+/).filter(Boolean);
+  const parts = name.split(',').map((part) => part.trim()).filter(Boolean);
+  while (parts.length > 1 && isCredentials(parts[parts.length - 1])) parts.pop();
+  if (!parts.length) return '';
+  const lastFirst = parts.length > 1; // "Rivera, Ana"
+  const words = (lastFirst ? parts[1] : parts[0]).split(/\s+/).filter(Boolean);
   if (!words.length) return '';
-  const honorific = /^(dr|mr|mrs|ms|mx|miss|rev|fr|sr|prof)\.?$/i;
-  if (honorific.test(words[0])) return words.length > 2 ? words[1].replace(/[,;:]+$/, '') : '';
-  return words[0].replace(/[,;:]+$/, '');
+  let word = words[0];
+  if (HONORIFIC.test(word)) {
+    // "Smith, Dr. Jane": the given name follows; "Dr. Jane Smith": it is the
+    // middle word; "Mrs. Rivera": there is none.
+    word = lastFirst || words.length > 2 ? words[1] || '' : '';
+  }
+  word = word.replace(/^["'“”‘’()[\]<>«»*•–—-]+|["“”‘’()[\]<>«»,;:!?*•–—-]+$/g, '');
+  if (!word || /[@\d]/.test(word) || /['’]s$/i.test(word)) return '';
+  const handle = /^([A-Za-z]+)[._][A-Za-z]/.exec(word);
+  return handle ? handle[1] : word;
 }
 
 export function digitsForPhone(phone: string): string {

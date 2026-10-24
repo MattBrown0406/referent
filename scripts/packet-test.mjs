@@ -174,6 +174,15 @@ assert(!buildPacket(profileCash, partnerNoCost, reasonsNoCost, 'family').include
 assert(buildFitReasons(profileCash, { ...partnerB, monthlyCost: 0, cashMin: 1200, cashMax: 2400 }, fitB).includes('Monthly cash cost is $2,400 — within the $2,500 budget'));
 // A budget of 0 is no budget (as in the ranking), so nothing is "within" it.
 assert(buildFitReasons({ ...profileCash, maxBudget: 0 }, partnerB, fitB).includes('Monthly cash cost: $2,400'));
+assert(!buildPacket({ ...profileCash, maxBudget: 0 }, partnerB, reasonsB, 'family').includes('up to $0'), 'a budget of 0 is never printed');
+
+// The family's budget never reaches the program's copy: it would tell the
+// program the most the family can pay. The family's copy keeps it.
+const reasonsBPartner = buildFitReasons(profileCash, partnerB, fitB, 'partner');
+assert(reasonsBPartner.includes('Monthly cash cost: $2,400'), 'the program copy still states the program\'s own cost');
+const partnerCashPacket = buildPacket(profileCash, partnerB, reasonsBPartner, 'partner');
+assert(!/budget|\$2,500/i.test(partnerCashPacket), 'no budget line or amount in the program copy');
+assert(buildPacket(profileCash, partnerB, reasonsB, 'family').includes('- Budget: up to $2,500'), 'the family copy keeps the budget');
 
 // ─── 5. Away from home: the state is home, not where to look ───────────────
 const awayProfile = { ...profileInsurance, locationPreference: 'Away from home' };
@@ -185,6 +194,22 @@ const awayPacket = buildPacket(awayProfile, partnerA, reasonsA, 'partner');
 assert(awayPacket.includes('- Home state: Oregon') && awayPacket.includes('- Location preference: Away from home'));
 assert(!awayPacket.includes('- Location: Oregon'));
 assert(buildPacket(profileInsurance, partnerA, reasonsA, 'partner').includes('- Location: Oregon'), 'other preferences keep the Location line');
+// A program with no state on file is not "outside Oregon": the fit the
+// ranker hands the packet says unknown (sameState null), so no claim is made.
+{
+  const { scoreProgram, trackRecordPrior } = require(path.join(tmpDir, 'lib', 'matching.js'));
+  const { packetFitInput } = require(path.join(tmpDir, 'lib', 'packet.js'));
+  const awayCash = { ...awayProfile, insurance: 'Cash pay', therapies: [], mustHaveTherapies: [] };
+  for (const state of ['—', '', 'OREGON']) {
+    const noState = { ...partnerA, state };
+    const fit = packetFitInput(scoreProgram(awayCash, noState, undefined, trackRecordPrior({})), awayCash);
+    assert.equal(fit.sameState, null);
+    assert(!buildFitReasons(awayCash, noState, fit).some((reason) => reason.includes('away from home')), `state ${JSON.stringify(state)} never reads as away from home`);
+  }
+  const inCA = { ...partnerA, state: 'CA' };
+  const fitCA = packetFitInput(scoreProgram(awayCash, inCA, undefined, trackRecordPrior({})), awayCash);
+  assert(buildFitReasons(awayCash, inCA, fitCA).includes('Outside Oregon, away from home'), 'a program confirmed out of state still gets the line');
+}
 
 // ─── De-identification heuristic spot checks ───────────────────────────────
 

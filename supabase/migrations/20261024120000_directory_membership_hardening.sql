@@ -39,6 +39,9 @@
 --      columns of a match they create.
 --   9. Placement check-ins due "today" in US evening hours are no longer
 --      skipped because the server's UTC date already rolled over.
+--  10. Moving or releasing a listing (team join, account deletion) keeps
+--      its verification.
+--  11. Production table grants match what the migrations grant.
 --
 -- Transit rule: this file is pasted into the SQL editor from a chat client.
 -- ASCII only, no backslash characters anywhere, every top-level statement
@@ -1308,7 +1311,8 @@ REVOKE ALL ON FUNCTION public.org_move_workspace_rows(uuid, uuid) FROM PUBLIC, a
 --   * its pending claim requests move (a duplicate of one the team already
 --     has is dropped);
 --   * its entitlement rows merge into the team's: active if either is, the
---     later expiry, no expiry when an active row had none.
+--     later expiry of the ACTIVE rows (an inactive row's date never extends
+--     anything), no expiry when an active row had none.
 CREATE OR REPLACE FUNCTION public.org_move_directory_state(p_from uuid, p_to uuid, p_user uuid)
 RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER
@@ -1345,7 +1349,9 @@ BEGIN
   ON CONFLICT (org_id, entitlement) DO UPDATE SET
     active = t.active OR EXCLUDED.active,
     expires_at = CASE WHEN (t.active AND t.expires_at IS NULL) OR (EXCLUDED.active AND EXCLUDED.expires_at IS NULL) THEN NULL
-                      ELSE greatest(t.expires_at, EXCLUDED.expires_at) END,
+                      WHEN t.active AND EXCLUDED.active THEN greatest(t.expires_at, EXCLUDED.expires_at)
+                      WHEN EXCLUDED.active THEN EXCLUDED.expires_at
+                      ELSE t.expires_at END,
     source = CASE WHEN t.active THEN t.source ELSE EXCLUDED.source END,
     rc_app_user_id = CASE WHEN t.active THEN t.rc_app_user_id ELSE EXCLUDED.rc_app_user_id END;
 END
@@ -1911,5 +1917,60 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.schedule_placement_check_ins(uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.schedule_placement_check_ins(uuid) TO authenticated;
+
+-- ===========================================================================
+-- 10. Moving or releasing a listing keeps its verification
+-- ===========================================================================
+
+-- Same as 20260928170000, except that a write changing only who owns or
+-- submitted the listing (owner_org_id, suggested_by_org_id) leaves
+-- verified_at as it was. A team join (org_move_directory_state) and an
+-- account deletion (ON DELETE SET NULL on suggested_by_org_id) run as the
+-- member, not an admin, and used to clear the verification of every
+-- listing that workspace had submitted and ReferralFit had approved.
+-- Clients cannot write either column, so only server paths reach this.
+CREATE OR REPLACE FUNCTION public.guard_global_partner_verification()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF coalesce(current_setting('referralfit.seed_publish', true), '') = 'on' THEN
+    RETURN NEW;
+  END IF;
+  IF NOT public.is_platform_admin() AND auth.uid() IS NOT NULL THEN
+    NEW.status := OLD.status;
+    IF (NEW.owner_org_id, NEW.suggested_by_org_id) IS DISTINCT FROM (OLD.owner_org_id, OLD.suggested_by_org_id)
+       AND to_jsonb(NEW) - ARRAY['owner_org_id', 'suggested_by_org_id', 'verified_at', 'updated_at']
+         = to_jsonb(OLD) - ARRAY['owner_org_id', 'suggested_by_org_id', 'verified_at', 'updated_at'] THEN
+      NEW.verified_at := OLD.verified_at;
+    ELSIF public.global_listing_claimed_by_caller(OLD.id) THEN
+      NEW.verified_at := now();
+    ELSE
+      NEW.verified_at := NULL;
+    END IF;
+  END IF;
+  RETURN NEW;
+END
+$$;
+REVOKE ALL ON FUNCTION public.guard_global_partner_verification() FROM PUBLIC, anon, authenticated;
+
+-- ===========================================================================
+-- 11. Production table grants match the migrations
+-- ===========================================================================
+
+-- Where a default ACL granted authenticated every privilege on new tables,
+-- the earlier "REVOKE ... FROM anon, PUBLIC" left authenticated holding
+-- INSERT / UPDATE / DELETE that no migration granted. RLS has no write
+-- policy on these tables, so the writes were refused anyway, but on orgs
+-- the owner's rename policy let a direct UPDATE set intake_token and the
+-- other columns. Revoke the extras; a REVOKE of UPDATE also drops column
+-- grants, so the two intended orgs columns are granted again. Where no such
+-- default ACL exists (CI), this changes nothing.
+REVOKE INSERT, UPDATE, DELETE ON public.orgs, public.org_members, public.org_invites,
+  public.org_entitlements, public.org_revenuecat_grants, public.platform_admins,
+  public.center_members, public.center_claim_codes, public.center_claim_requests,
+  public.case_stage_history FROM authenticated;
+GRANT UPDATE (name, lead_response_target_minutes) ON public.orgs TO authenticated;
 
 COMMIT;

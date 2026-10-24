@@ -231,6 +231,42 @@ check('first names drop honorifics and trailing punctuation', () => {
   assert.equal(outreach.firstName(''), '');
 });
 
+check('credentials after a comma are not a first name; "Last, First" still is', () => {
+  assert.equal(outreach.firstName('Dana Holt, LCSW'), 'Dana');
+  assert.equal(outreach.firstName('Jane Doe, PhD, LADC'), 'Jane');
+  assert.equal(outreach.firstName('Dr. Dana Holt, Ph.D.'), 'Dana');
+  assert.equal(outreach.firstName('John Smith, Jr.'), 'John');
+  assert.equal(outreach.firstName('Dana, LMFT'), 'Dana');
+  assert.equal(outreach.firstName('Holt, Dana, LCSW'), 'Dana');
+  assert.equal(outreach.firstName('Smith Jr., John'), 'John');
+  assert.equal(outreach.firstName('Smith, Dr. Jane'), 'Jane');
+  assert.equal(outreach.firstName('RIVERA, ANA'), 'ANA', 'an all-caps "Last, First" still sends the first name, never the surname');
+});
+
+check('a name field holding contact details or someone else\'s name sends no name', () => {
+  for (const name of ['ana@example.test', '(541) 555-0142', '+1 541 555 0142', '5415550142', "Jake's mom", 'Jake’s mother', '—', '  ']) {
+    assert.equal(outreach.firstName(name), '', JSON.stringify(name));
+  }
+  assert.equal(outreach.firstName('jane.smith'), 'jane', 'a sign-up handle sends the first part only');
+  assert.equal(outreach.firstName('“Ana” Rivera'), 'Ana');
+  assert.equal(outreach.firstName('Mary Ann (sister)'), 'Mary');
+  const body = outreach.buildDraftRequest({
+    channel: 'text',
+    target: caseTarget,
+    recipient: { ...ana, name: 'ana.rivera@example.test' },
+    senderName: 'matt.brown',
+    practiceName: '',
+    history: { count: 0, lastChannel: '', lastAt: '' },
+    instructions: '',
+    now: new Date(),
+  });
+  assert.equal(body.recipient.firstName, '');
+  assert.equal(body.sender.firstName, 'matt');
+  assert.equal(/@|rivera|brown/i.test(JSON.stringify(body)), false, 'no address and no surname leaves the device');
+  const draft = outreach.templateDraft({ channel: 'text', target: partnerTarget, recipient: { ...outreach.partnerRecipient(PARTNER), name: 'Dana Holt, LCSW' }, senderName: 'Matt', practiceName: '', history: { count: 0, lastChannel: '', lastAt: '' } });
+  assert.equal(draft.body.startsWith('Hi Dana,'), true, draft.body);
+});
+
 console.log('— without AI, and the composers —');
 
 check('family fallback drafts are discreet', () => {
@@ -254,6 +290,15 @@ check('sms and mailto URLs are encoded for each platform', () => {
   assert.equal(outreach.smsUrl('(541) 555-0142', 'Hi Ana & co?', 'ios'), 'sms:5415550142&body=Hi%20Ana%20%26%20co%3F');
   assert.equal(outreach.smsUrl('+1 541 555 0142', 'Hi', 'android'), 'sms:+15415550142?body=Hi');
   assert.equal(outreach.mailtoUrl(' ana@example.test ', 'Checking in', 'Line one\nLine two'), 'mailto:ana@example.test?subject=Checking%20in&body=Line%20one%0ALine%20two');
+  // A body with every character that would end or split the query string
+  // (& # % ? = + newlines) and an emoji comes back intact.
+  const body = 'Rates & times: 50% off? #2 = A+B\n\nTalk soon 🙂 — Matt';
+  for (const url of [outreach.smsUrl('5415550142', body, 'ios'), outreach.smsUrl('5415550142', body, 'android'), outreach.mailtoUrl('ana@example.test', 'Q&A #1 100%', body)]) {
+    const query = url.slice(url.indexOf('body=') + 'body='.length);
+    assert.equal(/[&#\s?]/.test(query.replace(/&subject=.*$/, '')), false, `raw separators leaked into ${url}`);
+    assert.equal(decodeURIComponent(query), body);
+  }
+  assert.equal(new URL(outreach.mailtoUrl('ana@example.test', 'Q&A #1 100%', body)).searchParams.get('subject'), 'Q&A #1 100%');
 });
 
 check('channels need a usable number or address', () => {
