@@ -80,6 +80,23 @@ function isMissingFunction(error: unknown): boolean {
   return /could not find the function/i.test(describeError(error, ''));
 }
 
+// A server without prepare_account_deletion (migration 20261024120000 not
+// applied yet) refuses only in delete_own_account, after the files are gone.
+// Check the two refusals the app can see before removing anything: someone
+// joined the workspace since the screen loaded, or this account confirmed bed
+// counts (the old bed guard blocks the deletion). A check that cannot be read
+// is skipped; deletion then behaves as it always has.
+async function checkBeforeRemovingFiles(userId: string): Promise<void> {
+  const { count, error } = await supabase.from('org_members').select('user_id', { count: 'exact', head: true });
+  if (!error && typeof count === 'number' && count > 1) {
+    throw new StoreError('Someone joined your workspace since this screen opened. Close Workspace and settings, open it again, and try again. Nothing was deleted.', false);
+  }
+  const { data: beds, error: bedsError } = await supabase.from('global_partners').select('id').eq('beds_updated_by', userId).limit(1);
+  if (!bedsError && Array.isArray(beds) && beds.length) {
+    throw new StoreError('This account confirmed bed counts on a directory listing, which this server cannot release yet. Email matt@freedominterventions.com and we will delete the account for you. Nothing was deleted.', false);
+  }
+}
+
 export async function deleteOwnAccount({ userId, removeWorkspaceFiles }: DeleteOwnAccountOptions): Promise<void> {
   // Refusals come before anything is touched: files, caches, queued changes.
   const { error: prepareError } = await supabase.rpc('prepare_account_deletion');
@@ -87,6 +104,7 @@ export async function deleteOwnAccount({ userId, removeWorkspaceFiles }: DeleteO
     if (isNetworkError(prepareError)) throw new StoreError('Connect to the internet, then try again. Nothing was deleted.', false);
     throw new StoreError(serverMessage(prepareError, 'Your account could not be deleted.'), false);
   }
+  if (prepareError && removeWorkspaceFiles) await checkBeforeRemovingFiles(userId);
   // Flush anything still queued on this device and wipe the account's local
   // caches first, so a member's last edits reach the practice and nothing
   // stale survives the deletion. Refuses while offline.

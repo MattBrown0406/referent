@@ -410,7 +410,9 @@ check('a new lead\'s caller gets the same relationship in the app as on the serv
   // family member, in both the app's template and the draft function.
   const selfRow = appTable.find((row) => row.endsWith('=>self')) ?? '';
   for (const word of ['self', 'myself', 'me']) assert.ok(selfRow.includes(`'${word}'`), `"${word}" stays self`);
-  assert.equal(outreach.isCaseSubject('self'), true);
+  for (const word of ['self', 'myself', 'me', 'herself', 'himself', 'themselves']) {
+    assert.equal(outreach.isCaseSubject(word), true, `"${word}" is the case subject, even where the server saved it as typed`);
+  }
 });
 
 console.log(`\nAll ${passed} outreach checks passed.`);

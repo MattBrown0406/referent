@@ -2,7 +2,7 @@ import { decode } from 'base64-arraybuffer';
 import * as Crypto from 'expo-crypto';
 import * as FileSystem from 'expo-file-system/legacy';
 
-import { LeadTakenError, OfflineError, StoreError, asOfflineError, describeError, withHttpStatus } from './errors';
+import { LeadTakenError, OfflineError, StoreError, asOfflineError, describeError, errorCode, withHttpStatus } from './errors';
 import { currentAuthSessionIdentity, type AuthSessionIdentity } from './auth-session';
 import { fetchAllPages } from './paging';
 import { phoneSearchSuffix } from './phone';
@@ -486,6 +486,23 @@ async function runOrThrow(execute: () => PromiseLike<{ error: { message: string 
   });
 }
 
+// A create the app retries with the same ids after a timeout. Once migration
+// 20261024120000 is applied the server treats a repeat that already landed as
+// a no-op; before that, the repeat fails on the case's primary key. If the
+// case is already there in this workspace, the earlier attempt landed and the
+// retry has succeeded.
+async function createOnce(caseId: string, execute: () => PromiseLike<{ error: { message: string } | null; status?: number }>): Promise<void> {
+  await withStableCaseAccount(async (_userId, orgId) => {
+    const { error, status } = await execute();
+    if (!error) return;
+    if (errorCode(error) === '23505' && /cases_pkey/.test(error.message)) {
+      const { data, error: readError } = await supabase.from('cases').select('id').eq('id', caseId).eq('org_id', orgId).maybeSingle();
+      if (!readError && data) return;
+    }
+    throw caseFailure(error, status);
+  });
+}
+
 export async function createCase(record: CaseRecord, expectedUserId: string): Promise<void> {
   const row = { ...caseToRow(record), owner_id: expectedUserId };
   await runOrThrow(() => supabase.from('cases').insert(row));
@@ -508,7 +525,7 @@ export async function createCaseBundle(
   expectedUserId: string,
 ): Promise<void> {
   const followUpRow = firstFollowUp ? followUpToRpcRow(firstFollowUp) : null;
-  await runOrThrow(() => supabase.rpc('create_case_bundle', {
+  await createOnce(record.id, () => supabase.rpc('create_case_bundle', {
     p_expected_owner_id: expectedUserId,
     p_case: caseToRow(record),
     p_contact: primaryContact ? contactToRow(primaryContact) : null,
@@ -583,7 +600,7 @@ export function leadFollowUpTitle(caseTitle: string): string {
 // no-op success. Any other StoreError is a refusal (validation, permission):
 // roll back and show error.message.
 export async function createLead(input: NewLeadInput, expectedUserId: string): Promise<void> {
-  await runOrThrow(() => supabase.rpc('create_lead', {
+  await createOnce(input.caseId, () => supabase.rpc('create_lead', {
     p_expected_owner_id: expectedUserId,
     p_lead: {
       id: input.caseId,
@@ -600,6 +617,19 @@ export async function createLead(input: NewLeadInput, expectedUserId: string): P
       due_time: input.dueTime ?? '',
     },
   }));
+  // Until 20261024120000 is applied, the server saves "Calling about: son" as
+  // the caller's own relationship. Put the caller's side in place. Once the
+  // server does it, the saved value no longer equals the raw text and this
+  // matches nothing. Best effort: the lead itself is saved either way.
+  const about = input.aboutRelationship.trim();
+  const callerSide = leadCallerRelationship(about);
+  if (about && callerSide !== about) {
+    try {
+      await supabase.from('case_contacts').update({ relationship: callerSide }).eq('id', input.contactId).eq('relationship', about);
+    } catch {
+      // The practitioner can still edit the contact.
+    }
+  }
 }
 
 export type RecordedCasePayment = {

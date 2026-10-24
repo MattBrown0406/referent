@@ -230,7 +230,7 @@ const PURPOSE_LABELS: Record<FollowUpPurpose, string> = {
   none: 'a follow-up',
 };
 
-const SUBJECT_RELATIONSHIP = /^(the )?(subject|client|patient|self|loved one|identified (patient|person)|ip)$/i;
+const SUBJECT_RELATIONSHIP = /^(the )?(subject|client|patient|self|myself|me|himself|herself|themself|themselves|loved one|identified (patient|person)|ip)$/i;
 const REFERRER_RELATIONSHIP = /^(the )?(referent|referrer|referral source|referring (professional|provider|therapist))$/i;
 
 function lastContactPhrase(days: number | null, channel: OutreachChannel | ''): string {

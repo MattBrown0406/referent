@@ -354,4 +354,17 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   assert.match(readBack, /if \(activeUserIdRef\.current !== userId \|\| authGenerationRef\.current !== generation\) return 'ok' as const;\s*return refreshFromServer\('pull'\);/, 'the read-back never runs for another account');
 }
 
+// ─── Final check: the build against today's production schema ───────────────
+{
+  const casesSource = await readFile(new URL('../src/lib/cases.ts', import.meta.url), 'utf8');
+  assert.match(casesSource, /if \(errorCode\(error\) === '23505' && \/cases_pkey\/\.test\(error\.message\)\) \{[\s\S]{0,200}\.from\('cases'\)\.select\('id'\)\.eq\('id', caseId\)\.eq\('org_id', orgId\)/, 'a same-id retry of a create that landed succeeds before the migration');
+  for (const rpc of ['create_case_bundle', 'create_lead']) {
+    assert.match(casesSource, new RegExp(`await createOnce\\([^,]+, \\(\\) => supabase\\.rpc\\('${rpc}'`), `${rpc} goes through createOnce`);
+  }
+  assert.match(casesSource, /\.from\('case_contacts'\)\.update\(\{ relationship: callerSide \}\)\.eq\('id', input\.contactId\)\.eq\('relationship', about\)/, 'a lead caller gets their own relationship before the migration does it');
+  const accountSource = await readFile(new URL('../src/lib/account.ts', import.meta.url), 'utf8');
+  const order = ['prepare_account_deletion', 'if (prepareError && removeWorkspaceFiles) await checkBeforeRemovingFiles(userId);', 'await removeWorkspaceCaseFiles();', "supabase.rpc('delete_own_account')"].map((needle) => accountSource.indexOf(needle));
+  assert.ok(order.every((at) => at >= 0) && order.every((at, i) => i === 0 || at > order[i - 1]), 'without the preflight, the old-server checks run before any file is removed');
+}
+
 console.log('optimistic mutation serialization/dependency invariants: ok');

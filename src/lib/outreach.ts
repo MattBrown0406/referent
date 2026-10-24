@@ -434,7 +434,7 @@ export function buildDraftRequest(params: {
 // The case contact who is the person the family is worried about, read the
 // same way the draft function reads it (SUBJECT_RELATIONSHIP in
 // supabase/functions/draft-follow-up/draft.ts; outreach-test checks they match).
-const SUBJECT_RELATIONSHIP = /^(the )?(subject|client|patient|self|loved one|identified (patient|person)|ip)$/i;
+const SUBJECT_RELATIONSHIP = /^(the )?(subject|client|patient|self|myself|me|himself|herself|themself|themselves|loved one|identified (patient|person)|ip)$/i;
 
 export function isCaseSubject(relationship: string): boolean {
   return SUBJECT_RELATIONSHIP.test(relationship.replace(/\s+/g, ' ').trim());
