@@ -51,12 +51,13 @@ skipped.
 **Done -> next** (20261024120000 section 15). The next step keeps the
 completed step's assignee (or the `assigned_to` the client sends; unassigned
 if that person has left). A step that is already done or skipped keeps its
-first completion. If the next step is already saved (its id exists, or an
-open step with the same case, partner, kind, title and day does), the call
-writes nothing, so a replay or a second "Done -> next" queued after a crash
-cannot add a duplicate. Any other next step (a colleague, a VOB answer or a
-close finished the step first) is still saved with its timeline entry, as
-`record_outreach_sent` does.
+first completion. If the next step's id is already saved (a replay; after a
+crash the app replays a queued call with its original ids), the call writes
+nothing. Any other next step (a colleague, a VOB answer or a close finished
+the step first) is still saved with its timeline entry, as
+`record_outreach_sent` does. Only the id marks a replay: the app titles a
+next step from its kind and case, so two different steps often share kind,
+title and day, and matching on those would drop one without a word.
 
 **Membership realtime** (20261024120000 section 20). The `supabase_realtime`
 publication sends inserts and updates only (the app listens for

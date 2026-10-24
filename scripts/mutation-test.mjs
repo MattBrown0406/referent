@@ -306,22 +306,52 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
 {
   const leadBody = source.slice(source.indexOf('function saveNewLead(draft: NewLeadDraft)'), source.indexOf('function openNewLeadSheet()'));
   assert.doesNotMatch(leadBody, /leadRetry\?\.ids/, 'a lead save never takes the pending retry’s ids by itself');
-  assert.match(leadBody, /if \(retrying\) setLeadRetry\(\(current\) => \(current === retrying \? null : current\)\);/, 'a save clears only the retry it is for');
+  assert.match(leadBody, /if \(retrying\) setLeadRetries\(\(current\) => current\.filter\(\(item\) => item !== retrying\)\);/, 'a save clears only the retry it is for');
   const openLead = source.slice(source.indexOf('function openNewLeadSheet()'), source.indexOf('const todayCounts = useMemo('));
-  assert.match(openLead, /setLeadSheetRetry\(leadRetry\);\s*setShowNewLead\(true\);/, 'opening New lead binds a waiting retry to that sheet');
-  assert.match(openLead, /const session = leadSheetRetry;\s*if \(session\) setLeadRetry\(\(current\) => \(current === session \? null : current\)\);/, 'cancelling a new lead keeps another lead’s retry');
+  assert.match(openLead, /setLeadSheetRetry\(leadRetries\[0\] \?\? null\);\s*setShowNewLead\(true\);/, 'opening New lead binds the oldest waiting retry to that sheet');
+  assert.match(openLead, /const session = leadSheetRetry;\s*if \(session\) setLeadRetries\(\(current\) => current\.filter\(\(item\) => item !== session\)\);/, 'cancelling a new lead keeps another lead’s retry');
   assert.match(source, /initialDraft=\{leadSheetRetry\?\.draft \?\? null\}\s*notice=\{leadSheetRetry\?\.message\}\s*retry=\{Boolean\(leadSheetRetry\?\.retryable\)\}/, 'the sheet shows only its own retry');
   const caseBody = source.slice(source.indexOf('function saveNewCase()'), source.indexOf('function openNewCaseForm()'));
   assert.doesNotMatch(caseBody, /caseRetry\?\.ids|setCaseForm\(submittedForm\)/, 'a failed case never overwrites a form open on another case');
   const openCaseForm = source.slice(source.indexOf('function openNewCaseForm()'), source.indexOf('function changeCaseStatus('));
-  assert.match(openCaseForm, /setCaseFormRetry\(caseRetry\);\s*setCaseForm\(caseRetry \? caseRetry\.form : makeEmptyCaseForm\(\)\);/, 'New case opens a waiting retry with its own draft');
-  assert.match(openCaseForm, /const session = caseFormRetry;\s*if \(session\) setCaseRetry\(\(current\) => \(current === session \? null : current\)\);/, 'cancelling a new case keeps another case’s retry');
+  assert.match(openCaseForm, /const waiting = caseRetries\[0\] \?\? null;\s*setCaseFormRetry\(waiting\);\s*setCaseForm\(waiting \? waiting\.form : makeEmptyCaseForm\(\)\);/, 'New case opens the oldest waiting retry with its own draft');
+  assert.match(openCaseForm, /const session = caseFormRetry;\s*if \(session\) setCaseRetries\(\(current\) => current\.filter\(\(item\) => item !== session\)\);/, 'cancelling a new case keeps another case’s retry');
   assert.doesNotMatch(source, /\{caseRetry\?\.retryable|\{caseRetry\.message\}/, 'the form shows only its own retry');
   // Saving another lead meanwhile no longer cancels the failed one's reopen
   // (it was dropped silently): the reopen waits for its own retry only.
-  assert.match(leadBody, /stillWanted: \(\) => leadRetryRef\.current === retry \}/, 'a failed lead still reopens after another lead is saved');
-  assert.match(caseBody, /stillWanted: \(\) => caseRetryRef\.current === retry \}/, 'a failed case still reopens after another case is saved');
+  assert.match(leadBody, /stillWanted: \(\) => leadRetriesRef\.current\.includes\(retry\) \}/, 'a failed lead still reopens after another lead is saved');
+  assert.match(caseBody, /stillWanted: \(\) => caseRetriesRef\.current\.includes\(retry\) \}/, 'a failed case still reopens after another case is saved');
   assert.doesNotMatch(source, /createRetryTokenRef/);
+}
+
+// ─── Round 13: a second failure never displaces the first ──────────────────
+// Lead A fails while the sheet is open on lead B (A's reopen waits, and gives
+// up after ~30 s of typing); B is saved and fails too (still offline). With
+// one slot, B replaced A and A was gone without a word. Every failure now
+// waits in its own place, oldest first, until it is retried or cancelled.
+{
+  const leadBody = source.slice(source.indexOf('function saveNewLead(draft: NewLeadDraft)'), source.indexOf('function openNewLeadSheet()'));
+  const caseBody = source.slice(source.indexOf('function saveNewCase()'), source.indexOf('function openNewCaseForm()'));
+  assert.match(leadBody, /leadRetriesRef\.current = \[\.\.\.leadRetriesRef\.current, retry\];\s*setLeadRetries\(\(current\) => \[\.\.\.current, retry\]\);/, 'a failed lead is added to the waiting retries, never replacing one');
+  assert.match(caseBody, /caseRetriesRef\.current = \[\.\.\.caseRetriesRef\.current, retry\];\s*setCaseRetries\(\(current\) => \[\.\.\.current, retry\]\);/, 'a failed case is added to the waiting retries, never replacing one');
+  assert.doesNotMatch(source, /\bsetLeadRetry\(|\bsetCaseRetry\(|leadRetryRef|caseRetryRef/, 'no single-slot retry is left');
+  assert.match(source, /leadRetriesRef\.current = \[\];\s*caseRetriesRef\.current = \[\];\s*setLeadRetries\(\[\]\);\s*setCaseRetries\(\[\]\);\s*setLeadSheetRetry\(null\);\s*setCaseFormRetry\(null\);/, 'an account or workspace change drops every waiting retry');
+}
+
+// ─── Round 13: reopening a case reads back its restored steps ──────────────
+// The server puts back the steps a close skipped whichever way the case is
+// reopened, including Done -> a new status on a closed case's check-in; and a
+// refresh already running when the reopen lands keeps nothing it read
+// (changed meanwhile), so the read-back runs after it, not inside it.
+{
+  const statusBody = source.slice(source.indexOf('function changeCaseStatus('), source.indexOf('function saveCasePayment('));
+  assert.match(statusBody, /if \(saved && reopening\) readBackReopenedCase\(\);/, 'a reopen from the status picker reads its steps back');
+  const closeLoopBody = source.slice(source.indexOf('function closeLoopWithStatus('), source.indexOf('function confirmNextStep('));
+  assert.match(closeLoopBody, /const reopening = inactive\(record\.status\) && !inactive\(updatedCase\.status\);/, 'closing the loop knows when it reopens the case');
+  assert.match(closeLoopBody, /if \(!saved\) return;\s*if \(reopening\) readBackReopenedCase\(\);/, 'a reopen from Done reads its steps back');
+  const readBack = source.slice(source.indexOf('function readBackReopenedCase()'), source.indexOf('function saveCasePayment('));
+  assert.match(readBack, /const running = refreshInFlightRef\.current;\s*void \(running \? running\.catch\(\(\) => 'ok' as const\) : Promise\.resolve\('ok' as const\)\)/, 'the read-back waits for a refresh already running');
+  assert.match(readBack, /if \(activeUserIdRef\.current !== userId \|\| authGenerationRef\.current !== generation\) return 'ok' as const;\s*return refreshFromServer\('pull'\);/, 'the read-back never runs for another account');
 }
 
 console.log('optimistic mutation serialization/dependency invariants: ok');

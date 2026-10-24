@@ -1152,24 +1152,28 @@ export default function App() {
   // A New lead or New case that did not save keeps its draft and its ids:
   // the sheet reopens filled in, with the reason and a Retry that sends the
   // same ids again (the server treats a same-id retry that landed as success).
-  const [leadRetry, setLeadRetry] = useState<LeadRetry | null>(null);
-  const [caseRetry, setCaseRetry] = useState<CaseRetry | null>(null);
+  // Every failed save waits here, oldest first, until it is retried or
+  // cancelled: a second failure (lead A fails while the sheet is open on lead
+  // B, then B fails too, e.g. both offline) must never displace the first,
+  // which would then be lost without a word.
+  const [leadRetries, setLeadRetries] = useState<LeadRetry[]>([]);
+  const [caseRetries, setCaseRetries] = useState<CaseRetry[]>([]);
   // The retry the open New lead sheet / New case form was opened FOR (null:
   // a new one). Only its Save sends the kept ids: a lead that fails while the
   // sheet is open on another lead must not lend that lead its ids (a same-id
   // retry of a lead that did land is a no-op, so the second lead would be
-  // dropped) nor its notice. It waits in leadRetry / caseRetry instead.
+  // dropped) nor its notice. It waits in leadRetries / caseRetries instead.
   const [leadSheetRetry, setLeadSheetRetry] = useState<LeadRetry | null>(null);
   const [caseFormRetry, setCaseFormRetry] = useState<CaseRetry | null>(null);
-  // The retry waiting, for the reopen timers (state in their closures is
+  // The retries waiting, for the reopen timers (state in their closures is
   // stale). A failed save's sheet reopens once the screen is clear, and only
-  // while its retry is still the one waiting: saving or cancelling it (from a
-  // New lead / New case opened meanwhile), a newer failure, or signing out
-  // drops the reopen. Saving a different lead meanwhile does not.
-  const leadRetryRef = useRef<LeadRetry | null>(null);
-  const caseRetryRef = useRef<CaseRetry | null>(null);
-  leadRetryRef.current = leadRetry;
-  caseRetryRef.current = caseRetry;
+  // while its retry is still waiting: saving or cancelling it (from a New
+  // lead / New case opened meanwhile) or signing out drops the reopen.
+  // Saving a different lead meanwhile, or another failing, does not.
+  const leadRetriesRef = useRef<LeadRetry[]>([]);
+  const caseRetriesRef = useRef<CaseRetry[]>([]);
+  leadRetriesRef.current = leadRetries;
+  caseRetriesRef.current = caseRetries;
   const [leadSettings, setLeadSettings] = useState<LeadSettings>(DEFAULT_LEAD_SETTINGS);
   // Team basics: who is in the workspace (names on timeline rows, the
   // assignee pickers, "Take this lead") and the Today scope. A scope of null
@@ -1499,10 +1503,10 @@ export default function App() {
     setShowNewLead(false);
     setShowNewCase(false);
     // A draft kept for a retry belongs to the previous account.
-    leadRetryRef.current = null;
-    caseRetryRef.current = null;
-    setLeadRetry(null);
-    setCaseRetry(null);
+    leadRetriesRef.current = [];
+    caseRetriesRef.current = [];
+    setLeadRetries([]);
+    setCaseRetries([]);
     setLeadSheetRetry(null);
     setCaseFormRetry(null);
     setPacketDisclosureRestored(false);
@@ -3327,7 +3331,7 @@ export default function App() {
     const retrying = caseFormRetry;
     const ids = retrying?.ids ?? { caseId: makeId('c'), contactId: makeId('cc'), followUpId: makeId('f') };
     const submittedForm = caseForm;
-    if (retrying) setCaseRetry((current) => (current === retrying ? null : current));
+    if (retrying) setCaseRetries((current) => current.filter((item) => item !== retrying));
     setCaseFormRetry(null);
     const now = new Date().toISOString();
     const record: CaseRecord = {
@@ -3409,11 +3413,11 @@ export default function App() {
               ? 'The case did not reach the server (no connection). Nothing is lost: tap Retry when you have signal.'
               : `The case was not saved: ${describeError(error)}`,
           };
-          caseRetryRef.current = retry;
-          setCaseRetry(retry);
+          caseRetriesRef.current = [...caseRetriesRef.current, retry];
+          setCaseRetries((current) => [...current, retry]);
           // As for a lead: a file opened on the unsaved case closes with it.
           if (activeCaseIdRef.current === ids.caseId) closeCase();
-          afterSheetCloses(() => { setCaseForm(retry.form); setCaseFormRetry(retry); setShowNewCase(true); }, { ifScreenBusy: 'wait', stillWanted: () => caseRetryRef.current === retry });
+          afterSheetCloses(() => { setCaseForm(retry.form); setCaseFormRetry(retry); setShowNewCase(true); }, { ifScreenBusy: 'wait', stillWanted: () => caseRetriesRef.current.includes(retry) });
           return true;
         },
       },
@@ -3421,10 +3425,12 @@ export default function App() {
   }
 
   function openNewCaseForm() {
-    // A case still waiting for its retry opens with its draft, not blank
-    // (and a reopen still pending for it then finds it taken or done).
-    setCaseFormRetry(caseRetry);
-    setCaseForm(caseRetry ? caseRetry.form : makeEmptyCaseForm());
+    // A case still waiting for its retry (the oldest) opens with its draft,
+    // not blank (and a reopen still pending for it then finds it taken or
+    // done).
+    const waiting = caseRetries[0] ?? null;
+    setCaseFormRetry(waiting);
+    setCaseForm(waiting ? waiting.form : makeEmptyCaseForm());
     setShowNewCase(true);
   }
 
@@ -3432,7 +3438,7 @@ export default function App() {
     // Cancelling a retry's form discards that draft; cancelling a new case
     // leaves one still waiting for its retry alone.
     const session = caseFormRetry;
-    if (session) setCaseRetry((current) => (current === session ? null : current));
+    if (session) setCaseRetries((current) => current.filter((item) => item !== session));
     setCaseFormRetry(null);
     setShowNewCase(false);
   }
@@ -3473,8 +3479,24 @@ export default function App() {
       },
       'The case status change', next, previous,
     ).then((saved) => {
-      if (saved && reopening) void refreshFromServer('pull').catch(() => undefined);
+      if (saved && reopening) readBackReopenedCase();
     });
+  }
+
+  // A closed or lost case was reopened: the server put back the steps its
+  // close skipped, and this device never loads skipped steps, so read them
+  // back. A refresh already running began before the reopen (it finds the
+  // change and keeps nothing it read), so a fresh one follows it.
+  function readBackReopenedCase() {
+    const userId = activeUserIdRef.current;
+    const generation = authGenerationRef.current;
+    const running = refreshInFlightRef.current;
+    void (running ? running.catch(() => 'ok' as const) : Promise.resolve('ok' as const))
+      .then(() => {
+        if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation) return 'ok' as const;
+        return refreshFromServer('pull');
+      })
+      .catch(() => undefined);
   }
 
   function saveCasePayment(record: CaseRecord, patch: { paymentStatus?: PaymentStatus; quotedAmount?: number | null; paidAmount?: number }) {
@@ -4475,7 +4497,7 @@ export default function App() {
     // from the sheet opened for that retry).
     const retrying = leadSheetRetry;
     const ids = retrying?.ids ?? { caseId: makeId('c'), contactId: makeId('cc'), followUpId: makeId('f') };
-    if (retrying) setLeadRetry((current) => (current === retrying ? null : current));
+    if (retrying) setLeadRetries((current) => current.filter((item) => item !== retrying));
     setLeadSheetRetry(null);
     const now = new Date();
     const nowIso = now.toISOString();
@@ -4568,21 +4590,22 @@ export default function App() {
               ? 'The lead did not reach the server (no connection). Nothing is lost: tap Retry when you have signal.'
               : `The lead was not saved: ${describeError(error)}`,
           };
-          leadRetryRef.current = retry;
-          setLeadRetry(retry);
+          leadRetriesRef.current = [...leadRetriesRef.current, retry];
+          setLeadRetries((current) => [...current, retry]);
           // A file opened on the unsaved case closes with it (else the
           // screen stays "busy" and the sheet never returns).
           if (activeCaseIdRef.current === ids.caseId) closeCase();
-          afterSheetCloses(() => { setLeadSheetRetry(retry); setShowNewLead(true); }, { ifScreenBusy: 'wait', stillWanted: () => leadRetryRef.current === retry });
+          afterSheetCloses(() => { setLeadSheetRetry(retry); setShowNewLead(true); }, { ifScreenBusy: 'wait', stillWanted: () => leadRetriesRef.current.includes(retry) });
           return true;
         },
       },
     );
   }
 
-  // A lead still waiting for its retry opens with its draft, not blank.
+  // A lead still waiting for its retry (the oldest) opens with its draft,
+  // not blank.
   function openNewLeadSheet() {
-    setLeadSheetRetry(leadRetry);
+    setLeadSheetRetry(leadRetries[0] ?? null);
     setShowNewLead(true);
   }
 
@@ -4590,7 +4613,7 @@ export default function App() {
     // Cancelling a retry's sheet discards that draft; cancelling a new lead
     // leaves one still waiting for its retry alone.
     const session = leadSheetRetry;
-    if (session) setLeadRetry((current) => (current === session ? null : current));
+    if (session) setLeadRetries((current) => current.filter((item) => item !== session));
     setLeadSheetRetry(null);
     setShowNewLead(false);
   }
@@ -4824,6 +4847,10 @@ export default function App() {
       followUps.map((item) => item.id === followUp.id ? completed : item),
       record.id, record.status, updatedCase.status, now,
     );
+    // Reopened from closed or lost (a check-in done with a new status): the
+    // server brings back the steps the close skipped, as in changeCaseStatus.
+    const inactive = (value: CaseStatus) => value === 'closed' || value === 'lost';
+    const reopening = inactive(record.status) && !inactive(updatedCase.status);
     setCaseCloseLoopSaving(true);
     setCases(nextCases);
     setFollowUps(nextFollowUps);
@@ -4842,6 +4869,7 @@ export default function App() {
       previousCases,
     ).then((saved) => {
       if (!saved) return;
+      if (reopening) readBackReopenedCase();
       // The original status-pill press has fully settled before dismissing the
       // native sheet, avoiding the stale transparent-overlay race on iOS.
       requestAnimationFrame(() => {

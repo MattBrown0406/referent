@@ -2357,39 +2357,14 @@ CREATE TRIGGER cases_skip_follow_ups_on_close
 -- 15. complete_follow_up_with_next: the assignee carries over, once only
 -- ===========================================================================
 
--- True when the next step p_next is already saved: its id exists, or an
--- open step with the same case, partner, kind, title and day does (the
--- same "Done -> next" sent twice, e.g. queued again with new ids after a
--- crash hid the first). Invoker: only the caller's workspace is seen.
-CREATE OR REPLACE FUNCTION public.follow_up_next_saved(p_org uuid, p_next jsonb)
-RETURNS boolean
-LANGUAGE sql STABLE
-SECURITY INVOKER
-SET search_path = pg_catalog
-AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM public.follow_ups n
-     WHERE n.org_id = p_org
-       AND (n.id = nullif(p_next ->> 'id', '')::uuid
-            OR (n.status = 'open'
-                AND n.case_id IS NOT DISTINCT FROM nullif(p_next ->> 'case_id', '')::uuid
-                AND n.partner_id IS NOT DISTINCT FROM nullif(p_next ->> 'partner_id', '')::uuid
-                AND n.kind = coalesce(p_next ->> 'kind', 'follow_up')
-                AND n.title = p_next ->> 'title'
-                AND n.due_on = nullif(p_next ->> 'due_on', '')::date))
-  )
-$$;
-REVOKE ALL ON FUNCTION public.follow_up_next_saved(uuid, jsonb) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION public.follow_up_next_saved(uuid, jsonb) TO authenticated;
-
 -- Same as section 8 except:
---   * the next step is assigned to whoever the completed step was assigned
---     to, or to p_next.assigned_to when the client sends that key (JSON
---     null = unassigned); unassigned when that person has left;
---   * a step already done or skipped keeps its first completion. A replay,
---     or the same next step sent twice, then writes nothing; any other next
---     step (a colleague, a VOB answer or a close finished the step first)
---     is still saved with its timeline entry, as record_outreach_sent does.
+--   * the next step keeps the completed step's assignee, or takes
+--     p_next.assigned_to when sent (JSON null = unassigned); unassigned
+--     when that person has left;
+--   * a finished step keeps its first completion. Only a replay (the next
+--     step's id is saved) writes nothing; any other next step is saved with
+--     its timeline entry. Not matched on title and day: the app titles
+--     steps from kind and case, so different steps often share them.
 CREATE OR REPLACE FUNCTION public.complete_follow_up_with_next(p_completed jsonb, p_next jsonb, p_event jsonb)
 RETURNS void
 LANGUAGE plpgsql
@@ -2409,7 +2384,8 @@ BEGIN
    WHERE f.id = (p_completed ->> 'id')::uuid AND f.org_id = v_org_id
    FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'Follow-up not found for the authenticated owner' USING ERRCODE = 'P0002'; END IF;
-  IF v_status <> 'open' AND public.follow_up_next_saved(v_org_id, p_next) THEN RETURN; END IF;
+  IF v_status <> 'open' AND EXISTS (SELECT 1 FROM public.follow_ups n
+       WHERE n.id = nullif(p_next ->> 'id', '')::uuid AND n.org_id = v_org_id) THEN RETURN; END IF;
 
   IF p_next ? 'assigned_to' THEN
     v_assignee := nullif(p_next ->> 'assigned_to', '')::uuid;
@@ -2774,13 +2750,14 @@ GRANT EXECUTE ON FUNCTION public.update_vob_status(uuid, jsonb, uuid) TO authent
 -- deletion leaked user ids across workspaces. org_members is the only
 -- table in the publication and the app listens for UPDATE only. Only the
 -- publication's owner may change it; if that is not the role running this
--- paste, a warning says so and the rest of the migration still applies.
+-- paste (42501), a warning says so and the rest of the migration still
+-- applies. Any other error stops the paste as usual.
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
     ALTER PUBLICATION supabase_realtime SET (publish = 'insert, update');
   END IF;
-EXCEPTION WHEN OTHERS THEN
+EXCEPTION WHEN insufficient_privilege THEN
   RAISE WARNING 'supabase_realtime was not changed (%). In the dashboard, Database, Publications: turn off Delete and Truncate for supabase_realtime.', SQLERRM;
 END
 $$;

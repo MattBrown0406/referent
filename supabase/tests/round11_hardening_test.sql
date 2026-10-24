@@ -7,7 +7,7 @@
 -- against the old schema reports each failure instead of aborting.
 
 BEGIN;
-SELECT plan(75);
+SELECT plan(77);
 
 -- Actors (suffix 11a1)
 --   o1  owner of practice A ("Olivia Owner")
@@ -316,7 +316,7 @@ SELECT lives_ok(
        '{"id":"24600000-0000-0000-0000-0000000011a1","status":"done","completed_at":"2026-10-24T16:05:00Z"}'::jsonb,
        '{"id":"24800000-0000-0000-0000-0000000011a1","case_id":"24000000-0000-0000-0000-0000000011a1","title":"Call again","due_on":"2026-10-28","status":"open","kind":"follow_up"}'::jsonb,
        '{"id":"24890000-0000-0000-0000-0000000011a1","case_id":"24000000-0000-0000-0000-0000000011a1","kind":"system","body":"Completed: Call the program, set next: Call again"}'::jsonb) $$,
-  'a second Done -> next queued after a crash (new ids) succeeds'
+  'a second Done -> next with new ids (another device, the same step) succeeds'
 );
 SELECT lives_ok(
   $$ SELECT public.complete_follow_up_with_next(
@@ -330,14 +330,14 @@ SELECT is(
   (SELECT count(*) FILTER (WHERE title = 'Call again')::text || '|'
           || count(*) FILTER (WHERE id = '24800000-0000-0000-0000-0000000011a1')::text
      FROM public.follow_ups WHERE case_id = '24000000-0000-0000-0000-0000000011a1'),
-  '1|0',
-  'one next step: the crash duplicate is not inserted'
+  '2|1',
+  'only a replay (same next-step id) writes nothing; a next step with new ids is saved, never silently dropped'
 );
 SELECT is(
   (SELECT count(*)::integer FROM public.case_events
     WHERE id IN ('24790000-0000-0000-0000-0000000011a1', '24890000-0000-0000-0000-0000000011a1')),
-  1,
-  'one timeline entry for the completion'
+  2,
+  'each saved next step has its timeline entry, and the replay adds none'
 );
 SELECT is(
   (SELECT completed_at FROM public.follow_ups WHERE id = '24600000-0000-0000-0000-0000000011a1'),
@@ -369,6 +369,34 @@ SELECT is(
      FROM public.follow_ups f WHERE f.id = '24a00000-0000-0000-0000-0000000011a1'),
   'true|12000000-0000-0000-0000-0000000011a1|open|1',
   'the next step and its timeline entry are saved; the step keeps the colleague''s completion'
+);
+
+-- Theo already has his own "Follow up - Next step family" on Oct 29 (the
+-- app titles steps from kind and case). Maya finishes "Send the forms";
+-- the owner's "Done -> next" on it names a step with the same kind, title
+-- and day for herself. It is a different step, so it is saved.
+SET LOCAL ROLE authenticated;
+INSERT INTO public.follow_ups (id, case_id, title, due_on, kind, assigned_to) VALUES
+  ('24c00000-0000-0000-0000-0000000011a1', '24000000-0000-0000-0000-0000000011a1', 'Follow up - Next step family', '2026-10-29', 'follow_up', '13000000-0000-0000-0000-0000000011a1'),
+  ('24d00000-0000-0000-0000-0000000011a1', '24000000-0000-0000-0000-0000000011a1', 'Send the forms', CURRENT_DATE, 'follow_up', NULL);
+SELECT set_config('request.jwt.claim.sub', '12000000-0000-0000-0000-0000000011a1', true);
+UPDATE public.follow_ups SET status = 'done', completed_at = '2026-10-24T17:00:00Z' WHERE id = '24d00000-0000-0000-0000-0000000011a1';
+SELECT set_config('request.jwt.claim.sub', '11000000-0000-0000-0000-0000000011a1', true);
+SELECT lives_ok(
+  $$ SELECT public.complete_follow_up_with_next(
+       '{"id":"24d00000-0000-0000-0000-0000000011a1","status":"done","completed_at":"2026-10-24T17:05:00Z"}'::jsonb,
+       '{"id":"24e00000-0000-0000-0000-0000000011a1","case_id":"24000000-0000-0000-0000-0000000011a1","title":"Follow up - Next step family","due_on":"2026-10-29","status":"open","kind":"follow_up","assigned_to":"11000000-0000-0000-0000-0000000011a1"}'::jsonb,
+       '{"id":"24e90000-0000-0000-0000-0000000011a1","case_id":"24000000-0000-0000-0000-0000000011a1","kind":"system","body":"Completed: Send the forms, set next: Follow up - Next step family"}'::jsonb) $$,
+  'Done -> next naming the same kind, title and day as a colleague''s open step'
+);
+RESET ROLE;
+SELECT is(
+  (SELECT string_agg(coalesce(m.display_name, 'unassigned'), ', ' ORDER BY m.display_name)
+     FROM public.follow_ups f LEFT JOIN public.org_members m ON m.user_id = f.assigned_to
+    WHERE f.case_id = '24000000-0000-0000-0000-0000000011a1' AND f.title = 'Follow up - Next step family' AND f.status = 'open')
+  || '|' || (SELECT count(*) FROM public.case_events e WHERE e.id = '24e90000-0000-0000-0000-0000000011a1')::text,
+  'Olivia Owner, Theo Teammate|1',
+  'a next step that only looks like an open one is saved with its timeline entry, not dropped as a replay'
 );
 
 -- ===========================================================================
