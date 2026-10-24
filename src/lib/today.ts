@@ -347,17 +347,33 @@ const TODAY_KIND_ORDER: Record<string, number> = {
 };
 
 // ─── Closed and lost cases ──────────────────────────────────────────────────
-// A closed or lost case's follow-ups leave Today (and stop reminding; see
-// reminderFollowUps in notifications.ts). The server also skips them when a
-// case closes. A placement check-in stays: the outcome of a placement is still
-// worth recording after the case itself is done.
-
-export function inactiveCaseIds(cases: Pick<CaseRecord, 'id' | 'status'>[]): Set<string> {
-  return new Set(cases.filter((record) => record.status === 'closed' || record.status === 'lost').map((record) => record.id));
-}
-
-export function followUpOnInactiveCase(followUp: FollowUp, inactive: ReadonlySet<string>): boolean {
-  return Boolean(followUp.caseId && inactive.has(followUp.caseId) && followUp.kind !== 'check_in');
+// When a case becomes closed or lost, the server skips the follow-ups open on
+// it at that moment (trigger cases_skip_follow_ups_on_close); a placement
+// check-in stays open, since a placement's outcome is still worth recording
+// after the case itself is done. This is the same rule on this device,
+// applied the moment the status changes (before the server answers, or while
+// offline), so those steps leave Today and stop reminding at once.
+//
+// It is not a filter on the case's status: a step scheduled on the case
+// AFTER it closed (a check-in's "Next step", a call back for a lost lead, one
+// added with Schedule in the case file) is an ordinary open follow-up and
+// shows on Today and reminds like any other. Filtering every open step of a
+// closed or lost case hid exactly those, for good.
+export function skipFollowUpsOnCaseClose(
+  followUps: FollowUp[],
+  caseId: string,
+  previousStatus: string,
+  nextStatus: string,
+  at: string,
+): FollowUp[] {
+  if ((nextStatus !== 'closed' && nextStatus !== 'lost') || previousStatus === nextStatus) return followUps;
+  let changed = false;
+  const next = followUps.map((item) => {
+    if (item.caseId !== caseId || item.status !== 'open' || item.kind === 'check_in') return item;
+    changed = true;
+    return { ...item, status: 'skipped' as const, completedAt: at, snoozedUntil: undefined };
+  });
+  return changed ? next : followUps;
 }
 
 export function buildTodaySections(
@@ -366,7 +382,6 @@ export function buildTodaySections(
   today: Date,
   contextFor: (followUp: FollowUp) => TodayContext,
   newLeads: TodayCard[] = [],
-  inactiveCases: ReadonlySet<string> = new Set(),
 ): TodaySections {
   const todayStamp = dateStamp(today);
   const overdue: TodayCard[] = [];
@@ -377,7 +392,6 @@ export function buildTodaySections(
   for (const followUp of followUps) {
     if (followUp.status !== 'open') continue;
     if (leadFollowUpIds.has(followUp.id)) continue;
-    if (followUpOnInactiveCase(followUp, inactiveCases)) continue;
     // Snooze mirrors the server view (today_actions uses
     // coalesce(snoozed_until, due_on) <= CURRENT_DATE).
     const effectiveDue = followUp.snoozedUntil || followUp.dueOn;

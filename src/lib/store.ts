@@ -796,7 +796,11 @@ async function readmitUnreadableUnlocked(fence: SessionFence): Promise<void> {
     await writeRejectedUnlocked(fence.userId, [...current, ...toRejected.filter((entry) => !ids.has(entry.id))]);
   }
   const readmitted = new Set(readable.map((entry) => entry.id));
-  await writeUnreadableUnlocked(fence.userId, entries.filter((entry) => !readmitted.has(entry.id)));
+  // Re-read: the queue and rejected-list reads above quarantine whatever THIS
+  // build cannot read, into this same list. Writing back the copy read at the
+  // start would drop those entries silently.
+  const latest = await readUnreadableUnlocked(fence.userId);
+  await writeUnreadableUnlocked(fence.userId, latest.filter((entry) => !readmitted.has(entry.id)));
   await assertSessionFence(fence, true);
 }
 
@@ -1164,9 +1168,11 @@ export const WORKSPACE_REVERIFY_MS = 3_000;
 // the queue on disk; they are replayed once more on the next flush, which is
 // safe: inserts replay as INSERT ... ON CONFLICT DO NOTHING, every RPC is
 // replay-safe, updates re-apply the same columns, and an op already set aside
-// is recognised by its opId and not listed twice. Every snapshot on disk is
-// one the per-op version could have written, so the ordering rules below
-// (waiting ops ahead of the rest) hold at every point.
+// is recognised by its opId and not listed twice. Whenever the rejected list
+// changes the queue is written right after that op (see rejectedChanged), so
+// the queue and rejected list on disk together are always a pair the per-op
+// version could have written, and the ordering rules below (waiting ops ahead
+// of the rest; held ops in their original order) hold at every point.
 export const QUEUE_PERSIST_EVERY_OPS = 20;
 export const QUEUE_PERSIST_EVERY_MS = 2_000;
 
@@ -1218,28 +1224,41 @@ async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
 
   let unsaved = 0; // ops processed since the queue was last written
   let waitsChanged = false; // a retry count moved since then
+  // The rejected list was written since then (an op set aside, or held with
+  // one). The queue is then written right after that op, not at the next
+  // batch boundary: otherwise a kill in between leaves ops that already
+  // landed AHEAD of the set-aside one on disk, the next flush finds them
+  // holding its rows and files them behind it in the entry, and a Retry
+  // replays the older edit last (reverting the newer one).
+  let rejectedChanged = false;
   let savedAt = Date.now();
   const persist = async (queue: QueueOp[]) => {
     await writeQueueUnlocked(fence.userId, queue, waits);
     unsaved = 0;
     waitsChanged = false;
+    rejectedChanged = false;
     savedAt = Date.now();
   };
   // After each processed op: the session must still be the one that started.
   const step = async (queue: () => QueueOp[]) => {
     await assertSessionFence(fence);
     unsaved += 1;
-    if (unsaved >= QUEUE_PERSIST_EVERY_OPS || Date.now() - savedAt >= QUEUE_PERSIST_EVERY_MS) await persist(queue());
+    if (rejectedChanged || unsaved >= QUEUE_PERSIST_EVERY_OPS || Date.now() - savedAt >= QUEUE_PERSIST_EVERY_MS) await persist(queue());
   };
   // A stop with nothing processed or counted since the last write (e.g. no
   // connection at the first op) leaves the queue on disk as it is.
   const stop = async (stopped: 'offline' | 'transient', queue: QueueOp[]): Promise<FlushOutcome> => {
-    if (unsaved || waitsChanged) await persist(queue);
+    if (unsaved || waitsChanged || rejectedChanged) await persist(queue);
     return { ...outcome, remaining: queue.length, stopped };
+  };
+  const holdWithRejected = async (holder: string, op: QueueOp) => {
+    await rejected.attach(holder, op);
+    rejectedChanged = true;
   };
 
   const setAside = async (op: QueueOp, error: unknown, reason?: string) => {
     outcome.rejected.push(await rejected.reject(op, reason ?? describeError(error, 'The server refused this change.'), errorCode(error)));
+    rejectedChanged = true;
     delete waits.parentWaits[queueOpKey(op)];
     delete waits.transientWaits[queueOpKey(op)];
   };
@@ -1271,7 +1290,7 @@ async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
     const rejectedHolder = holderOf(rows, rejected.sets);
     const deferredHolder = rejectedHolder ? undefined : holderOf(rows, deferredSets);
     if (rejectedHolder) {
-      await rejected.attach(rejectedHolder, head);
+      await holdWithRejected(rejectedHolder, head);
     } else if (deferredHolder) {
       deferred.push(head);
       hold(rows, deferredSets, deferredHolder);
@@ -1308,7 +1327,7 @@ async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
     outcome.remaining = ops.length - index - 1 + deferred.length;
   }
   if (!deferred.length) {
-    if (unsaved || waitsChanged) await persist([]);
+    if (unsaved || waitsChanged || rejectedChanged) await persist([]);
     return outcome;
   }
 
@@ -1324,7 +1343,7 @@ async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
     const rejectedHolder = holderOf(rows, rejected.sets);
     const heldBy = rejectedHolder ? undefined : holderOf(rows, retrySets);
     if (rejectedHolder) {
-      await rejected.attach(rejectedHolder, op);
+      await holdWithRejected(rejectedHolder, op);
     } else if (heldBy) {
       retained.push(op);
       hold(rows, retrySets, heldBy);
@@ -1359,7 +1378,7 @@ async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
     await step(() => [...retained, ...deferred.slice(index + 1)]);
     outcome.remaining = retained.length + deferred.length - index - 1;
   }
-  if (unsaved || waitsChanged) await persist(retained);
+  if (unsaved || waitsChanged || rejectedChanged) await persist(retained);
   return outcome;
 }
 

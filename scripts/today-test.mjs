@@ -210,7 +210,7 @@ check('the saved case list falls back only when the server is unreachable',
 // or reopened offline must move yesterday's "today" items to OVERDUE.
 check('Today re-sorts when the local day changes',
   /\}, \[followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings\.leadResponseTargetMinutes, todayStamp\]\);/.test(appSource)
-  && /todayLoad\(followUps, partners, new Date\(\), cases\), \[followUps, partners, cases, todayStamp\]\)/.test(appSource)
+  && /todayLoad\(followUps, partners\), \[followUps, partners, todayStamp\]\)/.test(appSource)
   && /AppState\.addEventListener\('change', \(state\) => \{\s*if \(state !== 'active'\) return;\s*sync\(\);\s*scheduleMidnight\(\);/.test(appSource)
   && /timer = setTimeout\(\(\) => \{ sync\(\); scheduleMidnight\(\); \}/.test(appSource));
 check('Today has pull-to-refresh on its list',
@@ -280,28 +280,48 @@ for (const c of leadCards) console.log(`    ${today.formatWaiting(today.minutesW
 }
 
 // ─── Closed and lost cases leave Today ──────────────────────────────────────
-// Their follow-ups no longer show (or remind; notifications-test.mjs). A
-// placement check-in on a closed case still shows: the outcome is still due.
+// Closing a case (or losing a lead) skips the steps open on it then, as the
+// server's close trigger does; a placement check-in stays. A step scheduled
+// on the case afterwards (a check-in's Next step, a call back for a lost lead)
+// is open and shows like any other: the case's status is not a filter.
 console.log('\n── Closed and lost cases ──');
 {
-  const statusCases = [
-    { id: 'c-closed', status: 'closed' }, { id: 'c-lost', status: 'lost' }, { id: 'c-open', status: 'engaged' },
-  ];
-  const inactive = today.inactiveCaseIds(statusCases);
-  eq('inactiveCaseIds: closed and lost only', [...inactive].sort(), ['c-closed', 'c-lost']);
+  const AT = '2026-07-24T17:00:00.000Z';
   const caseFollowUps = [
-    fu({ id: 'x-closed', title: 'Closed case call', caseId: 'c-closed' }),
+    fu({ id: 'x-closed', title: 'Closed case call', caseId: 'c-closed', snoozedUntil: '2026-07-26' }),
     fu({ id: 'x-lost-overdue', title: 'Lost case overdue', caseId: 'c-lost', dueOn: '2026-07-20' }),
     fu({ id: 'x-check-in', title: 'Check-in', caseId: 'c-closed', kind: 'check_in', referralId: 'r-9' }),
+    fu({ id: 'x-done', title: 'Already done', caseId: 'c-closed', status: 'done' }),
     fu({ id: 'x-open', title: 'Open case call', caseId: 'c-open' }),
     fu({ id: 'x-partner', title: 'Partner only', partnerId: 'p-1' }),
   ];
-  const filtered = today.buildTodaySections(caseFollowUps, [], NOW, contextFor, [], inactive);
-  eq('TODAY keeps the open case, the partner item, and the check-in', filtered.today.map((c) => c.id).sort(), ['x-check-in', 'x-open', 'x-partner']);
-  eq('OVERDUE drops the lost case', filtered.overdue.map((c) => c.id), []);
-  eq('without case statuses nothing is dropped (old callers)', today.buildTodaySections(caseFollowUps, [], NOW, contextFor).today.length + today.buildTodaySections(caseFollowUps, [], NOW, contextFor).overdue.length, 5);
-  check('App passes the closed and lost cases to Today',
-    /buildTodaySections\(followUps, partnersDueToday\(partners, now, partnerSnoozes\), now, followUpContext, leads, inactiveCaseIds\(cases\)\)/.test(appSource));
+  const closed = today.skipFollowUpsOnCaseClose(caseFollowUps, 'c-closed', 'engaged', 'closed', AT);
+  eq('closing skips that case’s open steps only (check-in, done, other cases untouched)',
+    closed.map((item) => `${item.id}:${item.status}`),
+    ['x-closed:skipped', 'x-lost-overdue:open', 'x-check-in:open', 'x-done:done', 'x-open:open', 'x-partner:open']);
+  eq('a skip is stamped like the server’s (completed now, snooze cleared)',
+    [closed[0].completedAt, closed[0].snoozedUntil], [AT, undefined]);
+  check('losing a lead skips its steps too', today.skipFollowUpsOnCaseClose(caseFollowUps, 'c-lost', 'inquiry', 'lost', AT)[1].status === 'skipped');
+  check('any other status change returns the same list', today.skipFollowUpsOnCaseClose(caseFollowUps, 'c-closed', 'engaged', 'placed', AT) === caseFollowUps);
+  check('a case already closed is not re-closed', today.skipFollowUpsOnCaseClose(caseFollowUps, 'c-closed', 'closed', 'closed', AT) === caseFollowUps);
+  check('nothing open to skip returns the same list', today.skipFollowUpsOnCaseClose(caseFollowUps, 'c-none', 'engaged', 'closed', AT) === caseFollowUps);
+  const sections = today.buildTodaySections(closed, [], NOW, contextFor, []);
+  eq('TODAY after closing: the check-in, the open case, the partner item', sections.today.map((c) => c.id).sort(), ['x-check-in', 'x-open', 'x-partner']);
+  // A step scheduled on the case after it closed (its 30-day check-in's Next
+  // step, a call back for a lost lead) is not hidden by the case's status.
+  const afterClose = [fu({ id: 'x-next', title: 'Follow up — alumni call', caseId: 'c-closed', kind: 'follow_up' }), ...closed];
+  check('a step scheduled after the close shows on Today', today.buildTodaySections(afterClose, [], NOW, contextFor, []).today.some((c) => c.id === 'x-next'));
+  check('App no longer filters Today by case status',
+    /buildTodaySections\(followUps, partnersDueToday\(partners, now, partnerSnoozes\), now, followUpContext, leads\);/.test(appSource)
+    && !/inactiveCaseIds/.test(appSource));
+  const statusBody = appSource.slice(appSource.indexOf('function changeCaseStatus('), appSource.indexOf('function saveCasePayment('));
+  check('a status change to closed or lost skips the case’s steps on this device (and rolls back with it)',
+    /const nextFollowUps = skipFollowUpsOnCaseClose\(followUps, record\.id, record\.status, status, changedAt\);/.test(statusBody)
+    && /followUps: nextFollowUps, scorecards \},\s*\{ partners, referrals, referralMatches, touches, followUps, scorecards \}/.test(statusBody)
+    && /if \(nextFollowUps !== followUps\) setFollowUps\(followUps\);/.test(statusBody));
+  const closeLoopBody = appSource.slice(appSource.indexOf('function closeLoopWithStatus('), appSource.indexOf('function confirmNextStep('));
+  check('closing the loop into closed or lost skips the other steps too',
+    /const nextFollowUps = skipFollowUpsOnCaseClose\(\s*followUps\.map\(\(item\) => item\.id === followUp\.id \? completed : item\),\s*record\.id, record\.status, updatedCase\.status, now,\s*\);/.test(closeLoopBody));
 }
 
 // ─── The admit question follows the referral, not the packet ────────────────

@@ -84,7 +84,7 @@ trigger / hourly job  ->  notification_outbox  ->  push-dispatch (edge fn)  ->  
 | `follow_ups.assigned_to` set (insert or update) to someone other than the person assigning | the assignee | `assigned_to_me` |
 | `global_partners` inserted with status `pending` and a submitting workspace | every platform admin except the submitter | `directory_submission` |
 | `global_partners` moves from `pending` to `active` or `archived` | every member of the submitting workspace except the reviewer | `directory_decision` |
-| hourly job finds open follow-ups past their day that are mine (own assignee, or the case's assignee when the follow-up has none), ignoring closed or lost cases except placement check-ins | the member, once a day at 9 AM in their timezone | `overdue_mine` |
+| hourly job finds open follow-ups past their day that are mine (own assignee, or the case's assignee when the follow-up has none). Steps open when a case closed or was lost are skipped then (`TEAM_BASICS.md`), so they no longer count; a step scheduled after the close does | the member, once a day at 9 AM in their timezone | `overdue_mine` |
 | `set_listing_beds` moves a gender's count from 0 or unknown to open (`BED_AVAILABILITY.md`) | every member of a workspace that favorited or imported the listing, except the person who set it; opt-in, default off; at most once per listing per six hours | `bed_opened` |
 
 Timezone: the app reports the device offset on every registration and

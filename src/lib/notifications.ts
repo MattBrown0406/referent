@@ -186,21 +186,14 @@ export function followUpIsMine(
   return !assignee || assignee === me;
 }
 
-// A closed or lost case's follow-ups stop reminding (Today hides them too,
-// and the server skips them on close). A placement check-in still reminds:
-// the family's outcome is worth recording after the case itself is done.
-// Mirrors inactiveCaseIds / followUpOnInactiveCase in today.ts.
-function followUpOnClosedCase(followUp: FollowUp, closedCaseIds: ReadonlySet<string>): boolean {
-  return Boolean(followUp.caseId && closedCaseIds.has(followUp.caseId) && followUp.kind !== 'check_in');
-}
-
 // The follow-ups this device should remind about, per the input's scope.
+// Closing a case (or losing a lead) skips the steps open on it then, here and
+// on the server (skipFollowUpsOnCaseClose in today.ts), so they are no longer
+// open. A step scheduled on the case after that is open and reminds like any
+// other: the case's status is not a filter.
 export function reminderFollowUps(input: NotificationInput, ownerId: string): FollowUp[] {
-  const closedCaseIds = new Set((input.cases || [])
-    .filter((record) => record.status === 'closed' || record.status === 'lost')
-    .map((record) => record.id));
   const followUps = (input.followUps || [])
-    .filter((followUp) => followUp.status === 'open' && !followUpOnClosedCase(followUp, closedCaseIds));
+    .filter((followUp) => followUp.status === 'open');
   if (input.scope === 'everyone') return followUps;
   const userId = input.userId || ownerId;
   const assigneeByCase = new Map((input.cases || []).map((record) => [record.id, record.assignedTo]));
@@ -222,15 +215,9 @@ export function followUpsDue(followUps: FollowUp[], now = new Date()): FollowUp[
     .sort((a, b) => (a.snoozedUntil || a.dueOn).localeCompare(b.snoozedUntil || b.dueOn));
 }
 
-export function todayLoad(
-  followUps: FollowUp[],
-  partners: Partner[],
-  now = new Date(),
-  cases: Pick<CaseRecord, 'id' | 'status'>[] = [],
-): { actions: number; overdueCount: number } {
+export function todayLoad(followUps: FollowUp[], partners: Partner[], now = new Date()): { actions: number; overdueCount: number } {
   const today = dateStamp(startOfToday(now));
-  const closedCaseIds = new Set(cases.filter((record) => record.status === 'closed' || record.status === 'lost').map((record) => record.id));
-  const due = followUpsDue(followUps, now).filter((followUp) => !followUpOnClosedCase(followUp, closedCaseIds));
+  const due = followUpsDue(followUps, now);
   // Once a snooze expires, overdue age follows the original due date just like
   // today_actions/buildTodaySections; the snooze controls visibility, not age.
   const overdueCount = due.filter((followUp) => followUp.dueOn < today).length;

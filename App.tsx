@@ -196,7 +196,6 @@ import {
   cardAssignee,
   defaultTodayScope,
   filterTodaySections,
-  inactiveCaseIds,
   type TodayScope,
   followUpToCard,
   formatWaiting,
@@ -205,6 +204,7 @@ import {
   nextStepDate,
   partnersDueToday,
   prunePartnerSnoozes,
+  skipFollowUpsOnCaseClose,
   snoozeDate,
   TodayCard,
   WhenChoice,
@@ -270,6 +270,8 @@ type CreateRetry = {
   message: string;
   retryable: boolean;
 };
+type LeadRetry = CreateRetry & { draft: NewLeadDraft };
+type CaseRetry = CreateRetry & { form: CaseFormState };
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
 
 const COLORS = {
@@ -1150,11 +1152,24 @@ export default function App() {
   // A New lead or New case that did not save keeps its draft and its ids:
   // the sheet reopens filled in, with the reason and a Retry that sends the
   // same ids again (the server treats a same-id retry that landed as success).
-  const [leadRetry, setLeadRetry] = useState<CreateRetry & { draft: NewLeadDraft } | null>(null);
-  const [caseRetry, setCaseRetry] = useState<CreateRetry | null>(null);
-  // Each failed save gets a token; reopening waits for the sheet to finish
-  // closing, and is dropped if the user has moved on to a newer save.
-  const createRetryTokenRef = useRef(0);
+  const [leadRetry, setLeadRetry] = useState<LeadRetry | null>(null);
+  const [caseRetry, setCaseRetry] = useState<CaseRetry | null>(null);
+  // The retry the open New lead sheet / New case form was opened FOR (null:
+  // a new one). Only its Save sends the kept ids: a lead that fails while the
+  // sheet is open on another lead must not lend that lead its ids (a same-id
+  // retry of a lead that did land is a no-op, so the second lead would be
+  // dropped) nor its notice. It waits in leadRetry / caseRetry instead.
+  const [leadSheetRetry, setLeadSheetRetry] = useState<LeadRetry | null>(null);
+  const [caseFormRetry, setCaseFormRetry] = useState<CaseRetry | null>(null);
+  // The retry waiting, for the reopen timers (state in their closures is
+  // stale). A failed save's sheet reopens once the screen is clear, and only
+  // while its retry is still the one waiting: saving or cancelling it (from a
+  // New lead / New case opened meanwhile), a newer failure, or signing out
+  // drops the reopen. Saving a different lead meanwhile does not.
+  const leadRetryRef = useRef<LeadRetry | null>(null);
+  const caseRetryRef = useRef<CaseRetry | null>(null);
+  leadRetryRef.current = leadRetry;
+  caseRetryRef.current = caseRetry;
   const [leadSettings, setLeadSettings] = useState<LeadSettings>(DEFAULT_LEAD_SETTINGS);
   // Team basics: who is in the workspace (names on timeline rows, the
   // assignee pickers, "Take this lead") and the Today scope. A scope of null
@@ -1484,9 +1499,12 @@ export default function App() {
     setShowNewLead(false);
     setShowNewCase(false);
     // A draft kept for a retry belongs to the previous account.
-    createRetryTokenRef.current += 1;
+    leadRetryRef.current = null;
+    caseRetryRef.current = null;
     setLeadRetry(null);
     setCaseRetry(null);
+    setLeadSheetRetry(null);
+    setCaseFormRetry(null);
     setPacketDisclosureRestored(false);
     setTab('home');
   }, [applySnapshot]);
@@ -3304,11 +3322,13 @@ export default function App() {
       return;
     }
     if (!mutationSlotAvailable('The case')) return;
-    // A retry of a case that did not save sends the same ids again.
-    const ids = caseRetry?.ids ?? { caseId: makeId('c'), contactId: makeId('cc'), followUpId: makeId('f') };
-    const retryToken = ++createRetryTokenRef.current;
+    // A retry of a case that did not save sends the same ids again (only
+    // from the form opened for that retry).
+    const retrying = caseFormRetry;
+    const ids = retrying?.ids ?? { caseId: makeId('c'), contactId: makeId('cc'), followUpId: makeId('f') };
     const submittedForm = caseForm;
-    setCaseRetry(null);
+    if (retrying) setCaseRetry((current) => (current === retrying ? null : current));
+    setCaseFormRetry(null);
     const now = new Date().toISOString();
     const record: CaseRecord = {
       id: ids.caseId,
@@ -3379,15 +3399,21 @@ export default function App() {
         // in, with the reason and the same ids, once it has finished closing.
         onRejected: (error) => {
           const retryable = isRetryable(error);
-          setCaseForm(submittedForm);
-          setCaseRetry({
+          // The form is filled back in only when it reopens for this retry:
+          // it may be open on another case by now.
+          const retry: CaseRetry = {
             ids,
             retryable,
+            form: submittedForm,
             message: retryable
               ? 'The case did not reach the server (no connection). Nothing is lost: tap Retry when you have signal.'
               : `The case was not saved: ${describeError(error)}`,
-          });
-          afterSheetCloses(() => setShowNewCase(true), { ifScreenBusy: 'wait', stillWanted: () => createRetryTokenRef.current === retryToken });
+          };
+          caseRetryRef.current = retry;
+          setCaseRetry(retry);
+          // As for a lead: a file opened on the unsaved case closes with it.
+          if (activeCaseIdRef.current === ids.caseId) closeCase();
+          afterSheetCloses(() => { setCaseForm(retry.form); setCaseFormRetry(retry); setShowNewCase(true); }, { ifScreenBusy: 'wait', stillWanted: () => caseRetryRef.current === retry });
           return true;
         },
       },
@@ -3395,15 +3421,19 @@ export default function App() {
   }
 
   function openNewCaseForm() {
-    createRetryTokenRef.current += 1; // this open replaces a pending reopen
-    // A case still waiting for its retry opens with its draft, not blank.
-    if (!caseRetry) setCaseForm(makeEmptyCaseForm());
+    // A case still waiting for its retry opens with its draft, not blank
+    // (and a reopen still pending for it then finds it taken or done).
+    setCaseFormRetry(caseRetry);
+    setCaseForm(caseRetry ? caseRetry.form : makeEmptyCaseForm());
     setShowNewCase(true);
   }
 
   function closeNewCaseForm() {
-    createRetryTokenRef.current += 1;
-    setCaseRetry(null);
+    // Cancelling a retry's form discards that draft; cancelling a new case
+    // leaves one still waiting for its retry alone.
+    const session = caseFormRetry;
+    if (session) setCaseRetry((current) => (current === session ? null : current));
+    setCaseFormRetry(null);
     setShowNewCase(false);
   }
 
@@ -3415,6 +3445,10 @@ export default function App() {
     const previous = cases;
     const next = previous.map((item) => (item.id === record.id ? updated : item));
     setCases(next);
+    // Closed or lost: its open steps are skipped (check-ins stay), as the
+    // server's close trigger does, so they leave Today now.
+    const nextFollowUps = skipFollowUpsOnCaseClose(followUps, record.id, record.status, status, changedAt);
+    if (nextFollowUps !== followUps) setFollowUps(nextFollowUps);
     const eventId = makeId('e');
     const event: CaseEvent = {
       id: eventId,
@@ -3424,16 +3458,23 @@ export default function App() {
       occurredAt: updated.updatedAt,
     };
     applyCaseEvent(event);
+    // Reopened from closed or lost: the server brings back the steps that
+    // close skipped (the app never loads skipped steps), so read them back.
+    const inactive = (value: CaseStatus) => value === 'closed' || value === 'lost';
+    const reopening = inactive(record.status) && !inactive(status);
     void settleOptimisticWrite(
       () => updateCaseWithEvent(updated, event),
-      { partners, referrals, referralMatches, touches, followUps, scorecards },
+      { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
       { partners, referrals, referralMatches, touches, followUps, scorecards },
       () => {
         setCases(previous);
+        if (nextFollowUps !== followUps) setFollowUps(followUps);
         setCaseEvents((current) => current.filter((item) => item.id !== eventId));
       },
       'The case status change', next, previous,
-    );
+    ).then((saved) => {
+      if (saved && reopening) void refreshFromServer('pull').catch(() => undefined);
+    });
   }
 
   function saveCasePayment(record: CaseRecord, patch: { paymentStatus?: PaymentStatus; quotedAmount?: number | null; paidAmount?: number }) {
@@ -4270,8 +4311,10 @@ export default function App() {
   const allTodaySections = useMemo(() => {
     const now = new Date();
     const leads = newLeadCards(cases, allCaseContacts, followUps, leadSettings.leadResponseTargetMinutes, now);
-    // A closed or lost case's follow-ups leave Today; placement check-ins stay.
-    return buildTodaySections(followUps, partnersDueToday(partners, now, partnerSnoozes), now, followUpContext, leads, inactiveCaseIds(cases));
+    // A closed or lost case's steps leave Today because closing skips them
+    // (skipFollowUpsOnCaseClose, as the server does), not by case status: a
+    // step scheduled on the case after it closed still shows.
+    return buildTodaySections(followUps, partnersDueToday(partners, now, partnerSnoozes), now, followUpContext, leads);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings.leadResponseTargetMinutes, todayStamp]);
 
@@ -4428,10 +4471,12 @@ export default function App() {
   // when that stays inside today; past midnight it is simply due today.
   function saveNewLead(draft: NewLeadDraft) {
     if (!mutationSlotAvailable('The lead')) return;
-    // A retry of a lead that did not save sends the same ids again.
-    const ids = leadRetry?.ids ?? { caseId: makeId('c'), contactId: makeId('cc'), followUpId: makeId('f') };
-    const retryToken = ++createRetryTokenRef.current;
-    setLeadRetry(null);
+    // A retry of a lead that did not save sends the same ids again (only
+    // from the sheet opened for that retry).
+    const retrying = leadSheetRetry;
+    const ids = retrying?.ids ?? { caseId: makeId('c'), contactId: makeId('cc'), followUpId: makeId('f') };
+    if (retrying) setLeadRetry((current) => (current === retrying ? null : current));
+    setLeadSheetRetry(null);
     const now = new Date();
     const nowIso = now.toISOString();
     const title = leadCaseTitle(draft);
@@ -4515,15 +4560,20 @@ export default function App() {
         // the reason, and the same ids, once it has finished closing.
         onRejected: (error) => {
           const retryable = isRetryable(error);
-          setLeadRetry({
+          const retry: LeadRetry = {
             draft,
             ids,
             retryable,
             message: retryable
               ? 'The lead did not reach the server (no connection). Nothing is lost: tap Retry when you have signal.'
               : `The lead was not saved: ${describeError(error)}`,
-          });
-          afterSheetCloses(() => setShowNewLead(true), { ifScreenBusy: 'wait', stillWanted: () => createRetryTokenRef.current === retryToken });
+          };
+          leadRetryRef.current = retry;
+          setLeadRetry(retry);
+          // A file opened on the unsaved case closes with it (else the
+          // screen stays "busy" and the sheet never returns).
+          if (activeCaseIdRef.current === ids.caseId) closeCase();
+          afterSheetCloses(() => { setLeadSheetRetry(retry); setShowNewLead(true); }, { ifScreenBusy: 'wait', stillWanted: () => leadRetryRef.current === retry });
           return true;
         },
       },
@@ -4532,18 +4582,21 @@ export default function App() {
 
   // A lead still waiting for its retry opens with its draft, not blank.
   function openNewLeadSheet() {
-    createRetryTokenRef.current += 1; // this open replaces a pending reopen
+    setLeadSheetRetry(leadRetry);
     setShowNewLead(true);
   }
 
   function closeNewLeadSheet() {
-    createRetryTokenRef.current += 1;
-    setLeadRetry(null);
+    // Cancelling a retry's sheet discards that draft; cancelling a new lead
+    // leaves one still waiting for its retry alone.
+    const session = leadSheetRetry;
+    if (session) setLeadRetry((current) => (current === session ? null : current));
+    setLeadSheetRetry(null);
     setShowNewLead(false);
   }
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const todayCounts = useMemo(() => todayLoad(followUps, partners, new Date(), cases), [followUps, partners, cases, todayStamp]);
+  const todayCounts = useMemo(() => todayLoad(followUps, partners), [followUps, partners, todayStamp]);
 
   function openCaseById(caseId: string) {
     if (activeCaseId === caseId) return;
@@ -4765,7 +4818,12 @@ export default function App() {
     const previousCases = cases;
     const previousFollowUps = followUps;
     const nextCases = cases.map((item) => item.id === record.id ? updatedCase : item);
-    const nextFollowUps = followUps.map((item) => item.id === followUp.id ? completed : item);
+    // Closing or losing the case skips its other open steps (check-ins stay),
+    // as the server's close trigger does.
+    const nextFollowUps = skipFollowUpsOnCaseClose(
+      followUps.map((item) => item.id === followUp.id ? completed : item),
+      record.id, record.status, updatedCase.status, now,
+    );
     setCaseCloseLoopSaving(true);
     setCases(nextCases);
     setFollowUps(nextFollowUps);
@@ -7102,13 +7160,13 @@ export default function App() {
             <View style={styles.modalHeader}>
               <TouchableOpacity accessibilityLabel="Close new case form" onPress={closeNewCaseForm} style={styles.closeButton}><AppIcon name="close" size={22} /></TouchableOpacity>
               <Text style={styles.modalHeaderTitle}>New case</Text>
-              <TouchableOpacity accessibilityRole="button" accessibilityLabel={caseRetry?.retryable ? 'Retry saving case' : 'Save case'} style={styles.modalHeaderAction} onPress={saveNewCase}><Text style={styles.saveText}>{caseRetry?.retryable ? 'Retry' : 'Save'}</Text></TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel={caseFormRetry?.retryable ? 'Retry saving case' : 'Save case'} style={styles.modalHeaderAction} onPress={saveNewCase}><Text style={styles.saveText}>{caseFormRetry?.retryable ? 'Retry' : 'Save'}</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
-              {caseRetry ? (
+              {caseFormRetry ? (
                 <View accessibilityRole="alert" style={[styles.refreshNotice, styles.rejectedNotice]}>
                   <AppIcon name="alert-circle-outline" size={15} color={COLORS.coral} />
-                  <Text style={styles.refreshNoticeText}>{caseRetry.message}</Text>
+                  <Text style={styles.refreshNoticeText}>{caseFormRetry.message}</Text>
                 </View>
               ) : null}
               <Text style={styles.formIntro}>One family, one file. Everything else — more contacts, notes, documents, payments — gets added from the case file itself.</Text>
@@ -7134,7 +7192,7 @@ export default function App() {
               <FormField label="RELATIONSHIP" value={caseForm.contactRelationship} onChangeText={(contactRelationship) => setCaseForm((current) => ({ ...current, contactRelationship }))} placeholder="mother, stepdad, referent" />
               <FormField label="PHONE" value={caseForm.contactPhone} onChangeText={(contactPhone) => setCaseForm((current) => ({ ...current, contactPhone }))} placeholder="(541) 555-0142" keyboardType="phone-pad" />
               <FormField label="EMAIL" value={caseForm.contactEmail} onChangeText={(contactEmail) => setCaseForm((current) => ({ ...current, contactEmail }))} placeholder="name@email.com" keyboardType="email-address" />
-              <TouchableOpacity style={styles.primaryButton} onPress={saveNewCase}><Text style={styles.primaryButtonText}>{caseRetry?.retryable ? 'Retry creating case file' : 'Create case file'}</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.primaryButton} onPress={saveNewCase}><Text style={styles.primaryButtonText}>{caseFormRetry?.retryable ? 'Retry creating case file' : 'Create case file'}</Text></TouchableOpacity>
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
@@ -8936,9 +8994,9 @@ export default function App() {
       <NewLeadSheet
         visible={showNewLead}
         targetMinutes={leadSettings.leadResponseTargetMinutes}
-        initialDraft={leadRetry?.draft ?? null}
-        notice={leadRetry?.message}
-        retry={Boolean(leadRetry?.retryable)}
+        initialDraft={leadSheetRetry?.draft ?? null}
+        notice={leadSheetRetry?.message}
+        retry={Boolean(leadSheetRetry?.retryable)}
         onClose={closeNewLeadSheet}
         onSave={saveNewLead}
       />

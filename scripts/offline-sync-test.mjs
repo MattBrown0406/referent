@@ -1444,6 +1444,25 @@ function legacyWaitKey(text) {
     assert.equal(supa.requestDeadlineMs('https://x.supabase.co/auth/v1/token?grant_type=refresh_token', false), supa.REQUEST_TIMEOUT_MS);
   });
 
+  await check('an upload gets time for its size: a 25 MB scan on a slow uplink is not cut off by a flat deadline', async () => {
+    const upload = 'https://x.supabase.co/storage/v1/object/case-documents/u/c/d.pdf';
+    const scan = 25 * 1024 * 1024; // the case-documents bucket limit
+    assert.equal(supa.requestBodyBytes(new ArrayBuffer(scan)), scan, 'storage-js sends an upload as its ArrayBuffer');
+    assert.equal(supa.requestBodyBytes(new Uint8Array(10)), 10);
+    assert.equal(supa.requestBodyBytes('{"a":1}'), 7);
+    assert.equal(supa.requestBodyBytes({ size: 42 }), 42, 'a Blob');
+    assert.equal(supa.requestBodyBytes(undefined), 0);
+    const deadline = supa.requestDeadlineMs(upload, false, {}, scan);
+    assert.ok(deadline >= supa.STORAGE_TRANSFER_TIMEOUT_MS + (scan / supa.STORAGE_MIN_BYTES_PER_SECOND) * 1000, `25 MB gets ${deadline} ms`);
+    assert.ok(deadline > 5 * 60_000, 'minutes, not two: ~0.5 Mbit/s still finishes');
+    assert.equal(supa.requestDeadlineMs(upload, false, {}, 0), supa.STORAGE_TRANSFER_TIMEOUT_MS);
+    assert.equal(supa.requestDeadlineMs('https://x.supabase.co/rest/v1/rpc/finalize_match_packet', false, {}, 1_000_000), supa.REQUEST_TIMEOUT_MS, 'only storage transfers stretch');
+    // End to end: 40 ms base + 100 bytes at 1,000 B/s = 140 ms for an 80 ms upload.
+    const options = { storageTransferTimeoutMs: 40, storageMinBytesPerSecond: 1000 };
+    assert.equal(await supa.withRequestTimeout(answersAfter(80), options)(upload, { method: 'POST', body: new ArrayBuffer(100) }), 'done');
+    await assert.rejects(supa.withRequestTimeout(answersAfter(80), options)(upload, { method: 'POST', body: new ArrayBuffer(1) }), /timed out/);
+  });
+
   await check('through postgrest-js: a hung GET fails once at the deadline (no retries), reads as offline, and never shows a stack', async () => {
     const { PostgrestClient } = require(path.join(repoRoot, 'node_modules', '@supabase', 'postgrest-js', 'dist', 'index.cjs'));
     let calls = 0;
@@ -1677,6 +1696,20 @@ await check('a quarantined change comes back once the app can read it again', as
   assert.deepEqual(await store.listRejectedWrites(U), []);
 });
 
+await check('readmitting a change never drops one quarantined in the same pass', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const P = 'f6f6f6f6-f6f6-4f6f-8f6f-f6f6f6f6f6f6';
+  const readable = { kind: 'partner.insert', opId: uuid(), row: { id: P, name: 'Back again', organization: 'Org', types: ['Inpatient'], owner_id: U } };
+  const unknown = { kind: 'partner.archive', opId: uuid(), id: P }; // from a newer build
+  state.asyncStorage.set(unreadableKey, JSON.stringify({ version: 1, userId: U, entries: [{ id: uuid(), source: 'queue', raw: readable, reason: 'x', quarantinedAt: new Date().toISOString() }] }));
+  state.asyncStorage.set(queueKey, JSON.stringify({ version: 2, userId: U, ops: [unknown] }));
+  assert.equal(await store.flushWriteQueue(U), 1);
+  assert.ok(state.db.partners.some((row) => row.id === P), 'the readable one was sent');
+  const listed = await store.listRejectedWrites(U);
+  assert.deepEqual(listed.map((item) => [item.status, item.kind]), [['unreadable', 'partner.archive']], 'the one quarantined while readmitting is still listed');
+});
+
 await check('1,000 queued changes flush in reasonable time: no per-op hashing, workspace check or queue rewrite', async () => {
   await freshAccount();
   await store.hydrate(U);
@@ -1718,6 +1751,37 @@ await check('a flush cut off between queue writes replays what already landed, e
   assert.equal(state.db.partners.length, 50, 'every change landed once');
   assert.equal(await store.pendingWriteCount(U), 0);
   signIn();
+});
+
+await check('a change set aside mid-batch is never filed behind an older edit that already landed (killed before the next queue write)', async () => {
+  await freshAccount();
+  await store.hydrate(U);
+  const P = 'f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5';
+  state.db.partners.push({ id: P, name: 'Hope House', organization: 'Org', types: ['Inpatient'], note: 'v0', org_id: ORG, created_at: new Date().toISOString() });
+  const older = { kind: 'partner.update', opId: uuid(), id: P, patch: { note: 'v1' } };
+  const newer = { kind: 'partner.update', opId: uuid(), id: P, patch: { note: 'v2' } };
+  const others = Array.from({ length: 5 }, (_, i) => ({ kind: 'partner.insert', opId: uuid(), row: { id: `${String(i).padStart(8, '0')}-3000-4000-8000-000000000000`, name: `Other ${i}`, organization: 'Org', types: ['Inpatient'], owner_id: U } }));
+  state.asyncStorage.set(queueKey, JSON.stringify({ version: 2, userId: U, ops: [older, newer, ...others] }));
+  let updates = 0;
+  let inserts = 0;
+  state.failOn = (b) => {
+    if (b.table === 'partners' && b.op === 'update' && ++updates === 2) return { message: 'violates check constraint', code: '23514' };
+    // The app is gone after the third unrelated insert lands, well inside one batch.
+    if (b.op === 'upsert' && b.table === 'partners' && ++inserts === 3) state.storage.set(STORAGE_KEY, JSON.stringify(makeSession(U, 'sess-2', nowS() + 3600)));
+    return null;
+  };
+  await assert.rejects(store.flushWriteQueue(U), /session changed/);
+  assert.equal(state.db.partners.find((row) => row.id === P).note, 'v1', 'the older edit landed');
+  signIn();
+  state.failOn = null;
+  await store.flushWriteQueue(U).catch(() => undefined); // the relaunch
+  const [entry] = JSON.parse(state.asyncStorage.get(rejectedKey)).entries;
+  assert.deepEqual(entry.ops.map((op) => op.patch.note), ['v2'], 'the edit that already landed is not held behind the refused one');
+  const [item] = await store.listRejectedWrites(U);
+  assert.equal(item.heldChanges, 0);
+  await store.retryRejectedWrite(U, item.id);
+  assert.equal(state.db.partners.find((row) => row.id === P).note, 'v2', 'Retry ends at the user’s last edit');
+  assert.equal(state.db.partners.length, 6);
 });
 
 await check('waits saved under the old content-hash keys keep their attempt count, now under the op id', async () => {

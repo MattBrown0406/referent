@@ -7,7 +7,7 @@
 -- against the old schema reports each failure instead of aborting.
 
 BEGIN;
-SELECT plan(67);
+SELECT plan(75);
 
 -- Actors (suffix 11a1)
 --   o1  owner of practice A ("Olivia Owner")
@@ -136,12 +136,12 @@ VALUES ('20100000-0000-0000-0000-0000000011a1', '11000000-0000-0000-0000-0000000
 INSERT INTO public.referrals (id, owner_id, partner_id, direction, referred_on, case_id)
 VALUES ('20200000-0000-0000-0000-0000000011a1', '11000000-0000-0000-0000-0000000011a1', '20100000-0000-0000-0000-0000000011a1',
         'outbound', CURRENT_DATE - 10, '21000000-0000-0000-0000-0000000011a1');
-INSERT INTO public.follow_ups (id, case_id, title, due_on, kind, waiting_on) VALUES
-  ('21100000-0000-0000-0000-0000000011a1', '21000000-0000-0000-0000-0000000011a1', 'Call back', CURRENT_DATE - 3, 'follow_up', ''),
-  ('21200000-0000-0000-0000-0000000011a1', '21000000-0000-0000-0000-0000000011a1', 'Waiting on the wife', CURRENT_DATE, 'waiting_on', 'the wife'),
-  ('22100000-0000-0000-0000-0000000011a1', '22000000-0000-0000-0000-0000000011a1', 'Other family call', CURRENT_DATE, 'follow_up', ''),
-  ('23100000-0000-0000-0000-0000000011a1', '23000000-0000-0000-0000-0000000011a1', 'Consult', CURRENT_DATE, 'consult', ''),
-  ('23200000-0000-0000-0000-0000000011a1', '23000000-0000-0000-0000-0000000011a1', 'Send packet', CURRENT_DATE, 'follow_up', '');
+INSERT INTO public.follow_ups (id, case_id, title, due_on, kind, waiting_on, assigned_to) VALUES
+  ('21100000-0000-0000-0000-0000000011a1', '21000000-0000-0000-0000-0000000011a1', 'Call back', CURRENT_DATE - 3, 'follow_up', '', '13000000-0000-0000-0000-0000000011a1'),
+  ('21200000-0000-0000-0000-0000000011a1', '21000000-0000-0000-0000-0000000011a1', 'Waiting on the wife', CURRENT_DATE, 'waiting_on', 'the wife', NULL),
+  ('22100000-0000-0000-0000-0000000011a1', '22000000-0000-0000-0000-0000000011a1', 'Other family call', CURRENT_DATE, 'follow_up', '', NULL),
+  ('23100000-0000-0000-0000-0000000011a1', '23000000-0000-0000-0000-0000000011a1', 'Consult', CURRENT_DATE, 'consult', '', NULL),
+  ('23200000-0000-0000-0000-0000000011a1', '23000000-0000-0000-0000-0000000011a1', 'Send packet', CURRENT_DATE, 'follow_up', '', NULL);
 INSERT INTO public.follow_ups (id, case_id, title, due_on, kind, status, completed_at)
 VALUES ('21300000-0000-0000-0000-0000000011a1', '21000000-0000-0000-0000-0000000011a1', 'Done earlier', CURRENT_DATE - 5, 'follow_up', 'done', '2026-10-01T12:00:00Z');
 INSERT INTO public.follow_ups (id, case_id, referral_id, title, due_on, kind, check_in_days)
@@ -187,27 +187,77 @@ SELECT is(
   'marking a case lost from a completed step skips the case''s other open follow-ups'
 );
 
--- Overdue push at 9 AM local for o1 and m2. m2's only overdue step is an
--- old open follow-up on the closed case; o1's is a placement check-in on
--- that same case.
+-- Overdue push at 9 AM local for o1, m1 and m2, all three with an overdue
+-- step on the closed case. m2's ("Call back", assigned to Theo, three days
+-- late) was open when the case closed, so the close skipped it: no push.
+-- o1's is a placement check-in, kept open: a push. m1's was scheduled on
+-- the case AFTER it closed (a lost lead's call back, a placed case's next
+-- step): an ordinary open step, so a push, as on Today.
 SELECT set_config('test.tz', ((((9 - extract(hour FROM now() AT TIME ZONE 'UTC')::integer + 36) % 24) - 12) * 60)::text, true);
 INSERT INTO public.notification_preferences (user_id, push_enabled, tz_offset_minutes) VALUES
   ('11000000-0000-0000-0000-0000000011a1', true, current_setting('test.tz')::integer),
+  ('12000000-0000-0000-0000-0000000011a1', true, current_setting('test.tz')::integer),
   ('13000000-0000-0000-0000-0000000011a1', true, current_setting('test.tz')::integer);
 INSERT INTO public.push_tokens (expo_push_token, user_id, org_id, platform) VALUES
   ('ExponentPushToken[r11owner0001]', '11000000-0000-0000-0000-0000000011a1', current_setting('test.org_a')::uuid, 'ios'),
+  ('ExponentPushToken[r11maya00001]', '12000000-0000-0000-0000-0000000011a1', current_setting('test.org_a')::uuid, 'ios'),
   ('ExponentPushToken[r11theo00001]', '13000000-0000-0000-0000-0000000011a1', current_setting('test.org_a')::uuid, 'ios');
-INSERT INTO public.follow_ups (id, owner_id, case_id, title, due_on, kind, assigned_to) VALUES
-  ('21500000-0000-0000-0000-0000000011a1', '11000000-0000-0000-0000-0000000011a1', '21000000-0000-0000-0000-0000000011a1',
-   'Left open on a closed case', CURRENT_DATE - 5, 'follow_up', '13000000-0000-0000-0000-0000000011a1');
 INSERT INTO public.follow_ups (id, owner_id, case_id, referral_id, title, due_on, kind, check_in_days, assigned_to) VALUES
   ('21600000-0000-0000-0000-0000000011a1', '11000000-0000-0000-0000-0000000011a1', '21000000-0000-0000-0000-0000000011a1',
    '20200000-0000-0000-0000-0000000011a1', '30-day check-in', CURRENT_DATE - 5, 'check_in', 30, '11000000-0000-0000-0000-0000000011a1');
+INSERT INTO public.follow_ups (id, owner_id, case_id, title, due_on, kind, assigned_to) VALUES
+  ('21700000-0000-0000-0000-0000000011a1', '11000000-0000-0000-0000-0000000011a1', '21000000-0000-0000-0000-0000000011a1',
+   'Call back after closing', CURRENT_DATE - 1, 'promised_call', '12000000-0000-0000-0000-0000000011a1');
+SELECT is(
+  (SELECT status || '|' || assigned_to::text FROM public.follow_ups WHERE id = '21100000-0000-0000-0000-0000000011a1'),
+  'skipped|13000000-0000-0000-0000-0000000011a1',
+  'Theo''s late step was skipped when the case closed'
+);
 SELECT public.notify_overdue_follow_ups();
 SELECT is(
   (SELECT string_agg(user_id::text, ',' ORDER BY user_id) FROM public.notification_outbox WHERE kind = 'overdue_mine'),
-  '11000000-0000-0000-0000-0000000011a1',
-  'the overdue push ignores a closed case''s follow-up but still counts its placement check-in'
+  '11000000-0000-0000-0000-0000000011a1,12000000-0000-0000-0000-0000000011a1',
+  'the overdue push counts a closed case''s check-in and a step scheduled after the close, not a step the close skipped'
+);
+
+-- Reopening puts back exactly the steps the close skipped, also across a
+-- closed -> lost move; a step skipped by hand and a finished step stay.
+SET LOCAL ROLE authenticated;
+INSERT INTO public.cases (id, title) VALUES ('2b000000-0000-0000-0000-0000000011a1', 'Reopened family');
+INSERT INTO public.follow_ups (id, case_id, title, due_on, kind, snoozed_until) VALUES
+  ('2b100000-0000-0000-0000-0000000011a1', '2b000000-0000-0000-0000-0000000011a1', 'Consult Friday', CURRENT_DATE + 3, 'consult', NULL),
+  ('2b200000-0000-0000-0000-0000000011a1', '2b000000-0000-0000-0000-0000000011a1', 'Promised call', CURRENT_DATE, 'promised_call', CURRENT_DATE + 1);
+INSERT INTO public.follow_ups (id, case_id, title, due_on, kind, status, completed_at) VALUES
+  ('2b300000-0000-0000-0000-0000000011a1', '2b000000-0000-0000-0000-0000000011a1', 'Skipped by hand', CURRENT_DATE, 'follow_up', 'skipped', '2026-10-02T12:00:00Z'),
+  ('2b400000-0000-0000-0000-0000000011a1', '2b000000-0000-0000-0000-0000000011a1', 'Done earlier', CURRENT_DATE, 'follow_up', 'done', '2026-10-02T12:00:00Z');
+SELECT lives_ok(
+  $$ SELECT public.update_case_with_event('{"id":"2b000000-0000-0000-0000-0000000011a1","status":"closed"}'::jsonb,
+       '{"id":"2b900000-0000-0000-0000-0000000011a1","kind":"status_change","body":"inquiry to closed"}'::jsonb) $$,
+  'a case is closed by mistake'
+);
+INSERT INTO public.follow_ups (id, case_id, title, due_on, kind) VALUES
+  ('2b500000-0000-0000-0000-0000000011a1', '2b000000-0000-0000-0000-0000000011a1', 'Added after closing', CURRENT_DATE + 2, 'follow_up');
+SELECT lives_ok(
+  $$ SELECT public.update_case_with_event('{"id":"2b000000-0000-0000-0000-0000000011a1","status":"lost"}'::jsonb,
+       '{"id":"2b910000-0000-0000-0000-0000000011a1","kind":"status_change","body":"closed to lost"}'::jsonb) $$,
+  'then moved to lost'
+);
+SELECT is(
+  (SELECT string_agg(title || '=' || status, ', ' ORDER BY title) FROM public.follow_ups WHERE case_id = '2b000000-0000-0000-0000-0000000011a1'),
+  'Added after closing=skipped, Consult Friday=skipped, Done earlier=done, Promised call=skipped, Skipped by hand=skipped',
+  'closed, then lost: every open step is skipped'
+);
+SELECT lives_ok(
+  $$ SELECT public.update_case_with_event('{"id":"2b000000-0000-0000-0000-0000000011a1","status":"consult"}'::jsonb,
+       '{"id":"2b920000-0000-0000-0000-0000000011a1","kind":"status_change","body":"lost to consult"}'::jsonb) $$,
+  'and reopened'
+);
+RESET ROLE;
+SELECT is(
+  (SELECT string_agg(title || '=' || status || '/' || (completed_at IS NULL)::text || '/' || (completed_by IS NULL)::text, ', ' ORDER BY title)
+     FROM public.follow_ups WHERE case_id = '2b000000-0000-0000-0000-0000000011a1'),
+  'Added after closing=open/true/true, Consult Friday=open/true/true, Done earlier=done/false/false, Promised call=open/true/true, Skipped by hand=skipped/false/false',
+  'reopening puts back exactly the steps the close skipped, with no completion left on them'
 );
 
 -- ===========================================================================
@@ -293,6 +343,32 @@ SELECT is(
   (SELECT completed_at FROM public.follow_ups WHERE id = '24600000-0000-0000-0000-0000000011a1'),
   '2026-10-24T16:00:00Z'::timestamptz,
   'the finished step keeps its first completion'
+);
+
+-- Maya finishes a step from her phone moments before the owner's "Done ->
+-- next" on the same step arrives. The owner's next step is not a replay:
+-- it is saved with its timeline entry, and the step keeps Maya's completion.
+SET LOCAL ROLE authenticated;
+INSERT INTO public.follow_ups (id, case_id, title, due_on, kind) VALUES
+  ('24a00000-0000-0000-0000-0000000011a1', '24000000-0000-0000-0000-0000000011a1', 'Call the wife', CURRENT_DATE, 'follow_up');
+SELECT set_config('request.jwt.claim.sub', '12000000-0000-0000-0000-0000000011a1', true);
+UPDATE public.follow_ups SET status = 'done', completed_at = '2026-10-24T15:30:00Z' WHERE id = '24a00000-0000-0000-0000-0000000011a1';
+SELECT set_config('request.jwt.claim.sub', '11000000-0000-0000-0000-0000000011a1', true);
+SELECT lives_ok(
+  $$ SELECT public.complete_follow_up_with_next(
+       '{"id":"24a00000-0000-0000-0000-0000000011a1","status":"done","completed_at":"2026-10-24T16:10:00Z"}'::jsonb,
+       '{"id":"24b00000-0000-0000-0000-0000000011a1","case_id":"24000000-0000-0000-0000-0000000011a1","title":"Consult Monday","due_on":"2026-10-27","status":"open","kind":"consult"}'::jsonb,
+       '{"id":"24b90000-0000-0000-0000-0000000011a1","case_id":"24000000-0000-0000-0000-0000000011a1","kind":"system","body":"Completed: Call the wife, set next: Consult Monday"}'::jsonb) $$,
+  'Done -> next on a step a colleague just finished'
+);
+RESET ROLE;
+SELECT is(
+  (SELECT (f.completed_at = '2026-10-24T15:30:00Z'::timestamptz)::text || '|' || f.completed_by::text
+          || '|' || (SELECT n.status FROM public.follow_ups n WHERE n.id = '24b00000-0000-0000-0000-0000000011a1')
+          || '|' || (SELECT count(*) FROM public.case_events e WHERE e.id = '24b90000-0000-0000-0000-0000000011a1')::text
+     FROM public.follow_ups f WHERE f.id = '24a00000-0000-0000-0000-0000000011a1'),
+  'true|12000000-0000-0000-0000-0000000011a1|open|1',
+  'the next step and its timeline entry are saved; the step keeps the colleague''s completion'
 );
 
 -- ===========================================================================

@@ -1,5 +1,5 @@
 import { forceLocalSignOut } from './auth-session';
-import { RejectedWritesError, StoreError, describeError, errorCode } from './errors';
+import { RejectedWritesError, StoreError, describeError, errorCode, isServerUnreachable } from './errors';
 import { fetchCurrentOrgId } from './org';
 import { fetchAllPages } from './paging';
 import { forgetWorkspaceBinding, isNetworkError, prepareForWorkspaceChange, rejectedWriteCount, waitingWriteCount } from './store';
@@ -64,6 +64,9 @@ async function removeWorkspaceCaseFiles(): Promise<void> {
 // The server's own wording for a refusal ("Remove the other members of your
 // workspace first", …), without the PostgREST code suffix describeError adds.
 function serverMessage(error: unknown, fallback: string): string {
+  // A gateway or network failure is not a refusal worth quoting (its text may
+  // be an HTML page); describeError gives safe text for those.
+  if (isServerUnreachable(error)) return describeError(error, fallback);
   const message = (error as { message?: unknown } | null)?.message;
   return typeof message === 'string' && message.trim() ? message.trim() : describeError(error, fallback);
 }

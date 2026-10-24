@@ -197,26 +197,28 @@ assert.equal(nativeState.scheduled.some((item) => /Teammate/.test(item.content.b
   assert.doesNotMatch(source, /body: `\$\{followUp\.title\}|\$\{partner\.(name|organization)\}|followUpBody/, 'no notification body is built from a title or a partner name');
 }
 
-// A closed or lost case's follow-ups stop reminding; a placement check-in on
-// it still reminds. todayLoad (the header count) agrees.
+// Closing a case (or losing a lead) skips the steps open on it then, so they
+// stop reminding; a placement check-in on it still reminds. A step scheduled
+// on the case after it closed is open and reminds like any other: the case's
+// status is not a filter. todayLoad (the header count) agrees.
 {
   nativeState.scheduled = [];
   const closedCases = [{ id: 'c-closed', status: 'closed' }, { id: 'c-lost', status: 'lost' }, { id: 'c-open', status: 'engaged' }];
   const closedFollowUps = [
-    { id: 'f-closed', title: 'Closed', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-closed', assignedTo: ME },
-    { id: 'f-lost-consult', title: 'Lost consult', kind: 'consult', dueTime: '15:00', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-lost', assignedTo: ME },
+    { id: 'f-closed', title: 'Closed', dueOn: stamp(tomorrow), status: 'skipped', note: '', caseId: 'c-closed', assignedTo: ME },
+    { id: 'f-lost-consult', title: 'Lost consult', kind: 'consult', dueTime: '15:00', dueOn: stamp(tomorrow), status: 'skipped', note: '', caseId: 'c-lost', assignedTo: ME },
     { id: 'f-check-in', title: 'Check-in', kind: 'check_in', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-closed', referralId: 'r1', assignedTo: ME },
+    { id: 'f-call-back', title: 'Call back — lost lead', kind: 'promised_call', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-lost', assignedTo: ME },
     { id: 'f-open', title: 'Open case', dueOn: stamp(tomorrow), status: 'open', note: '', caseId: 'c-open', assignedTo: ME },
   ];
   const input = { partners: [], referrals: [], referralMatches: [], followUps: closedFollowUps, cases: closedCases };
-  assert.deepEqual(notifications.reminderFollowUps(input, ME).map((item) => item.id), ['f-check-in', 'f-open'], 'closed and lost cases drop out; check-ins stay');
-  assert.deepEqual(notifications.reminderFollowUps({ ...input, scope: 'everyone' }, ME).map((item) => item.id), ['f-check-in', 'f-open'], 'in every scope');
+  assert.deepEqual(notifications.reminderFollowUps(input, ME).map((item) => item.id), ['f-check-in', 'f-call-back', 'f-open'], 'skipped steps drop out; check-ins and steps scheduled after the close stay');
+  assert.deepEqual(notifications.reminderFollowUps({ ...input, scope: 'everyone' }, ME).map((item) => item.id), ['f-check-in', 'f-call-back', 'f-open'], 'in every scope');
   await notifications.rescheduleNotifications(input, ME);
-  assert.equal(nativeState.scheduled.filter((item) => item.content.title === 'Follow-up due').length, 2);
-  assert.equal(nativeState.scheduled.filter((item) => item.content.title === 'Consult in 30 minutes').length, 0, 'no consult alert for a lost case');
+  assert.equal(nativeState.scheduled.filter((item) => item.content.title === 'Follow-up due').length, 3);
+  assert.equal(nativeState.scheduled.filter((item) => item.content.title === 'Consult in 30 minutes').length, 0, 'no consult alert for a skipped consult');
   const dueNow = closedFollowUps.map((item) => ({ ...item, dueOn: stamp(new Date()) }));
-  assert.equal(notifications.todayLoad(dueNow, [], new Date(), closedCases).actions, 2, 'the header count skips closed and lost cases too');
-  assert.equal(notifications.todayLoad(dueNow, [], new Date()).actions, 4, 'without case statuses nothing is dropped');
+  assert.equal(notifications.todayLoad(dueNow, [], new Date()).actions, 3, 'the header count skips skipped steps, not a case by its status');
 }
 
 // Overdue follow-ups collapse into ONE summary at 9:00 instead of each firing

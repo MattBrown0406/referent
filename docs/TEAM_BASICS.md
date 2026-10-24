@@ -38,16 +38,33 @@ colleague already has. Same return shape as `assign_case` (`event_body`,
 `assign_case` is unchanged and stays the explicit "Assigned to" picker.
 
 **Closing a case** (20261024120000 section 14). When a case becomes
-`closed` or `lost`, by any path, its open follow-ups are marked `skipped`
-(stamped now, by the member who closed it). Placement check-ins
-(`kind = 'check_in'`) stay open. The 9 AM overdue push ignores follow-ups
-on closed or lost cases except check-ins, matching Today.
+`closed` or `lost`, by any path, the follow-ups open on it at that moment
+are marked `skipped` (by the member who closed it, `completed_at` = the
+case's `stage_changed_at`, which marks them as that close's). Placement
+check-ins (`kind = 'check_in'`) stay open. A step scheduled on the case
+after it closed is an ordinary open step: Today shows it and the 9 AM
+overdue push counts it. Reopening the case (any status other than closed
+or lost) puts exactly the steps its close skipped back to open; a move
+between closed and lost carries them along. Steps skipped by hand stay
+skipped.
 
 **Done -> next** (20261024120000 section 15). The next step keeps the
 completed step's assignee (or the `assigned_to` the client sends; unassigned
-if that person has left). A step that is already done or skipped is not
-completed again and no next step or timeline entry is written, so a second
-"Done -> next" queued after a crash cannot add a duplicate next step.
+if that person has left). A step that is already done or skipped keeps its
+first completion. If the next step is already saved (its id exists, or an
+open step with the same case, partner, kind, title and day does), the call
+writes nothing, so a replay or a second "Done -> next" queued after a crash
+cannot add a duplicate. Any other next step (a colleague, a VOB answer or a
+close finished the step first) is still saved with its timeline entry, as
+`record_outreach_sent` does.
+
+**Membership realtime** (20261024120000 section 20). The `supabase_realtime`
+publication sends inserts and updates only (the app listens for
+`org_members` updates), so a removed member's or deleted account's row is
+never broadcast to other workspaces. Only the publication's owner can make
+that change: if the paste runs as another role it prints a warning and the
+rest of the migration still applies; then turn off Delete and Truncate for
+`supabase_realtime` under Database, Publications in the dashboard.
 
 **Today: Mine / Everyone.** Mine keeps what is assigned to you and anything
 nobody has taken yet, so an unowned item never disappears from everyone's

@@ -2307,19 +2307,39 @@ GRANT EXECUTE ON FUNCTION public.prepare_account_deletion() TO authenticated;
 -- schedule_placement_check_ins creates) stay open: a placement's outcome
 -- is still worth recording after the case is done. A trigger, so every
 -- status write behaves the same. A skip is stamped like a client skip
--- (completed_at now; completed_by the member who closed the case).
+-- (completed_by the member who closed the case), with completed_at the
+-- case's stage_changed_at, which marks it as that close's skip. Reopening
+-- the case puts exactly those steps back to open (the app never loads a
+-- skipped step, so a mis-tapped "closed" could not be undone otherwise);
+-- moving between closed and lost moves the mark to the new status. A step
+-- scheduled after the close is an ordinary open step (Today shows it and
+-- notify_overdue_follow_ups, unchanged from 20261001140000, counts it).
 CREATE OR REPLACE FUNCTION public.cases_skip_follow_ups_on_close()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, public
 AS $$
+DECLARE
+  v_closing boolean := NEW.status IN ('closed', 'lost');
 BEGIN
-  UPDATE public.follow_ups f
-     SET status = 'skipped', completed_at = now(), snoozed_until = NULL
-   WHERE f.case_id = NEW.id
-     AND f.org_id = NEW.org_id
-     AND f.status = 'open'
-     AND f.kind <> 'check_in';
+  IF OLD.status IN ('closed', 'lost') THEN
+    UPDATE public.follow_ups f
+       SET status = CASE WHEN v_closing THEN 'skipped' ELSE 'open' END,
+           completed_at = CASE WHEN v_closing THEN NEW.stage_changed_at END
+     WHERE f.case_id = NEW.id
+       AND f.org_id = NEW.org_id
+       AND f.status = 'skipped'
+       AND f.kind <> 'check_in'
+       AND f.completed_at = OLD.stage_changed_at;
+  END IF;
+  IF v_closing THEN
+    UPDATE public.follow_ups f
+       SET status = 'skipped', completed_at = NEW.stage_changed_at, snoozed_until = NULL
+     WHERE f.case_id = NEW.id
+       AND f.org_id = NEW.org_id
+       AND f.status = 'open'
+       AND f.kind <> 'check_in';
+  END IF;
   RETURN NULL;
 END
 $$;
@@ -2329,60 +2349,47 @@ DROP TRIGGER IF EXISTS cases_skip_follow_ups_on_close ON public.cases;
 CREATE TRIGGER cases_skip_follow_ups_on_close
   AFTER UPDATE OF status ON public.cases
   FOR EACH ROW
-  WHEN (NEW.status IN ('closed', 'lost') AND OLD.status IS DISTINCT FROM NEW.status)
+  WHEN (OLD.status IS DISTINCT FROM NEW.status
+        AND (NEW.status IN ('closed', 'lost') OR OLD.status IN ('closed', 'lost')))
   EXECUTE FUNCTION public.cases_skip_follow_ups_on_close();
-
--- Same as 20261001140000 except a follow-up on a closed or lost case no
--- longer counts, unless it is a placement check-in (kept open above, and
--- still on Today in the app).
-CREATE OR REPLACE FUNCTION public.notify_overdue_follow_ups()
-RETURNS integer
-LANGUAGE plpgsql SECURITY DEFINER
-SET search_path = public
-AS $$
-DECLARE
-  v_pref record;
-  v_local timestamp;
-  v_count integer := 0;
-BEGIN
-  FOR v_pref IN SELECT user_id, tz_offset_minutes, overdue_notified_on
-                  FROM public.notification_preferences
-                 WHERE push_enabled AND overdue_mine LOOP
-    v_local := (now() AT TIME ZONE 'UTC') + make_interval(mins => v_pref.tz_offset_minutes);
-    IF extract(hour FROM v_local) <> 9 THEN CONTINUE; END IF;
-    IF v_pref.overdue_notified_on IS NOT DISTINCT FROM v_local::date THEN CONTINUE; END IF;
-    IF NOT EXISTS (
-      SELECT 1 FROM public.follow_ups f
-        LEFT JOIN public.cases c ON c.id = f.case_id
-       WHERE f.status = 'open'
-         AND coalesce(f.snoozed_until, f.due_on) < v_local::date
-         AND coalesce(f.assigned_to, c.assigned_to) = v_pref.user_id
-         AND (c.id IS NULL OR c.status NOT IN ('closed', 'lost') OR f.kind = 'check_in')
-    ) THEN CONTINUE; END IF;
-    IF public.notify_enqueue(v_pref.user_id, 'overdue_mine', jsonb_build_object('day', v_local::date::text)) THEN
-      v_count := v_count + 1;
-    END IF;
-    UPDATE public.notification_preferences SET overdue_notified_on = v_local::date WHERE user_id = v_pref.user_id;
-  END LOOP;
-  RETURN v_count;
-END
-$$;
-REVOKE ALL ON FUNCTION public.notify_overdue_follow_ups() FROM PUBLIC, anon, authenticated, service_role;
 
 -- ===========================================================================
 -- 15. complete_follow_up_with_next: the assignee carries over, once only
 -- ===========================================================================
 
+-- True when the next step p_next is already saved: its id exists, or an
+-- open step with the same case, partner, kind, title and day does (the
+-- same "Done -> next" sent twice, e.g. queued again with new ids after a
+-- crash hid the first). Invoker: only the caller's workspace is seen.
+CREATE OR REPLACE FUNCTION public.follow_up_next_saved(p_org uuid, p_next jsonb)
+RETURNS boolean
+LANGUAGE sql STABLE
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.follow_ups n
+     WHERE n.org_id = p_org
+       AND (n.id = nullif(p_next ->> 'id', '')::uuid
+            OR (n.status = 'open'
+                AND n.case_id IS NOT DISTINCT FROM nullif(p_next ->> 'case_id', '')::uuid
+                AND n.partner_id IS NOT DISTINCT FROM nullif(p_next ->> 'partner_id', '')::uuid
+                AND n.kind = coalesce(p_next ->> 'kind', 'follow_up')
+                AND n.title = p_next ->> 'title'
+                AND n.due_on = nullif(p_next ->> 'due_on', '')::date))
+  )
+$$;
+REVOKE ALL ON FUNCTION public.follow_up_next_saved(uuid, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.follow_up_next_saved(uuid, jsonb) TO authenticated;
+
 -- Same as section 8 except:
 --   * the next step is assigned to whoever the completed step was assigned
 --     to, or to p_next.assigned_to when the client sends that key (JSON
---     null = unassigned), and is unassigned when that person is no longer
---     a member of the workspace (as record_outreach_sent does);
---   * a follow-up that is already done or skipped is left alone and the
---     call writes nothing. A replay of the same call finds its next step
---     and timeline entry already there; a second "Done -> next" that the
---     app queued after a crash hid the first (new ids) no longer adds a
---     duplicate next step.
+--     null = unassigned); unassigned when that person has left;
+--   * a step already done or skipped keeps its first completion. A replay,
+--     or the same next step sent twice, then writes nothing; any other next
+--     step (a colleague, a VOB answer or a close finished the step first)
+--     is still saved with its timeline entry, as record_outreach_sent does.
 CREATE OR REPLACE FUNCTION public.complete_follow_up_with_next(p_completed jsonb, p_next jsonb, p_event jsonb)
 RETURNS void
 LANGUAGE plpgsql
@@ -2402,7 +2409,7 @@ BEGIN
    WHERE f.id = (p_completed ->> 'id')::uuid AND f.org_id = v_org_id
    FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'Follow-up not found for the authenticated owner' USING ERRCODE = 'P0002'; END IF;
-  IF v_status <> 'open' THEN RETURN; END IF;
+  IF v_status <> 'open' AND public.follow_up_next_saved(v_org_id, p_next) THEN RETURN; END IF;
 
   IF p_next ? 'assigned_to' THEN
     v_assignee := nullif(p_next ->> 'assigned_to', '')::uuid;
@@ -2413,11 +2420,13 @@ BEGIN
     v_assignee := NULL;
   END IF;
 
-  UPDATE public.follow_ups
-     SET status = p_completed ->> 'status',
-         completed_at = nullif(p_completed ->> 'completed_at', '')::timestamptz,
-         snoozed_until = nullif(p_completed ->> 'snoozed_until', '')::date
-   WHERE id = (p_completed ->> 'id')::uuid AND org_id = v_org_id;
+  IF v_status = 'open' THEN
+    UPDATE public.follow_ups
+       SET status = p_completed ->> 'status',
+           completed_at = nullif(p_completed ->> 'completed_at', '')::timestamptz,
+           snoozed_until = nullif(p_completed ->> 'snoozed_until', '')::date
+     WHERE id = (p_completed ->> 'id')::uuid AND org_id = v_org_id;
+  END IF;
 
   INSERT INTO public.follow_ups (
     id, owner_id, partner_id, referral_id, case_id, title, due_on, status,
@@ -2763,12 +2772,16 @@ GRANT EXECUTE ON FUNCTION public.update_vob_status(uuid, jsonb, uuid) TO authent
 -- Realtime sends a DELETE event with the old row's key to every subscriber
 -- of the table, whatever its filter, so a member leaving or an account
 -- deletion leaked user ids across workspaces. org_members is the only
--- table in the publication and the app listens for UPDATE only.
+-- table in the publication and the app listens for UPDATE only. Only the
+-- publication's owner may change it; if that is not the role running this
+-- paste, a warning says so and the rest of the migration still applies.
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
     ALTER PUBLICATION supabase_realtime SET (publish = 'insert, update');
   END IF;
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING 'supabase_realtime was not changed (%). In the dashboard, Database, Publications: turn off Delete and Truncate for supabase_realtime.', SQLERRM;
 END
 $$;
 
