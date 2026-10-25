@@ -140,7 +140,7 @@ eq('tomorrow', today.nextStepDate('tomorrow', NOW), '2026-07-25');
 eq('in 3 days', today.nextStepDate('in3days', NOW), '2026-07-27');
 eq('next week (+7)', today.nextStepDate('nextweek', NOW), '2026-07-31');
 eq('custom', today.nextStepDate('custom', NOW, '2026-08-14'), '2026-08-14');
-eq('custom without a date falls back to today', today.nextStepDate('custom', NOW), '2026-07-24');
+eq('custom without a date falls back to the first date offered (tomorrow)', today.nextStepDate('custom', NOW), '2026-07-25');
 eq('snooze +1', today.snoozeDate('plus1', NOW), '2026-07-25');
 eq('snooze +2', today.snoozeDate('plus2', NOW), '2026-07-26');
 eq('snooze next week', today.snoozeDate('nextweek', NOW), '2026-07-31');
@@ -205,6 +205,14 @@ check('hydration seeds contacts through the cache-aware case loader',
   /const load = await loadCaseList\(userId\);[\s\S]{0,700}setAllCaseContacts\(activeContacts\)/.test(appSource));
 check('the saved case list falls back only when the server is unreachable',
   /remote = await fetchCaseList\(\);\s*\} catch \(error\) \{\s*if \(!isNetworkError\(error\)\) throw error;/.test(storeSource));
+// The sections are rebuilt when the local day changes (midnight, or a return
+// to the foreground), not only when data changes: an app left open overnight
+// or reopened offline must move yesterday's "today" items to OVERDUE.
+check('Today re-sorts when the local day changes',
+  /\}, \[followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings\.leadResponseTargetMinutes, todayStamp\]\);/.test(appSource)
+  && /todayLoad\(followUps, partners\), \[followUps, partners, todayStamp\]\)/.test(appSource)
+  && /AppState\.addEventListener\('change', \(state\) => \{\s*if \(state !== 'active'\) return;\s*sync\(\);\s*scheduleMidnight\(\);/.test(appSource)
+  && /timer = setTimeout\(\(\) => \{ sync\(\); scheduleMidnight\(\); \}/.test(appSource));
 check('Today has pull-to-refresh on its list',
   /function HomeScreen\(\) \{[\s\S]{0,900}<ScrollView[^>]*refreshControl=\{renderRefreshControl\(\)\}/.test(appSource));
 
@@ -257,6 +265,74 @@ eq('sections without leads are unchanged', [leadSections.overdue.length, leadSec
 eq('minutesWaiting counts whole minutes and never goes negative', [today.minutesWaiting(minutesAgo(20), NOW), today.minutesWaiting(minutesAgo(-5), NOW)], [20, 0]);
 eq('formatWaiting', [4, 59, 60, 75, 1439, 1500, 3000].map(today.formatWaiting), ['4m', '59m', '1h 0m', '1h 15m', '23h 59m', '1d 1h', '2d 2h']);
 for (const c of leadCards) console.log(`    ${today.formatWaiting(today.minutesWaiting(c.lead.arrivedAt, NOW)).padEnd(7)} ${c.lead.immediateDanger ? '⚠ ' : '  '}${c.title}  — ${c.subtitle}`);
+
+// A snoozed lead leaves NEW LEADS until its snooze date, and does not show
+// under TODAY or OVERDUE meanwhile; once the date comes it is back in NEW LEADS.
+{
+  const snoozedLeadFollowUps = leadFollowUps.map((item) => (item.id === 'f-lead-1' ? { ...item, snoozedUntil: '2026-07-25' } : item));
+  const snoozedCards = today.newLeadCards(leadCases, leadContacts, snoozedLeadFollowUps, 15, NOW);
+  eq('a snoozed lead is not in NEW LEADS', snoozedCards.map((c) => c.id), ['f-lead-2', 'f-lead-3']);
+  const snoozedSections = today.buildTodaySections(snoozedLeadFollowUps, due, NOW, contextFor, snoozedCards);
+  check('nor under TODAY or OVERDUE while snoozed', !snoozedSections.today.concat(snoozedSections.overdue).some((c) => c.id === 'f-lead-1'));
+  const nextDay = new Date(2026, 6, 25, 9, 0, 0);
+  check('it comes back to NEW LEADS on the snooze date', today.newLeadCards(leadCases, leadContacts, snoozedLeadFollowUps, 15, nextDay).some((c) => c.id === 'f-lead-1'));
+  check('a snooze that already passed changes nothing', today.newLeadCards(leadCases, leadContacts, leadFollowUps.map((item) => (item.id === 'f-lead-1' ? { ...item, snoozedUntil: '2026-07-20' } : item)), 15, NOW).some((c) => c.id === 'f-lead-1'));
+}
+
+// ─── Closed and lost cases leave Today ──────────────────────────────────────
+// Closing a case (or losing a lead) skips the steps open on it then, as the
+// server's close trigger does; a placement check-in stays. A step scheduled
+// on the case afterwards (a check-in's Next step, a call back for a lost lead)
+// is open and shows like any other: the case's status is not a filter.
+console.log('\n── Closed and lost cases ──');
+{
+  const AT = '2026-07-24T17:00:00.000Z';
+  const caseFollowUps = [
+    fu({ id: 'x-closed', title: 'Closed case call', caseId: 'c-closed', snoozedUntil: '2026-07-26' }),
+    fu({ id: 'x-lost-overdue', title: 'Lost case overdue', caseId: 'c-lost', dueOn: '2026-07-20' }),
+    fu({ id: 'x-check-in', title: 'Check-in', caseId: 'c-closed', kind: 'check_in', referralId: 'r-9' }),
+    fu({ id: 'x-done', title: 'Already done', caseId: 'c-closed', status: 'done' }),
+    fu({ id: 'x-open', title: 'Open case call', caseId: 'c-open' }),
+    fu({ id: 'x-partner', title: 'Partner only', partnerId: 'p-1' }),
+  ];
+  const closed = today.skipFollowUpsOnCaseClose(caseFollowUps, 'c-closed', 'engaged', 'closed', AT);
+  eq('closing skips that case’s open steps only (check-in, done, other cases untouched)',
+    closed.map((item) => `${item.id}:${item.status}`),
+    ['x-closed:skipped', 'x-lost-overdue:open', 'x-check-in:open', 'x-done:done', 'x-open:open', 'x-partner:open']);
+  eq('a skip is stamped like the server’s (completed now, snooze cleared)',
+    [closed[0].completedAt, closed[0].snoozedUntil], [AT, undefined]);
+  check('losing a lead skips its steps too', today.skipFollowUpsOnCaseClose(caseFollowUps, 'c-lost', 'inquiry', 'lost', AT)[1].status === 'skipped');
+  check('any other status change returns the same list', today.skipFollowUpsOnCaseClose(caseFollowUps, 'c-closed', 'engaged', 'placed', AT) === caseFollowUps);
+  check('a case already closed is not re-closed', today.skipFollowUpsOnCaseClose(caseFollowUps, 'c-closed', 'closed', 'closed', AT) === caseFollowUps);
+  check('nothing open to skip returns the same list', today.skipFollowUpsOnCaseClose(caseFollowUps, 'c-none', 'engaged', 'closed', AT) === caseFollowUps);
+  const sections = today.buildTodaySections(closed, [], NOW, contextFor, []);
+  eq('TODAY after closing: the check-in, the open case, the partner item', sections.today.map((c) => c.id).sort(), ['x-check-in', 'x-open', 'x-partner']);
+  // A step scheduled on the case after it closed (its 30-day check-in's Next
+  // step, a call back for a lost lead) is not hidden by the case's status.
+  const afterClose = [fu({ id: 'x-next', title: 'Follow up — alumni call', caseId: 'c-closed', kind: 'follow_up' }), ...closed];
+  check('a step scheduled after the close shows on Today', today.buildTodaySections(afterClose, [], NOW, contextFor, []).today.some((c) => c.id === 'x-next'));
+  check('App no longer filters Today by case status',
+    /buildTodaySections\(followUps, partnersDueToday\(partners, now, partnerSnoozes\), now, followUpContext, leads\);/.test(appSource)
+    && !/inactiveCaseIds/.test(appSource));
+  const statusBody = appSource.slice(appSource.indexOf('function changeCaseStatus('), appSource.indexOf('function saveCasePayment('));
+  check('a status change to closed or lost skips the case’s steps on this device (and rolls back with it)',
+    /const nextFollowUps = skipFollowUpsOnCaseClose\(followUps, record\.id, record\.status, status, changedAt\);/.test(statusBody)
+    && /followUps: nextFollowUps, scorecards \},\s*\{ partners, referrals, referralMatches, touches, followUps, scorecards \}/.test(statusBody)
+    && /if \(nextFollowUps !== followUps\) setFollowUps\(followUps\);/.test(statusBody));
+  const closeLoopBody = appSource.slice(appSource.indexOf('function closeLoopWithStatus('), appSource.indexOf('function confirmNextStep('));
+  check('closing the loop into closed or lost skips the other steps too',
+    /const nextFollowUps = skipFollowUpsOnCaseClose\(\s*followUps\.map\(\(item\) => item\.id === followUp\.id \? completed : item\),\s*record\.id, record\.status, updatedCase\.status, now,\s*\);/.test(closeLoopBody));
+}
+
+// ─── The admit question follows the referral, not the packet ────────────────
+// An outbound referral with no admit answer yet asks "did they admit?" when
+// its check is done, whether it went out by packet or by Assign & refer.
+check('admit question gated on direction Outbound and admitted == null',
+  /referralAwaitingAnswer: Boolean\(referral && referral\.direction === 'Outbound' && referral\.admitted == null\)/.test(appSource)
+  && !/referralAwaitingAnswer: Boolean\(referral\?\.packetSentAt/.test(appSource));
+check('Today context lookups use Maps, not a find per card',
+  /function followUpContext\(followUp: FollowUp\) \{\s*const partner = followUp\.partnerId \? partnerById\.get\(followUp\.partnerId\)/.test(appSource));
+check('Done → Next step keeps the assignee', /caseId: followUp\.caseId,[\s\S]{0,200}assignedTo: followUp\.assignedTo,[\s\S]{0,40}kind: stepForm\.kind/.test(appSource));
 
 // ─── Mine / Everyone (team basics) ──────────────────────────────────────────
 const scopeFollowUps = [

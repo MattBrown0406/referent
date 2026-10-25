@@ -75,12 +75,15 @@ const stages = [
   { id: 's4', caseId: 'c2', status: 'placed', enteredAt: '2026-07-12T12:00:00Z' },
   { id: 's5', caseId: 'c3', status: 'lost', enteredAt: '2026-07-21T12:00:00Z' },
 ];
+// Square invoices here came from the webhook (lastSyncedAt set): only those
+// take the place of a case's own quote and payments.
+const SYNCED = '2026-08-01T00:00:00Z';
 const integrations = [
-  { id: 'i1', caseId: 'c1', provider: 'square', recordType: 'invoice', externalId: 'inv1', status: 'partially_paid', amountCents: 100000, paidAmountCents: 50000, currency: 'USD', dueOn: '2026-08-01', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' },
+  { id: 'i1', caseId: 'c1', provider: 'square', recordType: 'invoice', externalId: 'inv1', status: 'partially_paid', amountCents: 100000, paidAmountCents: 50000, currency: 'USD', dueOn: '2026-08-01', externalUrl: '', metadata: {}, lastSyncedAt: SYNCED, updatedAt: '2026-08-01T00:00:00Z' },
   { id: 'i2', caseId: 'c1', provider: 'pandadoc', recordType: 'document', externalId: 'doc1', status: 'document.sent', amountCents: 350000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' },
   // Older still-open proposal for the same case must not be double-counted.
   { id: 'i2-old', caseId: 'c1', provider: 'pandadoc', recordType: 'document', externalId: 'doc0', status: 'document.viewed', amountCents: 250000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-07-31T00:00:00Z' },
-  { id: 'i3', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv2', status: 'paid', amountCents: 200000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' },
+  { id: 'i3', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv2', status: 'paid', amountCents: 200000, currency: 'USD', externalUrl: '', metadata: {}, lastSyncedAt: SYNCED, updatedAt: '2026-08-01T00:00:00Z' },
 ];
 const referrals = [
   { id: 'r1', partnerId: 'p1', direction: 'Outbound', clientLabel: 'A.B.', date: '2026-07-10', outcome: 'Placed', note: '' },
@@ -110,6 +113,103 @@ equal('source ordering', result.sources.map((item) => [item.source, item.cases, 
   ['Professional referral', 1, 2000],
 ]);
 equal('average days to engaged', result.averageDaysToEngaged, 2.5);
+
+// ─── The same external record linked by two teammates ──────────────────────
+// case_integrations is unique per owner, so a teammate can link the same
+// Square invoice or PandaDoc document to the same case. Webhooks sync only
+// the connecting owner's row; the teammate's copy goes stale. Each record
+// counts once per case, and the synced copy speaks for it.
+const syncedIntegrations = integrations;
+const teammateCopies = [
+  // Same invoice, same case, linked later by a teammate and never synced.
+  { id: 'i1-teammate', caseId: 'c1', provider: 'square', recordType: 'invoice', externalId: ' inv1 ', status: 'unpaid', amountCents: 100000, paidAmountCents: 0, currency: 'USD', dueOn: '2026-08-01', externalUrl: '', metadata: {}, updatedAt: '2026-08-03T00:00:00Z' },
+  // Same paid invoice on c2, linked twice.
+  { id: 'i3-teammate', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv2', status: 'paid', amountCents: 200000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-07-30T00:00:00Z' },
+  // Same open proposal on c1, linked twice.
+  { id: 'i2-teammate', caseId: 'c1', provider: 'pandadoc', recordType: 'document', externalId: 'doc1', status: 'document.sent', amountCents: 350000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-07-30T00:00:00Z' },
+  // A contract on c2 the provider says is completed; the teammate's stale
+  // copy still reads "sent" (and was edited more recently) and must not
+  // count as pending.
+  { id: 'i4', caseId: 'c2', provider: 'pandadoc', recordType: 'document', externalId: 'doc9', status: 'document.completed', amountCents: 500000, currency: 'USD', externalUrl: '', metadata: {}, lastSyncedAt: '2026-08-02T00:00:00Z', updatedAt: '2026-08-02T00:00:00Z' },
+  { id: 'i4-teammate', caseId: 'c2', provider: 'pandadoc', recordType: 'document', externalId: 'doc9', status: 'document.sent', amountCents: 500000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-04T00:00:00Z' },
+];
+const duplicated = business.computeBusinessDashboard(cases, referrals, { stages, integrations: [...syncedIntegrations, ...teammateCopies] }, 90, new Date(2026, 7, 6, 12));
+equal('a record linked twice counts once: revenue', {
+  quoted: duplicated.quotedRevenue,
+  collected: duplicated.collectedRevenue,
+  outstanding: duplicated.outstandingRevenue,
+}, { quoted: 3000, collected: 2500, outstanding: 500 });
+equal('a record linked twice counts once: invoices and contracts', [duplicated.pendingContracts, duplicated.pendingContractRevenue, duplicated.openInvoices, duplicated.overdueInvoices], [1, 3500, 1, 1]);
+equal('a record linked twice counts once: per source', duplicated.sources.map((item) => [item.source, item.quoted, item.collected]), [
+  ['Website', 1000, 500],
+  ['Professional referral', 2000, 2000],
+]);
+const pick = (rows) => business.uniqueIntegrations(rows).map((item) => item.id);
+const row = (overrides) => ({ caseId: 'c1', provider: 'square', recordType: 'invoice', externalId: 'inv1', status: 'unpaid', amountCents: null, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z', ...overrides });
+equal('the synced copy wins over a more recently edited one', pick([row({ id: 'b', updatedAt: '2026-08-09T00:00:00Z', amountCents: 100 }), row({ id: 'a', lastSyncedAt: '2026-08-01T00:00:00Z' })]), ['a']);
+equal('then a copy with an amount', pick([row({ id: 'a', updatedAt: '2026-08-09T00:00:00Z' }), row({ id: 'b', amountCents: 100 })]), ['b']);
+equal('then the most recent edit, then the lower id', [
+  pick([row({ id: 'a' }), row({ id: 'b', updatedAt: '2026-08-02T00:00:00Z' })]),
+  pick([row({ id: 'b' }), row({ id: 'a' })]),
+], [['b'], ['a']]);
+equal('distinct records, cases, record types and providers all stay', pick([
+  row({ id: '1' }),
+  row({ id: '2', externalId: 'inv2' }),
+  row({ id: '3', caseId: 'c2' }),
+  row({ id: '4', recordType: 'payment' }),
+  row({ id: '5', provider: 'pandadoc', recordType: 'document' }),
+]), ['1', '2', '3', '4', '5']);
+
+// ─── A canceled invoice is not quoted revenue ──────────────────────────────
+// The family was invoiced $15,000 by mistake, the invoice was canceled and a
+// corrected $12,000 one sent. The case's quote is $12,000, not $27,000.
+{
+  const reissued = [
+    { id: 'x1', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv-wrong', status: 'CANCELED', amountCents: 1500000, paidAmountCents: null, currency: 'USD', dueOn: '2026-07-15', externalUrl: '', metadata: {}, lastSyncedAt: SYNCED, updatedAt: '2026-07-14T00:00:00Z' },
+    { id: 'x2', caseId: 'c2', provider: 'square', recordType: 'invoice', externalId: 'inv-right', status: 'unpaid', amountCents: 1200000, paidAmountCents: 0, currency: 'USD', dueOn: '2026-09-15', externalUrl: '', metadata: {}, lastSyncedAt: SYNCED, updatedAt: '2026-07-15T00:00:00Z' },
+  ];
+  const canceled = business.computeBusinessDashboard([cases[1]], [], { stages, integrations: reissued }, 90, new Date(2026, 7, 6, 12));
+  equal('a canceled invoice counts toward neither quoted, collected nor outstanding', [canceled.quotedRevenue, canceled.collectedRevenue, canceled.outstandingRevenue, canceled.sources[0].quoted, canceled.openInvoices], [12000, 0, 12000, 12000, 1]);
+  // A refund still shows what was billed, with nothing collected or owed.
+  const refunded = business.computeBusinessDashboard([cases[1]], [], { stages, integrations: [{ ...reissued[1], status: 'refunded', paidAmountCents: 1200000 }] }, 90, new Date(2026, 7, 6, 12));
+  equal('a refunded invoice is quoted, not collected, not outstanding', [refunded.quotedRevenue, refunded.collectedRevenue, refunded.outstandingRevenue], [12000, 0, 0]);
+}
+
+// ─── Who speaks for a case's money ─────────────────────────────────────────
+// An invoice linked by hand is a reminder, not a record from Square: the
+// case's own quote and payments still count. Only a webhook-synced invoice
+// (lastSyncedAt) takes their place.
+{
+  const now = new Date(2026, 7, 6, 12);
+  const record = makeCase({ id: 'm1', status: 'engaged', quotedAmount: 9000, paidAmount: 4000, createdAt: '2026-07-01T12:00:00Z' });
+  const invoice = { id: 'm-inv', caseId: 'm1', provider: 'square', recordType: 'invoice', externalId: 'inv-m', status: 'paid', amountCents: 100000, paidAmountCents: null, currency: 'USD', dueOn: '2026-07-20', externalUrl: '', metadata: {}, updatedAt: '2026-08-01T00:00:00Z' };
+  const money = (items, cases = [record]) => {
+    const result = business.computeBusinessDashboard(cases, [], { stages: [], integrations: items }, 90, now);
+    return [result.quotedRevenue, result.collectedRevenue, result.outstandingRevenue];
+  };
+  equal('a hand-linked "paid" invoice does not replace the case totals', money([invoice]), [9000, 4000, 5000]);
+  equal('a synced invoice does', money([{ ...invoice, lastSyncedAt: SYNCED }]), [1000, 1000, 0]);
+  equal('a legacy "completed" counts as paid', money([{ ...invoice, status: 'completed', lastSyncedAt: SYNCED }]), [1000, 1000, 0]);
+  equal('status case and spacing do not matter', money([{ ...invoice, status: 'PAID', lastSyncedAt: SYNCED }]), [1000, 1000, 0]);
+  equal('a draft is neither quoted nor outstanding', money([{ ...invoice, status: 'DRAFT', paidAmountCents: 0, lastSyncedAt: SYNCED }, { ...invoice, id: 'm-inv2', externalId: 'inv-m2', status: 'unpaid', amountCents: 300000, paidAmountCents: 0, lastSyncedAt: SYNCED }]), [3000, 0, 3000]);
+  const partial = business.computeBusinessDashboard([record], [], { stages: [], integrations: [{ ...invoice, status: 'partially_refunded', paidAmountCents: 100000, lastSyncedAt: SYNCED }] }, 90, now);
+  equal('a partially refunded invoice is finished: nothing outstanding, not open, not overdue', [partial.quotedRevenue, partial.collectedRevenue, partial.outstandingRevenue, partial.openInvoices, partial.overdueInvoices], [1000, 1000, 0, 0, 0]);
+  equal('and its refund is labelled as not tracked', partial.refundsNotTracked, 1);
+  equal('nothing else is labelled', business.computeBusinessDashboard([record], [], { stages: [], integrations: [{ ...invoice, lastSyncedAt: SYNCED }] }, 90, now).refundsNotTracked, 0);
+  equal('open / not open', ['unpaid', 'partially_paid', 'scheduled', 'paid', 'Partially Refunded', 'refunded', 'cancelled', 'draft', 'completed'].map(business.invoiceIsOpen), [true, true, true, false, false, false, false, false, false]);
+  equal('normalized statuses', ['Completed', 'CANCELLED', 'Partially paid', 'partially-refunded'].map(business.normalizeInvoiceStatus), ['paid', 'canceled', 'partially_paid', 'partially_refunded']);
+  equal('the picker offers Square\'s statuses', business.SQUARE_INVOICE_STATUSES.map((option) => option.value), ['unpaid', 'partially_paid', 'paid', 'partially_refunded', 'refunded', 'canceled', 'draft']);
+  // A lost case owes nothing; its quote stays in Quoted.
+  const lost = { ...record, id: 'm2', status: 'lost' };
+  equal('a lost case contributes nothing to outstanding (case totals)', money([], [lost]), [9000, 4000, 0]);
+  equal('a lost case contributes nothing to outstanding (synced invoice)', money([{ ...invoice, caseId: 'm2', status: 'unpaid', paidAmountCents: 0, lastSyncedAt: SYNCED }], [lost]), [1000, 0, 0]);
+  const panel = readFileSync(path.join(repoRoot, 'src/lib/CaseIntegrationPanel.tsx'), 'utf8');
+  equal('the panel picks a Square invoice status from the list instead of typing it', [
+    /squareStatusChoices\(form\.status\)\.map/.test(panel),
+    /isSquareInvoice\(form\) \? \(/.test(panel),
+    /refund amount not tracked/.test(panel),
+  ], [true, true, true]);
+}
 
 // ─── Speed to lead ──────────────────────────────────────────────────────────
 // A lead is a case with leadCapturedAt; its clock stops at firstTouchAt. The
@@ -146,6 +246,17 @@ equal('per-source lead counts', leadResult.sources.map((item) => [item.source, i
   ['Inbound call', 2, 2, 0],
 ]);
 equal('the dashboard target defaults to 15 minutes', business.computeBusinessDashboard(leadCases, [], { stages: [], integrations: [] }, 90, leadNow).speedToLead.targetMinutes, 15);
+
+equal('whole-dollar fields read what people type, and refuse what they would misread', [
+  business.parseWholeDollars(''),
+  business.parseWholeDollars('1500'),
+  business.parseWholeDollars('$1,500'),
+  business.parseWholeDollars('1,500.00'),
+  business.parseWholeDollars('0'),
+  business.parseWholeDollars('1500.50'),
+  business.parseWholeDollars('4,50'),
+  business.parseWholeDollars('abc'),
+], [null, 1500, 1500, 1500, 0, undefined, undefined, undefined]);
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

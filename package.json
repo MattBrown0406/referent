@@ -15,8 +15,10 @@
     "expo-file-system": "57.0.1",
     "expo-font": "57.0.1",
     "expo-image-picker": "~57.0.6",
+    "expo-mail-composer": "57.0.1",
     "expo-notifications": "~57.0.7",
     "expo-secure-store": "57.0.1",
+    "expo-sms": "57.0.1",
     "expo-status-bar": "~57.0.1",
     "expo-updates": "~57.0.10",
     "react": "19.2.3",
@@ -35,7 +37,7 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "typecheck": "tsc --noEmit --pretty false",
-    "test": "node scripts/native-compat-test.mjs && node scripts/store-account-test.mjs && node scripts/notifications-test.mjs && node scripts/mutation-test.mjs && node scripts/phone-test.mjs && node scripts/packet-test.mjs && node scripts/matching-test.mjs && node scripts/business-test.mjs && node scripts/contract-revenue-test.mjs && node scripts/today-test.mjs && node scripts/self-serve-accounts-test.mjs && node scripts/directory-submission-test.mjs && node scripts/bed-availability-test.mjs && node scripts/outcomes-test.mjs && node scripts/insurance-test.mjs",
+    "test": "node scripts/native-compat-test.mjs && node scripts/store-account-test.mjs && node scripts/notifications-test.mjs && node scripts/mutation-test.mjs && node scripts/phone-test.mjs && node scripts/packet-test.mjs && node scripts/matching-test.mjs && node scripts/business-test.mjs && node scripts/contract-revenue-test.mjs && node scripts/today-test.mjs && node scripts/self-serve-accounts-test.mjs && node scripts/directory-submission-test.mjs && node scripts/bed-availability-test.mjs && node scripts/outcomes-test.mjs && node scripts/insurance-test.mjs && node scripts/outreach-test.mjs",
     "quality": "npm run typecheck && npm test",
     "eas-build-pre-install": "npm install --global npm@10.9.8"
   },
@@ -49,8 +51,10 @@
         "expo-file-system",
         "expo-font",
         "expo-image-picker",
+        "expo-mail-composer",
         "expo-notifications",
         "expo-secure-store",
+        "expo-sms",
         "expo-updates",
         "react-native"
       ]

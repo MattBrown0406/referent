@@ -12,6 +12,7 @@ import {
 
 import { formatMoney, type Referral } from '../data';
 import BenchmarksPanel from './BenchmarksPanel';
+import { INTAKE_LINK_ENABLED } from './intake-link';
 import type { CaseRecord } from './cases';
 import { formatTurnaroundDays } from './insurance';
 import { formatDays, formatRate, formatStars } from './outcomes';
@@ -20,6 +21,8 @@ import {
   type BusinessPeriod,
   computeBusinessDashboard,
   type CaseIntegration,
+  invoiceIsOpen,
+  uniqueIntegrations,
 } from './business';
 
 type Props = {
@@ -73,8 +76,10 @@ function needsAttention(record: CaseIntegration, today: string): boolean {
     return record.recordType === 'document'
       && !['document.completed', 'document.paid', 'document.declined', 'document.voided', 'completed', 'paid', 'declined', 'voided'].includes(status);
   }
+  // Open invoices only: paid, refunded (in full or in part), canceled and
+  // draft invoices never need chasing.
   return record.recordType === 'invoice'
-    && !['paid', 'canceled', 'cancelled', 'refunded'].includes(status)
+    && invoiceIsOpen(record.status)
     && Boolean(record.dueOn && record.dueOn <= today);
 }
 
@@ -98,7 +103,8 @@ export default function BusinessDashboard({
   );
   const speed = metrics.speedToLead;
   const today = localDateStamp(new Date());
-  const attention = data.integrations.filter((record) => needsAttention(record, today));
+  // One row per linked invoice or contract, even when two teammates linked it.
+  const attention = uniqueIntegrations(data.integrations).filter((record) => needsAttention(record, today));
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
@@ -146,7 +152,7 @@ export default function BusinessDashboard({
           ) : null}
 
           <Text style={styles.sectionTitle}>Financial snapshot</Text>
-          <Text style={styles.sectionNote}>The period selects cases by open date; dollar figures are their current totals. Linked Square invoices take precedence over manual case totals.</Text>
+          <Text style={styles.sectionNote}>The period selects cases by open date; dollar figures are their current totals. Invoices synced from Square take the place of a case's own quote and payments; an invoice linked by hand does not. Drafts are not counted, and a lost case owes nothing.</Text>
           <View style={styles.metricGrid}>
             <View style={styles.metricCard}>
               <Text style={styles.metricLabel}>COLLECTED</Text>
@@ -169,9 +175,14 @@ export default function BusinessDashboard({
               <Text style={styles.metricDetail}>{metrics.placedCases} placed · {metrics.lostCases} lost</Text>
             </View>
           </View>
+          {metrics.refundsNotTracked > 0 ? (
+            <Text style={styles.emptyFootnote}>
+              Refunds not tracked: {metrics.refundsNotTracked} partially refunded {metrics.refundsNotTracked === 1 ? 'invoice does' : 'invoices do'} not say how much went back, so Collected shows what was paid before the refund.
+            </Text>
+          ) : null}
 
           <Text style={styles.sectionTitle}>Speed to lead</Text>
-          <Text style={styles.sectionNote}>Leads from New lead and the intake link, by arrival date. The clock runs from arrival to the first logged call, text, email, or meeting. Target: {speed.targetMinutes} minutes (Workspace).</Text>
+          <Text style={styles.sectionNote}>{INTAKE_LINK_ENABLED ? 'Leads from New lead and the intake link' : 'Leads from New lead'}, by arrival date. The clock runs from arrival to the first logged call, text, email, or meeting. Target: {speed.targetMinutes} minutes (Workspace).</Text>
           <View style={styles.metricGrid}>
             <View style={styles.metricCard}>
               <Text style={styles.metricLabel}>MEDIAN RESPONSE</Text>
@@ -187,7 +198,7 @@ export default function BusinessDashboard({
             </View>
           </View>
           {speed.leads === 0 ? (
-            <Text style={styles.emptyFootnote}>Add leads with New lead on Today, or share your intake link from Workspace, and this fills in.</Text>
+            <Text style={styles.emptyFootnote}>{INTAKE_LINK_ENABLED ? 'Add leads with New lead on Today, or share your intake link from Workspace, and this fills in.' : 'Add leads with New lead on Today and this fills in.'}</Text>
           ) : null}
 
           <Text style={styles.sectionTitle}>Case funnel</Text>
@@ -329,7 +340,7 @@ export default function BusinessDashboard({
                 return (
                   <TouchableOpacity
                     key={record.id}
-                    onPress={() => record.externalUrl ? Linking.openURL(record.externalUrl) : onOpenCase(record.caseId)}
+                    onPress={() => (record.externalUrl ? Linking.openURL(record.externalUrl).catch(() => onOpenCase(record.caseId)) : onOpenCase(record.caseId))}
                     style={[styles.attentionRow, index === attention.length - 1 && styles.lastRow]}
                   >
                     <View style={styles.attentionBadge}><Text style={styles.attentionBadgeText}>{record.provider === 'square' ? 'S' : 'P'}</Text></View>

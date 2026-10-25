@@ -14,7 +14,10 @@ Two doors into the same place:
 1. **New lead** on Today (the app). Phone-first, under ten seconds: caller
    name, phone, optional email, who they are calling about (relationship and
    first name only), lead source, and one safety choice. Saving creates the
-   case (status inquiry), the caller as primary contact, a **first-call**
+   case (status inquiry), the caller as primary contact (with their own side
+   of the relationship: calling about a son makes them "parent", about
+   themselves "self"; `lead_caller_relationship()`, "family member" when
+   unsure), a **first-call**
    follow-up due today at now + the workspace's first-call target, and a
    system timeline entry, in one transaction (`create_lead`).
 2. **The intake link** (hosted form). Each workspace has an opaque token on
@@ -58,7 +61,7 @@ Then:
 | `cases.first_touch_at` | Set once by the `case_events_first_touch` trigger on the first `call`, `text`, `email`, or `meeting` event for the case. Never moves. Backfilled for existing cases from their earliest logged touch. |
 | `cases.lead_channel` | `app` or `intake_link`. |
 | `cases.lead_urgency` | `none` or `immediate_danger`. |
-| `intake_rate_limits` | Fixed-window counters keyed `token:<token>` and `ip:<hmac>`. Service role only. |
+| `intake_rate_limits` | Fixed-window counters keyed `token:<token>`, `ip:<hmac>` and `ip-post:<hmac>`. Service role only. |
 
 Only leads captured through New lead or the intake link count toward speed to
 lead. A case created with the full New case form is not a lead (its
@@ -170,10 +173,45 @@ until the function exists. Nothing else depends on it.
 | Honeypot (`company`) filled | 200 thank-you page, nothing created. |
 | Other methods | 405. |
 
-Rate limits (in `supabase/functions/intake/intake.ts`): 30 submissions per
-token per hour, 6 per visitor address per hour, enforced by
-`intake_rate_limit_hit` in the database. Pages carry a strict
+Rate limits (in `supabase/functions/intake/intake.ts`), enforced by
+`intake_rate_limit_hit` in the database, in this order (`admitPost`):
+
+1. every POST from a visitor address, whatever it contains: 20 per hour
+   (`ip-post:<hmac>`);
+2. the form is read, the honeypot checked, and the fields validated; a
+   honeypot or invalid post stops here and is charged to nothing else;
+3. a submission that will create a lead: 6 per visitor address per hour
+   (`ip:<hmac>`), then a hard cap of 300 per link per hour
+   (`token-hard:<token>`, refused with 429), then the link budget of 30 per
+   hour (`token:<token>`).
+
+A lead past the 30-an-hour budget (but under the hard cap) is still created,
+so a flood on a practice's link cannot turn a real family away. The function
+sends it with `suspected_spam: true`; `create_lead_from_intake` adds a
+"Possible spam" line to the case summary and queues no new-lead push. An
+"immediate danger" answer keeps its flag and summary line either way
+(20261024120000 section 21).
+
+Junk posts therefore never spend the practice's link budget (before
+2026-10-24 about 30 junk posts could lock a link for an hour), and a family
+that mistypes a few times is not locked out.
+
+The visitor address is `cf-connecting-ip`, else the last `X-Forwarded-For`
+hop (added by the nearest proxy), else `x-real-ip`; never the first
+`X-Forwarded-For` entry, which the client writes. The per-address buckets
+slow down casual abuse; the per-link buckets (charged only for leads that
+would be created) are the backstop, and a lead flood still needs
+valid-looking names and phone numbers.
+
+The form has no `action` attribute, so it posts back to the page's own URL
+(hosted: `/functions/v1/intake/<token>`; the function itself sees only
+`/intake/<token>`, so an action built from that path made every hosted
+submit 404). CSP `form-action 'self'` allows it. Pages carry a strict
 Content-Security-Policy, no scripts, `noindex`, and `no-store`.
+
+In-app quick-add (`create_lead`) is replay-safe: a retry with the same case
+id after a timeout returns that case and writes nothing (no second first
+call, timeline entry or push). `create_case_bundle` follows the same rule.
 
 Local checks, matching CI:
 

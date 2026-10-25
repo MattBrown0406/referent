@@ -21,10 +21,11 @@ every screen.
    Re-run it any time to reset the reviewer workspace; it refuses to touch a
    workspace that has any other member.
 3. **Sign in once yourself** on a device with those credentials and tap
-   through Today, Partners, Matching, Cases, Business, Directory, Workspace.
-   The sample partners are complete, so partner detail shows **Submit to
-   directory**. If a reviewer taps it, an `example.com` listing lands in
-   Workspace → *Directory submissions*; reject it
+   through the tabs (Home, Match, Cases, Directory, Referrals), the Business
+   dashboard, and Workspace and settings (the gear icon at the top of the
+   screen). The sample partners are complete, so partner detail shows **Submit
+   to directory**. If a reviewer taps it, an `example.com` listing lands in
+   Workspace and settings → *Directory submissions*; reject it
    (`docs/DIRECTORY_SUBMISSIONS.md`).
 4. **App Store Connect → App Information → App Review Information.**
    - Sign-in required: **on**
@@ -43,8 +44,9 @@ Facts the answer rests on (all verifiable in this repo):
 - Sign-in is email/password. The sign-in screen also offers self-serve
   "Create account" (practice name, your name, email, password) and "Forgot
   password?" (`src/lib/LoginScreen.tsx`). Accounts are free.
-- In-app account deletion (guideline 5.1.1(v)): Workspace screen → "Delete
-  account…" → two confirmations → `public.delete_own_account()` RPC deletes
+- In-app account deletion (guideline 5.1.1(v)): Workspace and settings (the
+  gear icon at the top of every screen) → "Delete account…" → two
+  confirmations → `public.delete_own_account()` RPC deletes
   the auth user (and the whole workspace when the user is its sole owner).
   See `docs/SELF_SERVE_ACCOUNTS.md`.
 - `react-native-purchases` is **not** installed. No RevenueCat products,
@@ -70,7 +72,11 @@ Suggested reply — paste into the App Store Connect message thread:
 > content or feature has ever been sold for this app.
 >
 > **4. What paid content is unlocked without In-App Purchase?** None. All
-> functionality is free for every account.
+> functionality is free for every account. One optional feature, AI-drafted
+> follow-up messages, can use the practitioner's own API key from a
+> third-party AI provider (Anthropic), which they obtain and manage with that
+> provider directly. ReferralFit does not sell, resell, or receive payment for
+> it, and the app links to no purchase.
 >
 > **5. Are the enterprise services sold to single users, consumers, or for
 > family use?** No enterprise services are sold. ReferralFit is a free
@@ -79,7 +85,8 @@ Suggested reply — paste into the App Store Connect message thread:
 >
 > **6. How do users obtain an account? Is there a fee?** Anyone can create an
 > account from the sign-in screen ("Create account") at no charge, and can
-> delete it from the Workspace screen. ReferralFit also sets up accounts for a
+> delete it in the app (Workspace and settings, the gear icon at the top of
+> the screen). ReferralFit also sets up accounts for a
 > practice's staff on request. There is no fee to create an account or to use
 > the app. The demo account provided in App
 > Review Information has full access to every feature.
@@ -91,7 +98,7 @@ the app never collects payment details.
 
 ## 3. Notes for the reviewer (App Review Information → Notes)
 
-Current text for 1.0.3 (8). Fill in the demo password from App Store Connect;
+Current text for 1.0.4 (2). Fill in the demo password from App Store Connect;
 never write it here.
 
 > ReferralFit is a free B2B tool for addiction-intervention practices. It is
@@ -107,8 +114,9 @@ never write it here.
 > private workspace immediately. "Forgot password?" sends a reset link that
 > opens the app.
 >
-> ACCOUNT DELETION (5.1.1(v)): Workspace tab → scroll to "Delete account…" →
-> two confirmations. This deletes the sign-in and, for a sole owner, the whole
+> ACCOUNT DELETION (5.1.1(v)): tap the gear icon at the top right of any
+> screen (Workspace and settings) → scroll to "Delete account…" → two
+> confirmations. This deletes the sign-in and, for a sole owner, the whole
 > workspace. Please do not delete the demo account; create a throwaway account
 > if you want to test deletion.
 >
@@ -123,20 +131,24 @@ never write it here.
 > They are not a way to pay ReferralFit, and the app never collects payment
 > details.
 >
-> Push notifications are optional. Local reminders (daily briefing,
-> follow-up cadence) are scheduled on the device; server-sent pushes (a new
-> lead, something assigned to you, your follow-ups past due, a directory
-> decision) are turned on by the user in Workspace > "Notify me about..."
-> and carry only a generic line with no names or case details.
+> FOLLOW UP / AI DRAFTS (optional): the Follow up button (on the Home tab, a
+> case, or a partner) gives a ready draft to edit and send from the iPhone's own Messages
+> or Mail; it works without any setup. "Draft with AI" is optional and uses
+> the practice's own Anthropic API key, which the user creates under their
+> own Anthropic account and adds in the app. ReferralFit sells nothing and receives no
+> payment for it. Before a key is added, the app explains exactly what is
+> sent to Anthropic. Trying "Draft with AI" needs your own Anthropic key;
+> every other part of Follow up works without one.
 >
-> NEW LEAD / INTAKE LINK: "New lead" on Today is a quick form for a practice
-> to record an inbound call (name and phone are enough); the lead then shows
-> under NEW LEADS with a clock until the practice calls back. Workspace →
-> "Your intake link" is a public web page, branded with the practice name,
-> that a family can fill in to ask the practice to call them. It is hosted
-> by us, collects only a name, phone, optional email, and who the call is
-> about, and states that it is not emergency care. It involves no payment
-> and no account.
+> Notifications are optional and asked for only after the user taps to turn
+> them on. Reminders (daily briefing, follow-up cadence, consults) are
+> scheduled on the device and show only generic text, never client, family,
+> or program names.
+>
+> NEW LEAD: "New lead" on the Home tab is a quick form for a practice to
+> record an inbound call (name and phone are enough); the lead then shows
+> under NEW LEADS with a clock until the practice calls back. It involves no
+> payment and no account.
 
 If email confirmation is turned on in Supabase before the review, add:
 

@@ -14,6 +14,17 @@ const ALLOWLIST = new Map([
   // dependency only — it does not ship in the app binary.
   ['GHSA-w3rx-r6r6-pgpr', 'image-size ICNS infinite loop — no patched release'],
   ['GHSA-5p2g-fcmc-qvqq', 'image-size JXL/HEIF infinite loops — no patched release'],
+  // node-forge (transitive: @expo/cli and expo-updates →
+  // @expo/code-signing-certificates). Signature-verification flaw; no patched
+  // version exists (vulnerable <= 1.4.0, first_patched_version: null as of
+  // 2026-10-23). Used by the Expo CLI for update code signing at build time
+  // only — it is not in the app's JS bundle.
+  ['GHSA-86w9-cpqp-85rv', 'node-forge PKCS#1 v1.5 verification — no patched release'],
+  // zod (transitive: @expo/cli pins zod 3). Memory exhaustion on oversized
+  // input; patched only in zod 4.6.6, and no 3.x release has the fix (as of
+  // 2026-10-23). Validates the Expo CLI's own config at build time — not in
+  // the app's JS bundle. Remove once @expo/cli moves to a patched zod.
+  ['GHSA-mrhx-c7xc-m3w5', 'zod oversized-collection memory exhaustion — no patched 3.x release'],
 ]);
 
 let report;

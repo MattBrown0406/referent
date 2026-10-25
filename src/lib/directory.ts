@@ -1,7 +1,8 @@
 import { newUuid } from './cases';
 import { currentAuthSessionIdentity } from './auth-session';
 import { mapListingBeds, type BedGender, type ListingBeds, type ListingBedsRow } from './beds';
-import { StoreError } from './errors';
+import { StoreError, describeError } from './errors';
+import { fetchAllPages } from './paging';
 import { supabase } from './supabase';
 import type { InsuranceNetworkPreference, Partner, PartnerType } from '../data';
 
@@ -198,14 +199,21 @@ export async function setListingBeds(listingId: string, input: SetListingBedsInp
 
 // Distinct states with active listings, for filter pills. Cheap even at
 // thousands of listings because only one column crosses the wire.
+// Paged (PostgREST stops at max_rows without an error) on the immutable id.
 export async function fetchGlobalDirectoryStates(): Promise<string[]> {
-  const { data, error } = await supabase
-    .from('global_partners')
-    .select('state')
-    .eq('status', 'active');
-  if (error) throw new StoreError(error.message || 'Could not load directory states.', false);
-  const unique = new Set(((data || []) as { state: string | null }[]).map((row) => row.state || '').filter(Boolean));
+  let rows: { id: string; state: string | null }[];
+  try {
+    rows = await fetchAllPages<{ id: string; state: string | null }>((from, to) => supabase.from('global_partners').select('id, state').eq('status', 'active').order('id').range(from, to));
+  } catch (error) {
+    throw directoryReadError(error, 'Could not load directory states.');
+  }
+  const unique = new Set(rows.map((row) => row.state || '').filter(Boolean));
   return [...unique].sort();
+}
+
+function directoryReadError(error: unknown, fallback: string): StoreError {
+  if (error instanceof StoreError) return error;
+  return new StoreError(describeError(error, fallback), false);
 }
 
 type GlobalPartnerStatsRow = {
@@ -255,13 +263,14 @@ export async function fetchGlobalPartnerStats(ids: string[]): Promise<Map<string
 export type FavoriteTarget = 'partner' | 'global_partner';
 
 export async function fetchFavoriteIds(target: FavoriteTarget): Promise<Set<string>> {
-  const { data, error } = await supabase
-    .from('user_favorites')
-    .select('target_id')
-    .eq('target_type', target)
-    .order('position');
-  if (error) throw new StoreError(error.message || 'Could not load favorites.', false);
-  return new Set(((data || []) as { target_id: string }[]).map((row) => row.target_id));
+  let rows: { target_id: string }[];
+  try {
+    // One row per (user, type, target): target_id is the page key.
+    rows = await fetchAllPages<{ target_id: string }>((from, to) => supabase.from('user_favorites').select('target_id').eq('target_type', target).order('target_id').range(from, to), { keyOf: (row) => row.target_id });
+  } catch (error) {
+    throw directoryReadError(error, 'Could not load favorites.');
+  }
+  return new Set(rows.map((row) => row.target_id));
 }
 
 // Returns the new favorite state.
@@ -409,15 +418,22 @@ export async function clearPartnerOverride(partnerId: string, field: string): Pr
   if (error) throw new StoreError(error.message || 'Could not reset this field.', false);
 }
 
+// The whole active directory, paged on the immutable id (a listing edited
+// mid-fetch cannot move across a page boundary), then shown by state and
+// organization as before.
 export async function fetchGlobalDirectory(): Promise<GlobalPartner[]> {
-  const { data, error } = await supabase
-    .from('global_partners')
-    .select('id, name, organization, types, city, state, regions, phone, email, website, monthly_cost, insurance, insurance_networks, therapies, populations, levels, description, verified_at')
-    .eq('status', 'active')
-    .order('state')
-    .order('organization');
-  if (error) throw new StoreError(error.message || 'Could not load the directory.', false);
-  return ((data || []) as GlobalPartnerRow[]).map(mapListing);
+  let rows: GlobalPartnerRow[];
+  try {
+    rows = await fetchAllPages<GlobalPartnerRow>((from, to) => supabase.from('global_partners').select('id, name, organization, types, city, state, regions, phone, email, website, monthly_cost, insurance, insurance_networks, therapies, populations, levels, description, verified_at').eq('status', 'active').order('id').range(from, to));
+  } catch (error) {
+    throw directoryReadError(error, 'Could not load the directory.');
+  }
+  return rows
+    .slice()
+    .sort((a, b) => (a.state || '').localeCompare(b.state || '')
+      || (a.organization || '').localeCompare(b.organization || '')
+      || a.id.localeCompare(b.id))
+    .map(mapListing);
 }
 
 // Imports a listing into the caller's workspace network and returns the
@@ -530,11 +546,19 @@ export type OrgDirectoryProfileState = {
   pendingClaim: OrgDirectoryClaimRequest | null;
 };
 
+// 'claimed' comes only from a server that predates migration 20261024120000
+// (collisions now always go to ReferralFit review).
+export type UpsertOrgDirectoryProfileStatus = 'created' | 'updated' | 'updated_pending_review' | 'conflict' | 'resubmitted_for_review' | 'merged' | 'claim_requested' | 'claimed';
+
 export type UpsertOrgDirectoryProfileResult = {
-  status: 'created' | 'updated' | 'claimed' | 'claim_requested';
-  listingId: string;
+  status: UpsertOrgDirectoryProfileStatus;
+  listingId: string | null;
   requestId?: string;
+  // The server's own explanation for review outcomes, shown as-is.
+  message?: string;
 };
+
+const PROFILE_STATUSES: UpsertOrgDirectoryProfileStatus[] = ['created', 'updated', 'updated_pending_review', 'conflict', 'resubmitted_for_review', 'merged', 'claim_requested', 'claimed'];
 
 export async function fetchOrgDirectoryProfile(): Promise<OrgDirectoryProfileState> {
   const [orgResult, roleResult] = await Promise.all([
@@ -607,13 +631,16 @@ export function orgDirectoryProfilePayload(input: OrgDirectoryProfileInput): Rec
 export async function upsertOrgDirectoryProfile(input: OrgDirectoryProfileInput): Promise<UpsertOrgDirectoryProfileResult> {
   const { data, error } = await supabase.rpc('upsert_org_directory_profile', { p_payload: orgDirectoryProfilePayload(input) });
   if (error) throw new StoreError(error.message || 'Could not publish your directory profile.', false);
-  const result = (data || {}) as { status?: string; listing_id?: string; request_id?: string };
-  const status = result.status;
-  if (status !== 'created' && status !== 'updated' && status !== 'claimed' && status !== 'claim_requested') {
+  const result = (data || {}) as { status?: string; listing_id?: string | null; request_id?: string; review_id?: string; message?: string };
+  const status = result.status as UpsertOrgDirectoryProfileStatus | undefined;
+  if (!status || !PROFILE_STATUSES.includes(status)) {
     throw new StoreError('The directory returned an unexpected response. Try again.', false);
   }
-  if (typeof result.listing_id !== 'string' || !result.listing_id) {
+  const listingId = typeof result.listing_id === 'string' && result.listing_id ? result.listing_id : null;
+  // Only a review request may come back without a listing the caller can see.
+  if (!listingId && status !== 'claim_requested') {
     throw new StoreError('The directory returned an unexpected response. Try again.', false);
   }
-  return { status, listingId: result.listing_id, requestId: typeof result.request_id === 'string' ? result.request_id : undefined };
+  const requestId = typeof result.request_id === 'string' ? result.request_id : typeof result.review_id === 'string' ? result.review_id : undefined;
+  return { status, listingId, requestId, message: typeof result.message === 'string' && result.message.trim() ? result.message.trim() : undefined };
 }

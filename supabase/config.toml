@@ -403,6 +403,11 @@ verify_jwt = false
 [functions.intake]
 verify_jwt = false
 
+# Checks the caller's access token itself (auth.getUser), so it works with the
+# project's publishable/secret API keys; see docs/FOLLOW_UP_OUTREACH.md.
+[functions.draft-follow-up]
+verify_jwt = false
+
 [analytics]
 enabled = true
 port = 55427

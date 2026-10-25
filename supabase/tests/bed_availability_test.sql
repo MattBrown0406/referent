@@ -393,6 +393,11 @@ SELECT is(
   'open -> still open queues nothing'
 );
 
+-- One bed_opened push per listing per six hours (20261024120000 section
+-- 20, covered in round11_hardening_test.sql): age the earlier pushes so
+-- the next opening is a fresh one.
+UPDATE public.notification_outbox SET created_at = now() - interval '7 hours' WHERE kind = 'bed_opened';
+
 SET LOCAL ROLE authenticated;
 SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000bd', true);
 SELECT public.set_listing_beds('d1000000-0000-0000-0000-0000000000bd', 4, 1, 'Dana Whitfield', '(541) 555-0444');

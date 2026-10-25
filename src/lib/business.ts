@@ -135,6 +135,9 @@ export type BusinessDashboardMetrics = {
   quotedRevenue: number;
   collectedRevenue: number;
   outstandingRevenue: number;
+  // Synced invoices partially refunded: the refund amount is not on the
+  // invoice, so collected counts what was paid before the refund.
+  refundsNotTracked: number;
   placedCases: number;
   lostCases: number;
   placementRate: number;
@@ -168,6 +171,21 @@ export function parseOptionalPositiveUsdCents(input: string): number | null | un
   if (!Number.isFinite(dollars) || dollars <= 0) return undefined;
   return Math.round(dollars * 100);
 }
+
+// Whole-dollar money fields (quotes, payments, costs, budgets): "$1,500",
+// "1500", or "1,500.00" → 1500; blank → null; "0" → 0. Anything else
+// (decimal commas, cents, words) → undefined so the caller can say so,
+// instead of "1500.00" silently becoming 150000 or "4,500" becoming 0.
+export function parseWholeDollars(input: string): number | null | undefined {
+  const value = input.trim();
+  if (!value) return null;
+  if (/^\$?0+(?:\.0{1,2})?$/.test(value)) return 0;
+  const cents = parseOptionalPositiveUsdCents(value);
+  if (typeof cents !== 'number' || cents % 100 !== 0) return undefined;
+  return cents / 100;
+}
+
+export const WHOLE_DOLLARS_HINT = 'Enter whole dollars, like 1500 or $1,500.';
 
 type StageRow = {
   id: string;
@@ -326,34 +344,124 @@ const terminalDocumentStatuses = new Set([
   'document.completed', 'document.paid', 'document.declined', 'document.voided',
   'completed', 'paid', 'declined', 'voided',
 ]);
-const terminalInvoiceStatuses = new Set(['paid', 'canceled', 'cancelled', 'refunded']);
+// ─── Square invoice statuses ────────────────────────────────────────────────
+// What the square-webhook stores (Square's invoice status, lowercased) and
+// what the case panel offers when an invoice is linked by hand.
+export const SQUARE_INVOICE_STATUSES: { value: string; label: string }[] = [
+  { value: 'unpaid', label: 'Unpaid' },
+  { value: 'partially_paid', label: 'Partially paid' },
+  { value: 'paid', label: 'Paid' },
+  { value: 'partially_refunded', label: 'Partially refunded' },
+  { value: 'refunded', label: 'Refunded' },
+  { value: 'canceled', label: 'Canceled' },
+  { value: 'draft', label: 'Draft' },
+];
 
-type CaseRevenue = { quoted: number; collected: number; outstanding: number };
+// "PAID", "Partially paid", "cancelled" → the webhook's spelling. A legacy
+// hand-typed "completed" meant paid.
+export function normalizeInvoiceStatus(status: string): string {
+  const value = (status || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (value === 'completed') return 'paid';
+  if (value === 'cancelled') return 'canceled';
+  return value;
+}
 
+// Finished: nothing more is expected on it. A partial refund comes after
+// payment, so it is finished too (never open or overdue).
+const finishedInvoiceStatuses = new Set(['paid', 'canceled', 'refunded', 'partially_refunded']);
+
+// Open: issued and still waiting on money. A draft has not been sent yet.
+export function invoiceIsOpen(status: string): boolean {
+  const value = normalizeInvoiceStatus(status);
+  return value !== 'draft' && !finishedInvoiceStatuses.has(value);
+}
+
+// A partial refund's amount is not on the invoice record, so it is not
+// tracked: collected shows what was paid before the refund.
+export function invoiceRefundUntracked(status: string): boolean {
+  return normalizeInvoiceStatus(status) === 'partially_refunded';
+}
+
+type CaseRevenue = { quoted: number; collected: number; outstanding: number; refundsUntracked: number };
+
+// case_integrations is unique on (owner_id, provider, record_type,
+// external_id), so two teammates can each link the same Square invoice or
+// PandaDoc document to one case. Counted twice, that doubles quoted,
+// collected and outstanding revenue and the open-invoice, overdue and
+// pending-contract figures. The dashboard counts one row per (case,
+// provider, record type, external id); the rows themselves stay as they are
+// so each teammate can still see and remove their own link.
+export function integrationRecordKey(item: Pick<CaseIntegration, 'caseId' | 'provider' | 'recordType' | 'externalId'>): string {
+  return JSON.stringify([item.caseId, item.provider, item.recordType, item.externalId.trim()]);
+}
+
+function timestamp(value: string | undefined): number {
+  const time = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(time) ? time : Number.NEGATIVE_INFINITY;
+}
+
+// Which copy speaks for the record: the one the provider synced most
+// recently (webhooks update only the connecting owner's row, so a teammate's
+// copy goes stale), then one that carries an amount, then the most recently
+// edited, then the lower id so the choice is stable.
+function preferredIntegration(a: CaseIntegration, b: CaseIntegration): CaseIntegration {
+  const synced = timestamp(a.lastSyncedAt) - timestamp(b.lastSyncedAt);
+  if (synced) return synced > 0 ? a : b;
+  const amount = Number(a.amountCents != null) - Number(b.amountCents != null);
+  if (amount) return amount > 0 ? a : b;
+  const updated = timestamp(a.updatedAt) - timestamp(b.updatedAt);
+  if (updated) return updated > 0 ? a : b;
+  return a.id <= b.id ? a : b;
+}
+
+export function uniqueIntegrations(integrations: CaseIntegration[]): CaseIntegration[] {
+  const kept = new Map<string, CaseIntegration>();
+  for (const item of integrations) {
+    const key = integrationRecordKey(item);
+    const current = kept.get(key);
+    kept.set(key, current ? preferredIntegration(current, item) : item);
+  }
+  return [...kept.values()];
+}
+
+// A case's money: its own quote and recorded payments, unless Square has
+// synced an invoice for it (the webhook stamps last_synced_at). An invoice
+// linked by hand never overrides what the case records: its status and
+// amounts are typed, not reported by Square. A lost case owes nothing
+// (outstanding 0); what it was quoted stays in Quoted.
 function revenueForCase(record: CaseRecord, integrations: CaseIntegration[]): CaseRevenue {
+  const lost = record.status === 'lost';
   const squareInvoices = integrations.filter((item) => item.caseId === record.id
-    && item.provider === 'square' && item.recordType === 'invoice' && item.amountCents != null);
+    && item.provider === 'square' && item.recordType === 'invoice' && item.amountCents != null
+    && Boolean(item.lastSyncedAt));
   if (!squareInvoices.length) {
     const quoted = record.quotedAmount || 0;
     return {
       quoted,
       collected: record.paidAmount,
-      outstanding: Math.max(quoted - record.paidAmount, 0),
+      outstanding: lost ? 0 : Math.max(quoted - record.paidAmount, 0),
+      refundsUntracked: 0,
     };
   }
 
   return squareInvoices.reduce<CaseRevenue>((totals, invoice) => {
-    const status = invoice.status.toLowerCase();
+    const status = normalizeInvoiceStatus(invoice.status);
+    // A canceled invoice was withdrawn before it was paid: it is not a quote
+    // any more. Counted, a corrected reissue doubled the case's quoted revenue.
+    // A draft has not been sent: not quoted, not owed.
+    if (status === 'canceled' || status === 'draft') return totals;
     const quoted = (invoice.amountCents || 0) / 100;
-    const reversed = ['canceled', 'cancelled', 'refunded'].includes(status);
+    const reversed = status === 'refunded';
+    const paidInFull = status === 'paid' || status === 'partially_refunded';
     const collected = reversed ? 0 : (invoice.paidAmountCents == null
-      ? (status === 'paid' ? quoted : 0)
+      ? (paidInFull ? quoted : 0)
       : Math.min(invoice.paidAmountCents / 100, quoted));
     totals.quoted += quoted;
     totals.collected += collected;
-    totals.outstanding += terminalInvoiceStatuses.has(status) ? 0 : Math.max(quoted - collected, 0);
+    totals.outstanding += lost || finishedInvoiceStatuses.has(status) ? 0 : Math.max(quoted - collected, 0);
+    if (invoiceRefundUntracked(status)) totals.refundsUntracked += 1;
     return totals;
-  }, { quoted: 0, collected: 0, outstanding: 0 });
+  }, { quoted: 0, collected: 0, outstanding: 0, refundsUntracked: 0 });
 }
 
 function hasReached(
@@ -395,14 +503,15 @@ export function computeBusinessDashboard(
   const engaged = scopedCases.filter((record) => hasReached(record, scopedStages, 'engaged')).length;
   const placed = scopedCases.filter((record) => hasReached(record, scopedStages, 'placed')).length;
   const base = scopedCases.length || 1;
-  const scopedIntegrations = data.integrations.filter((item) => scopedIds.has(item.caseId));
+  // One row per linked record per case, whoever linked it (uniqueIntegrations).
+  const scopedIntegrations = uniqueIntegrations(data.integrations.filter((item) => scopedIds.has(item.caseId)));
   const revenueByCase = new Map(scopedCases.map((record) => [record.id, revenueForCase(record, scopedIntegrations)]));
 
   const sourceMap = new Map<string, LeadSourceMetric>();
   for (const record of scopedCases) {
     const source = record.leadSource?.trim() || 'Unspecified';
     const metric = sourceMap.get(source) || { source, cases: 0, placed: 0, quoted: 0, collected: 0, leads: 0, leadsWithinTarget: 0 };
-    const revenue = revenueByCase.get(record.id) || { quoted: 0, collected: 0, outstanding: 0 };
+    const revenue = revenueByCase.get(record.id) || { quoted: 0, collected: 0, outstanding: 0, refundsUntracked: 0 };
     metric.cases += 1;
     metric.quoted += revenue.quoted;
     metric.collected += revenue.collected;
@@ -430,7 +539,7 @@ export function computeBusinessDashboard(
   const outboundPlaced = outboundReferrals.filter((referral) => referral.outcome === 'Placed').length;
   const today = localDateStamp(now);
   const squareInvoices = scopedIntegrations.filter((item) => item.provider === 'square' && item.recordType === 'invoice');
-  const openInvoices = squareInvoices.filter((item) => !terminalInvoiceStatuses.has(item.status.toLowerCase()));
+  const openInvoices = squareInvoices.filter((item) => invoiceIsOpen(item.status));
   const pendingContractsByCase = new Map<string, CaseIntegration>();
   scopedIntegrations
     .filter((item) => item.provider === 'pandadoc'
@@ -449,6 +558,7 @@ export function computeBusinessDashboard(
     quotedRevenue: [...revenueByCase.values()].reduce((sum, revenue) => sum + revenue.quoted, 0),
     collectedRevenue: [...revenueByCase.values()].reduce((sum, revenue) => sum + revenue.collected, 0),
     outstandingRevenue: [...revenueByCase.values()].reduce((sum, revenue) => sum + revenue.outstanding, 0),
+    refundsNotTracked: [...revenueByCase.values()].reduce((sum, revenue) => sum + revenue.refundsUntracked, 0),
     placedCases: placed,
     lostCases: scopedCases.filter((record) => record.status === 'lost').length,
     placementRate: scopedCases.length ? placed / scopedCases.length : 0,

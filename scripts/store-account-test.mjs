@@ -18,11 +18,13 @@ const mustContain = [
   "const QUEUE_KEY_PREFIX = 'referralfit-write-queue-v2:'",
   "const WORKSPACE_KEY_PREFIX = 'referralfit-workspace-v1:'",
   'type CacheEnvelope = { version: 2; userId: string; snapshot: Snapshot }',
-  'type QueueEnvelope = { version: 2; userId: string; ops: QueueOp[] }',
+  'type QueueEnvelope = { version: 2; userId: string; ops: QueueOp[]; parentWaits?: Record<string, OpWait>; transientWaits?: Record<string, OpWait> }',
+  "const REJECTED_KEY_PREFIX = 'referralfit-rejected-writes-v1:'",
+  'type RejectedEnvelope = { version: 1; userId: string; entries: RejectedEntry[] }',
   'parsed.userId?.toLowerCase() !== userId',
   'envelope.userId?.toLowerCase() !== fence.userId',
   'await withQueueLock(async () =>',
-  'await writeQueueUnlocked(fence.userId, [...ops, bindQueueOp(op, fence.userId)])',
+  'await writeQueueUnlocked(fence.userId, [...state.ops, bindQueueOp(op, fence.userId)], state)',
   "throw persistenceError('offline queue', error)",
   "throw persistenceError('cache', error)",
   "owner_id: userId",
@@ -59,7 +61,8 @@ const pageSize = Number(/export const PAGE_SIZE = (\d+);/.exec(pagingSource)?.[1
 assert.ok(Number.isFinite(maxRows) && maxRows > 0, 'supabase/config.toml must declare max_rows');
 assert.ok(Number.isFinite(pageSize) && pageSize > 0 && pageSize <= maxRows, `PAGE_SIZE (${pageSize}) must not exceed max_rows (${maxRows}) or the loop stops early`);
 assert.match(pagingSource, /export const MAX_PAGES = \d+;/, 'paging needs a hard safety ceiling');
-assert.match(pagingSource, /throw new StoreError\(/, 'exceeding the paging ceiling must fail loudly, never truncate silently');
+assert.match(pagingSource, /throw new PagingLimitError\(/, 'exceeding the paging ceiling must fail loudly, never truncate silently');
+assert.match(pagingSource, /export class PagingLimitError extends StoreError/, 'the ceiling error stays a StoreError (readable, never a raw object)');
 
 const listReadPattern = /supabase\s*\.from\('([^']+)'\)\s*\.select\(/g;
 for (const [name, text] of [['store', source], ['cases', casesSource], ['business', businessSource]]) {
@@ -91,11 +94,15 @@ assert.match(
 assert.doesNotMatch(source, /from\('follow_ups'\)\.select\('\*'\)\.order\('due_on'/, 'the due_on-ordered unfiltered follow-up read is what truncated the newest open items');
 // A partially loaded follow-up list must never re-insert rows the client
 // merely has not loaded: only open cached rows are candidates, and each is
-// verified against the server by id before an insert is queued.
-assert.match(source, /async function mergeUnsyncedLocal\(remote: Snapshot, local: Snapshot \| null\)/);
+// verified against the server by id. A cache-only row survives only while a
+// change that creates it is still waiting on this device (queue or rejected
+// list); otherwise it was deleted on the server and must not be resurrected.
+assert.match(source, /async function mergeUnsyncedLocal\(remote: Snapshot, local: Snapshot \| null, pending: PendingRows\)/);
 assert.match(source, /local\.followUps\.filter\(\(row\) => row\.id && row\.status === 'open' && !remoteFollowUpIds\.has\(row\.id\)\)/, 'only open cached follow-ups may be merge candidates');
 assert.match(source, /from\('follow_ups'\)\.select\('\*'\)\.in\('id', chunk\)/, 'merge candidates must be verified against the server by id');
-assert.match(source, /openCandidates\.filter\(\(row\) => !serverById\.has\(row\.id\)\)/, 'only ids unknown to the server may be queued as inserts');
+assert.match(source, /openCandidates\.filter\(\(row\) => !serverById\.has\(row\.id\) && isPendingRow\(pending\.followUps, row\.id\)\)/, 'only ids unknown to the server AND still created by a pending op may survive');
+assert.match(source, /readQueueUnlocked\(fence\.userId\);\s*const rejected = await readRejectedUnlocked\(fence\.userId\);\s*return \[\.\.\.rejected\.flatMap\(\(entry\) => entry\.ops\), \.\.\.queued\]/, 'pending ops come from the rejected list (every held op) and the live queue');
+assert.match(source, /const pendingOps = await readPendingOps\(fence\);\s*const latestLocal = overlayPendingOps\(cachedLocal, pendingOps\);\s*const pending = pendingCreatedRows\(pendingOps\);/, 'the merge sees the saved copy with every pending change applied');
 
 // The case list and every case contact load workspace-wide (each case card
 // shows the family's primary name and phone without opening the file).
@@ -132,8 +139,15 @@ for (const text of [
 assert.match(source, /remote = await fetchCaseList\(\);\s*\} catch \(error\) \{\s*if \(!isNetworkError\(error\)\) throw error;/, 'the case list must fall back to the saved copy only on a network error');
 assert.match(source, /remote = await fetchCaseFile\(caseId\);\s*\} catch \(error\) \{\s*if \(!isNetworkError\(error\)\) throw error;/, 'a case file must fall back to the saved copy only on a network error');
 // Same account fence and workspace wipe as the snapshot cache.
-assert.match(source, /export async function persistCaseList\([^)]*\)[^{]*\{[\s\S]{0,200}await assertWorkspaceFence\(fence\);[\s\S]{0,200}writeCaseListCacheUnlocked\(/, 'saving the case list must verify the bound workspace like persistCache');
-assert.match(source, /export async function persistCaseFile\([^)]*\)[^{]*\{[\s\S]{0,200}await assertWorkspaceFence\(fence\);[\s\S]{0,200}writeCaseFileCacheUnlocked\(/, 'saving a case file must verify the bound workspace like persistCache');
+assert.match(source, /export async function persistCaseList\([^)]*\)[^{]*\{[\s\S]{0,200}await assertCacheWorkspaceFence\(fence\);[\s\S]{0,200}writeCaseListCacheUnlocked\(/, 'saving the case list must verify the bound workspace like persistCache');
+assert.match(source, /export async function persistCaseFile\([^)]*\)[^{]*\{[\s\S]{0,200}await assertCacheWorkspaceFence\(fence\);[\s\S]{0,200}writeCaseFileCacheUnlocked\(/, 'saving a case file must verify the bound workspace like persistCache');
+assert.match(source, /export async function persistCache\([^)]*\)[^{]*\{[\s\S]{0,300}await assertCacheWorkspaceFence\(fence\);[\s\S]{0,250}writeCacheUnlocked\(/, 'persistCache must save offline under the verified binding');
+// The saved-copy fence is local only: no server round trip inside the cache lock.
+{
+  const fenceStart = source.indexOf('async function assertCacheWorkspaceFence(');
+  const fenceBody = source.slice(fenceStart, source.indexOf('\n}\n', fenceStart));
+  assert.ok(fenceStart > 0 && !/supabase\./.test(fenceBody), 'assertCacheWorkspaceFence must not call the server');
+}
 assert.match(source, /async function caseCacheKeys\(userId: string\)/);
 assert.match(source, /AsyncStorage\.getAllKeys\(\)/, 'a workspace wipe must find every saved case file, even ones the index lost');
 for (const wipe of source.match(/AsyncStorage\.multiRemove\(\[[\s\S]*?\]\)/g) || []) {
@@ -153,8 +167,9 @@ assert.ok(mergeStart > 0 && mergeEnd > mergeStart);
 assert.doesNotMatch(mergeBody, /case/i, 'mergeUnsyncedLocal must not touch case data (cases have no offline insert path)');
 assert.doesNotMatch(mergeBody, /CaseList|CaseFile|CachedCase/, 'mergeUnsyncedLocal must not see the case cache');
 for (const call of source.match(/mergeUnsyncedLocal\((?!remote: Snapshot)[^)]*\)/g) || []) {
-  assert.equal(call, 'mergeUnsyncedLocal(remote, latestLocal)', `merge input must be the Snapshot cache only: ${call}`);
+  assert.equal(call, 'mergeUnsyncedLocal(remote, latestLocal, pending)', `merge input must be the Snapshot cache plus pending queue rows only: ${call}`);
 }
+assert.doesNotMatch(mergeBody, /enqueue|QueueOp\b/, 'the merge must never queue anything: a pending row\'s op is already durable');
 const snapshotType = source.slice(source.indexOf('export type Snapshot = {'), source.indexOf('};', source.indexOf('export type Snapshot = {')));
 assert.doesNotMatch(snapshotType, /case/i, 'cases must stay out of the merged Snapshot');
 // An offline launch must reach the caches at all: the server-side workspace
@@ -162,7 +177,7 @@ assert.doesNotMatch(snapshotType, /case/i, 'cases must stay out of the merged Sn
 // device, and only for a lost connection.
 assert.match(source, /export async function readBoundWorkspace\(expectedUserId: string\): Promise<string \| null>/);
 assert.match(source, /return stored && isUuid\(stored\) \? stored\.toLowerCase\(\) : null;/);
-assert.match(appSource, /orgId = await fetchCurrentOrgId\(\);\s*\} catch \(error\) \{\s*if \(!isNetworkError\(error\)\) throw error;\s*const bound = await readBoundWorkspace\(userId\);\s*if \(!bound\) throw error;\s*orgId = bound;/, 'hydration must survive an offline workspace lookup using the last verified binding');
+assert.match(appSource, /orgId = await fetchCurrentOrgId\(\);\s*\} catch \(error\) \{\s*if \(!(?:isNetworkError|isServerUnreachable)\(error\)\) throw error;\s*const bound = await readBoundWorkspace\(userId\);\s*if \(!bound\) throw error;\s*orgId = bound;/, 'hydration must survive an offline workspace lookup using the last verified binding');
 // The App renders the saved copy instead of a blocking alert whenever one exists.
 assert.match(appSource, /const load = await loadCaseList\(userId\);[\s\S]{0,400}Alert\.alert\('Case files unavailable'/, 'hydration must load the case list through the cache-aware loader');
 assert.match(appSource, /setCaseListSource\(caseListLoad\)/);
@@ -171,7 +186,7 @@ assert.match(appSource, /renderSavedCopyNotice\(caseFileSource, 'case file'\)/, 
 assert.match(appSource, /renderSavedCopyNotice\(caseListSource, 'case list'\)/, 'a cached case list must say it is a saved copy');
 assert.match(appSource, /Showing saved copy from \$\{relativeActivity\(copy\.savedAt\)/);
 assert.match(appSource, /Opening a document needs a connection\./);
-assert.match(appSource, /if \(isNetworkError\(error\)\) \{\s*Alert\.alert\('Connection needed'/, 'opening a document offline must explain the signed-link requirement');
+assert.match(appSource, /if \((?:isNetworkError|isServerUnreachable)\(error\)\) \{\s*Alert\.alert\('Connection needed'/, 'opening a document offline must explain the signed-link requirement');
 // The saved copies follow what is on screen, but a cache-sourced copy is never written back.
 assert.match(appSource, /if \(!caseListSource \|\| caseListSource\.source !== 'remote'\) return;\s*void persistCaseList\(\{ cases, contacts: allCaseContacts \}, caseListSource\.userId\)/);
 assert.match(appSource, /if \(!activeCaseId \|\| !caseFileSource \|\| caseFileSource\.source !== 'remote'\) return;\s*void persistCaseFile\(activeCaseId, \{ events: caseEvents, documents: caseDocuments \}, caseFileSource\.userId\)/);
@@ -195,10 +210,10 @@ assert.match(appSource, /const FOREGROUND_REFRESH_MIN_INTERVAL_MS = 30_000;/);
 assert.match(appSource, /if \(trigger === 'foreground' && Date\.now\(\) - lastServerRefreshAtRef\.current < FOREGROUND_REFRESH_MIN_INTERVAL_MS\) return 'ok';/, 'foreground refresh must be debounced');
 assert.match(appSource, /if \(refreshInFlightRef\.current\) return refreshInFlightRef\.current;/, 'concurrent refreshes must coalesce');
 // Unconditional and in order: flush, then snapshot, then cases, then the open file.
-assert.match(appSource, /await flushWriteQueue\(userId\);[\s\S]{0,300}const refreshed = await refreshSnapshot\(userId\);[\s\S]{0,400}const caseLoad = await loadCaseList\(userId\);[\s\S]{0,1200}const fileLoad = await loadCaseFile\(userId, activeCaseId\);/, 'refresh must keep flush → snapshot → cases → open file');
+assert.match(appSource, /await flushWriteQueue\(userId\);[\s\S]{0,1100}const refreshed = await refreshSnapshot\(userId\);[\s\S]{0,900}const caseLoad = await loadCaseList\(userId\);[\s\S]{0,2200}const fileLoad = await loadCaseFile\(userId, openCaseId\);/, 'refresh must keep flush → snapshot → cases → open file');
 assert.doesNotMatch(appSource, /if \(flushed > 0\) \{\s*refreshed = await refreshSnapshot/, 'foreground refresh must no longer depend on a flushed write');
 assert.match(appSource, /await refreshFromServer\('foreground'\);/);
-assert.match(appSource, /if \(stillCurrent\(\) && !isNetworkError\(error\)\) Alert\.alert\('Sync issue'/, 'a foreground return with no connection must not alert');
+assert.match(appSource, /if \(stillCurrent\(\) && !(?:isNetworkError|isServerUnreachable)\(error\)\) Alert\.alert\('Sync issue'/, 'a foreground return with no connection must not alert');
 
 // Bounds + LRU eviction of saved case files, run against the real helpers.
 {
@@ -315,11 +330,26 @@ assert.match(appSource, /if \(stillCurrent\(\) && !isNetworkError\(error\)\) Ale
 
   // The ceiling fails loudly instead of looping or truncating.
   calls = [];
+  const endless = (from, to) => Array.from({ length: to - from + 1 }, (_, index) => ({ id: `row-${from + index}` }));
   await assert.rejects(
-    fetchAllPages(async (from, to) => { calls.push([from, to]); return { data: table(2), error: null }; }, { pageSize: 2, maxPages: 4 }),
-    (error) => error instanceof StoreError && /more than 8 rows/.test(error.message),
+    fetchAllPages(async (from, to) => { calls.push([from, to]); return { data: endless(from, to), error: null }; }, { pageSize: 2, maxPages: 4 }),
+    (error) => error instanceof StoreError && error.name === 'PagingLimitError' && /more than 8 rows/.test(error.message),
   );
   assert.equal(calls.length, 4, 'the ceiling must stop the loop after maxPages requests');
+
+  // A server that ignores the range (the same full page again) stops at once,
+  // not 50 requests later at the ceiling.
+  calls = [];
+  await assert.rejects(
+    fetchAllPages(async (from, to) => { calls.push([from, to]); return { data: table(2), error: null }; }, { pageSize: 2, maxPages: 50 }),
+    (error) => error instanceof StoreError && error.name === 'PagingLimitError' && /same rows again/.test(error.message),
+  );
+  assert.equal(calls.length, 2, 'no progress on a full page ends the read');
+
+  // The HTTP status rides along on a failed page (a gateway's 5xx page is a
+  // passing failure, not a refusal).
+  const gateway = { message: '<html><title>502 Bad Gateway</title></html>' };
+  await assert.rejects(fetchAllPages(async () => ({ data: null, error: gateway, status: 502 })), (error) => error === gateway && error.httpStatus === 502);
 }
 
 // Global v1/legacy storage is documented but must never be read or merged.
@@ -331,7 +361,11 @@ const expectedSignatures = [
   /export async function hydrate\(expectedUserId: string\)/,
   /export async function flushWriteQueue\(expectedUserId: string\)/,
   /export async function pendingWriteCount\(expectedUserId: string\)/,
-  /export async function prepareForWorkspaceChange\(expectedUserId: string\)/,
+  /export async function prepareForWorkspaceChange\(expectedUserId: string, options: WorkspaceChangeOptions = \{\}\)/,
+  /export async function listRejectedWrites\(expectedUserId: string\): Promise<RejectedWrite\[\]>/,
+  /export async function rejectedWriteCount\(expectedUserId: string\): Promise<number>/,
+  /export async function discardRejectedWrite\(expectedUserId: string, rejectedId: string\)/,
+  /export async function retryRejectedWrite\(expectedUserId: string, rejectedId: string\): Promise<number>/,
   /export async function bindLocalWorkspace\(expectedUserId: string, orgId: string\)/,
   /export async function persistCache\(snapshot: Snapshot, expectedUserId: string\)/,
   /export async function refreshSnapshot\(expectedUserId: string\)/,
@@ -350,7 +384,7 @@ assert.match(
 
 // Every AsyncStorage write is in a catch block that converts failure to StoreError.
 const writes = [...source.matchAll(/await AsyncStorage\.(?:setItem|multiSet)\([^;]+;/g)];
-assert.equal(writes.length, 5, 'unexpected AsyncStorage write path added without durability audit');
+assert.equal(writes.length, 7, 'unexpected AsyncStorage write path added without durability audit');
 for (const write of writes) {
   const following = source.slice(write.index, write.index + 520);
   assert.match(following, /catch \(error\) \{\s*throw persistenceError\(/);
@@ -362,9 +396,14 @@ assert.match(source, /complete_follow_up_with_next/, 'complete + next-step must 
 assert.match(source, /complete_follow_up_with_outcome/, 'follow-up + outcome must use its transactional RPC');
 assert.match(source, /contact\.log_activity/, 'case events and partner touches from one handoff must be one durable queue operation');
 assert.match(source, /log_contact_activity/, 'contact activity must use its transactional RPC');
-assert.match(source, /match_profile_id: null/, 'cyclic referral links must be cleared for dependency-safe base inserts');
 assert.match(source, /match\.delete/, 'match removal must remain durable while offline');
-assert.match(source, /referral_id: null/, 'cyclic match links must be cleared for dependency-safe base inserts');
+assert.match(source, /'outreach\.sent'/, 'outreach sends must stay one durable queue operation');
+// Queued inserts replay as INSERT ... ON CONFLICT DO NOTHING: replay-safe and
+// never able to overwrite a newer version of the row.
+assert.match(source, /const INSERT_ONCE = \{ onConflict: 'id', ignoreDuplicates: true \} as const;/);
+for (const table of ['partners', 'referrals', 'match_profiles', 'touches', 'follow_ups']) {
+  assert.match(source, new RegExp(`from\\('${table}'\\)\\.upsert\\(\\{ \\.\\.\\.op\\.row, owner_id: userId \\}, INSERT_ONCE\\)`), `queued ${table} inserts must not overwrite existing rows`);
+}
 assert.match(casesSource, /withStableCaseAccount/, 'case operations must reject account transitions');
 assert.match(casesSource, /current\.sessionId === expected\.sessionId/, 'case operations must share the stable login-session fence');
 assert.match(casesSource, /current\.orgId === expected\.orgId/, 'case operations must reject workspace transitions');
@@ -428,3 +467,7 @@ assert.match(directorySource, /supabase\.rpc\('upsert_org_directory_profile', \{
 assert.match(claimedMigration, /FUNCTION public\.global_listing_is_claimed\(p_global_id uuid\)/, 'migration must define the claimed helper');
 
 console.log('store account-scope/durability source invariants: ok');
+
+// Behavior, not just source shape: rejected/blocked queue ops, offline
+// sessions, merge resurrection, write ordering, paging and push persistence.
+await import('./offline-sync-test.mjs');

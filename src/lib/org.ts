@@ -1,4 +1,5 @@
 import { StoreError } from './errors';
+import { isNetworkError, isTransientServerError } from './store';
 import { supabase } from './supabase';
 
 // Workspace (org) client API — Phase 1 of the platform buildout. Every user
@@ -57,9 +58,20 @@ function fail(error: { message?: string } | null, fallback: string): never {
   throw new StoreError(error?.message || fallback, false);
 }
 
+// A lost connection, or a passing server failure (5xx, a gateway page), is
+// reported as offline (isNetworkError recognises it), so the launch opens the
+// saved copy under the workspace last verified on this device instead of
+// failing during an outage. Writes are unaffected: each one still needs the
+// server to confirm the workspace (store.ts assertWorkspaceFence).
 export async function fetchCurrentOrgId(): Promise<string> {
-  const { data, error } = await supabase.rpc('current_org_id');
-  if (error) fail(error, 'Could not resolve the active workspace.');
+  const { data, error, status } = await supabase.rpc('current_org_id');
+  if (error) {
+    const failure = Object.assign(error, { httpStatus: status });
+    if (isNetworkError(failure) || isTransientServerError(failure) || status === 0) {
+      throw new StoreError('Offline: the server cannot be reached right now.', false);
+    }
+    fail(error, 'Could not resolve the active workspace.');
+  }
   if (typeof data !== 'string' || !data) throw new StoreError('No active workspace is available.', false);
   return data.toLowerCase();
 }

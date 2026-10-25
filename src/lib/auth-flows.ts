@@ -56,6 +56,101 @@ export function parseAuthRedirect(url: string | null | undefined): AuthRedirect 
   return null;
 }
 
+// ─── Which auth links this device accepts ───────────────────────────────────
+// Any app or web page can open a referralfit:// URL, and a URL carrying
+// tokens would otherwise sign this phone into whatever account those tokens
+// belong to. Tokens are accepted only:
+//   - on the two paths Supabase redirects to (auth/recovery, auth/confirmed),
+//   - when this device itself started that flow (a sign-up or confirmation
+//     resend for auth/confirmed, a password reset for auth/recovery) within
+//     the last 24 hours. LoginScreen records the start (auth-link-guard.ts).
+// Signing a signed-in phone into a different account always asks first (App.tsx).
+
+export type AuthLinkPath = 'recovery' | 'confirmed';
+export type AuthFlowKind = 'signup' | 'recovery';
+// Epoch milliseconds each flow was last started on this device.
+export type AuthFlowStarts = Partial<Record<AuthFlowKind, number>>;
+
+export const AUTH_FLOW_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// "referralfit://auth/recovery#…" → 'recovery'. Anything else → null.
+export function authLinkPath(url: string | null | undefined): AuthLinkPath | null {
+  if (!url || typeof url !== 'string') return null;
+  const prefix = `${APP_SCHEME}://`;
+  if (!url.toLowerCase().startsWith(prefix)) return null;
+  const rest = url.slice(prefix.length);
+  const end = rest.search(/[?#]/);
+  const path = (end >= 0 ? rest.slice(0, end) : rest).replace(/^\/+|\/+$/g, '').toLowerCase();
+  if (path === 'auth/recovery') return 'recovery';
+  if (path === 'auth/confirmed') return 'confirmed';
+  return null;
+}
+
+export function authFlowForPath(path: AuthLinkPath): AuthFlowKind {
+  return path === 'recovery' ? 'recovery' : 'signup';
+}
+
+export type AuthLinkDecision =
+  // Not one of our auth links (or nothing usable in it): do nothing at all.
+  | { action: 'ignore' }
+  // Supabase reported a problem with a link for a flow this device started
+  // (expired, already used). The link's own wording is not shown: anyone can
+  // put any text in a URL.
+  | { action: 'error'; path: AuthLinkPath; code: string }
+  // A real auth link, but this device did not start that flow lately.
+  | { action: 'not_started'; path: AuthLinkPath; flow: AuthFlowKind }
+  | { action: 'accept'; path: AuthLinkPath; flow: AuthFlowKind; redirect: Exclude<AuthRedirect, { kind: 'error' }> };
+
+export function decideAuthLink(url: string | null | undefined, starts: AuthFlowStarts, now = Date.now()): AuthLinkDecision {
+  const path = authLinkPath(url);
+  if (!path) return { action: 'ignore' };
+  const redirect = parseAuthRedirect(url);
+  if (!redirect) return { action: 'ignore' };
+  const flow = authFlowForPath(path);
+  const startedAt = starts[flow];
+  const recent = typeof startedAt === 'number' && Number.isFinite(startedAt)
+    && now - startedAt >= 0 && now - startedAt <= AUTH_FLOW_WINDOW_MS;
+  if (!recent) return { action: 'not_started', path, flow };
+  if (redirect.kind === 'error') return { action: 'error', path, code: redirect.code };
+  return { action: 'accept', path, flow, redirect };
+}
+
+// The account a Supabase access token belongs to (its `sub` claim), read
+// without verifying it: only to ask before replacing a signed-in account.
+export function jwtSubject(token: string): string | null {
+  const payload = token.split('.')[1];
+  if (!payload) return null;
+  try {
+    const json = JSON.parse(decodeBase64Url(payload)) as { sub?: unknown };
+    return typeof json.sub === 'string' && json.sub ? json.sub.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+function decodeBase64Url(input: string): string {
+  const clean = input.replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+  let bits = 0;
+  let value = 0;
+  const bytes: number[] = [];
+  for (const char of clean) {
+    const index = BASE64_ALPHABET.indexOf(char);
+    if (index < 0) throw new Error('Not base64');
+    value = ((value << 6) | index) & 0xffffff;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((value >> bits) & 0xff);
+    }
+  }
+  // UTF-8 decode (claims are ASCII in practice; this keeps any other text intact).
+  let encoded = '';
+  for (const byte of bytes) encoded += `%${byte.toString(16).padStart(2, '0')}`;
+  return decodeURIComponent(encoded);
+}
+
 export function isRecoveryRedirect(redirect: AuthRedirect | null): boolean {
   return !!redirect && redirect.kind !== 'error' && redirect.type === 'recovery';
 }

@@ -9,7 +9,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.mattbrown.referralfit",
-      "buildNumber": "1",
+      "buildNumber": "2",
       "entitlements": {
         "aps-environment": "production"
       },
@@ -24,10 +24,7 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false,
-      "permissions": [
-        "android.permission.RECORD_AUDIO"
-      ]
+      "predictiveBackGestureEnabled": false
     },
     "web": {
       "favicon": "./assets/icon-referent-symbiosis.png",
@@ -36,7 +33,12 @@
     "scheme": "referralfit",
     "plugins": [
       "expo-font",
-      "expo-secure-store",
+      [
+        "expo-secure-store",
+        {
+          "faceIDPermission": false
+        }
+      ],
       [
         "expo-notifications",
         {
@@ -46,7 +48,9 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "ReferralFit attaches photos you choose (insurance cards, signed agreements) to private case files."
+          "photosPermission": "ReferralFit opens your photo library only when you choose to attach a photo, such as an insurance card or a signed agreement, to a private case file.",
+          "cameraPermission": false,
+          "microphonePermission": false
         }
       ]
     ],

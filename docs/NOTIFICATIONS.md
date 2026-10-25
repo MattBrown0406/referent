@@ -67,18 +67,25 @@ trigger / hourly job  ->  notification_outbox  ->  push-dispatch (edge fn)  ->  
    as `DeviceNotRegistered` (in a ticket or a receipt) is deleted so it is
    never tried again. The service role has no table grants; it only runs
    those four RPCs.
+   A **transient** send failure (network error or timeout, Expo 5xx, 429, 401 or 403,
+   `MessageRateExceeded`, a missing ticket) is recorded with `retry: true`:
+   `error` stays empty, the reason goes to `last_error`, and the claim picks
+   the row up again five minutes later, up to five attempts in all (then
+   `too_many_attempts`). Any other failure (`DeviceNotRegistered`,
+   `MessageTooBig`, other 4xx, no device) is final at once. Before
+   2026-10-24 every failure was final, so the retry never happened.
 
 ### What enqueues what
 
 | event | recipients | kind |
 | --- | --- | --- |
-| a case with `lead_captured_at` is inserted (quick-add or intake link) | every member of the workspace except the person who added it; or only the assignee when it arrived already assigned | `new_lead` |
+| a case with `lead_captured_at` is inserted (quick-add or intake link) | every member of the workspace except the person who added it; or only the assignee when it arrived already assigned. Not sent for an intake lead marked possible spam (link over its hourly budget, `LEAD_CAPTURE.md`) | `new_lead` |
 | `cases.assigned_to` set to someone other than the person assigning | the assignee | `assigned_to_me` |
 | `follow_ups.assigned_to` set (insert or update) to someone other than the person assigning | the assignee | `assigned_to_me` |
 | `global_partners` inserted with status `pending` and a submitting workspace | every platform admin except the submitter | `directory_submission` |
 | `global_partners` moves from `pending` to `active` or `archived` | every member of the submitting workspace except the reviewer | `directory_decision` |
-| hourly job finds open follow-ups past their day that are mine (own assignee, or the case's assignee when the follow-up has none) | the member, once a day at 9 AM in their timezone | `overdue_mine` |
-| `set_listing_beds` moves a gender's count from 0 or unknown to open (`BED_AVAILABILITY.md`) | every member of a workspace that favorited or imported the listing, except the person who set it; opt-in, default off | `bed_opened` |
+| hourly job finds open follow-ups past their day that are mine (own assignee, or the case's assignee when the follow-up has none). Steps open when a case closed or was lost are skipped then (`TEAM_BASICS.md`), so they no longer count; a step scheduled after the close does | the member, once a day at 9 AM in their timezone | `overdue_mine` |
+| `set_listing_beds` moves a gender's count from 0 or unknown to open (`BED_AVAILABILITY.md`) | every member of a workspace that favorited or imported the listing, except the person who set it; opt-in, default off; at most once per listing per six hours | `bed_opened` |
 
 Timezone: the app reports the device offset on every registration and
 preference save (`tz_offset_minutes`, minutes east of UTC). Until a device
@@ -196,8 +203,9 @@ this device or build yet" until it is.
 SELECT count(*) AS devices, count(DISTINCT user_id) AS members FROM public.push_tokens;
 SELECT count(*) FILTER (WHERE push_enabled) AS push_on, count(*) AS rows FROM public.notification_preferences;
 
--- 2. Outbox health: waiting, sent in the last day, failed.
+-- 2. Outbox health: waiting (retrying = waiting after a transient failure), sent in the last day, failed.
 SELECT count(*) FILTER (WHERE sent_at IS NULL AND error IS NULL) AS waiting,
+       count(*) FILTER (WHERE sent_at IS NULL AND error IS NULL AND last_error IS NOT NULL) AS retrying,
        count(*) FILTER (WHERE sent_at > now() - interval '1 day') AS sent_today,
        count(*) FILTER (WHERE error IS NOT NULL) AS failed,
        max(sent_at) AS last_sent

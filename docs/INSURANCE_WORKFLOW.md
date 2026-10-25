@@ -67,7 +67,10 @@ through the functions below so each change lands on the case timeline with
   the server computes its own when missing) assigned to the requester, and a
   timeline entry "VOB requested: <program>". Idempotent on the request id.
 - `update_vob_status(p_id, p_patch, p_event_id)` records the answer. Moving
-  to an answered status stamps `answered_at`, completes the chase follow-up,
+  to an answered status stamps `answered_at`, completes the chase follow-up
+  and any other open `waiting_on` follow-up on the case whose `waiting_on`
+  is the program name (any letter case; for example the step "Done -> still
+  waiting" left in the chase's place, 20261024120000 section 19),
   and writes "VOB in-network: <program>, about $500 out of pocket (per
   Maria)". Moving back to `requested` or `pending` clears `answered_at`. A
   note-only edit writes no entry.

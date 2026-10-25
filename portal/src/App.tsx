@@ -85,6 +85,29 @@ function csv(value: string): string[] {
 const BED_PROGRAM_TYPES = ['Inpatient', 'IOP / PHP', 'Sober Living', 'Detox'];
 const MAX_BEDS = 999;
 
+// A name / phone / website change the server held because another listing
+// already uses it (directory_review_requests, kind identity_edit). The
+// listing keeps its live values until ReferralFit reviews the change.
+type HeldEdit = {
+  collisions: string[];
+  proposed: { organization?: string | null; name?: string | null; phone?: string | null; website?: string | null };
+};
+
+const HELD_FIELD_LABELS: Record<string, string> = { name: 'name', phone: 'phone number', website: 'website' };
+
+function heldFieldsText(held: HeldEdit): string {
+  const labels = held.collisions.map((field) => HELD_FIELD_LABELS[field] || field);
+  if (labels.length <= 1) return labels[0] || 'name, phone number, or website';
+  return `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`;
+}
+
+// The server holds only the colliding group(s) and applies everything else
+// in the same save, so this names exactly what is waiting.
+function heldNotice(held: HeldEdit): string {
+  const several = held.collisions.length > 1;
+  return `Listing saved, except the new ${heldFieldsText(held)}: another directory listing already uses ${several ? 'them' : 'it'}, so ReferralFit will review ${several ? 'those changes' : 'that change'} first. Until then your current ${heldFieldsText(held)} ${several ? 'stay' : 'stays'} up; everything else you changed is live.`;
+}
+
 type BedsStatus = {
   beds_male: number | null;
   beds_female: number | null;
@@ -185,6 +208,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [heldEdit, setHeldEdit] = useState<HeldEdit | null>(null);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -227,10 +251,30 @@ export default function App() {
     };
     setListing(next);
     setForm(toForm(next));
+    await loadHeldEdit(next.id);
     const { data: count } = await supabase.rpc('center_listing_import_count');
     setImportCount(typeof count === 'number' ? count : null);
     await loadBeds(next);
   }, []);
+
+  // The pending held identity change for this listing, if any. Degrades to
+  // none when the server does not have the review queue yet.
+  async function loadHeldEdit(listingId: string): Promise<HeldEdit | null> {
+    const { data, error: heldError } = await supabase
+      .from('directory_review_requests')
+      .select('collisions, proposed')
+      .eq('global_partner_id', listingId)
+      .eq('kind', 'identity_edit')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const held = !heldError && data
+      ? { collisions: Array.isArray(data.collisions) ? (data.collisions as string[]) : [], proposed: (data.proposed || {}) as HeldEdit['proposed'] }
+      : null;
+    setHeldEdit(held);
+    return held;
+  }
 
   // Bed status and the last five confirmations. Both degrade to "not
   // available yet" when the server does not have the migration.
@@ -261,8 +305,15 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (session) void loadListing();
-    else { setListing(null); setForm(null); setImportCount(null); setBeds(null); setBedHistory([]); }
+    if (session) { setPassword(''); void loadListing(); }
+    else {
+      // Nothing from the previous account (its held edit, its last notice,
+      // the email and password it signed in with, a claim code it typed)
+      // may show for the next one on a shared browser.
+      setListing(null); setForm(null); setImportCount(null); setBeds(null); setBedHistory([]);
+      setHeldEdit(null); setNotice(''); setError('');
+      setEmail(''); setPassword(''); setClaimCode(''); setBedsForm(toBedsForm(null));
+    }
   }, [session, loadListing]);
 
   async function submitAuth(event: React.FormEvent) {
@@ -340,8 +391,13 @@ export default function App() {
         .maybeSingle();
       if (updateError) throw updateError;
       if (!updated) throw new Error('The listing was not updated. Sign in again and retry.');
-      setNotice('Listing saved. Your listing is the authoritative record for your program, so edits publish immediately and it stays verified.');
       await loadListing();
+      // A name, phone or website that another listing already uses is held
+      // server-side for review; say so instead of claiming it is live.
+      const held = await loadHeldEdit(listing.id);
+      setNotice(held
+        ? heldNotice(held)
+        : 'Listing saved. Your listing is the authoritative record for your program, so edits publish immediately and it stays verified.');
     } catch (saveError) {
       setError((saveError as Error).message);
     } finally {
@@ -592,6 +648,15 @@ export default function App() {
             <input value={form.therapies} onChange={(e) => setForm({ ...form, therapies: e.target.value })} />
             <label>Program description</label>
             <textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
+            {heldEdit ? (
+              <p className="help">
+                Waiting for ReferralFit review: your new {heldFieldsText(heldEdit)}
+                {heldEdit.proposed.organization && heldEdit.collisions.includes('name') ? ` ("${heldEdit.proposed.organization}")` : ''}
+                {heldEdit.proposed.phone && heldEdit.collisions.includes('phone') ? ` (${heldEdit.proposed.phone})` : ''}
+                {heldEdit.proposed.website && heldEdit.collisions.includes('website') ? ` (${heldEdit.proposed.website})` : ''}
+                {' '}matches another directory listing. The details above stay live until it is reviewed.
+              </p>
+            ) : null}
             <div className="actions">
               <button type="submit" disabled={busy}>Save listing</button>
             </div>

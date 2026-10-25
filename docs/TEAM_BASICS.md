@@ -17,9 +17,55 @@ follow-up with no assignee of its own belongs to whoever its case is
 assigned to; "Take this lead" on a NEW LEADS card assigns the case to you
 and so takes its first call with it. Leads from the intake link arrive
 unassigned. When a member leaves the practice, their assignments in it go
-back to Unassigned. `assign_case()` changes the case and writes the
+back to Unassigned, and their favorites in it are deleted (20261024120000
+section 17). `assign_case()` changes the case and writes the
 timeline entry ("Assigned to Mikayla", "Took this case", "Unassigned") in
 one transaction.
+
+**Take this lead** (20261024120000 section 16). `take_case(p_case_id,
+p_event_id)` assigns the caller only while the case has no assignee, so a
+stale Today list or two members tapping at once cannot take a lead a
+colleague already has. Same return shape as `assign_case` (`event_body`,
+`occurred_at`):
+
+| Case state | Result |
+| --- | --- |
+| unassigned | assigned to the caller; "Took this case" written with `p_event_id`; returns that wording |
+| already the caller's (or a replay) | success, nothing written; `event_body` is the wording of `p_event_id` if that entry exists, else `''` |
+| someone else's | error `P0001` "Already taken by <display name>", `hint` `already_taken`, `details` the assignee's user id; nothing changes |
+| not in the workspace | error `P0002` "Case not found" |
+
+`assign_case` is unchanged and stays the explicit "Assigned to" picker.
+
+**Closing a case** (20261024120000 section 14). When a case becomes
+`closed` or `lost`, by any path, the follow-ups open on it at that moment
+are marked `skipped` (by the member who closed it, `completed_at` = the
+case's `stage_changed_at`, which marks them as that close's). Placement
+check-ins (`kind = 'check_in'`) stay open. A step scheduled on the case
+after it closed is an ordinary open step: Today shows it and the 9 AM
+overdue push counts it. Reopening the case (any status other than closed
+or lost) puts exactly the steps its close skipped back to open; a move
+between closed and lost carries them along. Steps skipped by hand stay
+skipped.
+
+**Done -> next** (20261024120000 section 15). The next step keeps the
+completed step's assignee (or the `assigned_to` the client sends; unassigned
+if that person has left). A step that is already done or skipped keeps its
+first completion. If the next step's id is already saved (a replay; after a
+crash the app replays a queued call with its original ids), the call writes
+nothing. Any other next step (a colleague, a VOB answer or a close finished
+the step first) is still saved with its timeline entry, as
+`record_outreach_sent` does. Only the id marks a replay: the app titles a
+next step from its kind and case, so two different steps often share kind,
+title and day, and matching on those would drop one without a word.
+
+**Membership realtime** (20261024120000 section 20). The `supabase_realtime`
+publication sends inserts and updates only (the app listens for
+`org_members` updates), so a removed member's or deleted account's row is
+never broadcast to other workspaces. Only the publication's owner can make
+that change: if the paste runs as another role it prints a warning and the
+rest of the migration still applies; then turn off Delete and Truncate for
+`supabase_realtime` under Database, Publications in the dashboard.
 
 **Today: Mine / Everyone.** Mine keeps what is assigned to you and anything
 nobody has taken yet, so an unowned item never disappears from everyone's

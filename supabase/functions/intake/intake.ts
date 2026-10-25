@@ -4,8 +4,22 @@
 export const INTAKE_TOKEN_PATTERN = /^[0-9a-f]{32,64}$/;
 
 // Rate limits (fixed windows, enforced server-side in intake_rate_limit_hit).
+// TOKEN_LIMIT, TOKEN_HARD_LIMIT and IP_LIMIT are charged only for a
+// submission that would create a lead, so junk posts cannot lock a
+// practice's link. Past TOKEN_LIMIT a lead is still created but marked
+// possible spam (no push to the practice), so a flood cannot turn a real
+// family away; only past TOKEN_HARD_LIMIT (10x) is it refused.
+// IP_POST_LIMIT is charged for every POST from one address (honeypot,
+// invalid, or real) and is looser, so a family fixing a typo is never
+// locked out while one address still cannot hammer the endpoint.
 export const TOKEN_LIMIT = { perWindow: 30, windowSeconds: 3600 };
+export const TOKEN_HARD_LIMIT = { perWindow: 300, windowSeconds: 3600 };
 export const IP_LIMIT = { perWindow: 6, windowSeconds: 3600 };
+export const IP_POST_LIMIT = { perWindow: 20, windowSeconds: 3600 };
+
+export type RateLimit = { perWindow: number; windowSeconds: number };
+// Resolves true while the bucket is within its limit (and counts this hit).
+export type RateLimitHit = (bucket: string, limit: RateLimit) => Promise<boolean>;
 
 export const URGENCY_CHOICES = ['none', 'immediate_danger'] as const;
 export type Urgency = (typeof URGENCY_CHOICES)[number];
@@ -97,17 +111,63 @@ export function escapeHtml(value: string): string {
     .replaceAll("'", '&#39;');
 }
 
-// First address in X-Forwarded-For (the client), else the Supabase-provided
-// header, else empty. Only ever hashed, never stored.
+// The visitor address, only ever hashed, never stored: cf-connecting-ip
+// (set by the edge in front of the function), else the LAST
+// X-Forwarded-For hop (added by the nearest proxy), else x-real-ip, else
+// empty. Never the first X-Forwarded-For entry: the client writes that one.
 export function clientAddress(headers: Headers): string {
-  const forwarded = headers.get('x-forwarded-for') || '';
-  const first = forwarded.split(',')[0].trim();
-  if (first) return first;
-  return (headers.get('cf-connecting-ip') || headers.get('x-real-ip') || '').trim();
+  const edge = (headers.get('cf-connecting-ip') || '').trim();
+  if (edge) return edge;
+  const hops = (headers.get('x-forwarded-for') || '').split(',').map((hop) => hop.trim()).filter(Boolean);
+  if (hops.length) return hops[hops.length - 1];
+  return (headers.get('x-real-ip') || '').trim();
 }
 
-export function bucketNames(token: string, addressHash: string): { token: string; ip: string | null } {
-  return { token: `token:${token}`, ip: addressHash ? `ip:${addressHash}` : null };
+export function bucketNames(token: string, addressHash: string): { token: string; tokenHard: string; ip: string | null } {
+  return { token: `token:${token}`, tokenHard: `token-hard:${token}`, ip: addressHash ? `ip:${addressHash}` : null };
+}
+
+export function postBucketName(addressHash: string): string | null {
+  return addressHash ? `ip-post:${addressHash}` : null;
+}
+
+export type PostDecision =
+  | { kind: 'limited' }
+  | { kind: 'bad_content_type' }
+  | { kind: 'honeypot' }
+  | { kind: 'invalid'; reason: string }
+  | { kind: 'lead'; lead: IntakeLead; suspected: boolean };
+
+// The POST pipeline, in order: the per-address all-posts bucket; read the
+// form (null = not a form post); honeypot and validation; and only then the
+// per-address lead bucket, the per-token hard cap, and the per-token budget.
+// A post that will not create a lead never touches the practice's token
+// buckets, and a lead refused by the address bucket spends neither. A lead
+// past the budget (but under the hard cap) is admitted as suspected: the
+// database keeps it, marked possible spam, and sends no push.
+export async function admitPost(
+  token: string,
+  addressHash: string,
+  readForm: () => Promise<URLSearchParams | null>,
+  hit: RateLimitHit,
+): Promise<PostDecision> {
+  const postBucket = postBucketName(addressHash);
+  if (postBucket && !(await hit(postBucket, IP_POST_LIMIT))) return { kind: 'limited' };
+  const form = await readForm();
+  if (!form) return { kind: 'bad_content_type' };
+  const parsed = parseSubmission(form);
+  if (parsed.kind !== 'lead') return parsed;
+  const buckets = bucketNames(token, addressHash);
+  if (buckets.ip && !(await hit(buckets.ip, IP_LIMIT))) return { kind: 'limited' };
+  if (!(await hit(buckets.tokenHard, TOKEN_HARD_LIMIT))) return { kind: 'limited' };
+  const withinBudget = await hit(buckets.token, TOKEN_LIMIT);
+  return { kind: 'lead', lead: parsed.lead, suspected: !withinBudget };
+}
+
+// What create_lead_from_intake receives: the lead, plus the possible-spam
+// flag only when it applies.
+export function intakeRpcLead(decision: { lead: IntakeLead; suspected: boolean }): IntakeLead & { suspected_spam?: true } {
+  return decision.suspected ? { ...decision.lead, suspected_spam: true } : decision.lead;
 }
 
 // ─── Pages ──────────────────────────────────────────────────────────────────
@@ -160,13 +220,17 @@ ${body}
 </html>`;
 }
 
-export function formPage(practiceName: string, actionUrl: string, errorMessage = ''): string {
+// The form has no action attribute, so it posts back to the page's own URL.
+// Hosted, that URL is /functions/v1/intake/<token>; the function itself
+// only sees /intake/<token>, so an action built from its pathname 404'd.
+// CSP form-action 'self' allows the same-origin post.
+export function formPage(practiceName: string, errorMessage = ''): string {
   const practice = escapeHtml(practiceName);
   return page(`Reach ${practiceName}`, `
 <h1>Reach ${practice}</h1>
 <p class="lede">Tell us how to reach you and someone from ${practice} will call you back shortly. Addiction is a medical condition, and asking for help for someone you love is the right move. There is nothing to be ashamed of here.</p>
 ${errorMessage ? `<div class="alert" role="alert">${escapeHtml(errorMessage)}</div>` : ''}
-<form method="post" action="${escapeHtml(actionUrl)}" autocomplete="on">
+<form method="post" autocomplete="on">
   <div class="card">
     <label for="caller_name">Your name</label>
     <input type="text" id="caller_name" name="caller_name" required maxlength="120" autocomplete="name">

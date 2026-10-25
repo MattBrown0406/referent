@@ -86,9 +86,26 @@ Partner detail → **Shared directory**:
 | Approved | "In the shared directory". |
 | Not approved | "Not added to the directory", the reviewer's note, and "Submit again" once it is ready. |
 
-If the program or professional is already in the directory (same phone
-digits or website domain), submitting links the partner to the existing
-listing instead of creating a duplicate — same as before.
+If the program or professional is already in the directory, submitting
+links the partner to the existing listing instead of creating a duplicate.
+Since 2026-10-24 (`20261024120000_directory_membership_hardening.sql`,
+`directory_listing_match_for_partner`) "already in the directory" means all of:
+
+- the listing is **not claimed** (no owner workspace, no center account).
+  A claimant controls its listing's name and phone, so linking to it could
+  hand another practice's partner to an impersonator and overwrite it
+  through propagation. To track a claimed program, import it from the
+  directory instead;
+- the same phone digits or website domain;
+- a matching organization name (`directory_names_match`: equal ignoring
+  case, punctuation and a leading "The", or one name of at least four
+  letters starts the other). An **exact** name match is preferred; a
+  prefix-only match ("Recovery Unplugged" for "Recovery Unplugged
+  Nashville") also needs the same state, and the same city when both have
+  one, so one campus is never linked to another.
+
+Otherwise the submission becomes a new pending listing; the admin can merge
+true duplicates (`merge_global_partners`).
 
 Approved interventionists and therapists are found in the Directory screen
 under its existing **Interventionists** and **Therapists** filter pills

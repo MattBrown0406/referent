@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -26,13 +26,16 @@ import {
   updateLeadResponseTarget,
   type Workspace,
 } from './org';
-import { intakeLinkUrl, intakeShareMessage } from './intake-link';
+import { INTAKE_LINK_ENABLED, intakeLinkUrl, intakeShareMessage } from './intake-link';
+import { openPrivacyPolicy } from './privacy';
 import { SUPABASE_URL } from './supabase';
 import { type Entitlement, type EntitlementState } from './entitlements';
 import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySubmissions, type OrgDirectoryProfileState } from './directory';
 import DirectoryReviewQueue from './DirectoryReviewQueue';
 import { prepareForWorkspaceChange } from './store';
 import { deleteOwnAccount } from './account';
+import { AiDraftsCard } from './AiDraftKey';
+import { removeAnthropicKey } from './outreach-api';
 import {
   enablePush,
   fetchNotificationPreferences,
@@ -59,6 +62,7 @@ type Props = {
   // The account and its local session are already gone when this fires; the
   // caller resets in-memory state and lets the auth listener show sign-in.
   onAccountDeleted: () => void;
+  onSignOut: () => void;
   // Lead settings (intake token, first-call target) changed; the caller
   // refreshes what Today and the Business dashboard use.
   onLeadSettingsChanged?: () => void;
@@ -101,7 +105,7 @@ function profileStatusLabel(profile: NonNullable<OrgDirectoryProfileState['profi
   return profile.verifiedAt ? `Live · Verified ${profile.verifiedAt.slice(0, 10)}` : 'Live in the directory';
 }
 
-export default function WorkspaceScreen({ visible, userId, entitlements, onClose, onWorkspaceChanged, onEditDirectoryProfile, onAccountDeleted, onLeadSettingsChanged }: Props) {
+export default function WorkspaceScreen({ visible, userId, entitlements, onClose, onWorkspaceChanged, onEditDirectoryProfile, onAccountDeleted, onLeadSettingsChanged, onSignOut }: Props) {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [editingTarget, setEditingTarget] = useState<string | null>(null);
   const [linkCopied, setLinkCopied] = useState(false);
@@ -122,6 +126,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   const [notify, setNotify] = useState<PreferencesState | null>(null);
   const [notifyError, setNotifyError] = useState('');
   const [notifyNote, setNotifyNote] = useState('');
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -196,7 +202,15 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
         Alert.alert('Delete permanently?', 'You will be signed out on this device immediately and the account cannot be recovered.', [
           { text: 'Keep my account', style: 'cancel' },
           { text: 'Delete account', style: 'destructive', onPress: () => run(async () => {
-            await deleteOwnAccount({ userId, removeWorkspaceFiles: soloOwner });
+            try {
+              await deleteOwnAccount({ userId, removeWorkspaceFiles: soloOwner });
+            } catch (error) {
+              // A refusal (the server's own message is shown by run) may mean
+              // the workspace changed meanwhile: show it as it is now.
+              void load();
+              throw error;
+            }
+            await removeAnthropicKey(userId); // the account's AI key leaves this phone with it
             onAccountDeleted();
           }, 'Could not delete the account') },
         ]);
@@ -216,7 +230,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   }
 
   // ─── Intake link ─────────────────────────────────────────────────────────
-  const intakeUrl = workspace ? intakeLinkUrl(SUPABASE_URL, workspace.leadSettings.intakeToken) : '';
+  // Hidden while INTAKE_LINK_ENABLED is false: no URL, so nothing to copy or share.
+  const intakeUrl = workspace && INTAKE_LINK_ENABLED ? intakeLinkUrl(SUPABASE_URL, workspace.leadSettings.intakeToken) : '';
 
   function copyIntakeLink() {
     if (!intakeUrl) return;
@@ -255,9 +270,11 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
 
   function saveTarget() {
     if (!workspace || editingTarget === null) return;
-    const minutes = Number(editingTarget.trim());
+    const text = editingTarget.trim();
+    const minutes = Number(text);
     setEditingTarget(null);
-    if (!Number.isInteger(minutes) || minutes === workspace.leadSettings.leadResponseTargetMinutes) return;
+    // A cleared field keeps the current target; a target is at least a minute.
+    if (!text || !Number.isInteger(minutes) || minutes < 1 || minutes === workspace.leadSettings.leadResponseTargetMinutes) return;
     void run(async () => {
       await updateLeadResponseTarget(workspace.orgId, minutes);
       await load();
@@ -310,6 +327,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
     void run(async () => {
       const invite = await createWorkspaceInvite();
       await load();
+      // Closed while the code was being made: a share sheet presented from a
+      // closing screen never appears and never settles, which would leave
+      // every button here disabled. The code is listed above for next time.
+      if (!visibleRef.current) return;
       await Share.share({
         message: `Join my ${workspace?.name || 'ReferralFit'} workspace on ReferralFit. In the app, open Workspace → Join a practice and enter the code: ${invite.code} (${inviteExpiryLabel(invite.expiresAt)}).`,
       }).catch(() => undefined);
@@ -383,7 +404,9 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
             </TouchableOpacity>
           </View>
         ) : workspace ? (
-          <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+          // The join code and AI key fields sit low on a long page: keep the
+          // focused one above the keyboard (as the review queue does).
+          <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Practice name</Text>
               {editingName !== null ? (
@@ -414,7 +437,9 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
             </View>
 
             <View style={styles.card}>
-              <Text style={styles.cardLabel}>Your intake link</Text>
+              <Text style={styles.cardLabel}>{INTAKE_LINK_ENABLED ? 'Your intake link' : 'New leads'}</Text>
+              {INTAKE_LINK_ENABLED ? (
+              <>
               <Text style={styles.helpText}>
                 Put this link on your website, in your email signature, or send it by text. A family fills in a name and number, and the lead appears on Today with its first-call clock running. The page says who will call and that it is not emergency care.
               </Text>
@@ -437,6 +462,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 </>
               ) : (
                 <Text style={styles.helpText}>Your intake link is not available yet. Pull to refresh after the lead-capture update is applied.</Text>
+              )}
+              </>
+              ) : (
+                <Text style={styles.helpText}>Add a lead with New lead on Today. It goes on Today with its first-call clock running.</Text>
               )}
               <View style={styles.memberRow}>
                 <View style={styles.memberInfo}>
@@ -616,11 +645,14 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Your data is private</Text>
               <Text style={styles.helpText}>
-                Everything in this workspace — partners, cases, referrals, notes, and documents — belongs to your practice alone. Other practices using ReferralFit cannot see it, and ReferralFit staff do not have access to it. Only people you invite with a code can join this workspace.
+                Everything in this workspace — partners, cases, referrals, notes, and documents — is private to your workspace. Other practices using ReferralFit cannot see it, and ReferralFit does not sell it or share it with advertisers or data brokers. Only people you invite with a code can join this workspace.
               </Text>
               <Text style={[styles.helpText, styles.helpTextSpaced]}>
                 The only shared space is the Directory: your own profile if you build one, and one of your partners only when you choose to submit it and ReferralFit approves it. Benchmarks use anonymized totals and never identify a practice.
               </Text>
+              <TouchableOpacity accessibilityRole="link" accessibilityLabel="Privacy policy" accessibilityHint="Opens the ReferralFit privacy policy in your browser" onPress={openPrivacyPolicy} style={styles.linkButton}>
+                <Text style={styles.linkButtonText}>Privacy policy</Text>
+              </TouchableOpacity>
             </View>
 
             <View style={styles.card}>
@@ -642,6 +674,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 ReferralFit is free to use. There is nothing to buy in this app and no charge to your practice.
               </Text>
             </View>
+
+            <AiDraftsCard userId={userId} visible={visible} />
 
             {isOwner && entitlements.entitlements.pro ? (
               <View style={styles.card}>
@@ -693,6 +727,14 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 </View>
               </View>
             ) : null}
+
+            <View style={styles.card}>
+              <Text style={styles.cardLabel}>Sign out</Text>
+              <Text style={styles.helpText}>Signs this phone out of ReferralFit. Your workspace stays as it is, and you can sign back in any time.</Text>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Sign out" disabled={busy} onPress={onSignOut} style={[styles.smallButton, styles.helpTextSpaced, { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center' }]}>
+                <Text style={styles.smallButtonText}>Sign out</Text>
+              </TouchableOpacity>
+            </View>
 
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Delete account</Text>
@@ -783,6 +825,8 @@ const styles = StyleSheet.create({
   dangerButtonText: { color: COLORS.coral, fontWeight: '700' },
   helpText: { fontSize: 14, color: COLORS.gray, lineHeight: 20 },
   linkText: { fontSize: 13, color: COLORS.blue, backgroundColor: COLORS.blueSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 10 },
+  linkButton: { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center' },
+  linkButtonText: { fontSize: 15, fontWeight: '600', color: COLORS.blue, textDecorationLine: 'underline' },
   targetRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   targetInput: { width: 72, borderWidth: 1, borderColor: COLORS.line, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, fontSize: 16, color: COLORS.ink, backgroundColor: COLORS.bg, textAlign: 'center' },
   helpTextSpaced: { marginTop: 10 },

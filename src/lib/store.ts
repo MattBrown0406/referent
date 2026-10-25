@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { fetchCaseFile, fetchCaseList, newUuid, type CaseFile, type CaseList } from './cases';
+import { fetchCaseFile as fetchCaseFileFromServer, fetchCaseList as fetchCaseListFromServer, newUuid, type CaseFile, type CaseList } from './cases';
 import {
   makeCaseFileEnvelope,
   makeCaseFileIndexEnvelope,
@@ -13,8 +13,20 @@ import {
   type CachedCaseList,
 } from './case-cache';
 import { currentAuthSessionIdentity } from './auth-session';
-import { StoreError } from './errors';
-import { fetchAllPages } from './paging';
+import {
+  OfflineError,
+  RejectedWritesError,
+  StoreError,
+  asOfflineError,
+  describeError,
+  errorCode,
+  isNetworkError,
+  isServerUnreachable,
+  isTimeoutError,
+  isTransientServerError,
+  withHttpStatus,
+} from './errors';
+import { fetchAllPages, isPagingLimitError } from './paging';
 import { supabase } from './supabase';
 import type {
   ClientPopulation,
@@ -99,6 +111,10 @@ export type PartnerScorecard = {
   medianDaysToAdmit?: number | null;
   stillEnrolled?: number;
   network?: NetworkTrackRecord;
+  // How many outbound referrals avgFamilyExperience averages over (a non-admit
+  // is never rated). Counted from the loaded referrals; absent on cached cards
+  // from older builds, where matching falls back to the decided cases.
+  ratedCases?: number;
 };
 
 // Patch for the v2 outcome-enrichment columns on referrals (admitted,
@@ -159,6 +175,36 @@ export type PlacementDecision = {
 export type HydrateResult = {
   snapshot: Snapshot;
   source: 'remote' | 'cache';
+  // Set when queued changes could not be synced during hydration (some were
+  // rejected and set aside — see listRejectedWrites — or the flush failed and
+  // the saved copy is shown). Hydration still returns data either way.
+  syncError?: string;
+  // Set when the server copy could not be loaded in full (a list past the
+  // paging ceiling, paging.ts PagingLimitError) and the saved copy is shown
+  // instead: plain text for a notice. Not a sync problem.
+  notice?: string;
+};
+
+/**
+ * A queued offline change the server refused. It is moved out of the live
+ * queue (so later changes keep syncing and pendingWriteCount can reach 0) and
+ * kept here until the user retries or discards it.
+ */
+export type RejectedWrite = {
+  id: string;
+  // 'rejected': refused by the server (listRejectedWrites); 'waiting': still in
+  // the live queue, waiting on a record that has not reached the server
+  // (listWaitingWrites); 'unreadable': saved by a different version of the app
+  // and not readable by this one (listed with the rejected ones). All can be
+  // discarded (discardRejectedWrite / discardWaitingWrite); only rejected ones
+  // can be retried.
+  status: 'rejected' | 'waiting' | 'unreadable';
+  kind: string; // the queued operation kind, e.g. 'partner.update'
+  summary: string; // what the change was, in plain words
+  reason: string; // the server's explanation
+  code?: string; // PostgREST / Postgres error code, when there was one
+  rejectedAt: string; // ISO timestamptz (for 'waiting': when it first waited)
+  heldChanges: number; // later changes to the same records, kept with it
 };
 
 // ─── AsyncStorage keys ──────────────────────────────────────────────────────
@@ -175,6 +221,9 @@ const WORKSPACE_KEY_PREFIX = 'referralfit-workspace-v1:';
 const CASE_LIST_KEY_PREFIX = 'referralfit-case-list-v1:';
 const CASE_FILE_INDEX_KEY_PREFIX = 'referralfit-case-file-index-v1:';
 const CASE_FILE_KEY_PREFIX = 'referralfit-case-file-v1:';
+// Queued changes the server refused (see RejectedWrite). Same account key and
+// workspace binding as the queue; guarded by the queue lock.
+const REJECTED_KEY_PREFIX = 'referralfit-rejected-writes-v1:';
 
 function accountStorageKey(prefix: string, userId: string): string {
   if (!isUuid(userId)) throw new StoreError('Cannot use offline storage without a valid account ID.', false);
@@ -182,39 +231,35 @@ function accountStorageKey(prefix: string, userId: string): string {
 }
 
 // ─── Error classification ───────────────────────────────────────────────────
+// The classifiers live in errors.ts (cases.ts and org.ts share them) and are
+// re-exported here for App.tsx. isServerUnreachable is THE read classifier:
+// every read path below falls back to the saved copy on it.
 
-export function isNetworkError(error: unknown): boolean {
-  if (!error) return false;
-  const anyError = error as { name?: string; message?: string; status?: number; code?: string };
-  // PostgREST / Supabase errors carry a status or PG code — those reached the
-  // server, so queueing them would just fail again on flush.
-  if (typeof anyError.status === 'number' || (anyError.code && /^[0-9A-Z]{5}$/.test(anyError.code))) return false;
-  const message = String(anyError.message || error).toLowerCase();
-  return (
-    message.includes('network request failed') ||
-    message.includes('failed to fetch') ||
-    message.includes('networkerror') ||
-    message.includes('fetch failed') ||
-    message.includes('econnrefused') ||
-    message.includes('enotfound') ||
-    message.includes('etimedout') ||
-    message.includes('timeout') ||
-    message.includes('offline') ||
-    message.includes('internet')
-  );
-}
+export {
+  OfflineError,
+  RejectedWritesError,
+  StoreError,
+  describeError,
+  isNetworkError,
+  isServerUnreachable,
+  isTimeoutError,
+  isTransientServerError,
+} from './errors';
+export { PagingLimitError, isPagingLimitError } from './paging';
 
-export { StoreError } from './errors';
-
-type SessionFence = { userId: string; sessionId: string };
+// offline: the identity came from the session persisted on this device because
+// an expired access token could not be refreshed without a connection (see
+// auth-session.ts). It fences the account's on-device cache and queue only;
+// nothing is sent to the server under it — writes queue, reads use the cache.
+type SessionFence = { userId: string; sessionId: string; offline: boolean };
 
 async function sessionFence(expectedUserId?: string): Promise<SessionFence> {
-  const identity = await currentAuthSessionIdentity();
+  const identity = await currentAuthSessionIdentity({ allowOffline: true });
   if (!identity || !isUuid(identity.userId)) throw new StoreError('You must be signed in to use offline data.', false);
   if (expectedUserId && expectedUserId.toLowerCase() !== identity.userId) {
     throw new StoreError('The signed-in account changed. Retry this action for the current account.', false);
   }
-  return identity;
+  return { userId: identity.userId, sessionId: identity.sessionId, offline: Boolean(identity.offline) };
 }
 
 async function assertSessionFence(fence: SessionFence, queued = false): Promise<void> {
@@ -224,32 +269,68 @@ async function assertSessionFence(fence: SessionFence, queued = false): Promise<
   }
 }
 
-async function assertWorkspaceFence(fence: SessionFence): Promise<string> {
-  const key = accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId);
-  let storedOrg: string | null;
+// isNetworkError() classifies this as a lost connection, so callers treat it
+// exactly like a failed fetch.
+function offlineError(): OfflineError {
+  return new OfflineError();
+}
+
+async function readBindingUnlocked(userId: string): Promise<string | null> {
   try {
-    storedOrg = await AsyncStorage.getItem(key);
+    const stored = await AsyncStorage.getItem(accountStorageKey(WORKSPACE_KEY_PREFIX, userId));
+    return stored && isUuid(stored) ? stored.toLowerCase() : null;
   } catch (error) {
     throw persistenceError('cache', error);
   }
+}
+
+// Server-verified workspace: required before any server write. A lost
+// connection is rethrown untouched so callers can queue.
+async function assertWorkspaceFence(fence: SessionFence): Promise<string> {
+  if (fence.offline) throw offlineError();
+  const storedOrg = await readBindingUnlocked(fence.userId);
   const result = await supabase.rpc('current_org_id');
-  if (result.error) throw result.error;
+  if (result.error) {
+    const failure = failureOf(result);
+    if (isServerUnreachable(failure)) throw failure;
+    throw new StoreError(`The active workspace could not be verified: ${describeError(result.error)}`, false);
+  }
   if (typeof result.data !== 'string' || !storedOrg
-      || result.data.toLowerCase() !== storedOrg.toLowerCase()) {
+      || result.data.toLowerCase() !== storedOrg) {
     throw new StoreError('The active workspace changed. Reload before saving.', false);
   }
   await assertSessionFence(fence);
-  return storedOrg.toLowerCase();
+  return storedOrg;
+}
+
+// Workspace check for writes to this device's OWN saved copies (snapshot,
+// case list, case files): the binding last verified on this device, with no
+// server round trip. Those copies are only ever read back under that same
+// binding, and bindLocalWorkspace — the one place a workspace change is
+// adopted — wipes them under the cache lock (which every saved-copy write
+// holds), so a copy written under the old binding can never be read under the
+// new one. Asking the server here added nothing to that: it also passed right
+// after a re-bind, and it put two network calls (each up to the request
+// deadline on a bad network) inside the cache lock on every save — and when
+// the app was killed between the durable queue write and this cache write, a
+// relaunch showed the cache without the queued change. Server WRITES still
+// need the server's answer (assertWorkspaceFence).
+async function assertCacheWorkspaceFence(fence: SessionFence, expectedOrg?: string): Promise<string> {
+  const storedOrg = await readBindingUnlocked(fence.userId);
+  if (!storedOrg) throw new StoreError('This device has no verified workspace for offline data yet. Reconnect and reload.', false);
+  if (expectedOrg && storedOrg !== expectedOrg) throw new StoreError('The active workspace changed. Reload before saving.', false);
+  await assertSessionFence(fence);
+  return storedOrg;
 }
 
 function persistenceError(area: 'cache' | 'offline queue', error: unknown): StoreError {
-  const detail = error instanceof Error && error.message ? `: ${error.message}` : '';
+  const detail = error ? `: ${describeError(error)}` : '';
   return new StoreError(`Could not durably save the ${area}${detail}`, false);
 }
 
 // ─── Offline write queue (account-scoped, serialized FIFO) ──────────────────
 
-type QueueOp =
+type QueueOpBody =
   | { kind: 'partner.insert'; row: Record<string, unknown> }
   | { kind: 'partner.update'; id: string; patch: Record<string, unknown> }
   | { kind: 'referral.insert'; row: Record<string, unknown> }
@@ -265,11 +346,30 @@ type QueueOp =
   | { kind: 'referral.assign_match'; referral: Record<string, unknown>; match: Record<string, unknown> }
   | { kind: 'packet.finalize'; referral: Record<string, unknown>; match: Record<string, unknown> | null; touch: Record<string, unknown>; followUp: Record<string, unknown>; event: Record<string, unknown> | null }
   | { kind: 'contact.log_activity'; event: Record<string, unknown> | null; touch: Record<string, unknown> | null }
+  | { kind: 'outreach.sent'; completedId: string | null; next: Record<string, unknown>; event: Record<string, unknown> | null; touch: Record<string, unknown> | null }
   | { kind: 'referral.update'; id: string; patch: Record<string, unknown> }
   | { kind: 'placement.insert'; row: Record<string, unknown> }
   | { kind: 'referral.record_outcome'; referralId: string; outcome: Record<string, unknown>; completed: Record<string, unknown> | null };
 
-type QueueEnvelope = { version: 2; userId: string; ops: QueueOp[] };
+// opId: a unique id given to every op when it is queued (bindQueueOp), so two
+// identical edits (favorite on → off → on) stay two ops. It is only ever used
+// to recognise the SAME op twice (a crash between two durable writes), never
+// to merge ops by content. Ops queued by 1.0.4 (1) have none: the first flush
+// gives each one its own (flushQueueUnlocked) before any can be set aside.
+// Only an op that still has none is recognised by its content.
+type QueueOp = QueueOpBody & { opId?: string };
+
+function opIdentity(op: QueueOp): string {
+  return typeof op.opId === 'string' && op.opId ? `id:${op.opId}` : `json:${JSON.stringify(op)}`;
+}
+
+// Per-op retry bookkeeping, keyed by queueOpKey(op): parentWaits for ops the
+// server refused only because a row they need does not exist (yet), and
+// transientWaits for ops that hit a passing server failure. Older builds
+// ignore both fields, so the envelope version stays 2.
+type OpWait = { first: string; attempts: number };
+type QueueEnvelope = { version: 2; userId: string; ops: QueueOp[]; parentWaits?: Record<string, OpWait>; transientWaits?: Record<string, OpWait> };
+type QueueState = { ops: QueueOp[]; parentWaits: Record<string, OpWait>; transientWaits: Record<string, OpWait> };
 let queueMutex: Promise<void> = Promise.resolve();
 
 async function withQueueLock<T>(work: () => Promise<T>): Promise<T> {
@@ -286,7 +386,7 @@ async function withQueueLock<T>(work: () => Promise<T>): Promise<T> {
 
 function isQueueOp(value: unknown): value is QueueOp {
   if (!value || typeof value !== 'object') return false;
-  const op = value as { kind?: unknown; row?: unknown; id?: unknown; patch?: unknown; completed?: unknown; next?: unknown; event?: unknown; referralId?: unknown; outcome?: unknown; referral?: unknown; match?: unknown; caseId?: unknown; touch?: unknown; followUp?: unknown };
+  const op = value as { kind?: unknown; row?: unknown; id?: unknown; patch?: unknown; completed?: unknown; completedId?: unknown; next?: unknown; event?: unknown; referralId?: unknown; outcome?: unknown; referral?: unknown; match?: unknown; caseId?: unknown; touch?: unknown; followUp?: unknown };
   const insertKinds = ['partner.insert', 'referral.insert', 'match.insert', 'touch.insert', 'follow_up.insert', 'placement.insert'];
   const updateKinds = ['partner.update', 'match.update', 'follow_up.update', 'referral.update'];
   if (typeof op.kind !== 'string') return false;
@@ -308,6 +408,12 @@ function isQueueOp(value: unknown): value is QueueOp {
   if (op.kind === 'packet.finalize') return Boolean(op.referral && typeof op.referral === 'object' && op.touch && typeof op.touch === 'object'
     && op.followUp && typeof op.followUp === 'object' && (op.match === null || (op.match && typeof op.match === 'object'))
     && (op.event === null || (op.event && typeof op.event === 'object')));
+  if (op.kind === 'outreach.sent') return Boolean(
+    (op.completedId === null || typeof op.completedId === 'string')
+    && op.next && typeof op.next === 'object'
+    && (op.event === null || (op.event && typeof op.event === 'object'))
+    && (op.touch === null || (op.touch && typeof op.touch === 'object'))
+    && (op.event !== null || op.touch !== null));
   if (op.kind === 'contact.log_activity') return Boolean(
     (op.event === null || (op.event && typeof op.event === 'object'))
     && (op.touch === null || (op.touch && typeof op.touch === 'object'))
@@ -315,7 +421,87 @@ function isQueueOp(value: unknown): value is QueueOp {
   return updateKinds.includes(op.kind) && typeof op.id === 'string' && Boolean(op.patch && typeof op.patch === 'object');
 }
 
-async function readQueueUnlocked(userId: string): Promise<QueueOp[]> {
+// ─── Unreadable changes (account-scoped, guarded by the queue lock) ────────
+// A queued or set-aside change this build cannot read: an op kind it does not
+// know (an OTA rollback to a bundle older than the one that queued it), a
+// damaged entry, or a queue saved in a format it does not know. One such op
+// used to fail every read of the queue, and with it every save, for good. It
+// is now moved here, raw — never sent, never interpreted — and the rest keeps
+// working. The review list shows it (status 'unreadable', Discard only), and
+// a later build that can read it puts it back (readmitUnreadableUnlocked).
+// Writes go to this key first and only then out of the queue or the rejected
+// list: a crash in between leaves it in both (de-duplicated), never neither.
+const UNREADABLE_KEY_PREFIX = 'referralfit-unreadable-writes-v1:';
+const UNREADABLE_OP_REASON = 'This change was saved by a different version of ReferralFit and cannot be read by this one. Update the app to send it, or discard it.';
+const UNREADABLE_QUEUE_REASON = 'Changes waiting on this device were saved in a format this version of ReferralFit cannot read. Update the app to send them, or discard them.';
+
+type UnreadableEntry = { id: string; source: 'queue' | 'rejected'; raw: unknown; reason: string; quarantinedAt: string };
+type UnreadableEnvelope = { version: 1; userId: string; entries: UnreadableEntry[] };
+
+function isUnreadableEntry(value: unknown): value is UnreadableEntry {
+  const entry = value as Partial<UnreadableEntry> | null;
+  return Boolean(entry && typeof entry === 'object' && typeof entry.id === 'string' && (entry.source === 'queue' || entry.source === 'rejected')
+    && typeof entry.reason === 'string' && typeof entry.quarantinedAt === 'string' && 'raw' in entry);
+}
+
+// Same identity rules as opIdentity: an op (or a set-aside entry) is
+// recognised by its own id, never merged with a look-alike.
+function rawIdentity(raw: unknown): string {
+  const value = raw as { opId?: unknown; id?: unknown; ops?: unknown } | null;
+  if (value && typeof value === 'object') {
+    if (typeof value.opId === 'string' && value.opId) return `op:${value.opId}`;
+    if (Array.isArray(value.ops) && typeof value.id === 'string') return `entry:${value.id}`;
+  }
+  try {
+    return `json:${JSON.stringify(raw)}`;
+  } catch {
+    return `json:${String(raw)}`;
+  }
+}
+
+async function readUnreadableUnlocked(userId: string): Promise<UnreadableEntry[]> {
+  let raw: string | null;
+  try {
+    raw = await AsyncStorage.getItem(accountStorageKey(UNREADABLE_KEY_PREFIX, userId));
+  } catch (error) {
+    throw persistenceError('offline queue', error);
+  }
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as Partial<UnreadableEnvelope>;
+    if (parsed.version !== 1 || parsed.userId?.toLowerCase() !== userId || !Array.isArray(parsed.entries)) return [];
+    return parsed.entries.filter(isUnreadableEntry);
+  } catch {
+    return []; // holds nothing this build could send anyway
+  }
+}
+
+async function writeUnreadableUnlocked(userId: string, entries: UnreadableEntry[]): Promise<void> {
+  const envelope: UnreadableEnvelope = { version: 1, userId, entries };
+  try {
+    await AsyncStorage.setItem(accountStorageKey(UNREADABLE_KEY_PREFIX, userId), JSON.stringify(envelope));
+  } catch (error) {
+    throw persistenceError('offline queue', error);
+  }
+}
+
+async function quarantineUnlocked(userId: string, source: UnreadableEntry['source'], raws: unknown[], reason: string): Promise<void> {
+  if (!raws.length) return;
+  const entries = await readUnreadableUnlocked(userId);
+  const known = new Set(entries.map((entry) => rawIdentity(entry.raw)));
+  const quarantinedAt = new Date().toISOString();
+  for (const raw of raws) {
+    const identity = rawIdentity(raw);
+    if (known.has(identity)) continue;
+    known.add(identity);
+    entries.push({ id: newUuid(), source, raw, reason, quarantinedAt });
+  }
+  await writeUnreadableUnlocked(userId, entries);
+}
+
+const EMPTY_QUEUE_STATE = (): QueueState => ({ ops: [], parentWaits: {}, transientWaits: {} });
+
+async function readQueueStateUnlocked(userId: string): Promise<QueueState> {
   const key = accountStorageKey(QUEUE_KEY_PREFIX, userId);
   let raw: string | null;
   try {
@@ -323,20 +509,97 @@ async function readQueueUnlocked(userId: string): Promise<QueueOp[]> {
   } catch (error) {
     throw persistenceError('offline queue', error);
   }
-  if (!raw) return [];
+  if (!raw) return EMPTY_QUEUE_STATE();
+  let parsed: Partial<QueueEnvelope> | null;
   try {
-    const parsed = JSON.parse(raw) as Partial<QueueEnvelope>;
-    if (parsed.version !== 2 || parsed.userId?.toLowerCase() !== userId || !Array.isArray(parsed.ops) || !parsed.ops.every(isQueueOp)) {
-      throw new Error('stored queue failed account or format validation');
-    }
-    return parsed.ops;
-  } catch (error) {
-    throw persistenceError('offline queue', error);
+    parsed = JSON.parse(raw) as Partial<QueueEnvelope>;
+  } catch {
+    parsed = null;
   }
+  if (!parsed || typeof parsed !== 'object' || parsed.version !== 2 || parsed.userId?.toLowerCase() !== userId || !Array.isArray(parsed.ops)) {
+    // The queue as a whole cannot be read: keep it, raw, and start a new one.
+    await quarantineUnlocked(userId, 'queue', [raw], UNREADABLE_QUEUE_REASON);
+    await writeQueueUnlocked(userId, []);
+    return EMPTY_QUEUE_STATE();
+  }
+  const ops = parsed.ops.filter(isQueueOp);
+  const unreadable = parsed.ops.filter((op) => !isQueueOp(op));
+  const parentWaits = sanitizeWaits(parsed.parentWaits);
+  const transientWaits = sanitizeWaits(parsed.transientWaits);
+  const rekeyedParents = rekeyLegacyWaits(ops, parentWaits);
+  const rekeyed = rekeyLegacyWaits(ops, transientWaits) || rekeyedParents;
+  if (unreadable.length) await quarantineUnlocked(userId, 'queue', unreadable, UNREADABLE_OP_REASON);
+  if (unreadable.length || rekeyed) await writeQueueUnlocked(userId, ops, { parentWaits, transientWaits });
+  return { ops, parentWaits, transientWaits };
 }
 
-async function writeQueueUnlocked(userId: string, ops: QueueOp[]): Promise<void> {
-  const envelope: QueueEnvelope = { version: 2, userId, ops };
+async function readQueueUnlocked(userId: string): Promise<QueueOp[]> {
+  return (await readQueueStateUnlocked(userId)).ops;
+}
+
+function sanitizeWaits(value: unknown): Record<string, OpWait> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const waits: Record<string, OpWait> = {};
+  for (const [key, wait] of Object.entries(value as Record<string, unknown>)) {
+    const candidate = wait as Partial<OpWait> | null;
+    if (candidate && typeof candidate.first === 'string' && typeof candidate.attempts === 'number' && Number.isFinite(candidate.attempts)) {
+      waits[key] = { first: candidate.first, attempts: candidate.attempts };
+    }
+  }
+  return waits;
+}
+
+// Identity of a queued op for its retry bookkeeping (parentWaits,
+// transientWaits) and for holding related ops together: its opId. Every op
+// gets one when it is queued (bindQueueOp); ops queued by 1.0.4 (1) get one
+// on their first flush. Only an op that still has none falls back to a hash
+// of its content — the old key, which hashed every op on every queue write.
+function queueOpKey(op: QueueOp): string {
+  return typeof op.opId === 'string' && op.opId ? op.opId : legacyQueueOpKey(op);
+}
+
+function legacyQueueOpKey(op: QueueOp): string {
+  return uuidFromLegacyId(JSON.stringify(op));
+}
+
+// Waits saved by builds that keyed them by legacyQueueOpKey move to the op's
+// opId (in place), so an upgrade keeps each op's attempt count. Returns
+// whether anything moved. Hashes only while such old keys remain.
+function rekeyLegacyWaits(ops: QueueOp[], waits: Record<string, OpWait>): boolean {
+  const keys = Object.keys(waits);
+  if (!keys.length) return false;
+  const live = new Set(ops.map(queueOpKey));
+  if (keys.every((key) => live.has(key))) return false;
+  const byLegacyKey = new Map<string, string>();
+  for (const op of ops) if (typeof op.opId === 'string' && op.opId) byLegacyKey.set(legacyQueueOpKey(op), op.opId);
+  let moved = false;
+  for (const key of keys) {
+    if (live.has(key)) continue;
+    const opId = byLegacyKey.get(key);
+    if (opId && !waits[opId]) waits[opId] = waits[key];
+    delete waits[key];
+    moved = true;
+  }
+  return moved;
+}
+
+function liveWaits(waits: Record<string, OpWait>, live: Set<string>): Record<string, OpWait> {
+  return Object.fromEntries(Object.entries(waits).filter(([key]) => live.has(key)));
+}
+
+async function writeQueueUnlocked(
+  userId: string,
+  ops: QueueOp[],
+  waits: { parentWaits?: Record<string, OpWait>; transientWaits?: Record<string, OpWait> } = {},
+): Promise<void> {
+  const live = new Set(ops.map(queueOpKey));
+  const parentWaits = liveWaits(waits.parentWaits ?? {}, live);
+  const transientWaits = liveWaits(waits.transientWaits ?? {}, live);
+  const envelope: QueueEnvelope = {
+    version: 2, userId, ops,
+    ...(Object.keys(parentWaits).length ? { parentWaits } : {}),
+    ...(Object.keys(transientWaits).length ? { transientWaits } : {}),
+  };
   try {
     await AsyncStorage.setItem(accountStorageKey(QUEUE_KEY_PREFIX, userId), JSON.stringify(envelope));
   } catch (error) {
@@ -344,188 +607,835 @@ async function writeQueueUnlocked(userId: string, ops: QueueOp[]): Promise<void>
   }
 }
 
-async function enqueueOp(fence: SessionFence, op: QueueOp): Promise<void> {
-  await withQueueLock(async () => {
-    await assertSessionFence(fence);
-    const ops = await readQueueUnlocked(fence.userId);
-    await assertSessionFence(fence);
-    await writeQueueUnlocked(fence.userId, [...ops, bindQueueOp(op, fence.userId)]);
-    await assertSessionFence(fence, true);
-  });
+// Caller holds the queue lock.
+async function enqueueOpUnlocked(fence: SessionFence, op: QueueOp): Promise<void> {
+  await assertSessionFence(fence);
+  const state = await readQueueStateUnlocked(fence.userId);
+  await assertSessionFence(fence);
+  await writeQueueUnlocked(fence.userId, [...state.ops, bindQueueOp(op, fence.userId)], state);
+  await assertSessionFence(fence, true);
 }
 
-async function enqueueOps(fence: SessionFence, additions: QueueOp[]): Promise<void> {
-  if (!additions.length) return;
-  await withQueueLock(async () => {
+async function enqueueOp(fence: SessionFence, op: QueueOp): Promise<void> {
+  await withQueueLock(() => enqueueOpUnlocked(fence, op));
+}
+
+// ─── Which rows an op touches (for holding related changes together) ──────
+// Any op that writes a row a held op writes, or needs a row a held op would
+// create, is held with it — set aside together, retried together, discarded
+// together. Otherwise an edit to a row whose insert was set aside would run
+// first, match nothing (PostgREST reports success for 0 rows) and be lost,
+// and the insert would later land with the stale values.
+
+const FK_PARENT_TABLES: Record<string, string> = {
+  partner_id: 'partners',
+  assigned_partner_id: 'partners',
+  chosen_partner_id: 'partners',
+  referral_id: 'referrals',
+  match_profile_id: 'match_profiles',
+};
+
+// creates: rows the op may create (plain inserts, and the upserts inside
+// save_case / assign_match / finalize_packet). inserts: rows a plain insert
+// creates — only those may run ahead of a held edit of the same row (that edit
+// is waiting for them); everything else keeps FIFO order per row.
+type OpRows = { creates: string[]; inserts: string[]; writes: string[]; parents: string[] };
+
+function rowKey(table: string, id: unknown): string | null {
+  return typeof id === 'string' && id ? `${table}:${id.toLowerCase()}` : null;
+}
+
+function opRows(op: QueueOp): OpRows {
+  const rows: OpRows = { creates: [], inserts: [], writes: [], parents: [] };
+  const add = (list: string[], key: string | null) => { if (key) list.push(key); };
+  const parentsOf = (row: Record<string, unknown> | null | undefined) => {
+    if (!row) return;
+    for (const [column, table] of Object.entries(FK_PARENT_TABLES)) add(rows.parents, rowKey(table, row[column]));
+  };
+  const create = (table: string, row: Record<string, unknown> | null | undefined, plainInsert = false) => {
+    if (!row) return;
+    const key = rowKey(table, row.id);
+    add(rows.creates, key);
+    if (plainInsert) add(rows.inserts, key);
+    add(rows.writes, key);
+    parentsOf(row);
+  };
+  const write = (table: string, id: unknown, patch?: Record<string, unknown> | null) => {
+    add(rows.writes, rowKey(table, id));
+    parentsOf(patch);
+  };
+  switch (op.kind) {
+    case 'partner.insert': create('partners', op.row, true); break;
+    case 'referral.insert': create('referrals', op.row, true); break;
+    case 'match.insert': create('match_profiles', op.row, true); break;
+    case 'touch.insert': create('touches', op.row, true); break;
+    case 'follow_up.insert': create('follow_ups', op.row, true); break;
+    case 'placement.insert': create('placement_decisions', op.row, true); break;
+    case 'partner.update': write('partners', op.id, op.patch); break;
+    case 'match.update': write('match_profiles', op.id, op.patch); break;
+    case 'follow_up.update': write('follow_ups', op.id, op.patch); break;
+    case 'referral.update': write('referrals', op.id, op.patch); break;
+    case 'match.delete': write('match_profiles', op.id); break;
+    case 'follow_up.complete_next': write('follow_ups', op.completed.id, op.completed); create('follow_ups', op.next); parentsOf(op.event); break;
+    case 'follow_up.complete_outcome': write('follow_ups', op.completed.id, op.completed); write('referrals', op.referralId, op.outcome); break;
+    case 'referral.record_outcome': write('referrals', op.referralId, op.outcome); if (op.completed) write('follow_ups', op.completed.id, op.completed); break;
+    case 'match.save_case': create('match_profiles', op.match); break;
+    case 'referral.assign_match': create('referrals', op.referral); create('match_profiles', op.match); break;
+    case 'packet.finalize':
+      create('referrals', op.referral);
+      create('match_profiles', op.match);
+      create('touches', op.touch);
+      create('follow_ups', op.followUp);
+      parentsOf(op.event);
+      break;
+    case 'contact.log_activity': create('touches', op.touch); parentsOf(op.event); break;
+    case 'outreach.sent': write('follow_ups', op.completedId); create('follow_ups', op.next); create('touches', op.touch); parentsOf(op.event); break;
+  }
+  return rows;
+}
+
+// Row key → the holder (a rejected entry id, or a waiting op's key).
+type HoldSets = { writes: Map<string, string>; creates: Map<string, string> };
+
+function newHoldSets(): HoldSets {
+  return { writes: new Map(), creates: new Map() };
+}
+
+// A row a plain INSERT creates is held only by another held op that creates
+// it too — never by a held edit of it: that edit is waiting for exactly this
+// insert (e.g. an edit queued ahead of a retried insert), so the insert must
+// run. Every other op on a held row waits behind it (FIFO per row).
+function holderOf(rows: OpRows, sets: HoldSets): string | undefined {
+  const inserts = new Set(rows.inserts);
+  for (const key of rows.writes) {
+    const holder = inserts.has(key) ? sets.creates.get(key) : sets.writes.get(key) ?? sets.creates.get(key);
+    if (holder) return holder;
+  }
+  for (const key of rows.parents) {
+    const holder = sets.creates.get(key);
+    if (holder) return holder;
+  }
+  return undefined;
+}
+
+function hold(rows: OpRows, sets: HoldSets, holder: string): void {
+  for (const key of rows.writes) if (!sets.writes.has(key)) sets.writes.set(key, holder);
+  for (const key of rows.creates) if (!sets.creates.has(key)) sets.creates.set(key, holder);
+}
+
+// ─── Rejected changes (account-scoped, guarded by the queue lock) ──────────
+// One entry per refused op; `ops[0]` is the op the server refused and the rest
+// are later changes held with it (same row, or a row it would create).
+
+type RejectedEntry = { id: string; ops: QueueOp[]; reason: string; code?: string; rejectedAt: string };
+type RejectedEnvelope = { version: 1; userId: string; entries: RejectedEntry[] };
+
+function isRejectedEntry(value: unknown): value is RejectedEntry {
+  const entry = value as Partial<RejectedEntry> | null;
+  return Boolean(entry && typeof entry === 'object' && typeof entry.id === 'string' && typeof entry.reason === 'string'
+    && typeof entry.rejectedAt === 'string' && Array.isArray(entry.ops) && entry.ops.length > 0 && entry.ops.every(isQueueOp)
+    && (entry.code === undefined || typeof entry.code === 'string'));
+}
+
+async function readRejectedUnlocked(userId: string): Promise<RejectedEntry[]> {
+  let raw: string | null;
+  try {
+    raw = await AsyncStorage.getItem(accountStorageKey(REJECTED_KEY_PREFIX, userId));
+  } catch (error) {
+    throw persistenceError('offline queue', error);
+  }
+  if (!raw) return [];
+  let parsed: Partial<RejectedEnvelope> | null;
+  try {
+    parsed = JSON.parse(raw) as Partial<RejectedEnvelope>;
+  } catch {
+    parsed = null;
+  }
+  if (!parsed || typeof parsed !== 'object' || parsed.version !== 1 || parsed.userId?.toLowerCase() !== userId || !Array.isArray(parsed.entries)) {
+    await quarantineUnlocked(userId, 'rejected', [raw], UNREADABLE_QUEUE_REASON);
+    await writeRejectedUnlocked(userId, []);
+    return [];
+  }
+  // An entry is kept or quarantined whole: its held ops stay together.
+  const entries = parsed.entries.filter(isRejectedEntry);
+  if (entries.length !== parsed.entries.length) {
+    await quarantineUnlocked(userId, 'rejected', parsed.entries.filter((entry) => !isRejectedEntry(entry)), UNREADABLE_OP_REASON);
+    await writeRejectedUnlocked(userId, entries);
+  }
+  return entries;
+}
+
+async function writeRejectedUnlocked(userId: string, entries: RejectedEntry[]): Promise<void> {
+  const envelope: RejectedEnvelope = { version: 1, userId, entries };
+  try {
+    await AsyncStorage.setItem(accountStorageKey(REJECTED_KEY_PREFIX, userId), JSON.stringify(envelope));
+  } catch (error) {
+    throw persistenceError('offline queue', error);
+  }
+}
+
+// A build that can read a quarantined change again (the app was updated past
+// the version that queued it) puts it back: a queue op at the front of the
+// live queue (it was queued before anything still behind it), a set-aside
+// entry back in the rejected list. Caller holds the queue lock.
+async function readmitUnreadableUnlocked(fence: SessionFence): Promise<void> {
+  const entries = await readUnreadableUnlocked(fence.userId);
+  const readable = entries.filter((entry) => (entry.source === 'queue' ? isQueueOp(entry.raw) : isRejectedEntry(entry.raw)));
+  if (!readable.length) return;
+  await assertSessionFence(fence);
+  const toQueue = readable.filter((entry) => entry.source === 'queue').map((entry) => entry.raw as QueueOp);
+  if (toQueue.length) {
+    const state = await readQueueStateUnlocked(fence.userId);
+    const queued = new Set(state.ops.map(opIdentity));
+    await writeQueueUnlocked(fence.userId, [...toQueue.filter((op) => !queued.has(opIdentity(op))), ...state.ops], state);
+  }
+  const toRejected = readable.filter((entry) => entry.source === 'rejected').map((entry) => entry.raw as RejectedEntry);
+  if (toRejected.length) {
+    const current = await readRejectedUnlocked(fence.userId);
+    const ids = new Set(current.map((entry) => entry.id));
+    await writeRejectedUnlocked(fence.userId, [...current, ...toRejected.filter((entry) => !ids.has(entry.id))]);
+  }
+  const readmitted = new Set(readable.map((entry) => entry.id));
+  // Re-read: the queue and rejected-list reads above quarantine whatever THIS
+  // build cannot read, into this same list. Writing back the copy read at the
+  // start would drop those entries silently.
+  const latest = await readUnreadableUnlocked(fence.userId);
+  await writeUnreadableUnlocked(fence.userId, latest.filter((entry) => !readmitted.has(entry.id)));
+  await assertSessionFence(fence, true);
+}
+
+function rejectedHoldSets(entries: RejectedEntry[]): HoldSets {
+  const sets = newHoldSets();
+  for (const entry of entries) for (const op of entry.ops) hold(opRows(op), sets, entry.id);
+  return sets;
+}
+
+// Where a NEW change goes relative to the refused changes: `holder` is the
+// refused entry it must wait with, if any. When an older op in the live queue
+// is (or will be, once a flush reaches it) held by that same entry, the new op
+// must queue behind it rather than join the entry directly — otherwise it
+// would be listed (and retried) ahead of the older edit. The same goes when
+// an older queued op touches any OTHER row of the new op (a packet held
+// through its match, with an older stamp of its referral queued): joining the
+// entry now, the new op would hold that row too, the flush would then attach
+// the older edit behind it, and a retry would replay the older edit last.
+function placeNewOp(rows: OpRows, rejectedSets: HoldSets, queue: QueueOp[]): { holder?: string; behindQueue: boolean } {
+  const combined: HoldSets = { writes: new Map(rejectedSets.writes), creates: new Map(rejectedSets.creates) };
+  const queuedSets = newHoldSets();
+  const heldInQueue = new Set<string>();
+  for (const queued of queue) {
+    const queuedRows = opRows(queued);
+    hold(queuedRows, queuedSets, queueOpKey(queued));
+    const holder = holderOf(queuedRows, combined);
+    if (!holder) continue;
+    heldInQueue.add(holder);
+    hold(queuedRows, combined, holder);
+  }
+  const holder = holderOf(rows, combined);
+  if (!holder) return { behindQueue: false };
+  return { holder, behindQueue: heldInQueue.has(holder) || holderOf(rows, queuedSets) !== undefined };
+}
+
+// In-memory view of the rejected list for one locked operation. Every change
+// is written through BEFORE the caller removes the op from the live queue: a
+// crash in between leaves it in both places (replayed once more, listed once
+// — entries are de-duplicated), never in neither.
+type RejectedList = {
+  entries: RejectedEntry[];
+  sets: HoldSets;
+  reject(op: QueueOp, reason: string, code: string | undefined): Promise<RejectedEntry>;
+  attach(entryId: string, op: QueueOp): Promise<void>;
+};
+
+async function openRejectedList(fence: SessionFence): Promise<RejectedList> {
+  const entries = await readRejectedUnlocked(fence.userId);
+  const sets = rejectedHoldSets(entries);
+  const save = async () => {
     await assertSessionFence(fence);
-    const ops = await readQueueUnlocked(fence.userId);
-    await assertSessionFence(fence);
-    const existing = new Set(ops.map((op) => JSON.stringify(op)));
-    const uniqueAdditions = additions.map((op) => bindQueueOp(op, fence.userId)).filter((op) => {
-      const serialized = JSON.stringify(op);
-      if (existing.has(serialized)) return false;
-      existing.add(serialized);
-      return true;
-    });
-    if (uniqueAdditions.length) await writeQueueUnlocked(fence.userId, [...ops, ...uniqueAdditions]);
-    await assertSessionFence(fence, uniqueAdditions.length > 0);
-  });
+    await writeRejectedUnlocked(fence.userId, entries);
+    await assertSessionFence(fence, true);
+  };
+  return {
+    entries,
+    sets,
+    async reject(op, reason, code) {
+      const identity = opIdentity(op);
+      const existing = entries.find((entry) => entry.ops.some((item) => opIdentity(item) === identity));
+      if (existing) return existing;
+      const entry: RejectedEntry = { id: newUuid(), ops: [op], reason, ...(code ? { code } : {}), rejectedAt: new Date().toISOString() };
+      entries.push(entry);
+      hold(opRows(op), sets, entry.id);
+      await save();
+      return entry;
+    },
+    async attach(entryId, op) {
+      const entry = entries.find((item) => item.id === entryId);
+      if (!entry) return;
+      // The same op (same opId) is never listed twice; equal-looking edits are
+      // distinct changes and all kept, in order.
+      const identity = opIdentity(op);
+      if (!entries.some((item) => item.ops.some((held) => opIdentity(held) === identity))) entry.ops.push(op);
+      hold(opRows(op), sets, entry.id);
+      await save();
+    },
+  };
+}
+
+function rowLabel(row: Record<string, unknown> | null | undefined): string {
+  if (!row) return '';
+  for (const field of ['name', 'title', 'client_label', 'organization']) {
+    const value = row[field];
+    if (typeof value === 'string' && value.trim()) return ` “${value.trim()}”`;
+  }
+  return '';
+}
+
+function describeQueueOp(op: QueueOp): string {
+  switch (op.kind) {
+    case 'partner.insert': return `Add partner${rowLabel(op.row)}`;
+    case 'partner.update': return `Edit partner${rowLabel(op.patch)}`;
+    case 'referral.insert': return `Log referral${rowLabel(op.row)}`;
+    case 'referral.update': return 'Update a referral';
+    case 'referral.record_outcome': return 'Record a placement outcome';
+    case 'referral.assign_match': return `Assign a program${rowLabel(op.match)}`;
+    case 'match.insert': return `Save match${rowLabel(op.row)}`;
+    case 'match.update': return `Edit match${rowLabel(op.patch)}`;
+    case 'match.delete': return 'Remove a match';
+    case 'match.save_case': return `Save match${rowLabel(op.match)} to its file`;
+    case 'touch.insert': return 'Log a partner touch';
+    case 'follow_up.insert': return `Add follow-up${rowLabel(op.row)}`;
+    case 'follow_up.update': return `Edit follow-up${rowLabel(op.patch)}`;
+    case 'follow_up.complete_next': return `Complete a follow-up and schedule${rowLabel(op.next)}`;
+    case 'follow_up.complete_outcome': return 'Complete a follow-up with its outcome';
+    case 'packet.finalize': return `Send a referral packet${rowLabel(op.referral)}`;
+    case 'contact.log_activity': return 'Log contact activity';
+    case 'outreach.sent': return `Log outreach and schedule${rowLabel(op.next)}`;
+    case 'placement.insert': return 'Record why a program was chosen';
+  }
+}
+
+function toRejectedWrite(entry: RejectedEntry): RejectedWrite {
+  return {
+    id: entry.id,
+    status: 'rejected',
+    kind: entry.ops[0].kind,
+    summary: describeQueueOp(entry.ops[0]),
+    reason: entry.reason,
+    ...(entry.code ? { code: entry.code } : {}),
+    rejectedAt: entry.rejectedAt,
+    heldChanges: entry.ops.length - 1,
+  };
+}
+
+function toUnreadableWrite(entry: UnreadableEntry): RejectedWrite {
+  const raw = entry.raw as { kind?: unknown; ops?: unknown } | null;
+  const first = raw && typeof raw === 'object' && Array.isArray(raw.ops) ? raw.ops[0] as { kind?: unknown } | undefined : raw;
+  const kind = first && typeof first === 'object' && typeof first.kind === 'string' ? first.kind : 'unknown';
+  const several = typeof entry.raw === 'string';
+  return {
+    id: entry.id,
+    status: 'unreadable',
+    kind,
+    summary: several ? 'Changes saved by a different version of the app' : 'A change saved by a different version of the app',
+    reason: entry.reason,
+    rejectedAt: entry.quarantinedAt,
+    heldChanges: raw && typeof raw === 'object' && Array.isArray(raw.ops) ? Math.max(0, raw.ops.length - 1) : 0,
+  };
+}
+
+function rejectedWritesError(entries: RejectedEntry[]): RejectedWritesError {
+  const count = entries.length;
+  const reasons = Array.from(new Set(entries.map((entry) => entry.reason))).slice(0, 3).join('; ');
+  const noun = count === 1 ? 'change' : 'changes';
+  const verb = count === 1 ? 'was' : 'were';
+  return new RejectedWritesError(
+    `${count} queued ${noun} could not be saved and ${verb} set aside so later changes can sync: ${reasons}`,
+    count,
+  );
 }
 
 function bindQueueOp(op: QueueOp, userId: string): QueueOp {
-  if ('row' in op) return { ...op, row: { ...op.row, owner_id: userId } } as QueueOp;
-  return op;
+  const opId = typeof op.opId === 'string' && op.opId ? op.opId : newUuid();
+  if ('row' in op) return { ...op, opId, row: { ...op.row, owner_id: userId } } as QueueOp;
+  return { ...op, opId };
+}
+
+// A queued insert is replayed with ON CONFLICT (id) DO NOTHING: replaying it
+// after it already landed (the app was killed before the queue was rewritten)
+// is a no-op, and it can never overwrite a newer version of the row — e.g. a
+// queued match insert replayed after the match was assigned online.
+const INSERT_ONCE = { onConflict: 'id', ignoreDuplicates: true } as const;
+
+// An UPDATE that matches no row is not an error to PostgREST. For a queued
+// change that means the row is not on the server: its insert has not landed
+// yet (or a teammate deleted it). It is treated like a missing parent.
+const ROW_MISSING_CODE = 'REFERRALFIT_ROW_MISSING';
+
+function rowMissingError(): { message: string; code: string } {
+  return { message: 'The record this change updates is not on the server (not saved yet, or deleted).', code: ROW_MISSING_CODE };
+}
+
+type WriteResponse = { error: unknown; status?: number; data?: unknown };
+
+// The HTTP status rides along on the error (httpStatus) so a 5xx with an HTML
+// body from a proxy is recognisable as a passing failure.
+function failureOf(response: WriteResponse): unknown {
+  return withHttpStatus(response.error, response.status);
 }
 
 // Inserts carry owner_id (attribution: who created the row). Updates and
 // deletes target rows by workspace (org_id), never by owner: teammates share
 // every workspace row, and an owner-scoped update against a colleague's row
 // would match nothing and report success while the change silently vanished.
+// Updates ask for the ids they changed so "matched nothing" is visible.
 async function applyQueueOp(op: QueueOp, userId: string, orgId: string): Promise<void> {
-  let error: { message: string } | null = null;
+  let response: WriteResponse = { error: null };
+  let isUpdate = false;
   switch (op.kind) {
     case 'partner.insert':
-      ({ error } = await supabase.from('partners').upsert({ ...op.row, owner_id: userId }));
+      response = await supabase.from('partners').upsert({ ...op.row, owner_id: userId }, INSERT_ONCE);
       break;
     case 'partner.update':
-      ({ error } = await supabase.from('partners').update(op.patch).eq('id', op.id).eq('org_id', orgId));
+      response = await supabase.from('partners').update(op.patch).eq('id', op.id).eq('org_id', orgId).select('id');
+      isUpdate = true;
       break;
     case 'referral.insert':
-      ({ error } = await supabase.from('referrals').upsert({ ...op.row, owner_id: userId }));
+      response = await supabase.from('referrals').upsert({ ...op.row, owner_id: userId }, INSERT_ONCE);
       break;
     case 'match.insert':
-      ({ error } = await supabase.from('match_profiles').upsert({ ...op.row, owner_id: userId }));
+      response = await supabase.from('match_profiles').upsert({ ...op.row, owner_id: userId }, INSERT_ONCE);
       break;
     case 'match.update':
-      ({ error } = await supabase.from('match_profiles').update(op.patch).eq('id', op.id).eq('org_id', orgId));
+      response = await supabase.from('match_profiles').update(op.patch).eq('id', op.id).eq('org_id', orgId).select('id');
+      isUpdate = true;
       break;
     case 'match.delete':
-      ({ error } = await supabase.from('match_profiles').delete().eq('id', op.id).eq('org_id', orgId));
+      response = await supabase.from('match_profiles').delete().eq('id', op.id).eq('org_id', orgId);
       break;
     case 'touch.insert':
-      ({ error } = await supabase.from('touches').upsert({ ...op.row, owner_id: userId }, { onConflict: 'id' }));
+      response = await supabase.from('touches').upsert({ ...op.row, owner_id: userId }, INSERT_ONCE);
       break;
     case 'follow_up.insert':
-      ({ error } = await supabase.from('follow_ups').upsert({ ...op.row, owner_id: userId }));
+      response = await supabase.from('follow_ups').upsert({ ...op.row, owner_id: userId }, INSERT_ONCE);
       break;
     case 'follow_up.update':
-      ({ error } = await supabase.from('follow_ups').update(op.patch).eq('id', op.id).eq('org_id', orgId));
+      response = await supabase.from('follow_ups').update(op.patch).eq('id', op.id).eq('org_id', orgId).select('id');
+      isUpdate = true;
       break;
     case 'follow_up.complete_next':
-      ({ error } = await supabase.rpc('complete_follow_up_with_next', { p_completed: op.completed, p_next: op.next, p_event: op.event }));
+      response = await supabase.rpc('complete_follow_up_with_next', { p_completed: op.completed, p_next: op.next, p_event: op.event });
       break;
     case 'follow_up.complete_outcome':
-      ({ error } = await supabase.rpc('complete_follow_up_with_outcome', {
+      response = await supabase.rpc('complete_follow_up_with_outcome', {
         p_completed: op.completed,
         p_referral_id: op.referralId,
         p_outcome: op.outcome,
-      }));
+      });
       break;
     case 'match.save_case':
-      ({ error } = await supabase.rpc('save_match_with_case', { p_expected_owner_id: userId, p_match: op.match, p_case_id: op.caseId }));
+      response = await supabase.rpc('save_match_with_case', { p_expected_owner_id: userId, p_match: op.match, p_case_id: op.caseId });
       break;
     case 'referral.assign_match':
-      ({ error } = await supabase.rpc('assign_match_referral', { p_expected_owner_id: userId, p_referral: op.referral, p_match: op.match }));
+      response = await supabase.rpc('assign_match_referral', { p_expected_owner_id: userId, p_referral: op.referral, p_match: op.match });
       break;
     case 'packet.finalize':
-      ({ error } = await supabase.rpc('finalize_match_packet', {
+      response = await supabase.rpc('finalize_match_packet', {
         p_expected_owner_id: userId, p_referral: op.referral, p_match: op.match,
         p_touch: op.touch, p_follow_up: op.followUp, p_event: op.event,
-      }));
+      });
       break;
     case 'contact.log_activity':
-      ({ error } = await supabase.rpc('log_contact_activity', {
+      response = await supabase.rpc('log_contact_activity', {
         p_expected_owner_id: userId, p_event: op.event, p_touch: op.touch,
-      }));
+      });
+      break;
+    case 'outreach.sent':
+      response = await supabase.rpc('record_outreach_sent', {
+        p_expected_owner_id: userId, p_completed_id: op.completedId, p_next: op.next, p_event: op.event, p_touch: op.touch,
+      });
       break;
     case 'referral.update':
-      ({ error } = await supabase.from('referrals').update(op.patch).eq('id', op.id).eq('org_id', orgId));
+      response = await supabase.from('referrals').update(op.patch).eq('id', op.id).eq('org_id', orgId).select('id');
+      isUpdate = true;
       break;
     case 'placement.insert':
-      ({ error } = await supabase.from('placement_decisions').upsert({ ...op.row, owner_id: userId }, { onConflict: 'id', ignoreDuplicates: true }));
+      response = await supabase.from('placement_decisions').upsert({ ...op.row, owner_id: userId }, { onConflict: 'id', ignoreDuplicates: true });
       break;
     case 'referral.record_outcome':
-      ({ error } = await supabase.rpc('record_placement_outcome', {
+      response = await supabase.rpc('record_placement_outcome', {
         p_referral_id: op.referralId, p_outcome: op.outcome, p_completed: op.completed,
-      }));
+      });
       break;
   }
-  if (error) throw error;
+  if (response.error) throw failureOf(response);
+  if (isUpdate && Array.isArray(response.data) && response.data.length === 0) throw rowMissingError();
 }
 
-// Flush queued mutations FIFO. Stops at the first network failure (we are still
-// offline); throws for genuine server-side errors while retaining the rejected
-// op on disk. Returns the number of ops that were applied.
+// ─── Failure classification ─────────────────────────────────────────────────
+
 // A foreign-key violation usually means the parent row (partner/referral/case)
 // simply has not been inserted yet — its own op may sit later in the queue, or
-// it failed on a previous pass. Those ops must be retried, never dropped, or a
-// referral whose partner failed once is lost forever.
+// it failed on a previous pass. Those ops are retried, not dropped, so a
+// referral whose partner failed once is not lost. But a parent that never
+// arrives (a teammate deleted it) would hold the op forever, so after a bounded
+// number of server refusals, or a week, the op is set aside as rejected too.
 function isMissingParentError(error: unknown): boolean {
   const err = error as { code?: string; message?: string } | null;
   const code = err?.code ?? '';
   const message = err?.message ?? '';
-  return code === '23503' || /foreign key constraint/i.test(message);
+  return code === '23503' || code === ROW_MISSING_CODE || /foreign key constraint/i.test(message);
 }
 
+// Passing server trouble (5xx, gateway pages, PostgREST connection codes,
+// serialization failures, ...) is classified by isTransientServerError in
+// errors.ts. Those ops stay in the live queue and the flush stops, exactly as
+// for a lost connection; a deterministic refusal is set aside.
+
+// 'timeout': the client gave up waiting (supabase.ts request deadline). The
+// request may have reached the server and may even have committed — every
+// queued op is replay-safe — so it is retried like a passing server failure
+// and COUNTS toward the transient caps: an op that always times out (too slow
+// for the deadline) is eventually set aside instead of blocking the queue
+// head forever. A plain lost connection ('network') never counts.
+type FailureKind = 'network' | 'timeout' | 'missing-parent' | 'transient' | 'refused';
+
+function classifyWriteFailure(error: unknown): FailureKind {
+  if (isTimeoutError(error)) return 'timeout';
+  if (isNetworkError(error) || (error as { httpStatus?: unknown } | null)?.httpStatus === 0) return 'network';
+  if (isMissingParentError(error)) return 'missing-parent';
+  if (isTransientServerError(error)) return 'transient';
+  return 'refused';
+}
+
+export const MAX_PARENT_WAIT_ATTEMPTS = 12;
+export const MAX_PARENT_WAIT_MS = 7 * 24 * 60 * 60 * 1000;
+// A "passing" failure that keeps happening is not passing: the op is set
+// aside (retry/discard from the review list) so it cannot block the queue
+// forever. Bound: 25 failed tries spanning at least 2 hours (an active user
+// flushes on every save/foreground), OR — for an app opened rarely — 5 tries
+// spanning at least 72 hours. A single blip, or an outage of a few minutes
+// across many saves, never sets anything aside.
+export const MAX_TRANSIENT_ATTEMPTS = 25;
+export const MIN_TRANSIENT_WAIT_MS = 2 * 60 * 60 * 1000;
+export const LONG_TRANSIENT_ATTEMPTS = 5;
+export const LONG_TRANSIENT_WAIT_MS = 72 * 60 * 60 * 1000;
+
+function transientCapped(wait: OpWait, waitedMs: number): boolean {
+  return (wait.attempts >= MAX_TRANSIENT_ATTEMPTS && waitedMs >= MIN_TRANSIENT_WAIT_MS)
+    || (wait.attempts >= LONG_TRANSIENT_ATTEMPTS && waitedMs >= LONG_TRANSIENT_WAIT_MS);
+}
+
+function bumpWait(waits: Record<string, OpWait>, key: string, now = Date.now()): { wait: OpWait; waitedMs: number } {
+  const previous = waits[key];
+  const wait: OpWait = { first: previous?.first ?? new Date(now).toISOString(), attempts: (previous?.attempts ?? 0) + 1 };
+  waits[key] = wait;
+  const waitedMs = now - Date.parse(wait.first);
+  return { wait, waitedMs: Number.isFinite(waitedMs) ? waitedMs : 0 };
+}
+
+type FlushOutcome = {
+  flushed: number; // ops applied on the server
+  rejected: RejectedEntry[]; // ops newly set aside by this flush (each may hold others)
+  remaining: number; // ops still in the live queue
+  // Why the flush stopped early (the rest of the queue is untouched), or null
+  // when every op was tried and whatever remains is waiting on a missing row.
+  stopped: 'offline' | 'transient' | null;
+};
+
+// During a flush the workspace is re-verified with the server at least every
+// WORKSPACE_REVERIFY_OPS applied ops or WORKSPACE_REVERIFY_MS, and always
+// before an op is set aside or left waiting — rather than before every op,
+// which doubled the requests of a flush (1,000 queued changes: 1,000 extra
+// round trips, each held under the queue lock).
+//
+// Why that is safe: the per-op check was itself only a check-then-act — the
+// workspace could change between it and the write — so it never closed the
+// window, it only kept it to one round trip. Now it is bounded at a few
+// seconds. A change of workspace while this device is flushing needs the
+// membership to be changed from ANOTHER device in that window (a join on this
+// device runs prepareForWorkspaceChange, which flushes under the same lock
+// first). The ways such a change shows up are all re-checked before acting:
+// a refusal (RLS) or an update that matched nothing (org_id filter) forces a
+// fresh verification before the op is set aside or deferred, so a moved
+// account stops the flush ("workspace changed") instead of setting its queue
+// aside. Updates and deletes are additionally scoped to the verified org_id.
+export const WORKSPACE_REVERIFY_OPS = 20;
+export const WORKSPACE_REVERIFY_MS = 3_000;
+// The queue on disk is rewritten after every QUEUE_PERSIST_EVERY_OPS processed
+// ops (or QUEUE_PERSIST_EVERY_MS), whenever the flush stops, and at its end —
+// not after every op, which re-serialized the whole queue per op (O(N²) for a
+// long offline stretch). A crash in between leaves ops that already landed in
+// the queue on disk; they are replayed once more on the next flush, which is
+// safe: inserts replay as INSERT ... ON CONFLICT DO NOTHING, every RPC is
+// replay-safe, updates re-apply the same columns, and an op already set aside
+// is recognised by its opId and not listed twice. Whenever the rejected list
+// changes the queue is written right after that op (see rejectedChanged), so
+// the queue and rejected list on disk together are always a pair the per-op
+// version could have written, and the ordering rules below (waiting ops ahead
+// of the rest; held ops in their original order) hold at every point.
+export const QUEUE_PERSIST_EVERY_OPS = 20;
+export const QUEUE_PERSIST_EVERY_MS = 2_000;
+
+// Flush queued mutations FIFO. Caller holds the queue lock.
+//   - lost connection / passing server failure / timeout: stop, keep
+//     everything (a timeout or a passing failure counts toward the caps);
+//   - missing parent row (FK, or an update that matched nothing): keep it in
+//     the queue (in its place) and retry it after the rest — with every later
+//     op on the same row or needing a row it creates held right behind it;
+//   - refused by the server: set aside in the rejected list together with
+//     every later op it holds, and carry on with the rest.
+async function flushQueueUnlocked(fence: SessionFence): Promise<FlushOutcome> {
+  if (!fence.offline) await readmitUnreadableUnlocked(fence);
+  const state = await readQueueStateUnlocked(fence.userId);
+  const waits = { parentWaits: { ...state.parentWaits }, transientWaits: { ...state.transientWaits } };
+  let ops = state.ops;
+  const outcome: FlushOutcome = { flushed: 0, rejected: [], remaining: ops.length, stopped: null };
+  if (!ops.length) return outcome;
+  if (fence.offline) return { ...outcome, stopped: 'offline' };
+  // 1.0.4 (1) queued ops without an opId, and its full-row patches make a
+  // repeated edit (favorite on → off → on) byte-identical to the first one.
+  // Give each its own opId, durably, before any op can be set aside — matched
+  // by content, the third would be taken for the first and dropped.
+  if (ops.some((op) => !(typeof op.opId === 'string' && op.opId))) {
+    ops = ops.map((op) => (typeof op.opId === 'string' && op.opId ? op : { ...op, opId: newUuid() }));
+    await assertSessionFence(fence);
+    await writeQueueUnlocked(fence.userId, ops, waits);
+  }
+  const rejected = await openRejectedList(fence);
+
+  // Server workspace check (see WORKSPACE_REVERIFY_OPS); null = no connection
+  // or a passing failure. `force` asks the server again regardless.
+  let verifiedOrg: string | null = null;
+  let verifiedAt = 0;
+  let appliedSinceVerify = 0;
+  const verify = async (force = false): Promise<string | null> => {
+    if (!force && verifiedOrg && appliedSinceVerify < WORKSPACE_REVERIFY_OPS && Date.now() - verifiedAt < WORKSPACE_REVERIFY_MS) return verifiedOrg;
+    verifiedOrg = null;
+    try {
+      verifiedOrg = await assertWorkspaceFence(fence);
+    } catch (error) {
+      if (isServerUnreachable(error)) return null;
+      throw error;
+    }
+    verifiedAt = Date.now();
+    appliedSinceVerify = 0;
+    return verifiedOrg;
+  };
+
+  let unsaved = 0; // ops processed since the queue was last written
+  let waitsChanged = false; // a retry count moved since then
+  // The rejected list was written since then (an op set aside, or held with
+  // one). The queue is then written right after that op, not at the next
+  // batch boundary: otherwise a kill in between leaves ops that already
+  // landed AHEAD of the set-aside one on disk, the next flush finds them
+  // holding its rows and files them behind it in the entry, and a Retry
+  // replays the older edit last (reverting the newer one).
+  let rejectedChanged = false;
+  let savedAt = Date.now();
+  const persist = async (queue: QueueOp[]) => {
+    await writeQueueUnlocked(fence.userId, queue, waits);
+    unsaved = 0;
+    waitsChanged = false;
+    rejectedChanged = false;
+    savedAt = Date.now();
+  };
+  // After each processed op: the session must still be the one that started.
+  const step = async (queue: () => QueueOp[]) => {
+    await assertSessionFence(fence);
+    unsaved += 1;
+    if (rejectedChanged || unsaved >= QUEUE_PERSIST_EVERY_OPS || Date.now() - savedAt >= QUEUE_PERSIST_EVERY_MS) await persist(queue());
+  };
+  // A stop with nothing processed or counted since the last write (e.g. no
+  // connection at the first op) leaves the queue on disk as it is.
+  const stop = async (stopped: 'offline' | 'transient', queue: QueueOp[]): Promise<FlushOutcome> => {
+    if (unsaved || waitsChanged || rejectedChanged) await persist(queue);
+    return { ...outcome, remaining: queue.length, stopped };
+  };
+  const holdWithRejected = async (holder: string, op: QueueOp) => {
+    await rejected.attach(holder, op);
+    rejectedChanged = true;
+  };
+
+  const setAside = async (op: QueueOp, error: unknown, reason?: string) => {
+    outcome.rejected.push(await rejected.reject(op, reason ?? describeError(error, 'The server refused this change.'), errorCode(error)));
+    rejectedChanged = true;
+    delete waits.parentWaits[queueOpKey(op)];
+    delete waits.transientWaits[queueOpKey(op)];
+  };
+  const applied = (op: QueueOp) => {
+    outcome.flushed += 1;
+    appliedSinceVerify += 1;
+    delete waits.parentWaits[queueOpKey(op)];
+    delete waits.transientWaits[queueOpKey(op)];
+  };
+  // Returns true when the flush must stop here (the op stays where it is).
+  const passingFailure = async (op: QueueOp, error: unknown, kind: 'timeout' | 'transient'): Promise<boolean> => {
+    const { wait, waitedMs } = bumpWait(waits.transientWaits, queueOpKey(op));
+    waitsChanged = true;
+    if (transientCapped(wait, waitedMs)) {
+      await setAside(op, error, kind === 'timeout'
+        ? `The server kept timing out on this change (${wait.attempts} tries).`
+        : `The server kept failing on this change (${wait.attempts} tries; ${describeError(error)}).`);
+      return false;
+    }
+    return true;
+  };
+
+  const deferred: QueueOp[] = [];
+  const deferredSets = newHoldSets();
+  for (let index = 0; index < ops.length; index += 1) {
+    const head = ops[index];
+    const unprocessed = () => [...deferred, ...ops.slice(index)];
+    const rows = opRows(head);
+    const rejectedHolder = holderOf(rows, rejected.sets);
+    const deferredHolder = rejectedHolder ? undefined : holderOf(rows, deferredSets);
+    if (rejectedHolder) {
+      await holdWithRejected(rejectedHolder, head);
+    } else if (deferredHolder) {
+      deferred.push(head);
+      hold(rows, deferredSets, deferredHolder);
+    } else {
+      const orgId = await verify();
+      if (orgId === null) return stop('offline', unprocessed());
+      try {
+        await applyQueueOp(head, fence.userId, orgId);
+        applied(head);
+      } catch (error) {
+        const kind = classifyWriteFailure(error);
+        if (kind === 'network') return stop('offline', unprocessed());
+        if (kind === 'timeout' || kind === 'transient') {
+          if (await passingFailure(head, error, kind)) return stop(kind === 'timeout' ? 'offline' : 'transient', unprocessed());
+        } else {
+          // Refused, or its row is missing: first make sure the workspace did
+          // not move under this flush (see WORKSPACE_REVERIFY_OPS).
+          if (await verify(true) === null) return stop('offline', unprocessed());
+          if (kind === 'missing-parent') {
+            deferred.push(head);
+            hold(rows, deferredSets, queueOpKey(head));
+          } else {
+            await setAside(head, error);
+          }
+        }
+      }
+    }
+    // On disk the waiting ops keep their place AHEAD of the rest: a flush that
+    // stops (or the app being killed) before reaching a later edit of a row a
+    // waiting op creates must not leave that edit in front of it — the edit
+    // would then match nothing, wait, and hold its own create (an upsert
+    // inside a packet / assignment / save) behind it for good.
+    await step(() => [...deferred, ...ops.slice(index + 1)]);
+    outcome.remaining = ops.length - index - 1 + deferred.length;
+  }
+  if (!deferred.length) {
+    if (unsaved || waitsChanged || rejectedChanged) await persist([]);
+    return outcome;
+  }
+
+  // Retry the waiting ops (in order) now that the rest of the queue landed:
+  // a parent later in the FIFO may exist now. Each flush that reaches the
+  // server and still finds the parent missing counts once against the cap.
+  const retained: QueueOp[] = [];
+  const retrySets = newHoldSets();
+  for (let index = 0; index < deferred.length; index += 1) {
+    const op = deferred[index];
+    const unprocessed = () => [...retained, ...deferred.slice(index)];
+    const rows = opRows(op);
+    const rejectedHolder = holderOf(rows, rejected.sets);
+    const heldBy = rejectedHolder ? undefined : holderOf(rows, retrySets);
+    if (rejectedHolder) {
+      await holdWithRejected(rejectedHolder, op);
+    } else if (heldBy) {
+      retained.push(op);
+      hold(rows, retrySets, heldBy);
+    } else {
+      const orgId = await verify();
+      if (orgId === null) return stop('offline', unprocessed());
+      try {
+        await applyQueueOp(op, fence.userId, orgId);
+        applied(op);
+      } catch (error) {
+        const kind = classifyWriteFailure(error);
+        if (kind === 'network') return stop('offline', unprocessed());
+        if (kind === 'timeout' || kind === 'transient') {
+          if (await passingFailure(op, error, kind)) return stop(kind === 'timeout' ? 'offline' : 'transient', unprocessed());
+        } else {
+          if (await verify(true) === null) return stop('offline', unprocessed());
+          if (kind === 'missing-parent') {
+            const { wait, waitedMs } = bumpWait(waits.parentWaits, queueOpKey(op));
+            waitsChanged = true;
+            if (wait.attempts >= MAX_PARENT_WAIT_ATTEMPTS || waitedMs >= MAX_PARENT_WAIT_MS) {
+              await setAside(op, error, `It depends on a record that was never saved or was deleted (${describeError(error)}).`);
+            } else {
+              retained.push(op);
+              hold(rows, retrySets, queueOpKey(op));
+            }
+          } else {
+            await setAside(op, error);
+          }
+        }
+      }
+    }
+    await step(() => [...retained, ...deferred.slice(index + 1)]);
+    outcome.remaining = retained.length + deferred.length - index - 1;
+  }
+  if (unsaved || waitsChanged || rejectedChanged) await persist(retained);
+  return outcome;
+}
+
+// Groups of live-queue ops waiting on a missing parent row: the op whose own
+// write keeps finding its parent missing, plus every later op held with it.
+type WaitingGroup = { key: string; ops: QueueOp[]; wait: OpWait; reason: string };
+
+function waitingGroups(state: QueueState): WaitingGroup[] {
+  const groups: WaitingGroup[] = [];
+  const sets = newHoldSets();
+  for (const op of state.ops) {
+    const rows = opRows(op);
+    const holder = holderOf(rows, sets);
+    const group = holder ? groups.find((item) => item.key === holder) : undefined;
+    if (group) {
+      group.ops.push(op);
+      hold(rows, sets, group.key);
+      continue;
+    }
+    const key = queueOpKey(op);
+    const wait = state.parentWaits[key];
+    if (!wait) continue; // not waiting: it syncs on the next flush
+    groups.push({
+      key, ops: [op], wait,
+      reason: `Waiting for a related record that has not reached the server (or was deleted). Tried ${wait.attempts} ${wait.attempts === 1 ? 'time' : 'times'}.`,
+    });
+    hold(rows, sets, key);
+  }
+  return groups;
+}
+
+function toWaitingWrite(group: WaitingGroup): RejectedWrite {
+  return {
+    id: group.key,
+    status: 'waiting',
+    kind: group.ops[0].kind,
+    summary: describeQueueOp(group.ops[0]),
+    reason: group.reason,
+    rejectedAt: group.wait.first,
+    heldChanges: group.ops.length - 1,
+  };
+}
+
+// Returns the number of ops applied. Stops quietly offline or on a passing
+// server failure (returns what was applied so far). When the server refused
+// queued ops they are moved to the rejected list — every unrelated later op
+// still flushes — and RejectedWritesError is thrown afterwards so the caller
+// can tell the user; it is not raised again for the same ops on later flushes.
 export async function flushWriteQueue(expectedUserId: string): Promise<number> {
   const fence = await sessionFence(expectedUserId);
-  return withQueueLock(async () => {
-    await assertWorkspaceFence(fence);
-    let flushed = 0;
-    let ops = await readQueueUnlocked(fence.userId);
-    const deferred: QueueOp[] = [];
-
-    while (ops.length) {
-      const [head, ...rest] = ops;
-      try {
-        const orgId = await assertWorkspaceFence(fence);
-        await applyQueueOp(head, fence.userId, orgId);
-        flushed += 1;
-      } catch (error) {
-        if (isNetworkError(error)) return flushed; // queue on disk is unchanged
-        if (isMissingParentError(error)) {
-          deferred.push(head);
-        } else {
-          // Never claim a rejected write disappeared successfully. Keep the
-          // exact operation durable and surface the rejection so the UI can
-          // tell the user rather than silently losing data.
-          await writeQueueUnlocked(fence.userId, [head, ...rest, ...deferred]);
-          const message = error instanceof Error ? error.message : String(error);
-          throw new StoreError(`A queued change was rejected by the server and remains pending: ${message}`, true);
-        }
-      }
-      await assertWorkspaceFence(fence);
-      ops = rest;
-      await writeQueueUnlocked(fence.userId, [...ops, ...deferred]);
-      await assertWorkspaceFence(fence);
-    }
-
-    // Retry children whose parents appeared later in the FIFO.
-    const retry = [...deferred];
-    const retained: QueueOp[] = [];
-    for (let index = 0; index < retry.length; index += 1) {
-      const op = retry[index];
-      try {
-        const orgId = await assertWorkspaceFence(fence);
-        await applyQueueOp(op, fence.userId, orgId);
-        flushed += 1;
-      } catch (error) {
-        if (isNetworkError(error) || isMissingParentError(error)) {
-          retained.push(op);
-        } else {
-          await writeQueueUnlocked(fence.userId, [...retained, op, ...retry.slice(index + 1)]);
-          const message = error instanceof Error ? error.message : String(error);
-          throw new StoreError(`A queued dependent change was rejected and remains pending: ${message}`, true);
-        }
-      }
-      await assertWorkspaceFence(fence);
-      await writeQueueUnlocked(fence.userId, [...retained, ...retry.slice(index + 1)]);
-      await assertWorkspaceFence(fence);
-    }
-    return flushed;
-  });
+  const outcome = await withQueueLock(() => flushQueueUnlocked(fence));
+  if (outcome.rejected.length) throw rejectedWritesError(outcome.rejected);
+  return outcome.flushed;
 }
 
+// Every op in the live queue, including ones waiting on a missing parent
+// (see syncStatus for the split the UI should show).
 export async function pendingWriteCount(expectedUserId: string): Promise<number> {
   const fence = await sessionFence(expectedUserId);
   return withQueueLock(async () => {
@@ -536,26 +1446,188 @@ export async function pendingWriteCount(expectedUserId: string): Promise<number>
   });
 }
 
+export type SyncStatus = {
+  pending: number; // queued changes that will sync on the next flush ("N to sync")
+  waiting: number; // changes waiting on a record that never reached the server (listWaitingWrites)
+  rejected: number; // changes the server refused (listRejectedWrites)
+};
+
+// What the sync indicator should show. Waiting changes are not "offline" —
+// the device is online, the server just lacks the row they need — so they
+// belong next to the rejected ones, where the user can discard them.
+export async function syncStatus(expectedUserId: string): Promise<SyncStatus> {
+  const fence = await sessionFence(expectedUserId);
+  return withQueueLock(async () => {
+    await assertSessionFence(fence);
+    const state = await readQueueStateUnlocked(fence.userId);
+    const groups = waitingGroups(state);
+    const waitingOps = groups.reduce((sum, group) => sum + group.ops.length, 0);
+    const rejected = (await readRejectedUnlocked(fence.userId)).length + (await readUnreadableUnlocked(fence.userId)).length;
+    await assertSessionFence(fence);
+    return { pending: state.ops.length - waitingOps, waiting: groups.length, rejected };
+  });
+}
+
+// Changes the server refused, oldest first, for a "N changes could not be
+// saved" notice, followed by changes this version of the app cannot read
+// (status 'unreadable'). None of them are in the live queue.
+export async function listRejectedWrites(expectedUserId: string): Promise<RejectedWrite[]> {
+  const fence = await sessionFence(expectedUserId);
+  return withQueueLock(async () => {
+    await assertSessionFence(fence);
+    const entries = await readRejectedUnlocked(fence.userId);
+    const unreadable = await readUnreadableUnlocked(fence.userId);
+    await assertSessionFence(fence);
+    return [...entries.map(toRejectedWrite), ...unreadable.map(toUnreadableWrite)];
+  });
+}
+
+export async function rejectedWriteCount(expectedUserId: string): Promise<number> {
+  return (await listRejectedWrites(expectedUserId)).length;
+}
+
+// Live-queue changes waiting on a missing parent (with what they hold), for
+// the same review list. They retry on every flush until they are capped.
+export async function listWaitingWrites(expectedUserId: string): Promise<RejectedWrite[]> {
+  const fence = await sessionFence(expectedUserId);
+  return withQueueLock(async () => {
+    await assertSessionFence(fence);
+    const groups = waitingGroups(await readQueueStateUnlocked(fence.userId));
+    await assertSessionFence(fence);
+    return groups.map(toWaitingWrite);
+  });
+}
+
+export async function waitingWriteCount(expectedUserId: string): Promise<number> {
+  return (await listWaitingWrites(expectedUserId)).length;
+}
+
+// Drop a waiting change, and everything held with it, from the live queue.
+export async function discardWaitingWrite(expectedUserId: string, waitingId: string): Promise<void> {
+  const fence = await sessionFence(expectedUserId);
+  await withQueueLock(async () => {
+    await assertSessionFence(fence);
+    const state = await readQueueStateUnlocked(fence.userId);
+    const group = waitingGroups(state).find((item) => item.key === waitingId);
+    if (!group) throw new StoreError('That change is no longer waiting.', false);
+    const drop = new Set(group.ops);
+    await writeQueueUnlocked(fence.userId, state.ops.filter((op) => !drop.has(op)), state);
+    await assertSessionFence(fence);
+  });
+}
+
+// Drop a refused change, and everything held with it, for good. The next
+// refresh replaces whatever it had changed locally with the server's copy (a
+// row it would have created is removed from the saved copy).
+// Also drops an unreadable change (same list, same Discard).
+export async function discardRejectedWrite(expectedUserId: string, rejectedId: string): Promise<void> {
+  const fence = await sessionFence(expectedUserId);
+  await withQueueLock(async () => {
+    await assertSessionFence(fence);
+    const entries = await readRejectedUnlocked(fence.userId);
+    const next = entries.filter((entry) => entry.id !== rejectedId);
+    if (next.length !== entries.length) await writeRejectedUnlocked(fence.userId, next);
+    const unreadable = await readUnreadableUnlocked(fence.userId);
+    const keptUnreadable = unreadable.filter((entry) => entry.id !== rejectedId);
+    if (keptUnreadable.length !== unreadable.length) await writeUnreadableUnlocked(fence.userId, keptUnreadable);
+    await assertSessionFence(fence);
+  });
+}
+
+export async function discardAllRejectedWrites(expectedUserId: string): Promise<void> {
+  const fence = await sessionFence(expectedUserId);
+  await withQueueLock(async () => {
+    await assertSessionFence(fence);
+    if ((await readRejectedUnlocked(fence.userId)).length) await writeRejectedUnlocked(fence.userId, []);
+    if ((await readUnreadableUnlocked(fence.userId)).length) await writeUnreadableUnlocked(fence.userId, []);
+    await assertSessionFence(fence);
+  });
+}
+
+// Put a refused change (and what it holds, in order) back at the front of the
+// live queue and flush. Returns the number of ops applied; throws
+// RejectedWritesError (and lists it again) if the server still refuses it.
+// Offline it simply stays queued.
+export async function retryRejectedWrite(expectedUserId: string, rejectedId: string): Promise<number> {
+  const fence = await sessionFence(expectedUserId);
+  await withQueueLock(async () => {
+    await assertSessionFence(fence);
+    const entries = await readRejectedUnlocked(fence.userId);
+    const entry = entries.find((item) => item.id === rejectedId);
+    if (!entry) {
+      if ((await readUnreadableUnlocked(fence.userId)).some((item) => item.id === rejectedId)) {
+        throw new StoreError('This change was saved by a different version of ReferralFit and cannot be sent by this one. Update the app, or discard it.', false);
+      }
+      throw new StoreError('That change is no longer waiting to be retried.', false);
+    }
+    const state = await readQueueStateUnlocked(fence.userId);
+    await assertSessionFence(fence);
+    // Live queue first, then out of the rejected list: never in neither.
+    // Ahead of the queue: a later edit of the same row may already be queued
+    // (made offline, or before an interrupted flush reached it), and creates
+    // must precede edits of the rows they create.
+    await writeQueueUnlocked(fence.userId, [...entry.ops, ...state.ops], state);
+    await writeRejectedUnlocked(fence.userId, entries.filter((item) => item.id !== rejectedId));
+    await assertSessionFence(fence, true);
+  });
+  return flushWriteQueue(fence.userId);
+}
+
+export type WorkspaceChangeOptions = {
+  // Account deletion, or a workspace change the user confirmed: changes the
+  // server refused and changes waiting on a record that will never arrive
+  // are dropped instead of blocking. Changes that can still sync never are.
+  discardRejected?: boolean;
+};
+
 // Joining another workspace changes the tenant behind an otherwise unchanged
 // auth user. Flush the old workspace queue, refuse to cross the boundary while
 // anything remains unsynced, then remove the account-scoped cache so hydrate()
 // cannot interpret old-workspace rows as new unsynced local records.
-export async function prepareForWorkspaceChange(expectedUserId: string): Promise<void> {
+//
+// The workspace binding is deliberately KEPT: if the join then fails (a
+// mistyped or expired code, no signal) the device is still correctly bound to
+// the workspace the server reports and keeps saving normally. After a
+// successful join the next bindLocalWorkspace sees the server's new workspace
+// differ from this binding and switches over (wiping again).
+export async function prepareForWorkspaceChange(expectedUserId: string, options: WorkspaceChangeOptions = {}): Promise<void> {
   const fence = await sessionFence(expectedUserId);
-  await flushWriteQueue(fence.userId);
+  if (fence.offline) throw new StoreError('Connect to the internet so this device can sync its changes, then try again.', false);
+  const flushed = await withQueueLock(() => flushQueueUnlocked(fence));
+  if (flushed.rejected.length && !options.discardRejected) throw rejectedWritesError(flushed.rejected);
   await assertSessionFence(fence);
-  // Match hydrate's cache-then-queue lock order to avoid lock inversion.
+  // Match hydrate's cache-then-queue lock order to avoid lock inversion, and
+  // re-read the queue under both locks (same flush as flushWriteQueue).
   await withCacheLock(async () => {
     await withQueueLock(async () => {
+      const state = await readQueueStateUnlocked(fence.userId);
       const pending = await readQueueUnlocked(fence.userId);
       if (pending.length) {
-        throw new StoreError('Sync pending changes before joining another workspace.', true);
+        const waitingOps = waitingGroups(state).reduce((sum, group) => sum + group.ops.length, 0);
+        if (flushed.stopped || waitingOps < pending.length) {
+          throw new StoreError('Sync pending changes before joining another workspace.', true);
+        }
+        if (!options.discardRejected) {
+          throw new StoreError(
+            `${pending.length} ${pending.length === 1 ? 'change' : 'changes'} on this device ${pending.length === 1 ? 'is' : 'are'} waiting for a record that never reached the server. Discard ${pending.length === 1 ? 'it' : 'them'} before joining another workspace.`,
+            true,
+          );
+        }
+      }
+      const setAsideCount = (await readRejectedUnlocked(fence.userId)).length + (await readUnreadableUnlocked(fence.userId)).length;
+      if (setAsideCount && !options.discardRejected) {
+        throw new StoreError(
+          `${setAsideCount} ${setAsideCount === 1 ? 'change' : 'changes'} on this device could not be saved. Retry or discard ${setAsideCount === 1 ? 'it' : 'them'} before joining another workspace.`,
+          false,
+        );
       }
       try {
+        forgetCacheWrite();
         await AsyncStorage.multiRemove([
           accountStorageKey(CACHE_KEY_PREFIX, fence.userId),
           accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
-          accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId),
+          accountStorageKey(REJECTED_KEY_PREFIX, fence.userId),
+          accountStorageKey(UNREADABLE_KEY_PREFIX, fence.userId),
           ...await caseCacheKeys(fence.userId),
         ]);
       } catch (error) {
@@ -564,6 +1636,30 @@ export async function prepareForWorkspaceChange(expectedUserId: string): Promise
       await assertSessionFence(fence);
     });
   });
+}
+
+// After the account itself is deleted on the server: drop the last
+// account-scoped key (the workspace binding) prepareForWorkspaceChange keeps,
+// and every saved copy again — a refresh or save that finished while the
+// deletion ran (document removal can take a while) may have written one
+// back, and nothing of a deleted account may stay on the device.
+export async function forgetWorkspaceBinding(expectedUserId: string): Promise<void> {
+  const fence = await sessionFence(expectedUserId);
+  await withCacheLock(async () => withQueueLock(async () => {
+    try {
+      forgetCacheWrite();
+      await AsyncStorage.multiRemove([
+        accountStorageKey(CACHE_KEY_PREFIX, fence.userId),
+        accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
+        accountStorageKey(REJECTED_KEY_PREFIX, fence.userId),
+        accountStorageKey(UNREADABLE_KEY_PREFIX, fence.userId),
+        ...await caseCacheKeys(fence.userId),
+        accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId),
+      ]);
+    } catch (error) {
+      throw persistenceError('cache', error);
+    }
+  }));
 }
 
 // The workspace this account's local cache and queue were last bound to, or
@@ -584,8 +1680,20 @@ export async function readBoundWorkspace(expectedUserId: string): Promise<string
   return stored && isUuid(stored) ? stored.toLowerCase() : null;
 }
 
+// Whether this account's session is currently known only from the device
+// (expired access token, no connection to refresh it). App.tsx can use it to
+// skip server lookups that would otherwise wait out supabase-js's retries.
+export async function isOfflineSession(expectedUserId: string): Promise<boolean> {
+  return (await sessionFence(expectedUserId)).offline;
+}
+
 // Bind account-local cache/queue data to the authoritative server workspace.
-// A missing marker is treated as untrusted legacy state and quarantined too.
+// A binding that positively names another workspace wipes everything local
+// (cache, queue, rejected list, case copies). A MISSING binding is treated as
+// untrusted for the saved copies only (they are re-read from the server); the
+// queue and rejected list are kept — they hold the user's unsynced edits, and
+// every queued op is still checked against the server's workspace before it
+// is sent (assertWorkspaceFence), so nothing can land in the wrong tenant.
 export async function bindLocalWorkspace(expectedUserId: string, orgId: string): Promise<boolean> {
   if (!isUuid(orgId)) throw new StoreError('A valid workspace is required before loading offline data.', false);
   const fence = await sessionFence(expectedUserId);
@@ -600,11 +1708,18 @@ export async function bindLocalWorkspace(expectedUserId: string, orgId: string):
     }
     const changed = previous?.toLowerCase() !== orgId.toLowerCase();
     if (changed) {
+      const differs = Boolean(previous);
       try {
+        forgetCacheWrite();
         await AsyncStorage.multiRemove([
           accountStorageKey(CACHE_KEY_PREFIX, fence.userId),
-          accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
           ...await caseCacheKeys(fence.userId),
+          // Unsynced edits are dropped only for a positively different workspace.
+          ...(differs ? [
+            accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
+            accountStorageKey(REJECTED_KEY_PREFIX, fence.userId),
+            accountStorageKey(UNREADABLE_KEY_PREFIX, fence.userId),
+          ] : []),
         ]);
         await AsyncStorage.setItem(workspaceKey, orgId.toLowerCase());
       } catch (error) {
@@ -755,8 +1870,21 @@ function toNumber(value: number | string | null | undefined): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function localDateStamp(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+// The calendar day, on this device, of a timestamptz (or a plain YYYY-MM-DD,
+// returned as is). Slicing the ISO string would give the UTC day, so an
+// evening touch in a US time zone would be recorded as tomorrow.
 function toDateStamp(iso: string | null | undefined, fallback: string): string {
-  return iso ? iso.slice(0, 10) : fallback;
+  if (!iso) return fallback;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso;
+  const parsed = new Date(iso);
+  return Number.isNaN(parsed.getTime()) ? iso.slice(0, 10) : localDateStamp(parsed);
 }
 
 const insuranceNetworkStatuses = new Set<InsuranceNetworkPreference>(['In-network', 'Out-of-network']);
@@ -1116,6 +2244,17 @@ function referralOutcomePatchToRow(patch: ReferralOutcomePatch): Record<string, 
 type CacheEnvelope = { version: 2; userId: string; snapshot: Snapshot };
 let cacheMutex: Promise<void> = Promise.resolve();
 
+// The snapshot object most recently written to an account's cache, so writing
+// the very same object again is skipped: refreshSnapshot saves what it read,
+// and App.tsx then hands that same object to persistCache (syncDerived).
+// Cleared whenever the cache key is removed. App state is immutable (every
+// change builds new objects), so the same object means the same content.
+let lastCacheWrite: { userId: string; snapshot: Snapshot } | null = null;
+
+function forgetCacheWrite(): void {
+  lastCacheWrite = null;
+}
+
 async function withCacheLock<T>(work: () => Promise<T>): Promise<T> {
   const previous = cacheMutex;
   let release!: () => void;
@@ -1144,11 +2283,13 @@ function parseSnapshot(value: unknown): Snapshot | null {
 
 async function writeCacheUnlocked(fence: SessionFence, snapshot: Snapshot): Promise<void> {
   const envelope: CacheEnvelope = { version: 2, userId: fence.userId, snapshot };
+  lastCacheWrite = null;
   try {
     await AsyncStorage.setItem(accountStorageKey(CACHE_KEY_PREFIX, fence.userId), JSON.stringify(envelope));
   } catch (error) {
     throw persistenceError('cache', error);
   }
+  lastCacheWrite = { userId: fence.userId, snapshot };
 }
 
 async function readCacheUnlocked(fence: SessionFence): Promise<Snapshot | null> {
@@ -1274,8 +2415,7 @@ function repairSnapshotIds(snapshot: Snapshot): { snapshot: Snapshot; repaired: 
 }
 
 // Follow-up ids the local cache has but the open-follow-up load did not return
-// are checked against the server before anything is queued. Only ids the
-// server does not know at all are unsynced local rows.
+// are checked against the server by id: a row the server has always wins.
 const FOLLOW_UP_PROBE_CHUNK = 200;
 
 async function fetchFollowUpsById(ids: string[]): Promise<FollowUpRow[]> {
@@ -1287,77 +2427,323 @@ async function fetchFollowUpsById(ids: string[]): Promise<FollowUpRow[]> {
   return rows;
 }
 
-// Merge rows that exist only in this account's local cache into a freshly
-// fetched server snapshot. The caller durably queues all missing inserts before
-// publishing the merged cache, so there is no fire-and-forget data-loss window.
-//
-// "Missing from remote" only means "never reached the server" when the remote
-// list is complete. Partners, referrals, match profiles and touches are loaded
-// in full (paged), so that holds for them. Follow-ups are NOT loaded in full —
-// only open ones are — so a cached follow-up can be missing because a teammate
-// (or this device, earlier) completed it. Re-inserting it would resurrect it as
-// open and overwrite the completion. So for follow-ups:
-//   - cached rows that are not open are never merge candidates (a completion is
-//     an update; it is either on the server or already in the write queue);
-//   - cached open rows the remote load lacks are looked up by id on the server.
-//     A row the server has is never re-queued: the server copy wins (kept if
-//     still open, dropped if completed). Only unknown ids are queued as inserts.
-async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null): Promise<{ snapshot: Snapshot; ops: QueueOp[] }> {
-  if (!local) return { snapshot: remote, ops: [] };
-  const merge = <T extends { id: string }>(r: T[], l: T[]): { rows: T[]; missing: T[] } => {
-    const have = new Set(r.map((x) => x.id));
-    const missing = l.filter((x) => x.id && !have.has(x.id));
-    return { rows: [...r, ...missing], missing };
-  };
-  const partners = merge(remote.partners, local.partners);
-  const referrals = merge(remote.referrals, local.referrals);
-  const matches = merge(remote.referralMatches, local.referralMatches);
-  const touches = merge(remote.touches, local.touches);
+// Which of `ids` exist on the server (any workspace row visible to RLS).
+type ProbedTable = 'partners' | 'referrals' | 'match_profiles' | 'touches';
 
+async function fetchExistingIds(table: ProbedTable, ids: string[]): Promise<Set<string>> {
+  const found = new Set<string>();
+  for (let start = 0; start < ids.length; start += FOLLOW_UP_PROBE_CHUNK) {
+    const chunk = ids.slice(start, start + FOLLOW_UP_PROBE_CHUNK);
+    const rows = await fetchAllPages<{ id: string }>((from, to) => supabase.from(table).select('id').in('id', chunk).order('id').range(from, to));
+    for (const row of rows) found.add(row.id);
+  }
+  return found;
+}
+
+// Ids of rows that a change still waiting on this device would create: every
+// op in the live queue and in the rejected list (a refused change keeps its
+// row visible until the user retries or discards it).
+type TableIds = {
+  partners: Set<string>;
+  referrals: Set<string>;
+  matches: Set<string>;
+  touches: Set<string>;
+  followUps: Set<string>;
+};
+
+// What changes still waiting on this device (live queue or rejected list) do
+// to each table: rows they create, rows they write (create, edit, complete),
+// and match profiles they delete.
+type PendingRows = TableIds & { written: TableIds; deletedMatches: Set<string> };
+
+const SNAPSHOT_TABLE: Record<string, keyof TableIds> = {
+  partners: 'partners',
+  referrals: 'referrals',
+  match_profiles: 'matches',
+  touches: 'touches',
+  follow_ups: 'followUps',
+};
+
+function emptyTableIds(): TableIds {
+  return { partners: new Set(), referrals: new Set(), matches: new Set(), touches: new Set(), followUps: new Set() };
+}
+
+function pendingCreatedRows(ops: QueueOp[]): PendingRows {
+  const pending: PendingRows = { ...emptyTableIds(), written: emptyTableIds(), deletedMatches: new Set() };
+  const add = (target: TableIds, key: string) => {
+    const split = key.indexOf(':');
+    const field = SNAPSHOT_TABLE[key.slice(0, split)];
+    if (field) target[field].add(key.slice(split + 1));
+  };
+  for (const op of ops) {
+    const rows = opRows(op);
+    for (const key of rows.creates) add(pending, key);
+    for (const key of rows.writes) add(pending.written, key);
+    if (op.kind === 'match.delete') pending.deletedMatches.add(op.id.toLowerCase());
+  }
+  return pending;
+}
+
+// Every change still waiting on this device: the rejected list (set aside
+// from the live queue earlier, so older) and then the live queue, in order.
+// Caller holds the cache lock (cache-then-queue order, like hydrate).
+async function readPendingOps(fence: SessionFence): Promise<QueueOp[]> {
+  return withQueueLock(async () => {
+    await assertSessionFence(fence);
+    const queued = await readQueueUnlocked(fence.userId);
+    const rejected = await readRejectedUnlocked(fence.userId);
+    return [...rejected.flatMap((entry) => entry.ops), ...queued];
+  });
+}
+
+// ─── Pending changes on the saved copy ──────────────────────────────────────
+// A change is made durable in the queue BEFORE its saved copy is written (and
+// persistCache runs only after the store accepted it). If the app is killed in
+// between, the saved copy lacks the change while the queue has it, and an
+// offline relaunch would show the old copy: the user redoes the change and it
+// is sent twice. So wherever the saved copy is shown or merged, every pending
+// op (rejected list and live queue) is applied on top of it from the row data
+// the op itself carries — the same optimistic data the screen had.
+//
+// Only fields an op actually moves are changed (patch → app fields, diffed),
+// so a copy that already has the change comes back unchanged, and fields the
+// op does not touch (balances, server-stamped columns) are never rewritten.
+
+type OverlayTable = 'partners' | 'referrals' | 'referralMatches' | 'touches' | 'followUps';
+
+type OverlayMapping<T> = {
+  toRow: (item: T) => Record<string, unknown>;
+  fromRow: (row: Record<string, unknown>) => T;
+};
+
+const OVERLAY_MAPPINGS: { [K in OverlayTable]: OverlayMapping<Snapshot[K][number]> } = {
+  partners: {
+    toRow: (item) => ({ created_at: item.createdAt ?? null, last_contact_at: item.lastContact || null, ...partnerToRow(item) }),
+    fromRow: (row) => mapPartnerRow(row as unknown as PartnerRow, undefined),
+  },
+  referrals: {
+    toRow: (item) => ({ last_check_in_at: item.lastCheckInAt ?? null, ...referralToRow(item) }),
+    fromRow: (row) => mapReferralRow(row as unknown as ReferralRow),
+  },
+  referralMatches: {
+    toRow: (item) => ({ created_at: item.createdAt, updated_at: item.updatedAt, ...matchToRow(item) }),
+    fromRow: (row) => mapMatchRow(row as unknown as MatchRow),
+  },
+  touches: {
+    toRow: (item) => touchToRow(item),
+    fromRow: (row) => mapTouchRow(row as unknown as TouchRow),
+  },
+  followUps: {
+    toRow: (item) => ({ completed_by: item.completedBy ?? null, check_in_days: item.checkInDays ?? null, ...followUpToRow(item) }),
+    fromRow: (row) => mapFollowUpRow(row as unknown as FollowUpRow),
+  },
+};
+
+function sameValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+// Apply every pending op to a saved copy. Returns the same object when no op
+// changes anything. `null` stays null when nothing is pending.
+function overlayPendingOps(snapshot: Snapshot | null, ops: QueueOp[]): Snapshot | null {
+  if (!ops.length) return snapshot;
+  const base = snapshot ?? emptySnapshot();
+  const tables = {
+    partners: new Map(base.partners.map((item) => [String(item.id).toLowerCase(), item] as const)),
+    referrals: new Map(base.referrals.map((item) => [String(item.id).toLowerCase(), item] as const)),
+    referralMatches: new Map(base.referralMatches.map((item) => [String(item.id).toLowerCase(), item] as const)),
+    touches: new Map(base.touches.map((item) => [String(item.id).toLowerCase(), item] as const)),
+    followUps: new Map(base.followUps.map((item) => [String(item.id).toLowerCase(), item] as const)),
+  };
+  const dirty = new Set<OverlayTable>();
+  const now = new Date().toISOString();
+
+  // Change only the app fields the patch moves.
+  const patchRow = <K extends OverlayTable>(table: K, id: unknown, patch: Record<string, unknown> | null | undefined) => {
+    if (typeof id !== 'string' || !id || !patch) return;
+    const map = tables[table] as Map<string, Snapshot[K][number]>;
+    const existing = map.get(id.toLowerCase());
+    if (!existing) return;
+    const mapping = OVERLAY_MAPPINGS[table] as OverlayMapping<Snapshot[K][number]>;
+    const row = mapping.toRow(existing);
+    const before = mapping.fromRow(row) as Record<string, unknown>;
+    const after = mapping.fromRow({ ...row, ...patch }) as Record<string, unknown>;
+    let next: Record<string, unknown> | null = null;
+    for (const key of Object.keys(after)) {
+      if (key === 'id' || sameValue(after[key], before[key])) continue;
+      next = next ?? { ...(existing as Record<string, unknown>) };
+      next[key] = after[key];
+    }
+    if (!next) return;
+    map.set(id.toLowerCase(), next as Snapshot[K][number]);
+    dirty.add(table);
+  };
+  // A row the op creates: added when the copy lacks it. `mergeExisting`: the
+  // op writes the whole row (an upsert inside an RPC), so an existing copy
+  // takes its values too; a plain insert never rewrites a copy that exists.
+  const createRow = <K extends OverlayTable>(table: K, row: Record<string, unknown> | null | undefined, mergeExisting = false) => {
+    if (!row || typeof row.id !== 'string' || !row.id) return;
+    const map = tables[table] as Map<string, Snapshot[K][number]>;
+    if (map.has(row.id.toLowerCase())) {
+      if (mergeExisting) patchRow(table, row.id, row);
+      return;
+    }
+    const mapping = OVERLAY_MAPPINGS[table] as OverlayMapping<Snapshot[K][number]>;
+    map.set(row.id.toLowerCase(), mapping.fromRow({ created_at: now, updated_at: now, ...row }));
+    dirty.add(table);
+  };
+
+  for (const op of ops) {
+    switch (op.kind) {
+      case 'partner.insert': createRow('partners', op.row); break;
+      case 'partner.update': patchRow('partners', op.id, op.patch); break;
+      case 'referral.insert': createRow('referrals', op.row); break;
+      case 'referral.update': patchRow('referrals', op.id, op.patch); break;
+      case 'match.insert': createRow('referralMatches', op.row); break;
+      case 'match.update': patchRow('referralMatches', op.id, op.patch); break;
+      case 'match.delete':
+        if (tables.referralMatches.delete(op.id.toLowerCase())) dirty.add('referralMatches');
+        break;
+      case 'touch.insert': createRow('touches', op.row); break;
+      case 'follow_up.insert': createRow('followUps', op.row); break;
+      case 'follow_up.update': patchRow('followUps', op.id, op.patch); break;
+      case 'follow_up.complete_next':
+        patchRow('followUps', op.completed.id, op.completed);
+        createRow('followUps', op.next);
+        break;
+      case 'follow_up.complete_outcome':
+        patchRow('followUps', op.completed.id, op.completed);
+        patchRow('referrals', op.referralId, op.outcome);
+        break;
+      case 'referral.record_outcome':
+        patchRow('referrals', op.referralId, op.outcome);
+        if (op.completed) patchRow('followUps', op.completed.id, op.completed);
+        break;
+      case 'match.save_case': createRow('referralMatches', { ...op.match, case_id: op.caseId }, true); break;
+      case 'referral.assign_match':
+        createRow('referrals', op.referral, true);
+        createRow('referralMatches', op.match, true);
+        break;
+      case 'packet.finalize':
+        createRow('referrals', op.referral, true);
+        createRow('referralMatches', op.match, true);
+        createRow('touches', op.touch);
+        createRow('followUps', op.followUp, true);
+        break;
+      case 'contact.log_activity': createRow('touches', op.touch); break;
+      case 'outreach.sent': {
+        const completing = op.completedId ? tables.followUps.get(op.completedId.toLowerCase()) : undefined;
+        if (completing && completing.status === 'open') patchRow('followUps', op.completedId, { status: 'done', completed_at: completing.completedAt ?? now });
+        createRow('followUps', op.next);
+        createRow('touches', op.touch);
+        break;
+      }
+      case 'placement.insert': break; // not part of the Snapshot
+    }
+  }
+  if (!dirty.size) return snapshot;
+  return {
+    ...base,
+    partners: dirty.has('partners') ? [...tables.partners.values()] : base.partners,
+    referrals: dirty.has('referrals') ? [...tables.referrals.values()] : base.referrals,
+    referralMatches: dirty.has('referralMatches') ? [...tables.referralMatches.values()] : base.referralMatches,
+    touches: dirty.has('touches') ? [...tables.touches.values()] : base.touches,
+    followUps: dirty.has('followUps') ? [...tables.followUps.values()] : base.followUps,
+  };
+}
+
+// The saved copy as the screen should show it: the cache with every pending
+// change applied. null when there is neither a copy nor a pending change.
+async function readCacheWithPending(fence: SessionFence): Promise<Snapshot | null> {
+  return withCacheLock(async () => {
+    await assertSessionFence(fence);
+    const cached = await readCacheUnlocked(fence);
+    const pendingOps = await readPendingOps(fence);
+    await assertSessionFence(fence);
+    return overlayPendingOps(cached, pendingOps);
+  });
+}
+
+function isPendingRow(set: Set<string>, id: string): boolean {
+  return set.has(id.toLowerCase());
+}
+
+// Merge rows that exist only in this account's local cache into a freshly
+// fetched server snapshot.
+//
+// Rows a change still waiting on this device writes (`pending.written`: live
+// queue or rejected list — e.g. a completion held by a passing server failure)
+// show the device's version, not the server's: otherwise the queued edit
+// would vanish from screen and from the saved copy, and redoing it would send
+// it twice. A pending match deletion keeps the match hidden.
+//
+// A row the cache has and the server load lacks is one of three things: a
+// local row that has not reached the server yet, a row saved online while
+// this load was in flight, or a row someone deleted on the server (a
+// teammate, another device). Rows a pending change creates are kept. The
+// others are looked up by id: a row the server has was written after the load
+// began and is kept; a row it does not have was deleted and is dropped from
+// the saved copy — re-inserting it would undo the deletion. Nothing is queued
+// here; the op behind a pending row is already durable.
+//
+// Follow-ups load open rows only, so a cached one can be missing because it
+// was completed:
+//   - cached rows that are not open are never candidates (unless a pending
+//     change writes them);
+//   - cached open rows the remote load lacks are looked up by id on the server.
+//     A row the server has wins (kept if still open, dropped if completed)
+//     unless a pending change writes it. An id the server does not know
+//     survives only while a pending op creates it.
+async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null, pending: PendingRows): Promise<{ snapshot: Snapshot }> {
+  if (!local) return { snapshot: remote };
+  const keepUnsynced = async <T extends { id: string }>(
+    table: ProbedTable, r: T[], l: T[], created: Set<string>, written: Set<string>, deleted?: Set<string>,
+  ): Promise<T[]> => {
+    const localById = new Map(l.map((x) => [x.id, x]));
+    const fromServer = r
+      .filter((x) => !(deleted && isPendingRow(deleted, x.id)))
+      .map((x) => (isPendingRow(written, x.id) && localById.has(x.id) ? localById.get(x.id) as T : x));
+    const have = new Set(r.map((x) => x.id));
+    const extra = l.filter((x) => x.id && !have.has(x.id));
+    const unsure = extra.filter((x) => !isPendingRow(created, x.id));
+    const onServer = unsure.length ? await fetchExistingIds(table, unsure.map((x) => x.id)) : new Set<string>();
+    return [...fromServer, ...extra.filter((x) => isPendingRow(created, x.id) || onServer.has(x.id))];
+  };
+
+  const localFollowUps = new Map(local.followUps.map((row) => [row.id, row]));
+  const devicesCopy = (id: string) => (isPendingRow(pending.written.followUps, id) ? localFollowUps.get(id) : undefined);
   const remoteFollowUpIds = new Set(remote.followUps.map((row) => row.id));
   const openCandidates = local.followUps.filter((row) => row.id && row.status === 'open' && !remoteFollowUpIds.has(row.id));
   const serverCopies = openCandidates.length ? await fetchFollowUpsById(openCandidates.map((row) => row.id)) : [];
   const serverById = new Map(serverCopies.map((row) => [row.id, row]));
-  const followUps = {
-    rows: [
-      ...remote.followUps,
-      ...serverCopies.filter((row) => row.status === 'open').map(mapFollowUpRow),
-      ...openCandidates.filter((row) => !serverById.has(row.id)),
-    ],
-    missing: openCandidates.filter((row) => !serverById.has(row.id)),
-  };
-  const referralRows = referrals.missing.map((row) => referralToRow(row));
-  const matchRows = matches.missing.map((row) => matchToRow(row));
-  const ops: QueueOp[] = [
-    ...partners.missing.map((row): QueueOp => ({ kind: 'partner.insert', row: partnerToRow(row) })),
-    // A referral and match profile can point at each other. Insert both bases
-    // with the cyclic columns cleared, then restore those links only after both
-    // parents exist. This keeps recovery queues parent-before-child.
-    ...referralRows.map((row): QueueOp => ({ kind: 'referral.insert', row: { ...row, match_profile_id: null } })),
-    ...matchRows.map((row): QueueOp => ({ kind: 'match.insert', row: { ...row, referral_id: null } })),
-    ...referralRows.filter((row) => row.match_profile_id).map((row): QueueOp => ({
-      kind: 'referral.update', id: row.id as string, patch: { match_profile_id: row.match_profile_id },
-    })),
-    ...matchRows.filter((row) => row.referral_id).map((row): QueueOp => ({
-      kind: 'match.update', id: row.id as string, patch: { referral_id: row.referral_id },
-    })),
-    ...touches.missing.map((row): QueueOp => ({ kind: 'touch.insert', row: touchToRow(row) })),
-    ...followUps.missing.map((row): QueueOp => ({ kind: 'follow_up.insert', row: followUpToRow(row) })),
-  ];
+  const heldLocally = local.followUps.filter((row) => row.id && row.status !== 'open' && !remoteFollowUpIds.has(row.id) && devicesCopy(row.id));
   return {
     snapshot: {
-      partners: partners.rows,
-      referrals: referrals.rows,
-      referralMatches: matches.rows,
-      touches: touches.rows,
-      followUps: followUps.rows,
+      partners: await keepUnsynced('partners', remote.partners, local.partners, pending.partners, pending.written.partners),
+      referrals: await keepUnsynced('referrals', remote.referrals, local.referrals, pending.referrals, pending.written.referrals),
+      referralMatches: await keepUnsynced('match_profiles', remote.referralMatches, local.referralMatches, pending.matches, pending.written.matches, pending.deletedMatches),
+      touches: await keepUnsynced('touches', remote.touches, local.touches, pending.touches, pending.written.touches),
+      followUps: [
+        ...remote.followUps.map((row) => devicesCopy(row.id) ?? row),
+        ...serverCopies.filter((row) => row.status === 'open' || devicesCopy(row.id)).map((row) => devicesCopy(row.id) ?? mapFollowUpRow(row)),
+        ...openCandidates.filter((row) => !serverById.has(row.id) && isPendingRow(pending.followUps, row.id)),
+        ...heldLocally,
+      ],
       scorecards: remote.scorecards,
     },
-    ops,
   };
 }
 
 // ─── Read path ──────────────────────────────────────────────────────────────
+
+// Touches are the one list that grows with every call, text and email, so
+// they get twice the general ceiling (100,000 rows; paging.ts MAX_PAGES is
+// 50,000). Raising it further is not free: every row is held in memory and
+// written to the saved copy (one AsyncStorage value) on every save — about
+// 25-40 MB of JSON at this ceiling. Past it the launch shows the saved copy
+// with a notice (hydrate) instead of failing. The real fix is a time window
+// for touches (see the round-11 report), not a higher ceiling.
+export const TOUCH_MAX_PAGES = 100;
 
 // Every list is paged (see paging.ts) and ordered on an immutable key plus the
 // primary key, so a teammate's edit landing mid-fetch cannot move a row across
@@ -1373,7 +2759,7 @@ async function fetchSnapshot(): Promise<Snapshot> {
     fetchAllPages<PartnerRow>((from, to) => supabase.from('partners').select('*').order('created_at', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<ReferralRow>((from, to) => supabase.from('referrals').select('*').order('referred_on', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<MatchRow>((from, to) => supabase.from('match_profiles').select('*').order('created_at', { ascending: false }).order('id').range(from, to)),
-    fetchAllPages<TouchRow>((from, to) => supabase.from('touches').select('*').order('occurred_at', { ascending: false }).order('id').range(from, to)),
+    fetchAllPages<TouchRow>((from, to) => supabase.from('touches').select('*').order('occurred_at', { ascending: false }).order('id').range(from, to), { maxPages: TOUCH_MAX_PAGES }),
     fetchAllPages<BalanceRow>((from, to) => supabase.from('partner_balances').select('partner_id, inbound, outbound').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
     fetchAllPages<FollowUpRow>((from, to) => supabase.from('follow_ups').select('*').eq('status', 'open').order('created_at', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<ScorecardRow>((from, to) => supabase.from('partner_scorecard').select('partner_id, referrals_sent, admits, non_admits, avg_family_experience, last_referral_on, completed, decided_placements, completion_rate, median_days_to_admit, still_enrolled').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
@@ -1386,9 +2772,17 @@ async function fetchSnapshot(): Promise<Snapshot> {
   const listingByPartner = new Map<string, string>();
   for (const row of partnerRows) if (row.global_partner_id) listingByPartner.set(row.id, row.global_partner_id as string);
 
+  // partner_scorecard reports the family-experience average but not how many
+  // ratings it covers; the ranking needs that count, and the view averages
+  // exactly the outbound rated referrals loaded here (same RLS rows).
+  const ratedByPartner = new Map<string, number>();
+  for (const row of referralRows) {
+    if (row.direction === 'outbound' && row.family_experience != null) ratedByPartner.set(row.partner_id, (ratedByPartner.get(row.partner_id) ?? 0) + 1);
+  }
+
   const scorecards: Record<string, PartnerScorecard> = {};
   for (const row of scorecardRows) {
-    const card = mapScorecardRow(row);
+    const card = { ...mapScorecardRow(row), ratedCases: ratedByPartner.get(row.partner_id) ?? 0 };
     const listingId = listingByPartner.get(row.partner_id);
     const network = listingId ? networkByListing.get(listingId) : undefined;
     scorecards[row.partner_id] = network ? { ...card, network } : card;
@@ -1404,11 +2798,56 @@ async function fetchSnapshot(): Promise<Snapshot> {
   };
 }
 
+function emptySnapshot(): Snapshot {
+  return { partners: [], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} };
+}
+
+// Anything thrown by the data layer as a readable StoreError (PostgREST errors
+// are plain objects; a lost connection is passed through for classification).
+function asStoreError(error: unknown): unknown {
+  if (error instanceof StoreError || isNetworkError(error)) return error;
+  return new StoreError(describeError(error), false);
+}
+
+// A read that did not complete but left the saved copy valid: the server is
+// unreachable (offline, timed out, a passing 5xx / gateway page) or the list
+// is too long to load in full (paging.ts). Every read falls back to the cache
+// on these. Any other StoreError (session or workspace changed, storage
+// failure) still surfaces.
+function readFallsBackToCache(error: unknown): boolean {
+  if (isPagingLimitError(error)) return true;
+  if (error instanceof StoreError) return error instanceof OfflineError;
+  return isServerUnreachable(error);
+}
+
+// The fresh server copy merged with what this device still has pending, then
+// saved. Caller holds no lock.
+async function mergeAndSave(fence: SessionFence, remote: Snapshot): Promise<Snapshot> {
+  return withCacheLock(async () => {
+    await assertSessionFence(fence);
+    const cachedLocal = await readCacheUnlocked(fence);
+    const pendingOps = await readPendingOps(fence);
+    const latestLocal = overlayPendingOps(cachedLocal, pendingOps);
+    const pending = pendingCreatedRows(pendingOps);
+    const merged = await mergeUnsyncedLocal(remote, latestLocal, pending);
+    await assertSessionFence(fence);
+    await writeCacheUnlocked(fence, merged.snapshot);
+    await assertSessionFence(fence);
+    return merged.snapshot;
+  });
+}
+
 // Hydrate app state for one authenticated account. Remote is the source of
-// truth; network failure falls back only to that account's validated v2 cache.
-// Legacy global blobs remain quarantined because their owner cannot be proven.
+// truth; when it cannot be read (readFallsBackToCache) only that account's
+// validated v2 cache is shown — with every change still pending on this
+// device applied on top (overlayPendingOps). Legacy global blobs remain
+// quarantined because their owner cannot be proven. A queued change the
+// server refuses never locks the account out: it is set aside
+// (listRejectedWrites) and hydration continues; any other sync failure shows
+// the saved copy rather than an error.
 export async function hydrate(expectedUserId: string): Promise<HydrateResult> {
   const fence = await sessionFence(expectedUserId);
+  let syncError: string | undefined;
   try {
     const cachedBefore = await readCache(fence);
     if (cachedBefore) {
@@ -1416,45 +2855,55 @@ export async function hydrate(expectedUserId: string): Promise<HydrateResult> {
       if (repaired > 0) await writeCache(fence, fixed);
     }
 
-    await flushWriteQueue(fence.userId);
+    // No connection to refresh the session: the saved copy is all there is,
+    // and asking the server would only wait out supabase-js's retries.
+    if (fence.offline) return { snapshot: (await readCacheWithPending(fence)) ?? emptySnapshot(), source: 'cache' };
+
+    try {
+      await flushWriteQueue(fence.userId);
+    } catch (error) {
+      if (error instanceof RejectedWritesError) {
+        // Set aside; everything behind it flushed. Carry on to the server copy.
+        syncError = error.message;
+      } else {
+        await assertSessionFence(fence);
+        const cached = await readCacheWithPending(fence);
+        if (cached) return { snapshot: cached, source: 'cache', syncError: describeError(error) };
+        throw error;
+      }
+    }
     await assertSessionFence(fence);
     const remote = await fetchSnapshot();
     await assertSessionFence(fence);
-
-    const merged = await withCacheLock(async () => {
-      await assertSessionFence(fence);
-      const latestLocal = await readCacheUnlocked(fence);
-      const result = await mergeUnsyncedLocal(remote, latestLocal);
-      await assertSessionFence(fence);
-      // Queue persistence happens first: the cache must never claim an unsynced
-      // local row is safe until its retry operation is durable.
-      await enqueueOps(fence, result.ops);
-      await writeCacheUnlocked(fence, result.snapshot);
-      await assertSessionFence(fence);
-      return result.snapshot;
-    });
-    return { snapshot: merged, source: 'remote' };
+    const merged = await mergeAndSave(fence, remote);
+    return { snapshot: merged, source: 'remote', ...(syncError ? { syncError } : {}) };
   } catch (error) {
-    if (error instanceof StoreError) throw error;
+    if (!readFallsBackToCache(error) && error instanceof StoreError) throw error;
     await assertSessionFence(fence);
-    const cached = await readCache(fence);
-    if (cached) return { snapshot: cached, source: 'cache' };
-    if (isNetworkError(error)) {
-      return { snapshot: { partners: [], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} }, source: 'cache' };
-    }
-    throw error;
+    const cached = await readCacheWithPending(fence);
+    // The read was cut short by the size ceiling: say so (the saved copy is
+    // shown on every launch until support raises it).
+    const notice = isPagingLimitError(error) ? describeError(error) : undefined;
+    if (cached) return { snapshot: cached, source: 'cache', ...(syncError ? { syncError } : {}), ...(notice ? { notice } : {}) };
+    if (isServerUnreachable(error)) return { snapshot: emptySnapshot(), source: 'cache' };
+    throw asStoreError(error);
   }
 }
 
 // Refresh the account-scoped offline cache from the latest in-memory state.
+// Offline it still saves: the binding last verified on this device is the
+// fence (assertCacheWorkspaceFence — no server round trip). Writing the very
+// snapshot object that is already saved (refreshSnapshot's result, handed
+// back by App.tsx's syncDerived) is skipped.
 export async function persistCache(snapshot: Snapshot, expectedUserId: string): Promise<void> {
   // Acquire the cache lock before resolving the session so concurrent persists
   // commit in call order rather than getSession() completion order.
   await withCacheLock(async () => {
     const fence = await sessionFence(expectedUserId);
-    await assertWorkspaceFence(fence);
+    const boundOrg = await assertCacheWorkspaceFence(fence);
+    if (lastCacheWrite && lastCacheWrite.userId === fence.userId && lastCacheWrite.snapshot === snapshot) return;
     await writeCacheUnlocked(fence, snapshot);
-    await assertWorkspaceFence(fence);
+    await assertCacheWorkspaceFence(fence, boundOrg);
   });
 }
 
@@ -1467,29 +2916,118 @@ export async function persistCache(snapshot: Snapshot, expectedUserId: string): 
 // supabase-js query builders are thenables (PromiseLike), not real Promises.
 // `execute` receives the acting user (owner_id on inserts) and the bound
 // workspace (org_id filter on updates/deletes) verified by the workspace fence.
+//
+// Ordering: a change must never reach the server ahead of older changes still
+// queued on this device for the same records, or a later flush would replay
+// the stale ones over it (a queued full-row partner patch reverting a newer
+// note; a queued match insert undoing an assignment made online). So under
+// the queue lock the queue is flushed first. Then:
+//   - a change to a record whose earlier change was refused joins that
+//     refused change (retried or discarded together) instead of running —
+//     an update would otherwise match nothing and be lost;
+//   - with no connection, or the server failing, it queues behind the rest;
+//   - when all that remains is waiting on records that never reached the
+//     server, an unrelated change goes straight through (the app stays
+//     online) and only one touching those records queues behind them.
+const UPDATE_KINDS = new Set<QueueOp['kind']>(['partner.update', 'match.update', 'follow_up.update', 'referral.update']);
+
 async function runOrQueue(
   expectedUserId: string,
   op: QueueOp,
-  execute: (userId: string, orgId: string) => PromiseLike<{ error: { message: string } | null }>,
+  execute: (userId: string, orgId: string) => PromiseLike<WriteResponse>,
 ): Promise<void> {
   const fence = await sessionFence(expectedUserId);
-  let result: { error: { message: string } | null };
+  const rows = opRows(op);
+  if (fence.offline) {
+    // Same rule as online: a change to a record whose earlier change was
+    // refused joins it in the rejected list rather than the live queue.
+    await withQueueLock(async () => {
+      const rejected = await openRejectedList(fence);
+      const place = placeNewOp(rows, rejected.sets, await readQueueUnlocked(fence.userId));
+      if (place.holder && !place.behindQueue) await rejected.attach(place.holder, bindQueueOp(op, fence.userId));
+      else await enqueueOpUnlocked(fence, op);
+    });
+    return;
+  }
+  await withQueueLock(async () => {
+    let stopped = false;
+    if ((await readQueueUnlocked(fence.userId)).length) {
+      // A refused older change is set aside (listRejectedWrites); it does not
+      // fail this unrelated save.
+      stopped = (await flushQueueUnlocked(fence)).stopped !== null;
+    }
+    const rejected = await openRejectedList(fence);
+    const remaining = await readQueueUnlocked(fence.userId);
+    const place = placeNewOp(rows, rejected.sets, remaining);
+    if (place.holder) {
+      if (place.behindQueue) await enqueueOpUnlocked(fence, op);
+      else await rejected.attach(place.holder, bindQueueOp(op, fence.userId));
+      return;
+    }
+    if (remaining.length) {
+      const waitingSets = newHoldSets();
+      for (const queued of remaining) hold(opRows(queued), waitingSets, queueOpKey(queued));
+      if (stopped || holderOf(rows, waitingSets)) {
+        await enqueueOpUnlocked(fence, op);
+        return;
+      }
+    }
+    let result: WriteResponse;
+    try {
+      const orgId = await assertWorkspaceFence(fence);
+      result = await execute(fence.userId, orgId);
+    } catch (error) {
+      if (!isServerUnreachable(error)) throw asStoreError(error);
+      await enqueueOpUnlocked(fence, op);
+      return;
+    }
+    if (!result.error) {
+      await assertSessionFence(fence);
+      if (UPDATE_KINDS.has(op.kind) && Array.isArray(result.data) && result.data.length === 0) {
+        throw new StoreError('This change did not apply: the record is no longer on the server (it may have been deleted on another device). Refresh to see the latest.', false);
+      }
+      return;
+    }
+    const kind = classifyWriteFailure(failureOf(result));
+    if (kind === 'network' || kind === 'timeout' || kind === 'transient') {
+      // Not refused (a timed-out write may even have landed): queue it; the
+      // replay is safe either way.
+      await enqueueOpUnlocked(fence, op);
+      return;
+    }
+    throw new StoreError(describeError(result.error), false);
+  });
+}
+
+// The columns of `next` whose values differ from `previous` (the row as this
+// device last saved it). Sending only those means an edit never rewrites a
+// field the user did not touch — whatever a teammate saved there meanwhile
+// survives, and a replayed queued edit cannot revert it.
+function changedColumns(next: Record<string, unknown>, previous: Record<string, unknown> | null): Record<string, unknown> {
+  if (!previous) return next;
+  const patch: Record<string, unknown> = {};
+  for (const [column, value] of Object.entries(next)) {
+    if (JSON.stringify(value) !== JSON.stringify(previous[column])) patch[column] = value;
+  }
+  return patch;
+}
+
+function withoutId(row: Record<string, unknown>): Record<string, unknown> {
+  const { id: _id, ...rest } = row;
+  return rest;
+}
+
+// The saved copy of one row, as it was before the edit being written: App.tsx
+// persists the cache only after the store accepts a write. Best effort — no
+// copy means the full row is sent, as before.
+async function savedRow<T>(expectedUserId: string, pick: (snapshot: Snapshot) => T | undefined): Promise<T | undefined> {
   try {
-    const orgId = await assertWorkspaceFence(fence);
-    result = await execute(fence.userId, orgId);
-  } catch (error) {
-    if (!isNetworkError(error)) throw error;
-    await assertSessionFence(fence);
-    await enqueueOp(fence, op);
-    return;
+    const fence = await sessionFence(expectedUserId);
+    const snapshot = await readCache(fence);
+    return snapshot ? pick(snapshot) : undefined;
+  } catch {
+    return undefined;
   }
-  await assertWorkspaceFence(fence);
-  if (!result.error) return;
-  if (isNetworkError(result.error)) {
-    await enqueueOp(fence, op);
-    return;
-  }
-  throw new StoreError(result.error.message, false);
 }
 
 export async function createPartner(partner: Partner, expectedUserId: string): Promise<void> {
@@ -1499,9 +3037,11 @@ export async function createPartner(partner: Partner, expectedUserId: string): P
 
 export async function updatePartner(partner: Partner, expectedUserId: string): Promise<void> {
   const row = partnerToRow(partner);
-  const { id, ...patch } = row;
+  const before = await savedRow(expectedUserId, (snapshot) => snapshot.partners.find((item) => safeId(item.id) === row.id));
+  const patch = changedColumns(withoutId(row), before ? withoutId(partnerToRow(before)) : null);
+  if (!Object.keys(patch).length) return; // nothing changed since the saved copy
   await runOrQueue(expectedUserId, { kind: 'partner.update', id: safeId(partner.id) as string, patch }, (_userId, orgId) =>
-    supabase.from('partners').update(patch).eq('id', safeId(partner.id)).eq('org_id', orgId));
+    supabase.from('partners').update(patch).eq('id', safeId(partner.id)).eq('org_id', orgId).select('id'));
 }
 
 export async function createReferral(referral: Referral, expectedUserId: string): Promise<void> {
@@ -1516,10 +3056,12 @@ export async function createMatchProfile(match: ReferralMatch, expectedUserId: s
 
 export async function updateMatchProfile(match: ReferralMatch, expectedUserId: string): Promise<void> {
   const row = matchToRow(match);
-  const { id, ...patch } = row;
   const safeMatchId = safeId(match.id) as string;
+  const before = await savedRow(expectedUserId, (snapshot) => snapshot.referralMatches.find((item) => safeId(item.id) === safeMatchId));
+  const patch = changedColumns(withoutId(row), before ? withoutId(matchToRow(before)) : null);
+  if (!Object.keys(patch).length) return; // nothing changed since the saved copy
   await runOrQueue(expectedUserId, { kind: 'match.update', id: safeMatchId, patch }, (_userId, orgId) =>
-    supabase.from('match_profiles').update(patch).eq('id', safeMatchId).eq('org_id', orgId));
+    supabase.from('match_profiles').update(patch).eq('id', safeMatchId).eq('org_id', orgId).select('id'));
 }
 
 export async function deleteMatchProfile(matchId: string, expectedUserId: string): Promise<void> {
@@ -1591,6 +3133,30 @@ export async function logContactActivity(
   }));
 }
 
+// A follow-up text or email that was sent, or a call that was logged, from
+// the outreach sheet: closes the step it came from (if any), logs the case
+// event and/or partner touch, and creates the next step — one atomic,
+// replay-safe write (record_outreach_sent).
+export async function recordOutreachSent(
+  completedId: string | null,
+  next: FollowUp,
+  event: PacketCaseEvent | null,
+  touch: Touch | null,
+  expectedUserId: string,
+): Promise<void> {
+  if (!event && !touch) throw new StoreError('A case event or partner touch is required.', false);
+  const op: QueueOp = {
+    kind: 'outreach.sent',
+    completedId: completedId ? safeId(completedId) as string : null,
+    next: followUpToRow(next),
+    event: event ? packetEventToRow(event) : null,
+    touch: touch ? touchToRow(touch) : null,
+  };
+  await runOrQueue(expectedUserId, op, (userId) => supabase.rpc('record_outreach_sent', {
+    p_expected_owner_id: userId, p_completed_id: op.completedId, p_next: op.next, p_event: op.event, p_touch: op.touch,
+  }));
+}
+
 export async function createFollowUp(followUp: FollowUp, expectedUserId: string): Promise<void> {
   const row = followUpToRow(followUp);
   await runOrQueue(expectedUserId, { kind: 'follow_up.insert', row }, (userId) => supabase.from('follow_ups').insert({ ...row, owner_id: userId }));
@@ -1598,10 +3164,12 @@ export async function createFollowUp(followUp: FollowUp, expectedUserId: string)
 
 export async function updateFollowUp(followUp: FollowUp, expectedUserId: string): Promise<void> {
   const row = followUpToRow(followUp);
-  const { id, ...patch } = row;
   const safeFollowUpId = safeId(followUp.id) as string;
+  const before = await savedRow(expectedUserId, (snapshot) => snapshot.followUps.find((item) => safeId(item.id) === safeFollowUpId));
+  const patch = changedColumns(withoutId(row), before ? withoutId(followUpToRow(before)) : null);
+  if (!Object.keys(patch).length) return; // nothing changed since the saved copy
   await runOrQueue(expectedUserId, { kind: 'follow_up.update', id: safeFollowUpId, patch }, (_userId, orgId) =>
-    supabase.from('follow_ups').update(patch).eq('id', safeFollowUpId).eq('org_id', orgId));
+    supabase.from('follow_ups').update(patch).eq('id', safeFollowUpId).eq('org_id', orgId).select('id'));
 }
 
 export async function completeFollowUpWithNext(
@@ -1676,7 +3244,7 @@ export async function updateReferralOutcome(id: string, patch: ReferralOutcomePa
   const row = referralOutcomePatchToRow(patch);
   const safeReferralId = safeId(id) as string;
   await runOrQueue(expectedUserId, { kind: 'referral.update', id: safeReferralId, patch: row }, (_userId, orgId) =>
-    supabase.from('referrals').update(row).eq('id', safeReferralId).eq('org_id', orgId));
+    supabase.from('referrals').update(row).eq('id', safeReferralId).eq('org_id', orgId).select('id'));
 }
 
 export async function updateReferralPacketStamp(
@@ -1688,7 +3256,7 @@ export async function updateReferralPacketStamp(
   const patch = { packet_sent_at: packetSentAt, match_profile_id: safeId(matchProfileId) };
   const safeReferralId = safeId(id) as string;
   await runOrQueue(expectedUserId, { kind: 'referral.update', id: safeReferralId, patch }, (_userId, orgId) =>
-    supabase.from('referrals').update(patch).eq('id', safeReferralId).eq('org_id', orgId));
+    supabase.from('referrals').update(patch).eq('id', safeReferralId).eq('org_id', orgId).select('id'));
 }
 
 // Attach (or detach) a case on a match profile.
@@ -1696,30 +3264,25 @@ export async function updateMatchCase(id: string, caseId: string | null, expecte
   const patch = { case_id: safeId(caseId) };
   const safeMatchId = safeId(id) as string;
   await runOrQueue(expectedUserId, { kind: 'match.update', id: safeMatchId, patch }, (_userId, orgId) =>
-    supabase.from('match_profiles').update(patch).eq('id', safeMatchId).eq('org_id', orgId));
+    supabase.from('match_profiles').update(patch).eq('id', safeMatchId).eq('org_id', orgId).select('id'));
 }
 
 // Re-hydrate from the server and durably update this account's cache. Returns
-// null only for an actual network failure; persistence/session failures surface.
+// null when the server cannot be reached (isServerUnreachable: offline, timed
+// out, a passing 5xx / gateway page) or the session is known to be offline —
+// the screen keeps its saved copy. A list too long to load (PagingLimitError)
+// and persistence/session failures surface.
 export async function refreshSnapshot(expectedUserId: string): Promise<Snapshot | null> {
   const fence = await sessionFence(expectedUserId);
+  if (fence.offline) return null;
   try {
     const remote = await fetchSnapshot();
     await assertSessionFence(fence);
-    return await withCacheLock(async () => {
-      await assertSessionFence(fence);
-      const latestLocal = await readCacheUnlocked(fence);
-      const merged = await mergeUnsyncedLocal(remote, latestLocal);
-      await assertSessionFence(fence);
-      await enqueueOps(fence, merged.ops);
-      await writeCacheUnlocked(fence, merged.snapshot);
-      await assertSessionFence(fence);
-      return merged.snapshot;
-    });
+    return await mergeAndSave(fence, remote);
   } catch (error) {
-    if (error instanceof StoreError) throw error;
-    if (isNetworkError(error)) return null;
-    throw error;
+    if (error instanceof StoreError && !(error instanceof OfflineError)) throw error;
+    if (isServerUnreachable(error)) return null;
+    throw asStoreError(error);
   }
 }
 
@@ -1804,6 +3367,26 @@ async function writeCaseFileCacheUnlocked(fence: SessionFence, caseId: string, f
   }
 }
 
+// The server reads behind loadCaseList / loadCaseFile, with every
+// unreachable-class failure (offline, timed out, a passing 5xx / gateway
+// page) turned into an OfflineError, so the fallback below — "use the saved
+// copy on a network error" — covers all of them, not only a lost connection.
+async function fetchCaseList(): Promise<CaseList> {
+  try {
+    return await fetchCaseListFromServer();
+  } catch (error) {
+    throw asOfflineError(error);
+  }
+}
+
+async function fetchCaseFile(caseId: string): Promise<CaseFile> {
+  try {
+    return await fetchCaseFileFromServer(caseId);
+  } catch (error) {
+    throw asOfflineError(error);
+  }
+}
+
 export type CaseListLoad = { list: CaseList; source: 'remote' | 'cache'; savedAt: string };
 export type CaseFileLoad = { file: CaseFile; source: 'remote' | 'cache'; savedAt: string; truncated: boolean };
 
@@ -1815,6 +3398,7 @@ export async function loadCaseList(expectedUserId: string): Promise<CaseListLoad
   const fence = await sessionFence(expectedUserId);
   let remote: CaseList;
   try {
+    if (fence.offline) throw offlineError(); // straight to the saved copy
     remote = await fetchCaseList();
   } catch (error) {
     if (!isNetworkError(error)) throw error;
@@ -1837,6 +3421,7 @@ export async function loadCaseFile(expectedUserId: string, caseId: string): Prom
   const fence = await sessionFence(expectedUserId);
   let remote: CaseFile;
   try {
+    if (fence.offline) throw offlineError(); // straight to the saved copy
     remote = await fetchCaseFile(caseId);
   } catch (error) {
     if (!isNetworkError(error)) throw error;
@@ -1856,14 +3441,15 @@ export async function loadCaseFile(expectedUserId: string, caseId: string): Prom
 
 // Save the in-memory case list (server-loaded or edited online) as the
 // offline copy for this account. Never called with a cache-sourced list.
-// Same fence as persistCache: the server must still agree on the bound
-// workspace, so a copy is never written under a binding that has moved on.
+// Same fence as persistCache: the server, when it can be reached, must still
+// agree on the bound workspace, so a copy is never written under a binding
+// that has moved on.
 export async function persistCaseList(list: CaseList, expectedUserId: string): Promise<void> {
   await withCacheLock(async () => {
     const fence = await sessionFence(expectedUserId);
-    await assertWorkspaceFence(fence);
+    await assertCacheWorkspaceFence(fence);
     await writeCaseListCacheUnlocked(fence, list, new Date().toISOString());
-    await assertWorkspaceFence(fence);
+    await assertCacheWorkspaceFence(fence);
   });
 }
 
@@ -1872,8 +3458,8 @@ export async function persistCaseList(list: CaseList, expectedUserId: string): P
 export async function persistCaseFile(caseId: string, file: CaseFile, expectedUserId: string): Promise<void> {
   await withCacheLock(async () => {
     const fence = await sessionFence(expectedUserId);
-    await assertWorkspaceFence(fence);
+    await assertCacheWorkspaceFence(fence);
     await writeCaseFileCacheUnlocked(fence, caseId, file, new Date().toISOString());
-    await assertWorkspaceFence(fence);
+    await assertCacheWorkspaceFence(fence);
   });
 }

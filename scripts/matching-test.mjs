@@ -5,8 +5,11 @@
 //   (c) score components sum to the total, max 100, weights as documented
 //   (d) ties: lower family cost first, then a rotation that is stable for one
 //       match profile id and differs across ids
-//   (e) track record: one 5-star review cannot outrank twenty 4.6s
+//   (e) track record: one 5-star review cannot outrank twenty 4.6s; no
+//       history scores the prior, and bad history never beats none
 //   (f) a financial relationship never changes the order or any score
+//   (h) location preference: "Away from home" searches every state
+//   (i) a cash cost not on file is unknown, never free
 
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -41,6 +44,8 @@ const {
   mustHaveNeedsForProfile, populationForProfile, rankOfPartner, placementCandidates,
   WEIGHT_CLINICAL_FIT, WEIGHT_FAMILY_COST, WEIGHT_LOCATION, WEIGHT_TRACK_RECORD, MAX_SCORE,
   TRACK_RECORD_PRIOR_CASES, MUST_HAVE_BY_DEFAULT, OUT_OF_NETWORK_COST_SHARE,
+  priorTrackRecordScore, priorForCard, knownMonthlyCostForPartner, monthlyCostForPartner, regionFitForPartner,
+  CASH_UNKNOWN_COST_SHARE,
 } = m;
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -268,7 +273,10 @@ const ids = (ranked) => ranked.map((score) => score.partner.id);
   const cash = (cost, budget) => scoreProgram(profile({ insurance: 'Cash pay', maxBudget: budget }), partner({ monthlyCost: cost }), undefined, prior).components.cost;
   assert.equal(cash(10000, 10000), 12.5);
   assert.equal(cash(5000, 10000), 18.8);
-  assert.equal(cash(0, 10000), 25);
+  // 0 is a cost never entered, not a free program: neutral points, never full
+  // (this asserted 25 before: an unknown cost scored as the cheapest possible).
+  assert.equal(cash(0, 10000), WEIGHT_FAMILY_COST * CASH_UNKNOWN_COST_SHARE);
+  assert.equal(cash(0, undefined), 12.5);
   assert.equal(cash(30000, undefined), 12.5);
   assert.ok(cash(2000, 10000) > cash(8000, 10000), 'cash scores higher the further under budget');
   // Location: close/away from the state on each side; unknown state is neutral.
@@ -328,8 +336,12 @@ const ids = (ranked) => ranked.map((score) => score.partner.id);
   const equalAdmits = { ...cards, 'one-five': { ...cards['one-five'], admits: 1, nonAdmits: 0 }, twenty: { ...cards.twenty, admits: 20, nonAdmits: 0 } };
   const priorEqual = trackRecordPrior(equalAdmits);
   assert.ok(trackRecordScore(equalAdmits.twenty, priorEqual).score > trackRecordScore(equalAdmits['one-five'], priorEqual).score);
-  assert.equal(trackRecordScore(undefined, prior).score, 7.5, 'no data is neutral');
-  assert.equal(trackRecordScore({ admits: 0, nonAdmits: 0, avgFamilyExperience: 5 }, prior).score, 7.5, 'a rating with no decided cases is still neutral');
+  // No data scores the prior, not a flat 7.5 (7.5 is the prior only when nobody has data).
+  const priorScore = priorTrackRecordScore(prior);
+  assert.ok(priorScore > 7.5, `this network is better than a coin flip (${priorScore})`);
+  assert.equal(trackRecordScore(undefined, prior).score, priorScore, 'no data scores exactly the prior');
+  assert.equal(trackRecordScore({ admits: 0, nonAdmits: 0, avgFamilyExperience: 5 }, prior).score, priorScore, 'a rating with no decided cases still scores the prior');
+  assert.equal(trackRecordScore(undefined, trackRecordPrior(noCards)).score, 7.5, 'with nobody\'s data the prior is half');
   // End to end: identical programs except the scorecard.
   const a = partner({ id: 'one-five' });
   const b = partner({ id: 'twenty' });
@@ -337,7 +349,92 @@ const ids = (ranked) => ranked.map((score) => score.partner.id);
   // More evidence moves the score further from the prior, in both directions.
   const strong = trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: 5 }, prior).score;
   const weak = trackRecordScore({ admits: 0, nonAdmits: 20, avgFamilyExperience: 1 }, prior).score;
-  assert.ok(strong > 7.5 && strong <= 15 && weak < 7.5 && weak >= 0);
+  assert.ok(strong > priorScore && strong <= 15 && weak < priorScore && weak >= 0);
+}
+
+{
+  // The family-experience average counts as the referrals it covers, not as
+  // every decided case: non-admits are never rated and the stars are
+  // optional. Weighted by decided cases, one 5-star family among twenty
+  // admits lifted a program over one with twenty families averaging 4.6.
+  const cards = {
+    'one-rating': { admits: 20, nonAdmits: 0, avgFamilyExperience: 5.0, ratedCases: 1 },
+    'twenty-ratings': { admits: 20, nonAdmits: 0, avgFamilyExperience: 4.6, ratedCases: 20 },
+    n1: { admits: 8, nonAdmits: 4, avgFamilyExperience: 4.0, ratedCases: 8 },
+    n2: { admits: 6, nonAdmits: 3, avgFamilyExperience: 3.8, ratedCases: 5 },
+  };
+  for (const id of ['r-1', 'r-2', 'r-3']) {
+    assert.deepEqual(ids(rankPrograms(profile({ id, insurance: 'Cash pay' }), [partner({ id: 'one-rating' }), partner({ id: 'twenty-ratings' })], cards)), ['twenty-ratings', 'one-rating'],
+      'twenty 4.6s outrank a single 5-star, however many unrated admits sit beside it');
+  }
+  const prior = trackRecordPrior(cards);
+  // One 1-star among twenty unrated admits is one family, not twenty.
+  const oneBad = trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: 1, ratedCases: 1 }, prior).score;
+  const allBad = trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: 1, ratedCases: 20 }, prior).score;
+  assert.ok(oneBad > allBad + 1, `one bad rating (${oneBad}) must not score like twenty (${allBad})`);
+  // With no ratings at all the experience signal sits on the prior.
+  const unrated = trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: null, ratedCases: 0 }, prior).score;
+  assert.equal(trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: 5, ratedCases: 0 }, prior).score, unrated);
+  // A card cached by an older build (no count) reads as before: every decided case.
+  assert.equal(trackRecordScore({ admits: 20, nonAdmits: 0, avgFamilyExperience: 4.6 }, prior).score, trackRecordScore(cards['twenty-ratings'], prior).score);
+  // The workspace prior weighs each average by its ratings too.
+  const priorOldWeights = trackRecordPrior(Object.fromEntries(Object.entries(cards).map(([key, value]) => [key, { ...value, ratedCases: undefined }])));
+  assert.ok(Math.abs(prior.experience - ((1 * 1 + 20 * 0.9 + 8 * 0.75 + 5 * 0.7) / 34)) < 1e-9);
+  assert.ok(priorOldWeights.experience > prior.experience, 'the single 5-star no longer counts twenty times in the prior');
+}
+
+{
+  // Bad evidence never beats no evidence (reviewer's case): in a workspace
+  // with a good record, a program whose only referral was a 1-star
+  // non-admit used to score 9.3 and outrank a never-used program at 7.5.
+  const cards = {
+    good1: { admits: 8, nonAdmits: 2, avgFamilyExperience: 4.2 },
+    good2: { admits: 9, nonAdmits: 1, avgFamilyExperience: 4.4 },
+    bad: { admits: 0, nonAdmits: 1, avgFamilyExperience: 1 },
+  };
+  const ranked = rankPrograms(profile({ id: 'mp1', insurance: 'Cash pay', maxBudget: 30000 }), [partner({ id: 'bad' }), partner({ id: 'never' })], cards);
+  assert.deepEqual(ids(ranked), ['never', 'bad'], 'a never-used program outranks one with only a bad referral');
+  const prior = trackRecordPrior(cards);
+  assert.ok(ranked[1].components.trackRecord < ranked[0].components.trackRecord);
+  assert.equal(ranked[0].components.trackRecord, Math.round(priorTrackRecordScore(prior) * 10) / 10);
+
+  // Property: for any prior (workspace or network), a record no better than
+  // the program's prior on every signal never scores above that program with
+  // no record, and one no worse never scores below it. Includes the old
+  // cutoff case: a weak network (N) inside a strong workspace (W), five or
+  // more bad local cases. Switching the prior from N to W at five cases used
+  // to lift the score above the no-evidence one.
+  let state = 7;
+  const random = () => { state = (Math.imul(state, 1103515245) + 12345) >>> 0; return state / 4294967296; };
+  const toStars = (unit) => 1 + 4 * unit;
+  for (let round = 0; round < 400; round += 1) {
+    const workspace = { experience: random(), admitRate: random(), completion: random() };
+    const network = random() < 0.6 ? { admitRate: random(), familyExperience: toStars(random()), completionRate: random() < 0.8 ? random() : null } : undefined;
+    const p = priorForCard({ admits: 0, nonAdmits: 0, avgFamilyExperience: null, network }, workspace);
+    const none = trackRecordScore({ admits: 0, nonAdmits: 0, avgFamilyExperience: null, network }, workspace).score;
+    const decided = 1 + Math.floor(random() * 40);
+    const placements = Math.floor(random() * (decided + 1));
+    const worse = {
+      admits: Math.floor(decided * p.admitRate * random()),
+      avgFamilyExperience: toStars(p.experience * random()),
+      completionRate: p.completion * random(),
+    };
+    const better = {
+      admits: Math.min(decided, Math.ceil(decided * (p.admitRate + (1 - p.admitRate) * random()))),
+      avgFamilyExperience: toStars(p.experience + (1 - p.experience) * random()),
+      completionRate: p.completion + (1 - p.completion) * random(),
+    };
+    const card = (signals) => ({ ...signals, nonAdmits: decided - signals.admits, decidedPlacements: placements, network });
+    assert.ok(trackRecordScore(card(worse), workspace).score <= none + 1e-9, `round ${round}: worse-than-prior evidence beat no evidence`);
+    assert.ok(trackRecordScore(card(better), workspace).score >= none - 1e-9, `round ${round}: better-than-prior evidence fell below no evidence`);
+  }
+  const weakNetwork = { admitRate: 0.2, familyExperience: 1.8, completionRate: 0.2 };
+  const strongWorkspace = { experience: 0.9, admitRate: 0.9, completion: 0.9 };
+  const noRecord = trackRecordScore({ admits: 0, nonAdmits: 0, avgFamilyExperience: null, network: weakNetwork }, strongWorkspace).score;
+  for (const decided of [1, 4, 5, 6, 12]) {
+    const bad = trackRecordScore({ admits: 0, nonAdmits: decided, avgFamilyExperience: 1, decidedPlacements: 0, network: weakNetwork }, strongWorkspace).score;
+    assert.ok(bad <= noRecord, `${decided} one-star non-admits (${bad}) must not beat no record (${noRecord})`);
+  }
 }
 
 // ─── (g) outcomes loop: completion joins the blend; network prior for thin history ──
@@ -357,9 +454,9 @@ const ids = (ranked) => ranked.map((score) => score.partner.id);
   ]);
   const prior = trackRecordPrior(cards);
   assert.ok(prior.completion > 0.5 && prior.completion < 0.8, `completion prior is case-weighted (${prior.completion})`);
-  // A partner with no data is neutral, with or without completion data.
-  assert.equal(trackRecordScore(undefined, prior).score, 7.5);
-  assert.equal(trackRecordScore({ admits: 0, nonAdmits: 0, avgFamilyExperience: 5, decidedPlacements: 0, completionRate: 1 }, prior).score, 7.5);
+  // A partner with no data scores the prior, with or without completion data.
+  assert.equal(trackRecordScore(undefined, prior).score, priorTrackRecordScore(prior));
+  assert.equal(trackRecordScore({ admits: 0, nonAdmits: 0, avgFamilyExperience: 5, decidedPlacements: 0, completionRate: 1 }, prior).score, priorTrackRecordScore(prior));
   // Completion cannot push above the max, even with absurd inputs.
   const perfect = trackRecordScore({ admits: 50, nonAdmits: 0, avgFamilyExperience: 5, decidedPlacements: 50, completionRate: 1 }, { experience: 1, admitRate: 1, completion: 1 }).score;
   assert.ok(Math.abs(perfect - WEIGHT_TRACK_RECORD) < 1e-9, `everything perfect scores exactly the weight (${perfect})`);
@@ -378,8 +475,17 @@ const ids = (ranked) => ranked.map((score) => score.partner.id);
   const network = { admitRate: 0.95, familyExperience: 4.9, completionRate: 0.95 };
   const thin = { admits: 1, nonAdmits: 1, avgFamilyExperience: 3, decidedPlacements: 1, completionRate: 0 };
   assert.ok(trackRecordScore({ ...thin, network }, prior).score > trackRecordScore(thin, prior).score, 'a strong network record lifts a thin local one');
+  // The network is the prior at any amount of local history (no switch at
+  // five cases: that switch let bad local evidence lift a score). Its pull
+  // fades as local cases accrue: a rich record barely moves.
   const rich = { admits: 20, nonAdmits: 2, avgFamilyExperience: 4.4, decidedPlacements: 10, completionRate: 0.7 };
-  assert.equal(trackRecordScore({ ...rich, network }, prior).score, trackRecordScore(rich, prior).score, 'with enough local history the network prior is not used');
+  const thinLift = trackRecordScore({ ...thin, network }, prior).score - trackRecordScore(thin, prior).score;
+  const richLift = trackRecordScore({ ...rich, network }, prior).score - trackRecordScore(rich, prior).score;
+  assert.ok(richLift >= 0 && richLift < thinLift / 2, `a rich local record leans on the network far less (${richLift} vs ${thinLift})`);
+  assert.ok(richLift <= WEIGHT_TRACK_RECORD * TRACK_RECORD_PRIOR_CASES / (22 + TRACK_RECORD_PRIOR_CASES), 'the prior weighs k / (n + k) at most');
+  // With no local history, the disclosed network figures are the score.
+  assert.equal(trackRecordScore({ admits: 0, nonAdmits: 0, avgFamilyExperience: null, network }, prior).score, priorTrackRecordScore(priorForCard({ admits: 0, nonAdmits: 0, avgFamilyExperience: null, network }, prior)));
+  assert.ok(trackRecordScore({ admits: 0, nonAdmits: 0, avgFamilyExperience: null, network }, prior).score > trackRecordScore(undefined, prior).score, 'a strong network record lifts a never-used program');
   assert.deepEqual(priorForCard({ ...thin, network: { admitRate: null, familyExperience: null, completionRate: null } }, prior), prior, 'withheld network figures fall back to the workspace prior');
   // Referral counts still never change the order, with completion in play.
   const programs = ['one-five', 'twenty', 'n1', 'n2'].map((id) => partner({ id }));
@@ -387,6 +493,102 @@ const ids = (ranked) => ranked.map((score) => score.partner.id);
   const permuted = programs.map((item, index) => ({ ...item, inbound: 40 - index * 7, outbound: index * 11 }));
   assert.deepEqual(ids(rankPrograms(profile({ id: 'm-outcomes', insurance: 'Cash pay' }), permuted, cards)), order);
   assert.equal(order[0], 'twenty');
+}
+
+// ─── (h) location preference: what the GEOGRAPHY state means ───────────────
+
+{
+  // Away from home: the state is home, not a filter. Every out-of-state
+  // program stays and scores the location points; home-state programs stay
+  // too (a preference demotes, it never hides) with none. Before, the state
+  // still filtered, so only home-state programs (scored 0) and nationwide
+  // ones survived: the preference hid exactly what the family asked for.
+  const inOR = partner({ id: 'in-or', state: 'OR' });
+  const inCA = partner({ id: 'in-ca', state: 'CA' });
+  const inWA = partner({ id: 'in-wa', state: 'WA' });
+  const natCA = partner({ id: 'nat-ca', state: 'CA', regions: ['Nationwide'] });
+  const programs = [inOR, inCA, inWA, natCA];
+  const away = rankPrograms(profile({ state: 'OR', locationPreference: 'Away from home' }), programs, noCards);
+  assert.deepEqual(ids(away).sort(), ['in-ca', 'in-or', 'in-wa', 'nat-ca'], 'away from home hides nothing for being out of state');
+  assert.equal(ids(away).at(-1), 'in-or', 'the home-state program sorts last');
+  assert.ok(away.every((score) => score.regionFit && !score.failedRequirements.includes('location')));
+  assert.deepEqual(away.map((score) => score.components.location), [10, 10, 10, 0]);
+  assert.deepEqual(away.map((score) => score.sameState), [false, false, false, true]);
+  // Close to family and No preference keep the state as the search area.
+  const close = rankPrograms(profile({ state: 'OR', locationPreference: 'Close to family' }), programs, noCards);
+  assert.deepEqual(ids(close), ['in-or', 'nat-ca']);
+  assert.deepEqual(close.map((score) => score.components.location), [10, 0]);
+  const none = rankPrograms(profile({ state: 'OR', locationPreference: 'No preference' }), programs, noCards);
+  assert.deepEqual(ids(none).sort(), ['in-or', 'nat-ca']);
+  assert.deepEqual(ids(rankPrograms(profile({ state: 'OR' }), programs, noCards)).sort(), ['in-or', 'nat-ca'], 'an older profile with no preference filters as before');
+  const hidden = scoreProgram(profile({ state: 'OR', locationPreference: 'Close to family' }), inCA, undefined, trackRecordPrior(noCards));
+  assert.deepEqual(hidden.failedRequirements, ['location'], 'out of state is a requirement under close to family: hidden, not demoted');
+  // No state: nothing to filter by or measure from, whatever the preference.
+  for (const locationPreference of ['No preference', 'Close to family', 'Away from home']) {
+    assert.equal(rankPrograms(profile({ state: 'ANY', locationPreference }), programs, noCards).length, 4);
+  }
+  assert.equal(regionFitForPartner({ state: 'OR', locationPreference: 'Away from home' }, inCA), true);
+  assert.equal(regionFitForPartner({ state: 'OR', locationPreference: 'Close to family' }, inCA), false);
+  assert.equal(regionFitForPartner({ state: 'OR' }, inCA), false);
+  // A program with no state on file (the partner form saves a blank as '—',
+  // and the field is free text) is neither close nor away. It used to read as
+  // "another state": full points under Away from home, level with a program
+  // confirmed out of state, and a packet line saying it was outside the
+  // family's state.
+  const prior = trackRecordPrior(noCards);
+  for (const state of ['—', '', 'OREGON', 'XX']) {
+    const unknownState = partner({ id: `unknown-${state}`, state, regions: ['Nationwide'] });
+    for (const locationPreference of ['Away from home', 'Close to family']) {
+      const scored = scoreProgram(profile({ state: 'OR', locationPreference }), unknownState, undefined, prior);
+      assert.equal(scored.sameState, null, `state ${JSON.stringify(state)} is unknown, not another state`);
+      assert.equal(scored.components.location, 0, `an unknown state never earns the ${locationPreference} points`);
+      assert.equal(scored.eligible, true, 'an unknown state does not hide a nationwide program');
+    }
+    assert.equal(scoreProgram(profile({ state: 'OR', locationPreference: 'No preference' }), unknownState, undefined, prior).components.location, 10);
+    assert.equal(scoreProgram(profile({ state: 'ANY', locationPreference: 'Away from home' }), unknownState, undefined, prior).components.location, 5);
+  }
+  const awayRanked = rankPrograms(profile({ state: 'OR', locationPreference: 'Away from home' }), [partner({ id: 'no-state', state: '—' }), inCA], noCards);
+  assert.deepEqual(ids(awayRanked), ['in-ca', 'no-state'], 'a confirmed out-of-state program outranks one whose state is not on file');
+  // The state is matched as a code, whatever its case or spacing.
+  assert.equal(regionFitForPartner({ state: 'OR', locationPreference: 'Close to family' }, partner({ state: ' or ' })), true);
+  assert.equal(scoreProgram(profile({ state: 'OR', locationPreference: 'Close to family' }), partner({ state: 'or' }), undefined, prior).components.location, 10);
+}
+
+// ─── (i) a cash cost not on file is unknown, never free ────────────────────
+
+{
+  const prior = trackRecordPrior(noCards);
+  const unknown = partner({ id: 'unknown', monthlyCost: 0, cashMin: 0, cashMax: 0 });
+  assert.equal(knownMonthlyCostForPartner(unknown), null);
+  assert.equal(monthlyCostForPartner(unknown), 0, 'display value stays 0 for the UI');
+  assert.equal(knownMonthlyCostForPartner(partner({ monthlyCost: 0, cashMax: 15000, cashMin: 9000 })), 15000, 'a blank monthly cost falls back to the legacy range, as on load');
+  assert.equal(knownMonthlyCostForPartner(partner({ monthlyCost: undefined, cashMax: 0, cashMin: 9000 })), 9000);
+  // Reviewer's case: budget 30,000; a priced program vs one with no cost.
+  // The unknown used to earn the full 25 and win.
+  const priced = partner({ id: 'priced', monthlyCost: 9000 });
+  const budgeted = rankPrograms(profile({ insurance: 'Cash pay', maxBudget: 30000 }), [unknown, priced], noCards);
+  assert.deepEqual(ids(budgeted), ['priced', 'unknown']);
+  assert.equal(budgeted[1].components.cost, 12.5, 'unknown cost earns neutral points, never full');
+  assert.ok(budgeted[0].components.cost > budgeted[1].components.cost);
+  assert.equal(budgeted[1].familyCost, null);
+  assert.equal(budgeted[1].eligible, true, 'an unknown cost is not hidden: the budget cannot be checked either way');
+  // Equal fit: a known cost sorts first in the tie-break, budget or not.
+  const atBudget = partner({ id: 'at-budget', monthlyCost: 30000 });
+  for (const id of ['m-x', 'm-y', 'm-z', 'm-w']) {
+    const tied = rankPrograms(profile({ id, insurance: 'Cash pay', maxBudget: 30000 }), [unknown, atBudget], noCards);
+    assert.equal(tied[0].total, tied[1].total, 'at budget and unknown score the same');
+    assert.deepEqual(ids(tied), ['at-budget', 'unknown'], 'a known cost wins the tie over an unknown one');
+    const noBudget = rankPrograms(profile({ id, insurance: 'Cash pay' }), [unknown, partner({ id: 'dear', monthlyCost: 90000 })], noCards);
+    assert.deepEqual(ids(noBudget), ['dear', 'unknown'], 'even an expensive known cost sorts before an unknown one');
+  }
+  // Two unknowns still rotate by profile id, like any other tie.
+  const unknowns = Array.from({ length: 6 }, (_, i) => partner({ id: `u-${i}`, monthlyCost: 0, cashMin: 0, cashMax: 0 }));
+  const orders = new Set(Array.from({ length: 12 }, (_, i) => ids(rankPrograms(profile({ id: `fam-${i}`, insurance: 'Cash pay' }), unknowns, noCards)).join(',')));
+  assert.ok(orders.size >= 4);
+  // Insurance is untouched: in-network still 0, out-of-network 1.
+  const inNet = scoreProgram(profile({ insurance: 'Aetna' }), partner({ insurance: ['Aetna'], insuranceNetworks: { Aetna: ['In-network'] }, monthlyCost: 0 }), undefined, prior);
+  assert.equal(inNet.familyCost, 0);
+  assert.equal(inNet.components.cost, WEIGHT_FAMILY_COST);
 }
 
 // ─── Placement helpers ──────────────────────────────────────────────────────

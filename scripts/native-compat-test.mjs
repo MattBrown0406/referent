@@ -13,6 +13,8 @@ const expected = {
   expoFont: '57.0.1',
   expoModulesCore: '57.0.7',
   expoSecureStore: '57.0.1',
+  expoSms: '57.0.1',
+  expoMailComposer: '57.0.1',
 };
 
 assert.equal(
@@ -45,6 +47,9 @@ for (const [packageName, expectedVersion] of [
   ['expo-crypto', expected.expoCrypto],
   ['expo-font', expected.expoFont],
   ['expo-secure-store', expected.expoSecureStore],
+  // Follow-up outreach: the Messages / Mail compose sheets. Same native cohort.
+  ['expo-sms', expected.expoSms],
+  ['expo-mail-composer', expected.expoMailComposer],
 ]) {
   assert.equal(
     packageJson.dependencies[packageName],
