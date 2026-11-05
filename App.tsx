@@ -153,6 +153,10 @@ import PlacementRequestSheet, { type PlacementSheetRequest } from './src/lib/Pla
 import PlacementCompare, { type CompareChoice } from './src/lib/PlacementCompare';
 import { usePlacementRequests } from './src/lib/placement-api';
 import { latestRequestForMatch, placementTodayItems, requestProgress, type PlacementRequest, type PlacementRequestView } from './src/lib/placement-requests';
+import LevelOfCareSheet from './src/lib/LevelOfCareSheet';
+import LevelOfCareCard, { AssessedLevelNote } from './src/lib/LevelOfCareCard';
+import { useCaseAssessments } from './src/lib/level-of-care-api';
+import { levelOfCarePacketLines, type PlacementLevel } from './src/lib/level-of-care';
 import {
   assignMatchReferral,
   completeFollowUpWithNext,
@@ -1264,6 +1268,11 @@ export default function App() {
   const [placementSheet, setPlacementSheet] = useState<PlacementSheetRequest | null>(null);
   const [placementCompareId, setPlacementCompareId] = useState<string | null>(null);
   const [pendingPlacementChoice, setPendingPlacementChoice] = useState<{ matchId: string; partnerId: string; choice: CompareChoice } | null>(null);
+  // Level-of-care assessment: the case whose assessment sheet is showing,
+  // inside the case file's own sheet (CaseDetailModal swaps its contents).
+  // The sheet's guarded "back" for the Modal's onRequestClose.
+  const [assessmentCaseId, setAssessmentCaseId] = useState<string | null>(null);
+  const assessmentBackRef = useRef<() => void>(() => setAssessmentCaseId(null));
   // The shortlist the clinician saw when they started an assignment, so the
   // placement record can say what was shown and at what rank the pick sat.
   const [pendingPlacement, setPendingPlacement] = useState<{ matchProfileId: string; rankedIds: string[]; candidates: PlacementCandidate[] } | null>(null);
@@ -1455,6 +1464,7 @@ export default function App() {
 
   const resetAccountState = useCallback(() => {
     setOutreach(null);
+    setAssessmentCaseId(null);
     setPlacementSheet(null);
     setPlacementCompareId(null);
     setPendingPlacementChoice(null);
@@ -2295,6 +2305,13 @@ export default function App() {
   // state is 'unavailable' and every placement button, card and screen hides.
   const placement = usePlacementRequests(session?.user?.id, credentialsNonce + workspaceEpoch);
   const placementAvailable = placement.state.status === 'ready';
+  // Level-of-care assessment (src/lib/level-of-care.ts): the open case
+  // file's assessments and the match's case's, read again on every full
+  // refresh. Matching reads only the CHOSEN level, as the match's level of
+  // care; scores and ranking never read anything else. Online only; on a
+  // server without 20261104150000 every card, note and packet line hides.
+  const caseAssessments = useCaseAssessments(session?.user?.id, credentialsNonce + workspaceEpoch, [activeCaseId, tab === 'match' ? matchCaseId : null]);
+  const matchAssessment = tab === 'match' ? caseAssessments.currentFor(matchCaseId) : null;
   const integrityByPartner = useMemo(() => {
     const result = new Map<string, ProgramIntegrity>();
     if (credentialIndex.state.status !== 'ready') return result;
@@ -2765,6 +2782,8 @@ export default function App() {
     if (alreadyReferred) setPendingPlacement(null);
     else setPendingPlacement({ matchProfileId: matchProfile.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
     const reasons = buildFitReasons(matchProfile, partner, packetFitInput(score, matchProfile));
+    // For the program's copy: the case's level-of-care rationale (read now if not yet).
+    if (matchProfile.caseId && !caseAssessments.entryFor(matchProfile.caseId)) void caseAssessments.load(matchProfile.caseId);
     setPacketDisclosureRestored(false);
     setPacketTarget({ partner, match: matchProfile, assignOnSend: !alreadyReferred, licenseOverride });
     setPacketAudience('family');
@@ -2782,6 +2801,7 @@ export default function App() {
     }
     const fitInput = fitInputForMatch(matchProfile, partner);
     const reasons = buildFitReasons(matchProfile, partner, fitInput);
+    if (matchProfile.caseId && !caseAssessments.entryFor(matchProfile.caseId)) void caseAssessments.load(matchProfile.caseId);
     setPacketDisclosureRestored(false);
     setPacketTarget({ partner, match: matchProfile, assignOnSend: false, licenseOverride });
     setPacketAudience('family');
@@ -2796,7 +2816,9 @@ export default function App() {
     setPacketDisclosureRestored(false);
     const fitInput = fitInputForMatch(packetTarget.match, packetTarget.partner);
     const costLines = audience === 'family' ? packetCostLines(packetTarget.match, packetTarget.partner, fitInput.networkStatus) : [];
-    setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput, audience), audience, costLines));
+    // The level-of-care rationale: the program's copy only (buildPacket drops it from the family's).
+    const rationaleLines = audience === 'partner' ? levelOfCarePacketLines(caseAssessments.currentFor(packetTarget.match.caseId), packetTarget.match.levelOfCare) : [];
+    setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput, audience), audience, costLines, rationaleLines));
   }
 
   // The placement record for an assignment made from a match: what was
@@ -3124,6 +3146,7 @@ export default function App() {
     setBenefitsForm(null);
     setVobForm(null);
     setVobAnswerForm(null);
+    setAssessmentCaseId(null);
     setCaseFileSource(null);
     setTimelineDraft('');
     setTimelineKind('note');
@@ -3220,6 +3243,7 @@ export default function App() {
     setBenefitsForm(null);
     setVobForm(null);
     setVobAnswerForm(null);
+    setAssessmentCaseId(null);
   }
 
   // ─── Insurance workflow: the Benefits card ──────────────────────────────
@@ -4541,10 +4565,15 @@ export default function App() {
   // the case summary (state code, insurance name, cash budget). When the new
   // profile is saved on the Match tab it is linked back to the case
   // (pendingCaseMatchId), and the case row points at the profile.
-  function startMatchForCase(record: CaseRecord) {
+  //
+  // `level` (Level-of-care assessment: "Find placement with this level"):
+  // the chosen level goes on the match form as its level of care, exactly as
+  // if picked by hand. Nothing else changes; the practitioner saves as usual.
+  function startMatchForCase(record: CaseRecord, level?: PlacementLevel) {
     const existing = referralMatches.find((item) => item.id === record.matchProfileId);
     if (existing) {
       loadReferralMatch(existing);
+      if (level) setMatchType(level);
       setTab('match');
       closeCase();
       return;
@@ -4560,6 +4589,7 @@ export default function App() {
     setMatchState(stateHint?.code || 'ANY');
     setMatchInsurance(insuranceHint || 'Cash pay');
     setMatchBudget(insuranceHint ? '' : budgetHint);
+    if (level) setMatchType(level);
     setTab('match');
     closeCase();
   }
@@ -6577,6 +6607,8 @@ export default function App() {
             onChange={setMatchType}
             options={[{ label: 'Any level of care', value: 'Any type' }, ...partnerTypes.map((type) => ({ label: type, value: type }))]}
           />
+          {/* Level-of-care assessment of the match's case: still editable; a gentle note if moved away. */}
+          <AssessedLevelNote assessment={matchAssessment} matchLevel={matchType as ReferralMatch['levelOfCare']} />
 
           <DropdownField
             label="GEOGRAPHY"
@@ -7101,6 +7133,7 @@ export default function App() {
     if (benefitsForm) return CaseBenefitsModal(activeCase);
     if (vobForm) return VobRequestModal(activeCase);
     if (vobAnswerForm) return VobAnswerModal(activeCase);
+    if (assessmentCaseId === activeCase.id) return LevelOfCareModal(activeCase);
     const record = activeCase;
     const colors = CASE_STATUS_COLORS[record.status];
     const linkedMatch = referralMatches.find((item) => item.id === record.matchProfileId)
@@ -7309,6 +7342,14 @@ export default function App() {
                 </TouchableOpacity>
                 <Text style={styles.casePaymentHint}>Enter a quote to mark the case quoted automatically. Use “Record another payment” for each coaching session or installment. Every change lands on the timeline.</Text>
               </View>
+
+              {/* Level of care: the current assessment, chosen level, and "Find placement" at it */}
+              <LevelOfCareCard
+                entry={caseAssessments.entryFor(record.id)}
+                nameFor={(userId) => (userId && userId === activeUserId.toLowerCase() ? 'you' : memberDisplayName(members, userId))}
+                onStart={() => { flushPendingCaseFields(); setAssessmentCaseId(record.id); }}
+                onFindPlacement={(level) => startMatchForCase(record, level)}
+              />
 
               {/* Benefits: the family's plan and the VOB requests */}
               {(() => {
@@ -8929,6 +8970,29 @@ export default function App() {
   }
 
   // ─── Insurance workflow editors (swapped inside the case sheet) ──────────
+
+  // Level-of-care assessment (src/lib/LevelOfCareSheet.tsx), inside the case
+  // file's own native Modal: CaseDetailModal swaps the contents, so nothing
+  // is ever presented over the case sheet. "Find placement with this level"
+  // closes the case file and opens the match through startMatchForCase.
+  function LevelOfCareModal(record: CaseRecord) {
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => assessmentBackRef.current()}>
+        <LevelOfCareSheet
+          caseId={record.id}
+          previous={caseAssessments.currentFor(record.id)}
+          backRef={assessmentBackRef}
+          onClose={() => setAssessmentCaseId(null)}
+          onSaved={(saved) => {
+            caseAssessments.saved(saved.assessment);
+            // The server wrote the timeline entry under the assessment's id.
+            applyCaseEvent({ id: saved.assessment.id, caseId: record.id, kind: 'system', body: saved.eventBody, occurredAt: saved.assessment.assessedAt, actorId: activeUserId.toLowerCase() });
+          }}
+          onFindPlacement={(level) => startMatchForCase(record, level)}
+        />
+      </Modal>
+    );
+  }
 
   function CaseBenefitsModal(record: CaseRecord) {
     if (!benefitsForm) return null;

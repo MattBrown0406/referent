@@ -118,7 +118,20 @@ export function buildFitReasons(matchProfile: ReferralMatch, partner: Partner, f
 // (familyCostPacketLines in family-cost.ts). The family's copy only: the
 // program's copy never carries the family's finances (like the budget
 // above), whatever is passed.
-export function buildPacket(matchProfile: ReferralMatch, partner: Partner, fitReasons: string[], audience: PacketAudience, familyCostLines: string[] = []): string {
+//
+// levelOfCareLines: the level-of-care rationale (levelOfCarePacketLines in
+// level-of-care.ts). The program's copy only, after the client criteria: it
+// is clinical reasoning for the program and the payer. The family's copy
+// never carries ratings or the rationale, whatever is passed; its "Level of
+// care" line already says the level in plain words.
+export function buildPacket(
+  matchProfile: ReferralMatch,
+  partner: Partner,
+  fitReasons: string[],
+  audience: PacketAudience,
+  familyCostLines: string[] = [],
+  levelOfCareLines: string[] = [],
+): string {
   const header = `Placement recommendation — ${matchProfile.clientLabel}`;
 
   const criteriaLines = [
@@ -155,6 +168,7 @@ export function buildPacket(matchProfile: ReferralMatch, partner: Partner, fitRe
   const disclosureLines = disclosure ? ['', disclosure] : [];
 
   const costLines = audience === 'family' && familyCostLines.length ? ['', ...familyCostLines] : [];
+  const rationaleLines = audience === 'partner' && levelOfCareLines.length ? ['', ...levelOfCareLines] : [];
 
   const partnerLead = [
     `Looking for placement for ${matchProfile.clientLabel}. Details below — does this look like a fit for your program?`,
@@ -162,7 +176,7 @@ export function buildPacket(matchProfile: ReferralMatch, partner: Partner, fitRe
   ];
 
   const body = audience === 'partner'
-    ? [header, '', ...partnerLead, ...criteriaLines, '', ...whyLines, ...disclosureLines, '', ...programLines]
+    ? [header, '', ...partnerLead, ...criteriaLines, ...rationaleLines, '', ...whyLines, ...disclosureLines, '', ...programLines]
     : [header, '', ...programLines, '', ...whyLines, ...disclosureLines, ...costLines, '', ...criteriaLines];
 
   return [...body, '', 'Sent via ReferralFit'].join('\n');
