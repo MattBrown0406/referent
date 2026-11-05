@@ -282,7 +282,8 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   assert.match(login, /await recordAuthFlowStart\('signup'\);\s*const \{ error: resendError \} = await supabase\.auth\.resend\(/, 'a resend is recorded');
   assert.match(login, /await recordAuthFlowStart\('recovery'\);\s*const \{ error: resetError \} = await supabase\.auth\.resetPasswordForEmail\(/, 'a reset is recorded');
   const handler = source.slice(source.indexOf('async function handleAuthUrl('), source.indexOf('Linking.getInitialURL()'));
-  assert.match(handler, /const decision = decideAuthLink\(url, await readAuthFlowStarts\(\)\);/);
+  assert.match(handler, /const decision = decideAuthLink\(url, await readAuthFlowStarts\(\), Date\.now\(\), webOrigin\);/);
+  assert.ok(handler.indexOf('clearAuthLinkFromAddressBar();') < handler.indexOf('const decision = decideAuthLink('), 'in a browser the tokens leave the address bar first');
   assert.ok(handler.indexOf("decision.action === 'not_started'") < handler.indexOf('supabase.auth.setSession('), 'nothing is exchanged for a flow this device did not start');
   assert.match(handler, /if \(current && \(!linkUser \|\| linkUser !== current\.userId\.toLowerCase\(\)\)\) \{[\s\S]{0,200}'Switch accounts\?'/, 'a link for another account asks before switching');
   assert.ok(handler.indexOf("'Switch accounts?'") < handler.indexOf('supabase.auth.setSession('), 'the question comes before the switch');

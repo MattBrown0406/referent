@@ -14,16 +14,15 @@ import {
 } from 'react-native';
 
 import {
+  authRedirectUrl,
   type AuthMode,
-  EMAIL_CONFIRM_REDIRECT,
   friendlyAuthError,
   isPlausibleEmail,
   normalizeEmail,
-  PASSWORD_RECOVERY_REDIRECT,
   PASSWORD_REQUIREMENTS,
   passwordProblem,
 } from './auth-flows';
-import { recordAuthFlowStart } from './auth-link-guard';
+import { currentWebOrigin, recordAuthFlowStart } from './auth-link-guard';
 import { openPrivacyPolicy } from './privacy';
 import { supabase } from './supabase';
 
@@ -134,7 +133,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
       password,
       options: {
         data: { practice_name: practice, display_name: name },
-        emailRedirectTo: EMAIL_CONFIRM_REDIRECT,
+        emailRedirectTo: authRedirectUrl('confirmed', currentWebOrigin()),
       },
     });
     setBusy(false);
@@ -167,7 +166,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
     const { error: resendError } = await supabase.auth.resend({
       type: 'signup',
       email: target,
-      options: { emailRedirectTo: EMAIL_CONFIRM_REDIRECT },
+      options: { emailRedirectTo: authRedirectUrl('confirmed', currentWebOrigin()) },
     });
     setBusy(false);
     if (resendError) {
@@ -190,7 +189,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
     // asked for a reset in the last day (App.tsx, decideAuthLink).
     await recordAuthFlowStart('recovery');
     const { error: resetError } = await supabase.auth.resetPasswordForEmail(normalizedEmail, {
-      redirectTo: PASSWORD_RECOVERY_REDIRECT,
+      redirectTo: authRedirectUrl('recovery', currentWebOrigin()),
     });
     setBusy(false);
     if (resetError) {
@@ -365,7 +364,9 @@ export default function LoginScreen({ onSignedIn }: Props) {
 
             {notice ? renderNotice(notice) : renderForm()}
 
-            <Text style={styles.footnote}>Free for your practice. Create an account in a minute. Your practice's data is private to your workspace — other practices can never see it, and it is not sold or shared with advertisers. Your session stays on this device in secure storage.</Text>
+            <Text style={styles.footnote}>Free for your practice. Create an account in a minute. Your practice's data is private to your workspace — other practices can never see it, and it is not sold or shared with advertisers. {Platform.OS === 'web'
+              ? 'You stay signed in in this browser until you sign out, so sign out when you finish on a shared computer.'
+              : 'Your session stays on this device in secure storage.'}</Text>
             <TouchableOpacity accessibilityRole="link" accessibilityLabel="Privacy policy" accessibilityHint="Opens the ReferralFit privacy policy in your browser" onPress={openPrivacyPolicy} style={styles.privacyLink}>
               <Text style={styles.privacyLinkText}>Privacy policy</Text>
             </TouchableOpacity>

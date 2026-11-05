@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Platform } from 'react-native';
 
 import type { AuthFlowKind, AuthFlowStarts } from './auth-flows';
 
@@ -45,5 +46,24 @@ export async function clearAuthFlowStart(kind: AuthFlowKind): Promise<void> {
     await writeAuthFlowStarts(starts);
   } catch {
     // ignored: the record expires after 24 hours anyway
+  }
+}
+
+// In a browser, the web app's own origin (https://app.referralfit.com): auth
+// emails send people back there, and only links on it are read. null in the
+// iPhone app.
+export function currentWebOrigin(): string | null {
+  if (Platform.OS !== 'web' || typeof window === 'undefined') return null;
+  return window.location.origin || null;
+}
+
+// A used (or refused) auth link's tokens must not stay in the address bar,
+// the browser history, or a bookmark: replace the page URL with the app root.
+export function clearAuthLinkFromAddressBar(): void {
+  if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+  try {
+    window.history.replaceState(null, '', '/');
+  } catch {
+    // ignored: the tokens are single-use and expire within the hour
   }
 }

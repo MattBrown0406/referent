@@ -252,7 +252,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   const permission = await getNotificationPermissionState();
   if (!isScheduleCurrent(generation, ownerId)) return;
   if (permission !== 'authorized') {
-    await Notifications.cancelAllScheduledNotificationsAsync();
+    if (permission !== 'unsupported') await Notifications.cancelAllScheduledNotificationsAsync();
     return;
   }
 
@@ -408,17 +408,22 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   }
 }
 
+// Scheduled reminders, delivered ones, and the last tap, as the system holds
+// them. A browser has none of these (the web app shows what is due on Today).
+async function clearSystemNotifications(): Promise<void> {
+  if (Platform.OS === 'web') return;
+  await Notifications.cancelAllScheduledNotificationsAsync();
+  await Notifications.dismissAllNotificationsAsync();
+  await Notifications.clearLastNotificationResponseAsync();
+}
+
 export function activateReferralFitNotificationOwner(ownerId: string): Promise<void> {
   scheduleOwnerId = ownerId;
   ++scheduleGeneration;
   // A tap that launched the app arrived before anyone was signed in: hand it
   // over now (for this account only) — the work below clears the OS copy.
   deliverHeldTaps();
-  return queueScheduleWork(async () => {
-    await Notifications.cancelAllScheduledNotificationsAsync();
-    await Notifications.dismissAllNotificationsAsync();
-    await Notifications.clearLastNotificationResponseAsync();
-  });
+  return queueScheduleWork(clearSystemNotifications);
 }
 
 export function rescheduleNotifications(input: NotificationInput, ownerId: string): Promise<void> {
@@ -430,11 +435,7 @@ export function rescheduleNotifications(input: NotificationInput, ownerId: strin
 export function cancelReferralFitNotifications(): Promise<void> {
   scheduleOwnerId = null;
   ++scheduleGeneration;
-  return queueScheduleWork(async () => {
-    await Notifications.cancelAllScheduledNotificationsAsync();
-    await Notifications.dismissAllNotificationsAsync();
-    await Notifications.clearLastNotificationResponseAsync();
-  });
+  return queueScheduleWork(clearSystemNotifications);
 }
 
 // ─── Tap handling ───────────────────────────────────────────────────────────
@@ -529,6 +530,7 @@ function deliverHeldTaps(): void {
 // activateReferralFitNotificationOwner names that same account.
 export function subscribeToNotificationResponses(onTarget: TapListener): () => void {
   tapListeners.add(onTarget);
+  if (Platform.OS === 'web') return () => { tapListeners.delete(onTarget); };
   const subscription = Notifications.addNotificationResponseReceivedListener(receiveResponse);
   deliverHeldTaps();
   Notifications.getLastNotificationResponseAsync()

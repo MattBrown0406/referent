@@ -49,6 +49,7 @@ import {
   type NotificationKind,
   type PreferencesState,
 } from './push';
+import { WEB_PAGE } from './web-layout';
 
 type Props = {
   visible: boolean;
@@ -805,7 +806,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: COLORS.bg },
+  safe: { flex: 1, backgroundColor: COLORS.bg, ...WEB_PAGE },
   header: {
     flexDirection: 'row',
     alignItems: 'center',

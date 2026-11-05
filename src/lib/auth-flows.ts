@@ -3,10 +3,42 @@
 // can run this file in plain node.
 
 // app.json "scheme" is referralfit. Supabase Auth → URL Configuration must
-// allow-list these exact URLs (see docs/SELF_SERVE_ACCOUNTS.md).
+// allow-list these exact URLs, and on the web the same two paths on the web
+// app's origin (https://app.referralfit.com/auth/recovery, …/auth/confirmed;
+// see docs/SELF_SERVE_ACCOUNTS.md).
 export const APP_SCHEME = 'referralfit';
 export const PASSWORD_RECOVERY_REDIRECT = `${APP_SCHEME}://auth/recovery`;
 export const EMAIL_CONFIRM_REDIRECT = `${APP_SCHEME}://auth/confirmed`;
+
+export type AuthLinkPath = 'recovery' | 'confirmed';
+
+// Where an auth email sends the person back: the app's own URL on a phone,
+// the page they started on in a browser (webOrigin, e.g.
+// https://app.referralfit.com). A web origin is always scheme + host only.
+export function authRedirectUrl(path: AuthLinkPath, webOrigin?: string | null): string {
+  const origin = webOrigin ? cleanOrigin(webOrigin) : null;
+  if (origin) return `${origin}/auth/${path}`;
+  return path === 'recovery' ? PASSWORD_RECOVERY_REDIRECT : EMAIL_CONFIRM_REDIRECT;
+}
+
+// "https://app.referralfit.com" from an origin; null for anything else
+// (another scheme, a path, a trailing slash, "null" from a sandboxed page).
+function cleanOrigin(value: string): string | null {
+  const match = /^(https?:\/\/[a-z0-9.-]+(:[0-9]{1,5})?)$/i.exec(value.trim());
+  return match ? match[1].toLowerCase() : null;
+}
+
+// The part of an auth link after its prefix ("auth/recovery#…"): after
+// referralfit:// always, after the web app's own origin + "/" only when one
+// is given. Any other URL gives null.
+function authLinkRest(url: string, webOrigin?: string | null): string | null {
+  const lower = url.toLowerCase();
+  const scheme = `${APP_SCHEME}://`;
+  if (lower.startsWith(scheme)) return url.slice(scheme.length);
+  const origin = webOrigin ? cleanOrigin(webOrigin) : null;
+  if (origin && lower.startsWith(`${origin}/`)) return url.slice(origin.length + 1);
+  return null;
+}
 
 export const MIN_PASSWORD_LENGTH = 8;
 export const PASSWORD_REQUIREMENTS = `At least ${MIN_PASSWORD_LENGTH} characters.`;
@@ -22,7 +54,7 @@ export type AuthRedirect =
 // (#access_token=…&refresh_token=…&type=recovery) or a PKCE query (?code=…).
 // Error redirects carry error_code / error_description. Anything that is not
 // one of our auth deep links returns null so ordinary URLs are ignored.
-export function parseAuthRedirect(url: string | null | undefined): AuthRedirect | null {
+export function parseAuthRedirect(url: string | null | undefined, webOrigin?: string | null): AuthRedirect | null {
   if (!url || typeof url !== 'string') return null;
   const hashIndex = url.indexOf('#');
   const queryIndex = url.indexOf('?');
@@ -50,35 +82,37 @@ export function parseAuthRedirect(url: string | null | undefined): AuthRedirect 
     return { kind: 'tokens', type, accessToken, refreshToken };
   }
   const code = params.get('code');
-  if (code && url.startsWith(`${APP_SCHEME}://`)) {
+  if (code && authLinkRest(url, webOrigin) !== null) {
     return { kind: 'code', type, code };
   }
   return null;
 }
 
 // ─── Which auth links this device accepts ───────────────────────────────────
-// Any app or web page can open a referralfit:// URL, and a URL carrying
-// tokens would otherwise sign this phone into whatever account those tokens
-// belong to. Tokens are accepted only:
+// Any app or web page can open a referralfit:// URL (or link to the web app
+// with tokens in it), and a URL carrying tokens would otherwise sign this
+// device into whatever account those tokens belong to. Tokens are accepted
+// only:
 //   - on the two paths Supabase redirects to (auth/recovery, auth/confirmed),
+//     after referralfit:// or, in a browser, after the web app's own origin,
 //   - when this device itself started that flow (a sign-up or confirmation
 //     resend for auth/confirmed, a password reset for auth/recovery) within
 //     the last 24 hours. LoginScreen records the start (auth-link-guard.ts).
 // Signing a signed-in phone into a different account always asks first (App.tsx).
 
-export type AuthLinkPath = 'recovery' | 'confirmed';
 export type AuthFlowKind = 'signup' | 'recovery';
 // Epoch milliseconds each flow was last started on this device.
 export type AuthFlowStarts = Partial<Record<AuthFlowKind, number>>;
 
 export const AUTH_FLOW_WINDOW_MS = 24 * 60 * 60 * 1000;
 
-// "referralfit://auth/recovery#…" → 'recovery'. Anything else → null.
-export function authLinkPath(url: string | null | undefined): AuthLinkPath | null {
+// "referralfit://auth/recovery#…" (or, with webOrigin,
+// "https://app.referralfit.com/auth/recovery#…") → 'recovery'. Anything else
+// → null.
+export function authLinkPath(url: string | null | undefined, webOrigin?: string | null): AuthLinkPath | null {
   if (!url || typeof url !== 'string') return null;
-  const prefix = `${APP_SCHEME}://`;
-  if (!url.toLowerCase().startsWith(prefix)) return null;
-  const rest = url.slice(prefix.length);
+  const rest = authLinkRest(url, webOrigin);
+  if (rest === null) return null;
   const end = rest.search(/[?#]/);
   const path = (end >= 0 ? rest.slice(0, end) : rest).replace(/^\/+|\/+$/g, '').toLowerCase();
   if (path === 'auth/recovery') return 'recovery';
@@ -101,10 +135,15 @@ export type AuthLinkDecision =
   | { action: 'not_started'; path: AuthLinkPath; flow: AuthFlowKind }
   | { action: 'accept'; path: AuthLinkPath; flow: AuthFlowKind; redirect: Exclude<AuthRedirect, { kind: 'error' }> };
 
-export function decideAuthLink(url: string | null | undefined, starts: AuthFlowStarts, now = Date.now()): AuthLinkDecision {
-  const path = authLinkPath(url);
+export function decideAuthLink(
+  url: string | null | undefined,
+  starts: AuthFlowStarts,
+  now = Date.now(),
+  webOrigin?: string | null,
+): AuthLinkDecision {
+  const path = authLinkPath(url, webOrigin);
   if (!path) return { action: 'ignore' };
-  const redirect = parseAuthRedirect(url);
+  const redirect = parseAuthRedirect(url, webOrigin);
   if (!redirect) return { action: 'ignore' };
   const flow = authFlowForPath(path);
   const startedAt = starts[flow];

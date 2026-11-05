@@ -1,6 +1,7 @@
 import { requireOptionalNativeModule } from 'expo';
+import * as Clipboard from 'expo-clipboard';
 import * as SecureStore from 'expo-secure-store';
-import { Linking, Platform } from 'react-native';
+import { Alert, Linking, Platform } from 'react-native';
 
 import {
   digitsForPhone,
@@ -217,9 +218,22 @@ export function releaseComposeOverlay() {
   releasePendingCompose?.();
 }
 
+// A browser cannot send a text: the message goes on the clipboard to send
+// from the practitioner's phone, and the sheet then asks whether it went.
+async function copyTextForPhone(phone: string, body: string): Promise<SendResult> {
+  try {
+    if (!(await Clipboard.setStringAsync(body))) return 'failed';
+  } catch {
+    return 'failed';
+  }
+  Alert.alert('Text copied', `A browser can't send texts. Paste it into a message to ${phone.trim()} from your phone.`);
+  return 'unknown';
+}
+
 export async function sendTextMessage(phone: string, body: string): Promise<SendResult> {
   const digits = digitsForPhone(phone);
   if (!digits) return 'failed';
+  if (Platform.OS === 'web') return copyTextForPhone(phone, body);
   const sms = loadSms();
   if (sms) {
     try {

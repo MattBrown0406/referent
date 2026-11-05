@@ -59,6 +59,7 @@ import {
   type ReviewedRequest,
   type SendKey,
 } from './placement-requests';
+import { WEB_PAGE } from './web-layout';
 
 // "Ask programs": from a saved match's ranked results, send ONE
 // de-identified request to up to 8 programs, then (for programs that do not
@@ -605,7 +606,7 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
 }
 
 const styles = StyleSheet.create({
-  page: { flex: 1, backgroundColor: COLORS.cream },
+  page: { flex: 1, backgroundColor: COLORS.cream, ...WEB_PAGE },
   flex: { flex: 1 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: COLORS.line, backgroundColor: COLORS.white },
   headerTitle: { flex: 1, textAlign: 'center', fontSize: 17, fontWeight: '800', color: COLORS.ink },

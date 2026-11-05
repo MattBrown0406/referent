@@ -24,6 +24,9 @@ writeFileSync(path.join(tmpDir, 'auth-flows.js'), js);
 
 const {
   APP_SCHEME,
+  authLinkPath,
+  authRedirectUrl,
+  decideAuthLink,
   EMAIL_CONFIRM_REDIRECT,
   PASSWORD_RECOVERY_REDIRECT,
   friendlyAuthError,
@@ -61,6 +64,29 @@ check('missing refresh token is ignored', parseAuthRedirect('referralfit://auth/
 check('foreign url with code is ignored', parseAuthRedirect('https://example.com/?code=abc'), null);
 check('plain launch url', parseAuthRedirect('referralfit://'), null);
 check('null url', parseAuthRedirect(null), null);
+
+// ─── The web app: links come back to its own origin ─────────────────────────
+const WEB = 'https://app.referralfit.com';
+check('web recovery redirect', authRedirectUrl('recovery', WEB), 'https://app.referralfit.com/auth/recovery');
+check('web confirm redirect', authRedirectUrl('confirmed', 'http://localhost:3222'), 'http://localhost:3222/auth/confirmed');
+check('phone redirect without an origin', authRedirectUrl('recovery', null), 'referralfit://auth/recovery');
+check('a bad origin falls back to the app scheme', authRedirectUrl('confirmed', 'null'), 'referralfit://auth/confirmed');
+check('an origin with a path is refused', authRedirectUrl('confirmed', 'https://app.referralfit.com/x'), 'referralfit://auth/confirmed');
+check('web link path', authLinkPath('https://app.referralfit.com/auth/recovery#access_token=AT&refresh_token=RT', WEB), 'recovery');
+check('web link path, any case and a trailing slash', authLinkPath('HTTPS://APP.REFERRALFIT.COM/auth/confirmed/?code=c', WEB), 'confirmed');
+check('web link needs the origin', authLinkPath('https://app.referralfit.com/auth/recovery#access_token=AT', null), null);
+check('a lookalike host is not the origin', authLinkPath('https://app.referralfit.com.example.net/auth/recovery#access_token=AT', WEB), null);
+check('another path on the origin', authLinkPath('https://app.referralfit.com/cases#access_token=AT', WEB), null);
+check('the scheme still works in a browser', authLinkPath('referralfit://auth/recovery#x=1', WEB), 'recovery');
+check('web pkce code', parseAuthRedirect('https://app.referralfit.com/auth/recovery?code=abc', WEB), { kind: 'code', type: '', code: 'abc' });
+check('web pkce code needs the origin', parseAuthRedirect('https://app.referralfit.com/auth/recovery?code=abc', null), null);
+const started = { recovery: 1_000_000 };
+check('web link accepted for a reset this browser started',
+  decideAuthLink('https://app.referralfit.com/auth/recovery#access_token=AT&refresh_token=RT&type=recovery', started, 1_000_500, WEB).action, 'accept');
+check('web link not started here',
+  decideAuthLink('https://app.referralfit.com/auth/confirmed#access_token=AT&refresh_token=RT&type=signup', started, 1_000_500, WEB).action, 'not_started');
+check('web link on another origin is ignored',
+  decideAuthLink('https://evil.example/auth/recovery#access_token=AT&refresh_token=RT', started, 1_000_500, WEB).action, 'ignore');
 check('isRecoveryRedirect true for recovery tokens', isRecoveryRedirect({ kind: 'tokens', type: 'recovery', accessToken: 'a', refreshToken: 'b' }), true);
 check('isRecoveryRedirect false for signup', isRecoveryRedirect({ kind: 'tokens', type: 'signup', accessToken: 'a', refreshToken: 'b' }), false);
 check('isRecoveryRedirect false for error', isRecoveryRedirect({ kind: 'error', code: 'x', description: 'y' }), false);
@@ -94,10 +120,10 @@ for (const text of [
   'supabase.auth.signInWithPassword(',
   'supabase.auth.signUp(',
   'data: { practice_name: practice, display_name: name }',
-  'emailRedirectTo: EMAIL_CONFIRM_REDIRECT',
+  "emailRedirectTo: authRedirectUrl('confirmed', currentWebOrigin())",
   'supabase.auth.resend(',
   'supabase.auth.resetPasswordForEmail(',
-  'redirectTo: PASSWORD_RECOVERY_REDIRECT',
+  "redirectTo: authRedirectUrl('recovery', currentWebOrigin())",
   'friendlyAuthError(',
   'passwordProblem(password, confirmPassword)',
   'Free for your practice. Create an account in a minute.',
@@ -137,7 +163,9 @@ for (const text of [
   "if (event === 'PASSWORD_RECOVERY') setPasswordRecovery(true);",
   'Linking.getInitialURL()',
   "Linking.addEventListener('url'",
-  'parseAuthRedirect(url)',
+  'parseAuthRedirect(url, webOrigin)',
+  'clearAuthLinkFromAddressBar();',
+  'decideAuthLink(url, await readAuthFlowStarts(), Date.now(), webOrigin)',
   'supabase.auth.setSession({ access_token: redirect.accessToken, refresh_token: redirect.refreshToken })',
   'supabase.auth.exchangeCodeForSession(redirect.code)',
   '<ResetPasswordScreen email=',

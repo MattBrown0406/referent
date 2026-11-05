@@ -43,6 +43,7 @@ import {
   type SafetyFlag,
 } from './level-of-care';
 import { newAssessmentId, saveCaseAssessment, type SavedAssessment } from './level-of-care-api';
+import { WEB_PAGE } from './web-layout';
 
 // The level-of-care assessment, opened from the case file. CONTENT ONLY: the
 // app puts it inside the case file's own native Modal (CaseDetailModal swaps
@@ -469,7 +470,7 @@ export default function LevelOfCareSheet({ caseId, names, previous, backRef, onC
 }
 
 const styles = StyleSheet.create({
-  page: { flex: 1, backgroundColor: COLORS.cream },
+  page: { flex: 1, backgroundColor: COLORS.cream, ...WEB_PAGE },
   flex: { flex: 1 },
   handle: { width: 42, height: 5, borderRadius: 3, backgroundColor: '#C8D0CC', alignSelf: 'center', marginTop: 8 },
   header: { minHeight: 58, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, paddingHorizontal: 14, paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: COLORS.line },

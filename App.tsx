@@ -97,7 +97,7 @@ import {
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
 import { decideAuthLink, jwtSubject, parseAuthRedirect } from './src/lib/auth-flows';
-import { clearAuthFlowStart, readAuthFlowStarts } from './src/lib/auth-link-guard';
+import { clearAuthFlowStart, clearAuthLinkFromAddressBar, currentWebOrigin, readAuthFlowStarts } from './src/lib/auth-link-guard';
 import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, fetchWorkspaceMembers, memberDisplayName, type LeadSettings, type OrgMember } from './src/lib/org';
 import { refreshPushRegistration, unregisterThisDevice } from './src/lib/push';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
@@ -157,6 +157,8 @@ import FamilyCostPanel from './src/lib/FamilyCostPanel';
 import CredentialsCard, { ShieldChip, credentialProgramForPartner, credentialsForPartner, useCredentialIndex } from './src/lib/CredentialsCard';
 import { credentialWatchItems, credentialWatchSubtitle, licenseConcernAlert, licenseOverrideNote, programIntegrity, type LicenseConcern, type ProgramIntegrity } from './src/lib/integrity';
 import PlacementRequestSheet, { clearUnansweredSendKeys, type PlacementSheetRequest } from './src/lib/PlacementRequestSheet';
+import { openCallOrText } from './src/lib/phone-actions';
+import { IS_WEB, useWideWeb, WEB_PAGE, WEB_SHEET, WEB_SHEET_OVERLAY } from './src/lib/web-layout';
 import PlacementCompare, { type CompareChoice } from './src/lib/PlacementCompare';
 import { usePlacementRequests } from './src/lib/placement-api';
 import { latestRequestForMatch, placementTodayItems, requestProgress, type PlacementRequest, type PlacementRequestView } from './src/lib/placement-requests';
@@ -1020,6 +1022,8 @@ function twelveHourToStoredTime(value: string, period: TimePeriod): string | nul
 }
 
 export default function App() {
+  // A wide browser window: sidebar instead of the bottom tabs (web-layout.ts).
+  const wideWeb = useWideWeb();
   const [tab, setTab] = useState<Tab>('home');
   const [partners, setPartners] = useState<Partner[]>(initialPartners);
   const [referrals, setReferrals] = useState<Referral[]>(initialReferrals);
@@ -1624,20 +1628,25 @@ export default function App() {
     };
   }, []);
 
-  // Auth deep links (referralfit://auth/recovery, referralfit://auth/confirmed).
-  // supabase.ts sets detectSessionInUrl: false, so the tokens in the link are
-  // exchanged here explicitly. A recovery link then opens ResetPasswordScreen.
-  // Any app or page can open a referralfit:// URL, so tokens are used only on
-  // those two paths and only for a sign-up or reset this device started in
-  // the last 24 hours (decideAuthLink, src/lib/auth-flows.ts); a link for a
-  // different account than the one signed in asks before switching.
+  // Auth deep links (referralfit://auth/recovery, referralfit://auth/confirmed;
+  // in a browser, the same paths on the web app's origin, read from the page
+  // URL). supabase.ts sets detectSessionInUrl: false, so the tokens in the
+  // link are exchanged here explicitly. A recovery link then opens
+  // ResetPasswordScreen. Any app or page can open such a URL, so tokens are
+  // used only on those two paths and only for a sign-up or reset this device
+  // started in the last 24 hours (decideAuthLink, src/lib/auth-flows.ts); a
+  // link for a different account than the one signed in asks before
+  // switching. In a browser the tokens are then cleared from the address bar.
   useEffect(() => {
     let active = true;
+    const webOrigin = currentWebOrigin();
+    const here = webOrigin ? 'this browser' : 'this device';
     async function handleAuthUrl(url: string | null) {
       if (!url || !active) return;
       // Only parsed so non-auth URLs stay cheap; decideAuthLink re-checks.
-      if (!parseAuthRedirect(url)) return;
-      const decision = decideAuthLink(url, await readAuthFlowStarts());
+      if (!parseAuthRedirect(url, webOrigin)) return;
+      clearAuthLinkFromAddressBar();
+      const decision = decideAuthLink(url, await readAuthFlowStarts(), Date.now(), webOrigin);
       if (!active || decision.action === 'ignore') return;
       if (decision.action === 'error') {
         Alert.alert('That link could not be used', `It has expired or was already used. Request a new one from the sign-in screen${decision.path === 'recovery' ? ' with “Forgot password?”' : ''}.`);
@@ -1647,8 +1656,8 @@ export default function App() {
         Alert.alert(
           decision.path === 'recovery' ? 'Request a new reset link' : 'Sign in to continue',
           decision.path === 'recovery'
-            ? 'For your security, a password reset link works only on the device that asked for it, within a day. Use “Forgot password?” on this device to get a new one.'
-            : 'If you just confirmed your email, sign in with your email and password. A confirmation link signs you in only on the device where you created the account.',
+            ? `For your security, a password reset link works only on the ${webOrigin ? 'browser' : 'device'} that asked for it, within a day. Use “Forgot password?” in ${here} to get a new one.`
+            : `If you just confirmed your email, sign in with your email and password. A confirmation link signs you in only on the ${webOrigin ? 'browser' : 'device'} where you created the account.`,
         );
         return;
       }
@@ -1661,7 +1670,7 @@ export default function App() {
           const switchAccounts = await new Promise<boolean>((resolve) => {
             Alert.alert(
               'Switch accounts?',
-              'This link is for a different ReferralFit account than the one signed in on this phone. Switching signs this phone into that account.',
+              `This link is for a different ReferralFit account than the one signed in on ${webOrigin ? 'this browser' : 'this phone'}. Switching signs ${webOrigin ? 'this browser' : 'this phone'} into that account.`,
               [
                 { text: 'Stay signed in', style: 'cancel', onPress: () => resolve(false) },
                 { text: 'Switch', style: 'destructive', onPress: () => resolve(true) },
@@ -1677,7 +1686,7 @@ export default function App() {
         : await supabase.auth.exchangeCodeForSession(redirect.code);
       if (!active) return;
       if (result.error) {
-        Alert.alert('That link has expired', 'Request a new one from the sign-in screen and open it on this device.');
+        Alert.alert('That link has expired', `Request a new one from the sign-in screen and open it in ${here}.`);
         return;
       }
       // One link per start: a second link needs the flow started again.
@@ -4403,14 +4412,23 @@ export default function App() {
       Alert.alert('Nothing to send to', kind === 'email' ? 'This contact has no email address.' : 'This contact has no phone number.');
       return;
     }
-    const url = kind === 'call' ? `tel:${target}` : kind === 'text' ? `sms:${target}` : `mailto:${target}`;
-    try {
-      const supported = await Linking.canOpenURL(url);
-      if (!supported) throw new Error('Unsupported contact action');
-      await Linking.openURL(url);
-    } catch {
-      Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
-      return;
+    if (kind === 'email') {
+      try {
+        const url = `mailto:${target}`;
+        const supported = await Linking.canOpenURL(url);
+        if (!supported) throw new Error('Unsupported contact action');
+        await Linking.openURL(url);
+      } catch {
+        Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
+        return;
+      }
+    } else {
+      const opened = await openCallOrText(kind, contact.phone, contact.name);
+      if (opened === 'declined') return;
+      if (opened === 'failed') {
+        Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
+        return;
+      }
     }
     const verbs = { call: 'Called', text: 'Texted', email: 'Emailed' } as const;
     const eventId = makeId('e');
@@ -5371,17 +5389,10 @@ export default function App() {
   // → the partner's phone. Every completed action logs (case_event and/or
   // partner touch) and offers the same quick-note prompt the case file uses.
   function cardContactAction(card: TodayCard, action: 'call' | 'text') {
-    const launch = async (digits: string): Promise<boolean> => {
-      const url = `${action === 'call' ? 'tel' : 'sms'}:${digits}`;
-      try {
-        const supported = await Linking.canOpenURL(url);
-        if (!supported) throw new Error('Unsupported contact action');
-        await Linking.openURL(url);
-        return true;
-      } catch {
-        Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
-        return false;
-      }
+    const launch = async (digits: string, who: string): Promise<boolean> => {
+      const opened = await openCallOrText(action, digits, who);
+      if (opened === 'failed') Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
+      return opened === 'done';
     };
     const clean = (phone: string) => phone.replace(/[^\d+]/g, '');
     if (card.caseId) {
@@ -5398,7 +5409,7 @@ export default function App() {
         setContactPick({ card, action, contacts });
         return;
       }
-      launch(clean(primary.phone)).then((opened) => {
+      launch(primary.phone, primary.name).then((opened) => {
         if (opened) logCardContact(card, action, primary);
       });
       return;
@@ -5410,7 +5421,7 @@ export default function App() {
         Alert.alert('No phone on file', `${partner?.organization || 'This partner'} has no phone number — add one in the Directory.`);
         return;
       }
-      launch(digits).then((opened) => {
+      launch(partner?.phone ?? digits, partner?.organization || 'this partner').then((opened) => {
         if (opened) logCardContact(card, action, undefined);
       });
       return;
@@ -6094,22 +6105,40 @@ export default function App() {
     return (
       <View style={styles.header}>
         <View style={styles.brandRow}>
-          <Image accessibilityLabel="ReferralFit partner network logo" source={require('./assets/icon-referent-symbiosis.png')} style={styles.brandMark} />
-          <TouchableOpacity accessibilityLabel={title || 'ReferralFit'} activeOpacity={0.7} onLongPress={confirmSignOut} delayLongPress={1200}>
-            <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
-          </TouchableOpacity>
+          {/* With the sidebar, the brand is in the sidebar; a title stays. */}
+          {wideWeb ? null : <Image accessibilityLabel="ReferralFit partner network logo" source={require('./assets/icon-referent-symbiosis.png')} style={styles.brandMark} />}
+          {wideWeb && !title ? null : (
+            <TouchableOpacity accessibilityLabel={title || 'ReferralFit'} activeOpacity={0.7} onLongPress={confirmSignOut} delayLongPress={1200}>
+              <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
+            </TouchableOpacity>
+          )}
         </View>
         <View style={styles.headerActions}>
+          {/* A browser has no pull to refresh. */}
+          {IS_WEB ? (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Refresh"
+              style={styles.headerIconButton}
+              disabled={pullRefreshing}
+              onPress={() => { void pullToRefresh(); }}
+            >
+              {pullRefreshing ? <ActivityIndicator size="small" color={COLORS.gray} /> : <AppIcon name="refresh-outline" size={20} color={COLORS.gray} />}
+            </TouchableOpacity>
+          ) : null}
           {/* Workspace: team, notifications, privacy, sign out, Delete account.
-              Its own icon, so it never reads as the Directory tab (people). */}
-          <TouchableOpacity
-            accessibilityRole="button"
-            accessibilityLabel="Workspace and settings"
-            style={styles.headerIconButton}
-            onPress={() => setShowWorkspace(true)}
-          >
-            <AppIcon name="settings-outline" size={20} color={COLORS.gray} />
-          </TouchableOpacity>
+              Its own icon, so it never reads as the Directory tab (people).
+              With the sidebar it is the sidebar's Settings. */}
+          {wideWeb ? null : (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Workspace and settings"
+              style={styles.headerIconButton}
+              onPress={() => setShowWorkspace(true)}
+            >
+              <AppIcon name="settings-outline" size={20} color={COLORS.gray} />
+            </TouchableOpacity>
+          )}
           {notificationPermissionState === 'blocked' ? (
             <TouchableOpacity
               accessibilityRole="button"
@@ -7149,14 +7178,16 @@ export default function App() {
     );
   }
 
+  const NAV_ITEMS: { key: Tab; label: string; icon: IconName; activeIcon: IconName }[] = [
+    { key: 'home', label: 'Home', icon: 'home-outline', activeIcon: 'home' },
+    { key: 'match', label: 'Match', icon: 'sparkles-outline', activeIcon: 'sparkles' },
+    { key: 'cases', label: 'Cases', icon: 'folder-outline', activeIcon: 'folder' },
+    { key: 'directory', label: 'Directory', icon: 'people-outline', activeIcon: 'people' },
+    { key: 'referrals', label: 'Referrals', icon: 'swap-horizontal-outline', activeIcon: 'swap-horizontal' },
+  ];
+
   function BottomNav() {
-    const items: { key: Tab; label: string; icon: IconName; activeIcon: IconName }[] = [
-      { key: 'home', label: 'Home', icon: 'home-outline', activeIcon: 'home' },
-      { key: 'match', label: 'Match', icon: 'sparkles-outline', activeIcon: 'sparkles' },
-      { key: 'cases', label: 'Cases', icon: 'folder-outline', activeIcon: 'folder' },
-      { key: 'directory', label: 'Directory', icon: 'people-outline', activeIcon: 'people' },
-      { key: 'referrals', label: 'Referrals', icon: 'swap-horizontal-outline', activeIcon: 'swap-horizontal' },
-    ];
+    const items = NAV_ITEMS;
     return (
       <View style={styles.bottomNav}>
         {items.map((item) => {
@@ -7168,6 +7199,44 @@ export default function App() {
             </TouchableOpacity>
           );
         })}
+      </View>
+    );
+  }
+
+  // A wide browser window: the same tabs down the left, with Settings.
+  function SideNav() {
+    return (
+      <View style={styles.sideNav} accessibilityRole="tablist">
+        <View style={styles.sideBrand}>
+          <Image accessibilityLabel="ReferralFit partner network logo" source={require('./assets/icon-referent-symbiosis.png')} style={styles.brandMark} />
+          <Text style={styles.brandName}>ReferralFit</Text>
+        </View>
+        {NAV_ITEMS.map((item) => {
+          const active = tab === item.key;
+          return (
+            <Pressable
+              key={item.key}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: active }}
+              accessibilityLabel={item.label}
+              onPress={() => setTab(item.key)}
+              style={({ hovered }: { pressed: boolean; hovered?: boolean }) => [styles.sideItem, active ? styles.sideItemActive : hovered ? styles.sideItemHover : null]}
+            >
+              <AppIcon name={active ? item.activeIcon : item.icon} size={19} color={active ? COLORS.forest : COLORS.gray} />
+              <Text style={[styles.sideLabel, active && styles.sideLabelActive]}>{item.label}</Text>
+            </Pressable>
+          );
+        })}
+        <View style={{ flex: 1 }} />
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Workspace and settings"
+          onPress={() => setShowWorkspace(true)}
+          style={({ hovered }: { pressed: boolean; hovered?: boolean }) => [styles.sideItem, hovered && styles.sideItemHover]}
+        >
+          <AppIcon name="settings-outline" size={19} color={COLORS.gray} />
+          <Text style={styles.sideLabel}>Settings</Text>
+        </Pressable>
       </View>
     );
   }
@@ -7922,7 +7991,7 @@ export default function App() {
             </View>
 
             <View style={styles.profileActions}>
-              <TouchableOpacity style={styles.profileAction} onPress={() => { if (selectedPartner.phone) Linking.openURL(`tel:${selectedPartner.phone.replace(/[^\d+]/g, '')}`).catch(() => Alert.alert('Unable to call', 'This device cannot place calls.')); else Alert.alert('No phone on file', 'Add a phone number in Edit.'); }}><AppIcon name="call" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Call</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.profileAction} onPress={() => { if (!selectedPartner.phone) Alert.alert('No phone on file', 'Add a phone number in Edit.'); else if (IS_WEB) Alert.alert(`Call ${selectedPartner.organization}`, `${selectedPartner.phone}\n\nA browser can't place calls. Use your phone.`); else Linking.openURL(`tel:${selectedPartner.phone.replace(/[^\d+]/g, '')}`).catch(() => Alert.alert('Unable to call', 'This device cannot place calls.')); }}><AppIcon name="call" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Call</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => { if (selectedPartner.email) Linking.openURL(`mailto:${selectedPartner.email}`).catch(() => Alert.alert('Unable to email', 'Set up a mail account on this device to send email.')); else Alert.alert('No email on file', 'Add an email address in Edit.'); }}><AppIcon name="mail" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Email</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openReferral('Outbound', selectedPartner.id)}><AppIcon name="paper-plane" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Refer</Text></TouchableOpacity>
               <TouchableOpacity accessibilityLabel={`Draft a follow-up to ${selectedPartner.organization || selectedPartner.name}`} style={styles.profileAction} onPress={() => openOutreachForPartner(selectedPartner, 'partner')}><AppIcon name="sparkles" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Follow up</Text></TouchableOpacity>
@@ -9492,15 +9561,9 @@ export default function App() {
                 <TouchableOpacity key={contact.id} style={styles.contactPickRow} onPress={async () => {
                   const pick = contactPick;
                   setContactPick(null);
-                  const url = `${pick.action === 'call' ? 'tel' : 'sms'}:${contact.phone.replace(/[^\d+]/g, '')}`;
-                  try {
-                    const supported = await Linking.canOpenURL(url);
-                    if (!supported) throw new Error('Unsupported contact action');
-                    await Linking.openURL(url);
-                    logCardContact(pick.card, pick.action, contact, { deferNoteSheet: true });
-                  } catch {
-                    Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
-                  }
+                  const opened = await openCallOrText(pick.action, contact.phone, contact.name);
+                  if (opened === 'done') logCardContact(pick.card, pick.action, contact, { deferNoteSheet: true });
+                  else if (opened === 'failed') Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
                 }}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.contactPickName}>{contact.name}{contact.isPrimary ? ' · primary' : ''}</Text>
@@ -9577,9 +9640,12 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
-      <View style={styles.appShell}>
-        <View style={styles.screen}>{tab === 'home' ? HomeScreen() : tab === 'match' ? MatchScreen() : tab === 'cases' ? CasesScreen() : tab === 'directory' ? DirectoryScreen() : ReferralsScreen()}</View>
-        {BottomNav()}
+      <View style={wideWeb ? styles.desktopShell : styles.appShell}>
+        {wideWeb ? SideNav() : null}
+        <View style={wideWeb ? styles.desktopMain : styles.screen}>
+          <View style={wideWeb ? styles.desktopScreen : styles.screen}>{tab === 'home' ? HomeScreen() : tab === 'match' ? MatchScreen() : tab === 'cases' ? CasesScreen() : tab === 'directory' ? DirectoryScreen() : ReferralsScreen()}</View>
+        </View>
+        {wideWeb ? null : BottomNav()}
       </View>
       {PartnerDetailModal()}
       {AddPartnerModal()}
@@ -9722,6 +9788,16 @@ const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: COLORS.cream },
   appShell: { flex: 1, alignSelf: 'center', width: '100%', maxWidth: 520, backgroundColor: COLORS.cream, overflow: 'hidden' },
   screen: { flex: 1 },
+  desktopShell: { flex: 1, flexDirection: 'row', backgroundColor: COLORS.cream },
+  desktopMain: { flex: 1, alignItems: 'center' },
+  desktopScreen: { flex: 1, width: '100%', maxWidth: 860 },
+  sideNav: { width: 228, backgroundColor: COLORS.white, borderRightWidth: 1, borderRightColor: COLORS.line, paddingTop: 18, paddingBottom: 16, paddingHorizontal: 12, gap: 2 },
+  sideBrand: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 10, marginBottom: 18 },
+  sideItem: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10, paddingHorizontal: 12, borderRadius: 10 },
+  sideItemActive: { backgroundColor: COLORS.mint },
+  sideItemHover: { backgroundColor: COLORS.mintPale },
+  sideLabel: { color: COLORS.inkSoft, fontSize: 15, fontWeight: '600' },
+  sideLabelActive: { color: COLORS.forest, fontWeight: '800' },
   scrollContent: { paddingHorizontal: 16, paddingTop: Platform.OS === 'android' ? 18 : 8, paddingBottom: 28 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, paddingVertical: 10, marginBottom: 22 },
   headerActions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 6, flexShrink: 1 },
@@ -9794,8 +9870,8 @@ const styles = StyleSheet.create({
   dropdownButton: { minHeight: 52, flexDirection: 'row', alignItems: 'center', gap: 11, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, borderRadius: 15, paddingHorizontal: 12 },
   dropdownLeading: { width: 34, height: 34, borderRadius: 10, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center' },
   dropdownValue: { flex: 1, flexShrink: 1, color: COLORS.ink, fontSize: 13, fontWeight: '700' },
-  dropdownOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(11, 32, 27, 0.42)', paddingBottom: Platform.OS === 'ios' ? 16 : 0 },
-  dropdownSheet: { maxHeight: '82%', backgroundColor: COLORS.cream, borderTopLeftRadius: 26, borderTopRightRadius: 26, paddingBottom: Platform.OS === 'ios' ? 26 : 22, shadowColor: COLORS.ink, shadowOpacity: 0.18, shadowRadius: 20, shadowOffset: { width: 0, height: -5 }, elevation: 12 },
+  dropdownOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(11, 32, 27, 0.42)', paddingBottom: Platform.OS === 'ios' ? 16 : 0, ...WEB_SHEET_OVERLAY },
+  dropdownSheet: { maxHeight: '82%', backgroundColor: COLORS.cream, borderTopLeftRadius: 26, borderTopRightRadius: 26, paddingBottom: Platform.OS === 'ios' ? 26 : 22, shadowColor: COLORS.ink, shadowOpacity: 0.18, shadowRadius: 20, shadowOffset: { width: 0, height: -5 }, elevation: 12, ...WEB_SHEET },
   dropdownSheetHandle: { width: 42, height: 5, borderRadius: 3, backgroundColor: '#C4CEC9', alignSelf: 'center', marginTop: 9 },
   dropdownSheetHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: COLORS.line },
   dropdownSheetEyebrow: { color: COLORS.gray, fontSize: 9, fontWeight: '800', letterSpacing: 1.1, marginBottom: 3 },
@@ -9956,7 +10032,7 @@ const styles = StyleSheet.create({
   navIconActive: { backgroundColor: COLORS.forest },
   navLabel: { color: COLORS.gray, fontSize: 9, fontWeight: '600' },
   navLabelActive: { color: COLORS.forest, fontWeight: '800' },
-  modalPage: { flex: 1, backgroundColor: COLORS.cream },
+  modalPage: { flex: 1, backgroundColor: COLORS.cream, ...WEB_PAGE },
   modalHandle: { width: 42, height: 5, borderRadius: 3, backgroundColor: '#C8D0CC', alignSelf: 'center', marginTop: 8 },
   modalHeader: { minHeight: 58, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, paddingHorizontal: 14, paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: COLORS.line },
   modalHeaderTitle: { flex: 1, flexShrink: 1, textAlign: 'center', color: COLORS.ink, fontSize: 15, fontWeight: '800' },

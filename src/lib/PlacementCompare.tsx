@@ -54,6 +54,7 @@ import {
   type PlacementRequest,
   type PlacementRequestView,
 } from './placement-requests';
+import { WEB_PAGE } from './web-layout';
 
 // The answers, side by side: one row per program in the practice's own
 // ranked order (rank: its place on the match screen when the request went
@@ -476,7 +477,7 @@ function Choice({ label, selected, onPress }: { label: string; selected: boolean
 }
 
 const styles = StyleSheet.create({
-  page: { flex: 1, backgroundColor: COLORS.cream },
+  page: { flex: 1, backgroundColor: COLORS.cream, ...WEB_PAGE },
   flex: { flex: 1 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: COLORS.line, backgroundColor: COLORS.white },
   headerTitle: { flex: 1, textAlign: 'center', fontSize: 17, fontWeight: '800', color: COLORS.ink },

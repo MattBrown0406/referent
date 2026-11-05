@@ -30,6 +30,7 @@ import { fetchListingCredentials } from './credentials';
 import CredentialsCard, { ShieldChip } from './CredentialsCard';
 import { localTodayStamp, programIntegrity, type ProgramCredential } from './integrity';
 import type { Partner } from '../data';
+import { WEB_PAGE } from './web-layout';
 
 type Props = {
   visible: boolean;
@@ -528,7 +529,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: COLORS.bg },
+  safe: { flex: 1, backgroundColor: COLORS.bg, ...WEB_PAGE },
   header: {
     flexDirection: 'row',
     alignItems: 'center',

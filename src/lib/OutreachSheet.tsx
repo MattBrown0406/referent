@@ -45,6 +45,7 @@ import {
   sendTextMessage,
 } from './outreach-api';
 import type { FollowUp, Touch } from './store';
+import { WEB_PAGE } from './web-layout';
 
 // The outreach sheet: pick who and how (text, email, or call), start from a
 // plain draft or ask the AI for one, edit it, and send it from the phone's own
@@ -649,7 +650,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
 }
 
 const styles = StyleSheet.create({
-  page: { flex: 1, backgroundColor: COLORS.cream },
+  page: { flex: 1, backgroundColor: COLORS.cream, ...WEB_PAGE },
   flex: { flex: 1 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: COLORS.line, backgroundColor: COLORS.white },
   headerTitle: { flex: 1, textAlign: 'center', fontSize: 17, fontWeight: '800', color: COLORS.ink },
