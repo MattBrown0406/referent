@@ -7,7 +7,22 @@ import { currentAuthSessionIdentity, type AuthSessionIdentity } from './auth-ses
 import { fetchAllPages } from './paging';
 import { phoneSearchSuffix } from './phone';
 import { supabase } from './supabase';
-import { memberIdLast4, type CaseBenefits, type PartnerPlanStatus, type SubscriberRelationship, type VobRequest, type VobStatus } from './insurance';
+import {
+  PLAN_COST_COLUMNS,
+  VOB_COST_COLUMNS,
+  memberIdLast4,
+  planCostsFromRow,
+  planCostsToPatch,
+  vobCostsFromRow,
+  vobCostsToPatch,
+  type CaseBenefits,
+  type PartnerPlanStatus,
+  type PlanCosts,
+  type SubscriberRelationship,
+  type VobCosts,
+  type VobRequest,
+  type VobStatus,
+} from './insurance';
 import type { FollowUp } from './store';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -890,6 +905,8 @@ export async function takeCase(caseId: string, eventId: string): Promise<CaseAss
 // The family's plan and the VOB requests on one case. Read when the case
 // file opens; written only through the RPCs so every change lands on the
 // timeline with the member who made it. Nothing here is cached offline.
+// The cost columns (20261104120000_family_cost.sql) ride along: the plan's
+// cost sharing and each answer's daily rates (family-cost.ts).
 
 type CaseBenefitsRow = {
   case_id: string;
@@ -898,7 +915,7 @@ type CaseBenefitsRow = {
   member_id_last4: string | null;
   subscriber_relationship: string | null;
   updated_at: string;
-};
+} & Partial<Record<(typeof PLAN_COST_COLUMNS)[number], number | boolean | null>>;
 
 type VobRequestRow = {
   id: string;
@@ -914,7 +931,7 @@ type VobRequestRow = {
   note: string | null;
   quoted_out_of_pocket: number | null;
   follow_up_id: string | null;
-};
+} & Partial<Record<(typeof VOB_COST_COLUMNS)[number], number | boolean | null>>;
 
 function mapBenefitsRow(row: CaseBenefitsRow): CaseBenefits {
   return {
@@ -923,6 +940,7 @@ function mapBenefitsRow(row: CaseBenefitsRow): CaseBenefits {
     planName: row.plan_name || '',
     memberIdLast4: row.member_id_last4 || '',
     subscriberRelationship: (row.subscriber_relationship || '') as SubscriberRelationship,
+    ...planCostsFromRow(row),
     updatedAt: row.updated_at,
   };
 }
@@ -941,26 +959,54 @@ function mapVobRow(row: VobRequestRow): VobRequest {
     answeredBy: row.answered_by || '',
     note: row.note || '',
     quotedOutOfPocket: row.quoted_out_of_pocket == null ? null : Number(row.quoted_out_of_pocket),
+    ...vobCostsFromRow(row),
     followUpId: row.follow_up_id || undefined,
   };
 }
 
-export type CaseBenefitsFile = { plan: CaseBenefits | null; requests: VobRequest[] };
+// costsAvailable is false on a server without 20261104120000 (the cost
+// columns do not exist yet, 42703): the plan and the requests still load,
+// and the editors hide the amounts instead of saving numbers the server
+// would silently drop.
+export type CaseBenefitsFile = { plan: CaseBenefits | null; requests: VobRequest[]; costsAvailable: boolean };
+
+const PLAN_COLUMNS = 'case_id, carrier, plan_name, member_id_last4, subscriber_relationship, updated_at';
+const VOB_COLUMNS = 'id, case_id, partner_id, global_partner_id, program_name, status, requested_at, requested_by, answered_at, answered_by, note, quoted_out_of_pocket, follow_up_id';
+// The same names as PLAN_COST_COLUMNS / VOB_COST_COLUMNS (family-cost-test checks it).
+const PLAN_COST_SELECT = 'in_deductible, in_deductible_met, in_oop_max, in_oop_met, in_coinsurance_pct, oon_benefits, oon_deductible, oon_deductible_met, oon_oop_max, oon_oop_met, oon_coinsurance_pct';
+const VOB_COST_SELECT = 'allowed_daily_rate, billed_daily_rate, copay_per_day, precert_required';
 
 export async function fetchCaseBenefits(caseId: string): Promise<CaseBenefitsFile> {
   return withStableCaseAccount(async (_userId, orgId) => {
-    const [planRows, requestRows] = await Promise.all([
-      fetchAllPages<CaseBenefitsRow>((from, to) => supabase.from('case_benefits').select('*').eq('org_id', orgId).eq('case_id', caseId).order('case_id').range(from, to)),
-      fetchAllPages<VobRequestRow>((from, to) => supabase.from('vob_requests').select('*').eq('org_id', orgId).eq('case_id', caseId).order('requested_at', { ascending: false }).order('id').range(from, to)),
+    const read = (withCosts: boolean) => Promise.all([
+      withCosts
+        ? fetchAllPages<CaseBenefitsRow>((from, to) => supabase.from('case_benefits').select(`${PLAN_COLUMNS}, ${PLAN_COST_SELECT}`).eq('org_id', orgId).eq('case_id', caseId).order('case_id').range(from, to))
+        : fetchAllPages<CaseBenefitsRow>((from, to) => supabase.from('case_benefits').select(PLAN_COLUMNS).eq('org_id', orgId).eq('case_id', caseId).order('case_id').range(from, to)),
+      withCosts
+        ? fetchAllPages<VobRequestRow>((from, to) => supabase.from('vob_requests').select(`${VOB_COLUMNS}, ${VOB_COST_SELECT}`).eq('org_id', orgId).eq('case_id', caseId).order('requested_at', { ascending: false }).order('id').range(from, to))
+        : fetchAllPages<VobRequestRow>((from, to) => supabase.from('vob_requests').select(VOB_COLUMNS).eq('org_id', orgId).eq('case_id', caseId).order('requested_at', { ascending: false }).order('id').range(from, to)),
     ]);
+    let costsAvailable = true;
+    let rows: [CaseBenefitsRow[], VobRequestRow[]];
+    try {
+      rows = await read(true);
+    } catch (error) {
+      if (errorCode(error) !== '42703') throw error;
+      costsAvailable = false;
+      rows = await read(false);
+    }
+    const [planRows, requestRows] = rows;
     return {
       plan: planRows.length ? mapBenefitsRow(planRows[0]) : null,
       requests: requestRows.map(mapVobRow),
+      costsAvailable,
     };
   });
 }
 
-export type CaseBenefitsPatch = Partial<Pick<CaseBenefits, 'carrier' | 'planName' | 'memberIdLast4' | 'subscriberRelationship'>>;
+// `costs`, when given, is the plan's whole cost sharing (null amounts clear
+// them). Leave it out on a server without 20261104120000 (costsAvailable).
+export type CaseBenefitsPatch = Partial<Pick<CaseBenefits, 'carrier' | 'planName' | 'memberIdLast4' | 'subscriberRelationship'>> & { costs?: PlanCosts };
 
 export type SavedCaseBenefits = Pick<CaseBenefits, 'carrier' | 'planName' | 'memberIdLast4' | 'subscriberRelationship'> & {
   eventBody: string; // '' when nothing changed (no timeline entry was written)
@@ -974,6 +1020,7 @@ export async function saveCaseBenefits(caseId: string, eventId: string, patch: C
     if ('planName' in patch) rpcPatch.plan_name = patch.planName;
     if ('memberIdLast4' in patch) rpcPatch.member_id_last4 = memberIdLast4(patch.memberIdLast4 || '');
     if ('subscriberRelationship' in patch) rpcPatch.subscriber_relationship = patch.subscriberRelationship;
+    if (patch.costs) Object.assign(rpcPatch, planCostsToPatch(patch.costs));
     const { data, error, status } = await supabase.rpc('save_case_benefits', { p_case_id: caseId, p_patch: rpcPatch, p_event_id: eventId });
     if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {
@@ -1048,7 +1095,10 @@ export async function requestVob(input: VobRequestInput): Promise<RequestedVob> 
   });
 }
 
-export type VobStatusPatch = Partial<Pick<VobRequest, 'status' | 'answeredBy' | 'note' | 'quotedOutOfPocket'>>;
+// `costs`, when given, is the answer's daily rates and pre-authorization
+// (null clears). Stored as sent or refused, so the optimistic copy is what
+// landed; the return columns are the 1.0.4 ones.
+export type VobStatusPatch = Partial<Pick<VobRequest, 'status' | 'answeredBy' | 'note' | 'quotedOutOfPocket'>> & { costs?: VobCosts };
 
 export type UpdatedVob = Pick<VobRequest, 'status' | 'answeredAt' | 'answeredBy' | 'note' | 'quotedOutOfPocket'> & {
   eventBody: string; // '' when the status did not change (no timeline entry)
@@ -1062,6 +1112,7 @@ export async function updateVobStatus(id: string, eventId: string, patch: VobSta
     if ('answeredBy' in patch) rpcPatch.answered_by = patch.answeredBy;
     if ('note' in patch) rpcPatch.note = patch.note;
     if ('quotedOutOfPocket' in patch) rpcPatch.quoted_out_of_pocket = patch.quotedOutOfPocket;
+    if (patch.costs) Object.assign(rpcPatch, vobCostsToPatch(patch.costs));
     const { data, error, status } = await supabase.rpc('update_vob_status', { p_id: id, p_patch: rpcPatch, p_event_id: eventId });
     if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {

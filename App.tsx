@@ -114,6 +114,8 @@ import {
 import { billsOutOfNetwork, checkInSchedule, formatDays, formatRate } from './src/lib/outcomes';
 import {
   type CaseBenefits,
+  EMPTY_NETWORK_BENEFITS,
+  EMPTY_VOB_COSTS,
   type PartnerPlanStatus,
   type SubscriberRelationship,
   type VobRequest,
@@ -131,6 +133,20 @@ import {
   vobChaseTitle,
   vobStatusLabel,
 } from './src/lib/insurance';
+import { DEFAULT_STAY_DAYS, familyCostCardLine, familyCostForProgram, familyCostPacketLines, perProgramNetwork, type FamilyCostEstimate } from './src/lib/family-cost';
+import {
+  NETWORK_BENEFIT_FIELDS,
+  TRISTATE_OPTIONS,
+  VOB_COST_FIELDS,
+  parsePlanCostsDraft,
+  parseVobCostsDraft,
+  planCostsDraft,
+  vobCostsDraft,
+  type NetworkBenefitsDraft,
+  type PlanCostsDraft,
+  type VobCostsDraft,
+} from './src/lib/family-cost-form';
+import FamilyCostPanel from './src/lib/FamilyCostPanel';
 import {
   assignMatchReferral,
   completeFollowUpWithNext,
@@ -401,6 +417,7 @@ type CaseBenefitsFormState = {
   planName: string;
   memberIdLast4: string;
   subscriberRelationship: SubscriberRelationship;
+  costs: PlanCostsDraft; // deductible, out-of-pocket, coinsurance as typed (family-cost-form.ts)
 };
 
 type VobRequestFormState = {
@@ -416,6 +433,7 @@ type VobAnswerFormState = {
   answeredBy: string;
   note: string;
   quoted: string; // whole dollars as typed
+  costs: VobCostsDraft; // daily rates, copay, pre-authorization as typed
 };
 
 // "2:14 PM" in the device's local time.
@@ -1055,6 +1073,11 @@ export default function App() {
   const [vobForm, setVobForm] = useState<VobRequestFormState | null>(null);
   const [vobAnswerForm, setVobAnswerForm] = useState<VobAnswerFormState | null>(null);
   const [vobSaving, setVobSaving] = useState(false);
+  // True cost to the family (src/lib/family-cost.ts): the length of stay each
+  // case's estimates use (30 days until changed; this device, this session),
+  // and whether the server stores the amounts (false before 20261104120000).
+  const [costDaysByCase, setCostDaysByCase] = useState<Record<string, number>>({});
+  const [benefitCostsAvailable, setBenefitCostsAvailable] = useState(true);
   // "Which of my partners take this plan?" from partners_for_plan, keyed by
   // "<plan>|<state>". The Directory filter and the VOB suggestion list read it.
   const [planStatuses, setPlanStatuses] = useState<Record<string, PartnerPlanStatus[]>>({});
@@ -1433,6 +1456,8 @@ export default function App() {
     setBenefitsByCase({});
     setVobsByCase({});
     setBenefitsLoadedFor({});
+    setCostDaysByCase({});
+    setBenefitCostsAvailable(true);
     setBenefitsForm(null);
     setVobForm(null);
     setVobAnswerForm(null);
@@ -2494,6 +2519,32 @@ export default function App() {
     return packetFitInput(score, matchProfile);
   }
 
+  // True cost to the family (src/lib/family-cost.ts) for one program, from
+  // the linked case's plan and VOB answers. Display only: the ranking never
+  // reads it. Null when there is nothing to estimate from: no linked case,
+  // its benefits not loaded, or (insured) no plan on file.
+  function familyCostFor(caseId: string | null | undefined, insurance: string, partner: Partner, networkStatus: PacketFitInput['networkStatus']): FamilyCostEstimate | null {
+    if (!caseId || benefitsLoadedFor[caseId] !== 'remote' || !benefitCostsAvailable) return null;
+    const plan = benefitsByCase[caseId] ?? null;
+    if (insurance !== 'Cash pay' && !plan) return null;
+    return familyCostForProgram({ insurance, plan, requests: vobsByCase[caseId] || [], partner, perProgram: perProgramNetwork(networkStatus), days: costDaysByCase[caseId] });
+  }
+
+  // The family copy's side-by-side estimate. buildPacket leaves it out of
+  // the program's copy whatever is passed: the family's finances stay theirs.
+  function packetCostLines(matchProfile: ReferralMatch, partner: Partner, networkStatus: PacketFitInput['networkStatus']): string[] {
+    const caseId = matchProfile.caseId;
+    if (!caseId || !familyCostFor(caseId, matchProfile.insurance, partner, networkStatus)) return [];
+    return familyCostPacketLines({
+      insurance: matchProfile.insurance,
+      plan: benefitsByCase[caseId] ?? null,
+      requests: vobsByCase[caseId] || [],
+      partner,
+      perProgram: perProgramNetwork(networkStatus),
+      days: costDaysByCase[caseId],
+    });
+  }
+
   // A program with a disclosed financial relationship needs one more tap
   // before it is assigned, in either flow. The wording is plain on purpose.
   function confirmDisclosedRelationship(partner: Partner, proceed: () => void) {
@@ -2532,7 +2583,7 @@ export default function App() {
     setPacketDisclosureRestored(false);
     setPacketTarget({ partner, match: matchProfile, assignOnSend: !alreadyReferred });
     setPacketAudience('family');
-    setPacketText(buildPacket(matchProfile, partner, reasons, 'family'));
+    setPacketText(buildPacket(matchProfile, partner, reasons, 'family', packetCostLines(matchProfile, partner, score.networkStatus)));
   }
 
   // From a Referred profile (assigned partner): the assignment already
@@ -2540,11 +2591,12 @@ export default function App() {
   function openPacketForAssigned(matchProfile: ReferralMatch) {
     const partner = partners.find((item) => item.id === matchProfile.assignedPartnerId);
     if (!partner) return;
-    const reasons = buildFitReasons(matchProfile, partner, fitInputForMatch(matchProfile, partner));
+    const fitInput = fitInputForMatch(matchProfile, partner);
+    const reasons = buildFitReasons(matchProfile, partner, fitInput);
     setPacketDisclosureRestored(false);
     setPacketTarget({ partner, match: matchProfile, assignOnSend: false });
     setPacketAudience('family');
-    setPacketText(buildPacket(matchProfile, partner, reasons, 'family'));
+    setPacketText(buildPacket(matchProfile, partner, reasons, 'family', packetCostLines(matchProfile, partner, fitInput.networkStatus)));
   }
 
   // Regenerate the editable text when the audience toggle flips. Edits made
@@ -2554,7 +2606,8 @@ export default function App() {
     setPacketAudience(audience);
     setPacketDisclosureRestored(false);
     const fitInput = fitInputForMatch(packetTarget.match, packetTarget.partner);
-    setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput, audience), audience));
+    const costLines = audience === 'family' ? packetCostLines(packetTarget.match, packetTarget.partner, fitInput.networkStatus) : [];
+    setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput, audience), audience, costLines));
   }
 
   // The placement record for an assignment made from a match: what was
@@ -2989,6 +3042,7 @@ export default function App() {
       if (activeUserIdRef.current !== userId) return;
       setBenefitsByCase((current) => ({ ...current, [caseId]: file.plan }));
       setVobsByCase((current) => ({ ...current, [caseId]: file.requests }));
+      setBenefitCostsAvailable(file.costsAvailable);
       setBenefitsLoadedFor((current) => ({ ...current, [caseId]: 'remote' }));
     } catch {
       if (activeUserIdRef.current !== userId) return;
@@ -3036,7 +3090,13 @@ export default function App() {
       planName: plan?.planName || '',
       memberIdLast4: plan?.memberIdLast4 || '',
       subscriberRelationship: plan?.subscriberRelationship || '',
+      costs: planCostsDraft(plan),
     });
+  }
+
+  // One cost field of the plan editor (network: inNetwork / outOfNetwork).
+  function setBenefitsCost(network: 'inNetwork' | 'outOfNetwork', key: keyof NetworkBenefitsDraft, value: string) {
+    setBenefitsForm((current) => (current ? { ...current, costs: { ...current.costs, [network]: { ...current.costs[network], [key]: value } } } : current));
   }
 
   function saveBenefits(record: CaseRecord) {
@@ -3048,13 +3108,26 @@ export default function App() {
       Alert.alert('Member id', 'Enter the last four characters of the member id, or leave it blank.');
       return;
     }
+    // The amounts are whole dollars, checked as the server checks them. A
+    // server without them (benefitCostsAvailable) keeps what it had: none.
+    const parsedCosts = benefitCostsAvailable ? parsePlanCostsDraft(form.costs) : null;
+    if (parsedCosts && !parsedCosts.ok) {
+      Alert.alert('Plan benefits', parsedCosts.message);
+      return;
+    }
     const previousPlan = benefitsByCase[record.id] ?? null;
+    const costs = parsedCosts?.ok ? parsedCosts.value : {
+      inNetwork: previousPlan?.inNetwork ?? EMPTY_NETWORK_BENEFITS,
+      outOfNetwork: previousPlan?.outOfNetwork ?? EMPTY_NETWORK_BENEFITS,
+      oonBenefits: previousPlan?.oonBenefits ?? null,
+    };
     const optimistic: CaseBenefits = {
       caseId: record.id,
       carrier: form.carrier.trim(),
       planName: form.planName.trim(),
       memberIdLast4: last4,
       subscriberRelationship: form.subscriberRelationship,
+      ...costs,
       updatedAt: new Date().toISOString(),
     };
     setBenefitsByCase((current) => ({ ...current, [record.id]: optimistic }));
@@ -3068,6 +3141,7 @@ export default function App() {
           planName: optimistic.planName,
           memberIdLast4: optimistic.memberIdLast4,
           subscriberRelationship: optimistic.subscriberRelationship,
+          ...(parsedCosts?.ok ? { costs: parsedCosts.value } : {}),
         });
       },
       { partners, referrals, referralMatches, touches, followUps, scorecards },
@@ -3126,6 +3200,7 @@ export default function App() {
       answeredBy: '',
       note: form.note.trim(),
       quotedOutOfPocket: null,
+      ...EMPTY_VOB_COSTS,
       followUpId,
     };
     const followUp: FollowUp = {
@@ -3226,6 +3301,7 @@ export default function App() {
       answeredBy: request.answeredBy,
       note: request.note,
       quoted: request.quotedOutOfPocket == null ? '' : String(request.quotedOutOfPocket),
+      costs: vobCostsDraft(request),
     });
   }
 
@@ -3242,6 +3318,11 @@ export default function App() {
       Alert.alert('Out of pocket', 'Enter whole dollars, or leave it blank.');
       return;
     }
+    const parsedCosts = benefitCostsAvailable ? parseVobCostsDraft(form.costs) : null;
+    if (parsedCosts && !parsedCosts.ok) {
+      Alert.alert('Daily rates', parsedCosts.message);
+      return;
+    }
     if (!mutationSlotAvailable('The VOB update')) return;
     const quoted = quotedParsed ?? null;
     const nowIso = new Date().toISOString();
@@ -3252,6 +3333,7 @@ export default function App() {
       answeredBy: form.answeredBy.trim(),
       note: form.note.trim(),
       quotedOutOfPocket: quoted,
+      ...(parsedCosts?.ok ? parsedCosts.value : {}),
       answeredAt: isVobAnswered(form.status) ? (statusChanged || !current.answeredAt ? nowIso : current.answeredAt) : undefined,
     };
     const previousVobs = vobsByCase[record.id] || [];
@@ -3272,6 +3354,7 @@ export default function App() {
           answeredBy: optimistic.answeredBy,
           note: optimistic.note,
           quotedOutOfPocket: quoted,
+          ...(parsedCosts?.ok ? { costs: parsedCosts.value } : {}),
         });
       },
       { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
@@ -6361,6 +6444,12 @@ export default function App() {
                   const line = planStatusLine(planNetworkStatusForPartner(match.partner, matchInsurance), matchCaseVobs, match.partner.id);
                   return <Text numberOfLines={1} style={line.confirmed ? styles.bedLineOpen : styles.bedLineUnconfirmed}>{line.text}</Text>;
                 })() : null}
+                {(() => {
+                  // What the family would pay, from the linked case's benefits.
+                  // Shown only; the score and the order above never read it.
+                  const cost = familyCostFor(matchCaseId, matchInsurance, match.partner, match.networkStatus);
+                  return cost ? <Text numberOfLines={2} style={cost.known ? styles.familyCostLine : styles.bedLineUnconfirmed}>{familyCostCardLine(cost)}{cost.known && cost.balanceBilling ? ' · balance billing possible' : ''}</Text> : null;
+                })()}
                 {match.verifyBenefits || match.disclosure || matchInsurance !== 'Cash pay' ? (
                   <View style={styles.matchFlags}>
                     {match.verifyBenefits ? <View style={styles.verifyBadge}><AppIcon name="alert-circle-outline" size={12} color={COLORS.inkSoft} /><Text style={styles.verifyBadgeText}>Verify benefits</Text></View> : null}
@@ -6924,12 +7013,13 @@ export default function App() {
                 const plan = benefitsByCase[record.id] ?? null;
                 const requests = (vobsByCase[record.id] || []).slice().sort((a, b) => b.requestedAt.localeCompare(a.requestedAt));
                 const loaded = benefitsLoadedFor[record.id];
+                const linkedMatch = referralMatches.find((item) => item.id === record.matchProfileId) || referralMatches.find((item) => item.caseId === record.id);
                 return (
                   <View style={styles.infoCard}>
                     <View style={styles.caseSectionHeader}>
                       <View>
                         <Text style={styles.infoTitle}>Benefits</Text>
-                        <Text style={styles.caseSectionHint}>Carrier, plan, and the last four of the member id. Nothing more is kept.</Text>
+                        <Text style={styles.caseSectionHint}>Carrier, plan, the last four of the member id{benefitCostsAvailable ? ', and the plan’s cost sharing' : ''}. Nothing more is kept.</Text>
                       </View>
                       <TouchableOpacity
                         accessibilityRole="button"
@@ -6995,6 +7085,18 @@ export default function App() {
                       );
                     }) : loaded === 'remote' ? (
                       <Text style={styles.caseEmptyNote}>No VOB requested yet. One tap asks a program and puts a reminder on Today for the next business day.</Text>
+                    ) : null}
+                    {loaded === 'remote' ? (
+                      <FamilyCostPanel
+                        plan={plan}
+                        requests={requests}
+                        partners={partners}
+                        insurance={linkedMatch?.insurance || plan?.carrier || ''}
+                        assignedPartnerId={linkedMatch?.assignedPartnerId}
+                        days={costDaysByCase[record.id] ?? DEFAULT_STAY_DAYS}
+                        onDaysChange={(days) => setCostDaysByCase((current) => ({ ...current, [record.id]: days }))}
+                        costsAvailable={benefitCostsAvailable}
+                      />
                     ) : null}
                     <Text style={styles.casePaymentHint}>Network status on partners and match results is what each program reports about itself. An answer recorded here is what the carrier said for this family only; it never changes the partner's listing.</Text>
                   </View>
@@ -8538,11 +8640,33 @@ export default function App() {
               <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => saveBenefits(record)}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
-              <Text style={styles.formIntro}>Just enough to ask a program for a VOB. Only the last four of the member id are kept; no date of birth, no SSN. Keep the card photo under Documents.</Text>
+              <Text style={styles.formIntro}>Just enough to ask a program for a VOB{benefitCostsAvailable ? ', and the plan’s numbers for an estimate of what the family would pay' : ''}. Only the last four of the member id are kept; no date of birth, no SSN. Keep the card photo under Documents.</Text>
               <DropdownField label="CARRIER" value={benefitsForm.carrier} icon="shield-checkmark-outline" onChange={(carrier) => setBenefitsForm((current) => (current ? { ...current, carrier } : current))} options={carrierOptions} />
               <FormField label="PLAN NAME (OPTIONAL)" value={benefitsForm.planName} onChangeText={(planName) => setBenefitsForm((current) => (current ? { ...current, planName } : current))} placeholder="PPO Choice, HMO, Medicaid plan name" />
               <FormField label="MEMBER ID, LAST FOUR ONLY" value={benefitsForm.memberIdLast4} onChangeText={(value) => setBenefitsForm((current) => (current ? { ...current, memberIdLast4: memberIdLast4(value) } : current))} placeholder="1234" />
               <DropdownField label="SUBSCRIBER" value={benefitsForm.subscriberRelationship} icon="person-outline" onChange={(value) => setBenefitsForm((current) => (current ? { ...current, subscriberRelationship: value as SubscriberRelationship } : current))} options={SUBSCRIBER_RELATIONSHIPS.map((item) => ({ label: item.label, value: item.value }))} />
+              {benefitCostsAvailable ? (
+                <>
+                  {/* True cost to the family: the plan's cost sharing (family-cost-form.ts). */}
+                  <Text style={styles.infoTitleStandalone}>In-network benefits</Text>
+                  <Text style={[styles.casePaymentHint, { marginBottom: 12 }]}>Whole dollars, from the VOB or the plan documents. Leave anything you do not know blank: the estimate says unknown instead of guessing.</Text>
+                  {NETWORK_BENEFIT_FIELDS.map((field) => (
+                    <FormField key={`in-${field.key}`} label={field.label} value={benefitsForm.costs.inNetwork[field.key]} onChangeText={(value) => setBenefitsCost('inNetwork', field.key, value)} placeholder={field.placeholder} keyboardType="number-pad" />
+                  ))}
+                  <Text style={styles.infoTitleStandalone}>Out-of-network benefits</Text>
+                  <Text style={[styles.fieldLabel, { marginTop: 10 }]}>DOES THE PLAN PAY ANYTHING OUT-OF-NETWORK?</Text>
+                  <View style={[styles.wrapPills, { marginBottom: 14 }]}>
+                    {TRISTATE_OPTIONS.map((option) => (
+                      <Pill key={option.label} label={option.label} active={benefitsForm.costs.oonBenefits === option.value} onPress={() => setBenefitsForm((current) => (current ? { ...current, costs: { ...current.costs, oonBenefits: option.value } } : current))} />
+                    ))}
+                  </View>
+                  {benefitsForm.costs.oonBenefits === false ? (
+                    <Text style={[styles.casePaymentHint, { marginBottom: 14 }]}>Then an out-of-network program costs the family its full price. The out-of-network amounts are cleared when you save.</Text>
+                  ) : NETWORK_BENEFIT_FIELDS.map((field) => (
+                    <FormField key={`oon-${field.key}`} label={field.label} value={benefitsForm.costs.outOfNetwork[field.key]} onChangeText={(value) => setBenefitsCost('outOfNetwork', field.key, value)} placeholder={field.placeholder} keyboardType="number-pad" />
+                  ))}
+                </>
+              ) : null}
               <TouchableOpacity accessibilityRole="button" style={styles.primaryButton} onPress={() => saveBenefits(record)}>
                 <Text style={styles.primaryButtonText}>Save plan</Text>
               </TouchableOpacity>
@@ -8645,11 +8769,25 @@ export default function App() {
               </View>
               <FormField label="WHO ANSWERED (OPTIONAL)" value={vobAnswerForm.answeredBy} onChangeText={(answeredBy) => setVobAnswerForm((current) => (current ? { ...current, answeredBy } : current))} placeholder="Maria in admissions" />
               <FormField label="QUOTED OUT OF POCKET, DOLLARS (OPTIONAL)" value={vobAnswerForm.quoted} onChangeText={(quoted) => setVobAnswerForm((current) => (current ? { ...current, quoted } : current))} placeholder="500" keyboardType="number-pad" />
-              <FormField label="NOTES" value={vobAnswerForm.note} onChangeText={(note) => setVobAnswerForm((current) => (current ? { ...current, note } : current))} placeholder="Deductible, coinsurance, authorization needed, what the family was told" multiline />
+              {benefitCostsAvailable ? (
+                <>
+                  {/* The program's rates feed the family's cost estimate (family-cost.ts). */}
+                  {VOB_COST_FIELDS.map((field) => (
+                    <FormField key={field.key} label={field.label} value={vobAnswerForm.costs[field.key]} onChangeText={(value) => setVobAnswerForm((current) => (current ? { ...current, costs: { ...current.costs, [field.key]: value } } : current))} placeholder={field.placeholder} keyboardType="number-pad" />
+                  ))}
+                  <Text style={styles.fieldLabel}>PRE-AUTHORIZATION REQUIRED?</Text>
+                  <View style={[styles.wrapPills, { marginBottom: 14 }]}>
+                    {TRISTATE_OPTIONS.map((option) => (
+                      <Pill key={option.label} label={option.label} active={vobAnswerForm.costs.precertRequired === option.value} onPress={() => setVobAnswerForm((current) => (current ? { ...current, costs: { ...current.costs, precertRequired: option.value } } : current))} />
+                    ))}
+                  </View>
+                </>
+              ) : null}
+              <FormField label="NOTES" value={vobAnswerForm.note} onChangeText={(note) => setVobAnswerForm((current) => (current ? { ...current, note } : current))} placeholder={benefitCostsAvailable ? 'What the family was told, anything the fields above do not cover' : 'Deductible, coinsurance, authorization needed, what the family was told'} multiline />
               <TouchableOpacity accessibilityRole="button" style={[styles.primaryButton, vobSaving && { opacity: 0.45 }]} onPress={() => saveVobAnswer(record)} disabled={vobSaving}>
                 <Text style={styles.primaryButtonText}>{vobSaving ? 'Saving…' : 'Save answer'}</Text>
               </TouchableOpacity>
-              <Text style={styles.casePaymentHint}>A status change is written to the timeline with your name. An answer also closes the reminder to check on it. This applies to this family only and never changes the partner's own network listing.</Text>
+              <Text style={styles.casePaymentHint}>A status change is written to the timeline with your name. An answer also closes the reminder to check on it. This applies to this family only and never changes the partner's own network listing.{benefitCostsAvailable ? ' The daily rates feed the family’s cost estimate on this case only; the program never sees it.' : ''}</Text>
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
@@ -9260,6 +9398,7 @@ const styles = StyleSheet.create({
   matchFlags: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 9 },
   bedLineOpen: { color: COLORS.forest, fontSize: 11, fontWeight: '700', marginTop: 7 },
   bedLineUnconfirmed: { color: COLORS.gray, fontSize: 11, fontWeight: '700', marginTop: 7 },
+  familyCostLine: { color: COLORS.inkSoft, fontSize: 11, fontWeight: '700', marginTop: 7 },
   verifyBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#F3F3EF', borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5 },
   verifyBadgeText: { color: COLORS.inkSoft, fontSize: 9, fontWeight: '800' },
   disclosureBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.coralPale, borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5, flexShrink: 1 },
