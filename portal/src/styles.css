@@ -131,3 +131,21 @@ select {
 .badge.credential-pending { background: var(--blue-soft); color: var(--blue); }
 .badge.credential-expiring { background: #fffaeb; color: #b54708; }
 .badge.credential-expired, .badge.credential-rejected { background: var(--coral-soft); color: var(--coral); }
+
+/* Placement requests (a practice asks a few programs at once). */
+.placement .requests { list-style: none; margin: 0; padding: 0; }
+.placement .requests li { border-top: 1px solid var(--line); }
+button.request {
+  width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 0; background: none; color: var(--ink); border-radius: 0; text-align: left; font-weight: 400;
+}
+.request-main { display: flex; flex-direction: column; gap: 3px; font-size: 15px; }
+.request-main span { color: var(--gray); font-size: 14px; }
+.request-main small, .request-side small { color: var(--gray); font-size: 12px; }
+.request-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
+.placement dl.summary { margin: 12px 0 4px; }
+.placement dl.summary div { display: flex; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); }
+.placement dl.summary dt { flex: 0 0 150px; font-size: 13px; font-weight: 700; color: var(--gray); }
+.placement dl.summary dd { margin: 0; font-size: 15px; }
+.placement .choices { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.placement > button.ghost.small { margin-bottom: 12px; }

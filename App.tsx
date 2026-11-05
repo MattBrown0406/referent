@@ -149,6 +149,10 @@ import {
 import FamilyCostPanel from './src/lib/FamilyCostPanel';
 import CredentialsCard, { ShieldChip, credentialProgramForPartner, credentialsForPartner, useCredentialIndex } from './src/lib/CredentialsCard';
 import { credentialWatchItems, credentialWatchSubtitle, licenseConcernAlert, licenseOverrideNote, programIntegrity, type LicenseConcern, type ProgramIntegrity } from './src/lib/integrity';
+import PlacementRequestSheet, { type PlacementSheetRequest } from './src/lib/PlacementRequestSheet';
+import PlacementCompare, { type CompareChoice } from './src/lib/PlacementCompare';
+import { usePlacementRequests } from './src/lib/placement-api';
+import { latestRequestForMatch, placementTodayItems, requestProgress, type PlacementRequest, type PlacementRequestView } from './src/lib/placement-requests';
 import {
   assignMatchReferral,
   completeFollowUpWithNext,
@@ -1254,6 +1258,12 @@ export default function App() {
   // Program Integrity Watch: bumped by every full refresh so credentials
   // (online only, never cached) are read again with everything else.
   const [credentialsNonce, setCredentialsNonce] = useState(0);
+  // Placement Request: the "Ask programs" sheet, the answers screen, and a
+  // program chosen there, handed to Assign & refer / Send packet once the
+  // answers screen has closed. Answers never change the ranking.
+  const [placementSheet, setPlacementSheet] = useState<PlacementSheetRequest | null>(null);
+  const [placementCompareId, setPlacementCompareId] = useState<string | null>(null);
+  const [pendingPlacementChoice, setPendingPlacementChoice] = useState<{ matchId: string; partnerId: string; choice: CompareChoice } | null>(null);
   // The shortlist the clinician saw when they started an assignment, so the
   // placement record can say what was shown and at what rank the pick sat.
   const [pendingPlacement, setPendingPlacement] = useState<{ matchProfileId: string; rankedIds: string[]; candidates: PlacementCandidate[] } | null>(null);
@@ -1445,6 +1455,9 @@ export default function App() {
 
   const resetAccountState = useCallback(() => {
     setOutreach(null);
+    setPlacementSheet(null);
+    setPlacementCompareId(null);
+    setPendingPlacementChoice(null);
     setPendingNav(null);
     setPacketSendConfirm(false);
     packetClosingRef.current = false;
@@ -2275,6 +2288,13 @@ export default function App() {
   // server without 20261104130000 the index is 'unavailable' and every
   // credential chip, card and prompt stays hidden.
   const credentialIndex = useCredentialIndex(session?.user?.id, linkedListingIds, credentialsNonce + workspaceEpoch);
+  // Placement Request (src/lib/placement-requests.ts): this practice's
+  // requests and the programs' answers, read again on every full refresh.
+  // DISPLAY ONLY: rankPrograms below never reads them and nothing writes
+  // back to matching. Online only; on a server without 20261104140000 the
+  // state is 'unavailable' and every placement button, card and screen hides.
+  const placement = usePlacementRequests(session?.user?.id, credentialsNonce + workspaceEpoch);
+  const placementAvailable = placement.state.status === 'ready';
   const integrityByPartner = useMemo(() => {
     const result = new Map<string, ProgramIntegrity>();
     if (credentialIndex.state.status !== 'ready') return result;
@@ -2315,6 +2335,29 @@ export default function App() {
   const partnerById = useMemo(() => new Map(partners.map((item) => [item.id, item])), [partners]);
   const caseById = useMemo(() => new Map(cases.map((item) => [item.id, item])), [cases]);
   const referralById = useMemo(() => new Map(referrals.map((item) => [item.id, item])), [referrals]);
+
+  // "Choose this program" on the answers screen: the request's saved match
+  // is on the form by now (choosePlacementProgram loaded it), so the usual
+  // Assign & refer / Send packet flow runs exactly as from a match card,
+  // once the answers screen has finished closing. It is never duplicated.
+  useEffect(() => {
+    const pending = pendingPlacementChoice;
+    if (!pending || selectedMatchId !== pending.matchId) return;
+    setPendingPlacementChoice(null);
+    afterSheetCloses(() => {
+      const partner = partnerById.get(pending.partnerId);
+      if (!partner) return;
+      if (pending.choice === 'refer') {
+        void openMatchedReferral(partner.id);
+        return;
+      }
+      const shown = matches.find((item) => item.partner.id === partner.id);
+      const match = referralMatches.find((item) => item.id === pending.matchId);
+      if (!match) return;
+      void openPacketComposer(partner, shown ?? scoreProgram(match, partner, scorecards[partner.id], trackRecordPrior(scorecards)));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingPlacementChoice, selectedMatchId]);
 
   // Sorted once per change to the list (it was re-sorted on every render,
   // which also re-ran the filter below each time).
@@ -2498,6 +2541,81 @@ export default function App() {
       outcome: 'Introduced',
     });
     setShowAddReferral(true);
+  }
+
+  // ─── Placement Request ──────────────────────────────────────────────────
+  // "Ask programs" sends ONE de-identified request (built on the server from
+  // the saved match) to up to 8 of the ranked programs; the answers screen
+  // shows their replies in that same ranked order. ETHICS: answers never
+  // change ranking or scores, programs cannot pay to be asked, and nothing
+  // identifies the client until the packet goes out through the usual flow.
+
+  // From the match results. The match is saved first (as for a packet),
+  // and the sheet lists the programs in the order on screen.
+  async function openPlacementSheet() {
+    const openings = screenOpenings();
+    const saved = await currentOrSavedMatch();
+    if (!saved) return;
+    if (anySheetOpenRef.current || overlayOpen() || screenOpenings() !== openings) return;
+    setPlacementSheet({
+      match: saved,
+      caseTitle: saved.caseId ? caseById.get(saved.caseId)?.title : undefined,
+      options: matches.map((score, index) => ({
+        partner: score.partner,
+        rank: index + 1,
+        line: `${partnerTypeLabel(score.partner)} · ${score.partner.city}, ${score.partner.state}`,
+        integrity: integrityByPartner.get(score.partner.id) ?? null,
+      })),
+    });
+  }
+
+  // From Today or a saved match card (nothing else is up then), or after
+  // another sheet has finished closing.
+  function openPlacementCompare(requestId: string) {
+    const view = placement.state.requests.find((item) => item.request.id === requestId);
+    const match = view?.request.matchProfileId ? referralMatches.find((item) => item.id === view.request.matchProfileId) : undefined;
+    // The family-cost estimate beside each answer needs the case's benefits.
+    if (match?.caseId && !benefitsLoadedFor[match.caseId]) void loadCaseBenefits(match.caseId);
+    if (anySheetOpenRef.current || overlayOpen()) {
+      afterSheetCloses(() => setPlacementCompareId(requestId));
+      return;
+    }
+    setPlacementCompareId(requestId);
+  }
+
+  // How the practitioner knows the request: its saved match's label.
+  function placementLabelFor(request: PlacementRequest): string {
+    const match = request.matchProfileId ? referralMatches.find((item) => item.id === request.matchProfileId) : undefined;
+    return match?.clientLabel || (request.caseId ? caseById.get(request.caseId)?.title : '') || 'Placement request';
+  }
+
+  // The family's estimated cost at that program (true cost to the family),
+  // shown to the practitioner only. scoreProgram here reads the network
+  // status for the estimate; the order on the answers screen never moves.
+  function placementCostLine(view: PlacementRequestView, partner: Partner): string | null {
+    const match = view.request.matchProfileId ? referralMatches.find((item) => item.id === view.request.matchProfileId) : undefined;
+    if (!match) return null;
+    const score = scoreProgram(match, partner, scorecards[partner.id], trackRecordPrior(scorecards));
+    const cost = familyCostFor(match.caseId, match.insurance, partner, score.networkStatus);
+    return cost ? `${familyCostCardLine(cost)}${cost.known && cost.balanceBilling ? ' · balance billing possible' : ''}` : null;
+  }
+
+  function placementMatchSaved(view: PlacementRequestView): boolean {
+    return Boolean(view.request.matchProfileId && referralMatches.some((item) => item.id === view.request.matchProfileId));
+  }
+
+  // "Choose this program": close the answers screen, put the request's saved
+  // match on the form, and let the effect above start the usual flow.
+  function choosePlacementProgram(view: PlacementRequestView, partner: Partner, choice: CompareChoice) {
+    const match = view.request.matchProfileId ? referralMatches.find((item) => item.id === view.request.matchProfileId) : undefined;
+    if (!match) {
+      Alert.alert('Saved match removed', 'This request\'s saved match was removed. Open the program from the Directory to refer the family.');
+      return;
+    }
+    setPlacementCompareId(null);
+    loadReferralMatch(match);
+    setTab('match');
+    setPendingPlacementChoice({ matchId: match.id, partnerId: partner.id, choice });
   }
 
   // iOS shows one sheet at a time from a screen: presenting the next while the
@@ -4034,7 +4152,8 @@ export default function App() {
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
     || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory
     || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
-    || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible,
+    || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible
+    || placementSheet || placementCompareId,
   );
   if (sheetOpenNow && !anySheetOpenRef.current) sheetOpenedCountRef.current += 1;
   anySheetOpenRef.current = sheetOpenNow;
@@ -6137,6 +6256,36 @@ export default function App() {
     );
   }
 
+  // Placement Request on Today: one card while a request is open, and for
+  // answers that arrived since the practitioner last looked.
+  function PlacementTodaySection() {
+    const placementToday = placementAvailable
+      ? placementTodayItems({ requests: placement.state.requests, seen: placement.seen, now: new Date(), userId: activeUserId, scope: todayScope, labelFor: placementLabelFor })
+      : [];
+    return placementToday.length ? (
+      <View style={styles.todaySection}>
+        <Text style={styles.todaySectionHeader}>🛏️ PLACEMENT REQUESTS</Text>
+        <View style={styles.credentialWatchCard}>
+          {placementToday.map((item, index) => (
+            <TouchableOpacity
+              key={item.requestId}
+              accessibilityRole="button"
+              accessibilityLabel={`${item.title}. ${item.detail}. Open the answers.`}
+              onPress={() => openPlacementCompare(item.requestId)}
+              style={[styles.credentialWatchRow, index === 0 && styles.placementTodayFirstRow]}
+            >
+              <View style={{ flex: 1 }}>
+                <Text style={styles.credentialWatchName}>{item.title}</Text>
+                <Text style={item.newAnswers ? styles.placementTodayNew : styles.credentialWatchLine}>{item.detail}</Text>
+              </View>
+              <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+            </TouchableOpacity>
+          ))}
+        </View>
+      </View>
+    ) : null;
+  }
+
   // Today Command Center — the prioritized daily operating list. The old
   // home told you what happened; this one tells you WHAT TO DO NEXT.
   function HomeScreen() {
@@ -6207,6 +6356,8 @@ export default function App() {
               {todaySections.partnersDue.map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
             </View>
           ) : null}
+
+          {PlacementTodaySection()}
 
           {credentialWatch.length ? (
             <View style={styles.todaySection}>
@@ -6374,6 +6525,18 @@ export default function App() {
                       <Text numberOfLines={1} style={styles.savedMatchMeta}>{item.levelOfCare === 'Any type' ? 'Any level' : item.levelOfCare} · {item.state === 'ANY' ? 'Any location' : item.state}</Text>
                       <Text style={[styles.savedMatchStatus, item.status === 'Referred' && styles.savedMatchStatusComplete]}>{assignedPartner ? `Referred to ${assignedPartner.organization}` : 'Matching in progress'}</Text>
                     </TouchableOpacity>
+                    {(() => {
+                      // Placement Request: the newest request for this match and how many answered.
+                      const asked = placementAvailable ? latestRequestForMatch(placement.state.requests, item.id) : null;
+                      if (!asked) return null;
+                      const progress = requestProgress(asked, new Date());
+                      return (
+                        <TouchableOpacity accessibilityLabel={`Program answers for ${item.clientLabel}: ${progress.label}`} accessibilityRole="button" style={styles.savedMatchAnswersButton} onPress={() => openPlacementCompare(asked.request.id)}>
+                          <AppIcon name="chatbubbles-outline" size={13} color={COLORS.forest} />
+                          <Text style={styles.savedMatchPacketButtonText}>Program answers {progress.answered}/{progress.total}</Text>
+                        </TouchableOpacity>
+                      );
+                    })()}
                     <View style={styles.savedMatchActions}>
                       {item.status === 'Referred' && assignedPartner ? (
                         <TouchableOpacity accessibilityLabel={`Send packet for ${item.clientLabel}`} accessibilityRole="button" style={styles.savedMatchPacketButton} onPress={() => openPacketForAssigned(item)}>
@@ -6532,6 +6695,18 @@ export default function App() {
           </View>
           <View style={styles.rankBadge}><AppIcon name="shield-checkmark" size={14} color={COLORS.forest} /><Text style={styles.rankBadgeText}>Fit ranked</Text></View>
         </View>
+
+        {/* Placement Request: ask several of these programs at once. Hidden on a server without the feature. */}
+        {placementAvailable && matches.length ? (
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Ask programs about beds, fit and cost" onPress={() => { void openPlacementSheet(); }} style={styles.askProgramsButton}>
+            <AppIcon name="paper-plane-outline" size={18} color={COLORS.forest} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.askProgramsTitle}>Ask programs</Text>
+              <Text style={styles.askProgramsBody}>One de-identified request to up to 8 of these programs. Compare their answers side by side.</Text>
+            </View>
+            <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+          </TouchableOpacity>
+        ) : null}
 
         {matches.length ? matches.slice(0, 8).map((match, index) => (
           <View key={match.partner.id} style={[styles.matchCard, index === 0 && styles.bestMatchCard]}>
@@ -9364,6 +9539,29 @@ export default function App() {
           resetAccountState();
         }}
       />
+      <PlacementRequestSheet
+        request={placementSheet}
+        senderName={senderName}
+        onClose={() => setPlacementSheet(null)}
+        onSent={placement.replace}
+        onOpenAnswers={(requestId) => {
+          setPlacementSheet(null);
+          afterSheetCloses(() => setPlacementCompareId(requestId));
+        }}
+      />
+      <PlacementCompare
+        requestId={placementCompareId}
+        placement={placement}
+        partnersById={partnerById}
+        senderName={senderName}
+        labelFor={placementLabelFor}
+        integrityFor={(partnerId) => integrityByPartner.get(partnerId)}
+        familyCostLineFor={placementCostLine}
+        canChoose={placementMatchSaved}
+        onClose={() => setPlacementCompareId(null)}
+        onSwitch={setPlacementCompareId}
+        onChoose={choosePlacementProgram}
+      />
       {DoneSheet()}
       {outreach?.origin === 'root' ? OutreachSheetView() : null}
       {NextStepSheet()}
@@ -9533,6 +9731,11 @@ const styles = StyleSheet.create({
   matchPriceText: { flexShrink: 0, color: COLORS.gray, fontSize: 10, fontWeight: '600', textAlign: 'right' },
   matchFlags: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 9 },
   credentialChipRow: { flexDirection: 'row', marginTop: 7 },
+  askProgramsButton: { minHeight: 64, flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: COLORS.white, borderRadius: 18, borderWidth: 1, borderColor: COLORS.forest, padding: 14, marginBottom: 14 },
+  askProgramsTitle: { color: COLORS.forest, fontSize: 14, fontWeight: '800' },
+  askProgramsBody: { color: COLORS.inkSoft, fontSize: 12, lineHeight: 17, marginTop: 2 },
+  placementTodayFirstRow: { borderTopWidth: 0 },
+  placementTodayNew: { color: COLORS.forest, fontSize: 12, fontWeight: '800', marginTop: 2 },
   credentialWatchCard: { backgroundColor: COLORS.white, borderRadius: 18, borderWidth: 1, borderColor: COLORS.line, padding: 14, gap: 4 },
   credentialWatchIntro: { color: COLORS.inkSoft, fontSize: 12, lineHeight: 17, marginBottom: 4 },
   credentialWatchRow: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8, borderTopWidth: 1, borderTopColor: '#EEF0EE' },
@@ -9730,6 +9933,7 @@ const styles = StyleSheet.create({
   packetButtonText: { color: COLORS.forest, fontSize: 11, fontWeight: '800' },
   savedMatchPacketButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 9, backgroundColor: COLORS.mint, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 6, alignSelf: 'flex-start' },
   savedMatchPacketButtonText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
+  savedMatchAnswersButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 6, backgroundColor: COLORS.mint, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 6, alignSelf: 'flex-start' },
   packetReminder: { color: COLORS.coral, fontSize: 10, lineHeight: 15, marginTop: -4, marginBottom: 14, fontWeight: '700' },
   packetEditor: { minHeight: 260, paddingTop: 13, textAlignVertical: 'top', lineHeight: 19 },
   packetShareHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: 12, textAlign: 'center' },
