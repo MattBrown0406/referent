@@ -40,14 +40,18 @@ turning on Confirm email for prospects.
 ### Authentication → URL Configuration
 
 Both the reset link and the confirmation link redirect into the app via its
-custom scheme (`"scheme": "referralfit"` in `app.json`). Supabase only
-redirects to allow-listed URLs, so add both:
+custom scheme (`"scheme": "referralfit"` in `app.json`), or, when the person
+started in the web app, back to the web app's own origin (see
+[WEB_APP.md](WEB_APP.md)). Supabase only redirects to allow-listed URLs, so
+add all four:
 
 | Field | Value |
 | --- | --- |
 | Site URL | keep as is (used only when a redirect is not allow-listed) |
 | Redirect URLs (add) | `referralfit://auth/recovery` |
 | Redirect URLs (add) | `referralfit://auth/confirmed` |
+| Redirect URLs (add) | `https://app.referralfit.com/auth/recovery` |
+| Redirect URLs (add) | `https://app.referralfit.com/auth/confirmed` |
 
 If these are missing, the email link lands on the Site URL in a browser tab
 instead of opening the app, and the user cannot set a new password.
@@ -102,10 +106,12 @@ metadata. `handle_new_user()` turns that into the workspace name and the
 owner's display name. Password is never logged or echoed.
 
 **Forgot password**: `supabase.auth.resetPasswordForEmail(email, { redirectTo:
-'referralfit://auth/recovery' })`. Opening the link on the phone launches the
-app; `App.tsx` exchanges the tokens in the link for a session and shows
-`src/lib/ResetPasswordScreen.tsx`, which calls `supabase.auth.updateUser`.
-The link must be opened on a device with the app installed.
+authRedirectUrl('recovery', currentWebOrigin()) })` — `referralfit://auth/recovery`
+on a phone, `https://app.referralfit.com/auth/recovery` in a browser. Opening
+the link launches the app (or the web app); `App.tsx` exchanges the tokens in
+the link for a session and shows `src/lib/ResetPasswordScreen.tsx`, which
+calls `supabase.auth.updateUser`. The link works only on the device or
+browser that asked for it, within a day.
 
 **Delete account** (`src/lib/WorkspaceScreen.tsx` → `src/lib/account.ts` →
 `public.prepare_account_deletion()` → files → `public.delete_own_account()`):
