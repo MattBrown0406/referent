@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Modal,
+  Platform,
   SafeAreaView,
   ScrollView,
   Share,
@@ -548,7 +549,9 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
 
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Notify me about...</Text>
-              {notify === null ? (
+              {Platform.OS === 'web' ? (
+                <Text style={styles.helpText}>Push notifications go to the ReferralFit iPhone app; turn them on there. In a browser, everything due is on Home, and Refresh brings in new answers.</Text>
+              ) : notify === null ? (
                 notifyError ? <Text style={styles.helpText}>Notification settings could not be loaded: {notifyError}</Text> : <ActivityIndicator color={COLORS.blue} />
               ) : !notify.available ? (
                 <Text style={styles.helpText}>Push notifications are not available yet. They switch on here once the server update is applied; nothing else is needed from you.</Text>
@@ -766,7 +769,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
 
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Sign out</Text>
-              <Text style={styles.helpText}>Signs this phone out of ReferralFit. Your workspace stays as it is, and you can sign back in any time.</Text>
+              <Text style={styles.helpText}>{Platform.OS === 'web' ? 'Signs this browser out of ReferralFit and removes your practice’s data from it. Your workspace stays as it is, and you can sign back in any time.' : 'Signs this phone out of ReferralFit. Your workspace stays as it is, and you can sign back in any time.'}</Text>
               <TouchableOpacity accessibilityRole="button" accessibilityLabel="Sign out" disabled={busy} onPress={onSignOut} style={[styles.smallButton, styles.helpTextSpaced, { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center' }]}>
                 <Text style={styles.smallButtonText}>Sign out</Text>
               </TouchableOpacity>

@@ -179,6 +179,7 @@ import {
   createTouch,
   bindLocalWorkspace,
   flushWriteQueue,
+  forgetWorkspaceBinding,
   finalizeMatchPacket,
   FollowUp,
   FollowUpKind,
@@ -6074,13 +6075,26 @@ export default function App() {
   }
 
   function confirmSignOut() {
-    Alert.alert('Sign out?', 'Offline data remains in this account’s isolated on-device cache.', [
+    // A browser may be shared, so signing out of the web app leaves none of
+    // the practice's data in it; the phone keeps its offline copy.
+    const unsaved = queuedWrites + rejectedWrites;
+    const message = IS_WEB
+      ? `This removes your practice’s data from this browser. Everything saved stays in your workspace.${unsaved ? ` ${unsaved} ${unsaved === 1 ? 'change has' : 'changes have'} not reached your workspace yet and will be lost if they cannot be saved now.` : ''}`
+      : 'Offline data remains in this account’s isolated on-device cache.';
+    Alert.alert('Sign out?', message, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Sign out', style: 'destructive', onPress: async () => {
         try {
+          const userId = activeUserIdRef.current;
           // Best effort: no signal must never trap someone signed in.
-          await unregisterThisDevice(activeUserIdRef.current || undefined).catch(() => undefined);
+          await unregisterThisDevice(userId || undefined).catch(() => undefined);
           await cancelReferralFitNotifications().catch(() => undefined);
+          if (IS_WEB && userId) {
+            // Save what can still be saved, then remove the cache, the
+            // queue and every saved case copy (store.ts).
+            await flushWriteQueue(userId).catch(() => undefined);
+            await forgetWorkspaceBinding(userId).catch(() => undefined);
+          }
           // Offline, supabase-js cannot sign out (it tries to refresh first and
           // gives up after ~25 s without clearing anything): clear it here.
           if (await isOfflineSession(activeUserIdRef.current).catch(() => false)) {
