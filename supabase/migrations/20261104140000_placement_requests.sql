@@ -75,13 +75,16 @@ $$;
 
 -- Accents off (NFKD, combining marks removed), then compatibility forms
 -- folded (NFKC) and lower case: Jose, JOSE and the accented spelling are
--- one word, and a full-width digit is a digit. fold() in the app.
+-- one word, and a full-width digit is a digit. Letters with a stroke have
+-- no accent to take off, so they are spelled out: o l d d h t i. fold() in
+-- the app.
 CREATE OR REPLACE FUNCTION public.identifying_fold(p text)
 RETURNS text
 LANGUAGE sql IMMUTABLE
 SET search_path = pg_catalog
 AS $$
-  SELECT lower(normalize(regexp_replace(normalize(coalesce(p, ''), NFKD), '[' || chr(768) || '-' || chr(879) || ']', '', 'g'), NFKC))
+  SELECT translate(lower(normalize(regexp_replace(normalize(coalesce(p, ''), NFKD), '[' || chr(768) || '-' || chr(879) || ']', '', 'g'), NFKC)),
+                   chr(248) || chr(322) || chr(273) || chr(240) || chr(295) || chr(359) || chr(305), 'olddhti')
 $$;
 REVOKE ALL ON FUNCTION public.identifying_fold(text) FROM PUBLIC, anon, authenticated;
 
@@ -120,8 +123,7 @@ AS $$
   SELECT ARRAY[
     'am', 'an', 'as', 'at', 'be', 'by', 'do', 'dr', 'ed', 'er', 'ex', 'go', 'he', 'hi', 'if', 'in', 'is', 'it',
     'iv', 'me', 'mo', 'mr', 'ms', 'my', 'no', 'of', 'oh', 'ok', 'on', 'or', 'pm', 're', 'so', 'to', 'tv', 'up',
-    'us', 'vs', 'we', 'de', 'el', 'en', 'es', 'la', 'le', 'lo', 'mi', 'se', 'si', 'su', 'te', 'tu', 'un', 'ya',
-    'yo']::text[]
+    'us', 'vs', 'we', 'de', 'el', 'en', 'es', 'la', 'mi', 'se', 'si', 'te', 'un', 'ya', 'yo']::text[]
 $$;
 REVOKE ALL ON FUNCTION public.identifying_everyday_two() FROM PUBLIC, anon, authenticated;
 
@@ -145,7 +147,9 @@ REVOKE ALL ON FUNCTION public.identifying_abbreviations() FROM PUBLIC, anon, aut
 -- The words of a case title, client label or contact name that could be a
 -- name: split on anything that is not a letter; three or more letters, or
 -- two that are not an everyday word or an abbreviation; never an ordinary
--- word. Sorted by code point. nameWords in the app.
+-- word. A possessive right before a relationship word ("her son" in a
+-- lead's title) is not a name; anywhere else (the surname Her) it is.
+-- Sorted by code point. nameWords in the app.
 CREATE OR REPLACE FUNCTION public.identifying_name_words(p_names text[])
 RETURNS text[]
 LANGUAGE sql IMMUTABLE
@@ -153,7 +157,9 @@ SET search_path = pg_catalog
 AS $$
   SELECT coalesce(array_agg(DISTINCT w.word COLLATE "C" ORDER BY w.word COLLATE "C"), ARRAY[]::text[])
     FROM unnest(coalesce(p_names, ARRAY[]::text[])) AS n(v),
-         regexp_split_to_table(public.identifying_fold(n.v), '[^[:alpha:]]+') AS w(word)
+         regexp_split_to_table(regexp_replace(public.identifying_fold(n.v),
+           '(?<![[:alpha:]])(my|his|her|their|our|your)(?= +(son|daughter|child|kid|boy|girl|stepson|stepdaughter|stepchild|grandson|granddaughter|grandchild|wife|husband|spouse|partner|boyfriend|girlfriend|fiance|fiancee|mom|mum|mother|dad|father|parent|stepparent|grandparent|stepdad|stepmom|stepfather|stepmother|grandmother|grandfather|grandma|grandpa|brother|sister|sibling|aunt|uncle|niece|nephew|cousin|friend|best|loved|family|client|patient)s?(?![[:alpha:]]))', ' ', 'g'),
+           '[^[:alpha:]]+') AS w(word)
    WHERE (length(w.word) >= 3
           OR (length(w.word) = 2 AND NOT (w.word = ANY (public.identifying_everyday_two()))
                                  AND NOT (w.word = ANY (public.identifying_abbreviations()))))
@@ -195,8 +201,10 @@ REVOKE ALL ON FUNCTION public.identifying_label_initials(text) FROM PUBLIC, anon
 
 -- A date in folded text: day/month/year with a real day and month (so
 -- 30/60/90 is a program length), an ISO date, month then day, day then
--- month (14th March; "14 may" only with a year), dob or born, and a
--- birthday followed by a number. mentionsDate in the app.
+-- month (14th March; "14 may" only with a year), a compact date with a
+-- year (14-Mar-1985, 14Mar85, Mar-14-1985), dob or born (not born-again or
+-- born and raised), and a birthday followed by a number. mentionsDate in
+-- the app.
 CREATE OR REPLACE FUNCTION public.identifying_mentions_date(p_plain text)
 RETURNS boolean
 LANGUAGE sql IMMUTABLE
@@ -206,8 +214,10 @@ AS $$
       OR p_plain ~ ('(?<![0-9])(19|20)[0-9]{2}[/.-]' || k.d || '[/.-]' || k.d || '(?![0-9])')
       OR p_plain ~ ('(?<![a-z])(' || k.m || '|may)[.]? +[0-9]{1,2}(?![0-9])')
       OR p_plain ~ ('(?<![0-9])[0-9]{1,2}(st|nd|rd|th)?( +of)? +' || k.m || '(?![a-z])')
+      OR p_plain ~ ('(?<![0-9])[0-9]{1,2}[-/.]?(' || k.m || '|may)[-/. ]?([0-9]{2}|[0-9]{4})(?![0-9])')
+      OR p_plain ~ ('(?<![a-z])(' || k.m || '|may)[-/.]?[0-9]{1,2}[-/.]([0-9]{2}|[0-9]{4})(?![0-9])')
       OR p_plain ~ '(?<![0-9])[0-9]{1,2}(st|nd|rd|th)?( +of)? +may +[0-9]{2,4}(?![0-9])'
-      OR p_plain ~ '(?<![a-z])(dob|d[.]o[.]b[.]?|born)(?![a-z])'
+      OR p_plain ~ '(?<![a-z])(dob|d[.]o[.]b[.]?|born)(?![a-z])(?![- ]+again(?![a-z])| +and +raised(?![a-z]))'
       OR p_plain ~ '(?<![a-z])(birth ?day|b-?day|birth ?date)[^0-9a-z]*((is|on|of|the) +)*[0-9]'
     FROM (SELECT '(0?[1-9]|[12][0-9]|3[01])'::text AS d,
                  '(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|june?|july?|aug(ust)?|sep(t)?(ember)?|oct(ober)?|nov(ember)?|dec(ember)?)'::text AS m) AS k

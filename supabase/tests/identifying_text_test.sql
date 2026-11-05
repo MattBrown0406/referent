@@ -13,7 +13,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(268);
+SELECT plan(286);
 
 -- ===========================================================================
 -- A. The functions themselves
@@ -375,6 +375,24 @@ SELECT is(public.identifying_text_problem('Stepchild and grandchild both at home
 SELECT is(public.identifying_text_problem('Rivera prefers mornings', ARRAY['Loved one', 'Rivera']::text[], NULL), 'Leave out names ("rivera" is a name on this case). Programs read this.', 'refused as name (rivera): Rivera prefers mornings [names: Loved one | Rivera] [label: none]');
 SELECT is(public.identifying_text_problem('Rivera and Lopez both asked', current_setting('test.names')::text[], current_setting('test.label')), 'Leave out names ("lopez" is a name on this case). Programs read this.', 'refused as name (lopez): Rivera and Lopez both asked');
 SELECT is(public.identifying_text_problem('Lopez and Jake both asked', current_setting('test.names')::text[], current_setting('test.label')), 'Leave out names ("jake" is a name on this case). Programs read this.', 'refused as name (jake): Lopez and Jake both asked');
+SELECT is(public.identifying_text_problem('Her mom is supportive', ARRAY['Sarah Mitchell — her son Kyle']::text[], NULL), NULL, 'allowed: Her mom is supportive [names: Sarah Mitchell — her son Kyle] [label: none]');
+SELECT is(public.identifying_text_problem('Our team will coordinate transport', ARRAY['Rosa Garcia — our son Mateo']::text[], NULL), NULL, 'allowed: Our team will coordinate transport [names: Rosa Garcia — our son Mateo] [label: none]');
+SELECT is(public.identifying_text_problem('His family wants him close to home', ARRAY['Calling about their son', 'His dad Tom Reyes']::text[], NULL), NULL, 'allowed: His family wants him close to home [names: Calling about their son | His dad Tom Reyes] [label: none]');
+SELECT is(public.identifying_text_problem('Her family agrees', ARRAY['Kao Her — son Tou']::text[], NULL), 'Leave out names ("her" is a name on this case). Programs read this.', 'refused as name (her): Her family agrees [names: Kao Her — son Tou] [label: none]');
+SELECT ok(coalesce(lower(public.identifying_text_problem('Pt 14-Mar-1985, needs detox', current_setting('test.names')::text[], current_setting('test.label'))) LIKE '%date%', false), 'refused as date: Pt 14-Mar-1985, needs detox');
+SELECT ok(coalesce(lower(public.identifying_text_problem('14Mar1985', current_setting('test.names')::text[], current_setting('test.label'))) LIKE '%date%', false), 'refused as date: 14Mar1985');
+SELECT ok(coalesce(lower(public.identifying_text_problem('DOB 14/Mar/85', current_setting('test.names')::text[], current_setting('test.label'))) LIKE '%date%', false), 'refused as date: DOB 14/Mar/85');
+SELECT ok(coalesce(lower(public.identifying_text_problem('Mar-14-1985', current_setting('test.names')::text[], current_setting('test.label'))) LIKE '%date%', false), 'refused as date: Mar-14-1985');
+SELECT ok(coalesce(lower(public.identifying_text_problem('March.14.85', current_setting('test.names')::text[], current_setting('test.label'))) LIKE '%date%', false), 'refused as date: March.14.85');
+SELECT is(public.identifying_text_problem('Sober since Oct-2023', current_setting('test.names')::text[], current_setting('test.label')), NULL, 'allowed: Sober since Oct-2023');
+SELECT is(public.identifying_text_problem('Relapsed Dec-24, 30 days sober before', current_setting('test.names')::text[], current_setting('test.label')), NULL, 'allowed: Relapsed Dec-24, 30 days sober before');
+SELECT is(public.identifying_text_problem('Prior stays Jan-Mar 2024 and Start Jan-25', current_setting('test.names')::text[], current_setting('test.label')), NULL, 'allowed: Prior stays Jan-Mar 2024 and Start Jan-25');
+SELECT is(public.identifying_text_problem('Born-again Christian, wants a faith based program', current_setting('test.names')::text[], current_setting('test.label')), NULL, 'allowed: Born-again Christian, wants a faith based program');
+SELECT is(public.identifying_text_problem('Born and raised in Ohio, wants to stay in state', current_setting('test.names')::text[], current_setting('test.label')), NULL, 'allowed: Born and raised in Ohio, wants to stay in state');
+SELECT ok(coalesce(lower(public.identifying_text_problem('Born in 1985', current_setting('test.names')::text[], current_setting('test.label'))) LIKE '%date%', false), 'refused as date: Born in 1985');
+SELECT is(public.identifying_text_problem('Lukasz prefers mornings', ARRAY['Łukasz Nowak']::text[], NULL), 'Leave out names ("lukasz" is a name on this case). Programs read this.', 'refused as name (lukasz): Lukasz prefers mornings [names: Łukasz Nowak] [label: none]');
+SELECT is(public.identifying_text_problem('Soren and Odegard family', ARRAY['Søren Ødegård']::text[], NULL), 'Leave out names ("odegard" is a name on this case). Programs read this.', 'refused as name (odegard): Soren and Odegard family [names: Søren Ødegård] [label: none]');
+SELECT is(public.identifying_text_problem('Le family wants close to home', ARRAY['Le family']::text[], NULL), 'Leave out names ("le" is a name on this case). Programs read this.', 'refused as name (le): Le family wants close to home [names: Le family] [label: none]');
 -- END fixture cases
 
 SELECT * FROM finish();

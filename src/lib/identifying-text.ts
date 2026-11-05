@@ -53,7 +53,7 @@ const NEVER_A_NAME = new Set([
 const EVERYDAY_TWO = new Set([
   'am', 'an', 'as', 'at', 'be', 'by', 'do', 'dr', 'ed', 'er', 'ex', 'go', 'he', 'hi', 'if', 'in', 'is', 'it', 'iv',
   'me', 'mo', 'mr', 'ms', 'my', 'no', 'of', 'oh', 'ok', 'on', 'or', 'pm', 're', 'so', 'to', 'tv', 'up', 'us', 'vs', 'we',
-  'de', 'el', 'en', 'es', 'la', 'le', 'lo', 'mi', 'se', 'si', 'su', 'te', 'tu', 'un', 'ya', 'yo',
+  'de', 'el', 'en', 'es', 'la', 'mi', 'se', 'si', 'te', 'un', 'ya', 'yo',
 ]);
 
 // Two-letter abbreviations a case title or contact name often carries that
@@ -90,6 +90,8 @@ const DATE_NUMBERS = new RegExp(`(?<![0-9])${DAY}[/.-]${DAY}[/.-]([0-9]{2}|[0-9]
 const DATE_ISO = new RegExp(`(?<![0-9])(19|20)[0-9]{2}[/.-]${DAY}[/.-]${DAY}(?![0-9])`, 'u');
 const DATE_MONTH_DAY = new RegExp(`(?<![a-z])${MONTHS}\\.? +[0-9]{1,2}(?![0-9])`, 'u');
 const DATE_DAY_MONTH = new RegExp(`(?<![0-9])[0-9]{1,2}(st|nd|rd|th)?( +of)? +${MONTHS_NOT_MAY}(?![a-z])`, 'u');
+const DATE_DMY_COMPACT = new RegExp(`(?<![0-9])[0-9]{1,2}[-/.]?${MONTHS}[-/. ]?([0-9]{2}|[0-9]{4})(?![0-9])`, 'u');
+const DATE_MDY_COMPACT = new RegExp(`(?<![a-z])${MONTHS}[-/.]?[0-9]{1,2}[-/.]([0-9]{2}|[0-9]{4})(?![0-9])`, 'u');
 const PHONE = new RegExp(`(?<![0-9])([0-9]{3}${SEP})?[0-9]{3}${SEP}[0-9]{4}(?![0-9])${NO_UNIT}`, 'u');
 const SSN = new RegExp(`(?<![0-9])[0-9]{3}${SEP}[0-9]{2}${SEP}[0-9]{4}(?![0-9])`, 'u');
 
@@ -112,8 +114,12 @@ function hasHiddenCharacters(text: string): boolean {
 
 // Accents off, then compatibility forms folded and lower case: a name typed
 // with or without its accents is one word, and a full-width digit is a digit.
+// Letters with a stroke have no accent to take off, so they are spelled out:
+// ø ł đ ð ħ ŧ ı read as o l d d h t i.
+const STROKE_LETTERS: Record<string, string> = { '\u00f8': 'o', '\u0142': 'l', '\u0111': 'd', '\u00f0': 'd', '\u0127': 'h', '\u0167': 't', '\u0131': 'i' };
 function fold(value: string): string {
-  return value.normalize('NFKD').replace(/[\u0300-\u036f]/gu, '').normalize('NFKC').toLowerCase();
+  return value.normalize('NFKD').replace(/[\u0300-\u036f]/gu, '').normalize('NFKC').toLowerCase()
+    .replace(/[\u00f8\u0142\u0111\u00f0\u0127\u0167\u0131]/gu, (char) => STROKE_LETTERS[char]);
 }
 
 // Lengths and order as the server counts them: whole characters, not UTF-16
@@ -147,13 +153,18 @@ function tokens(folded: string): string[] {
   return result.filter(Boolean);
 }
 
+// "Calling about: her son" puts a possessive in a lead's case title
+// (lead_caller_relationship strips the same words). Right before a
+// relationship word it is not a name; anywhere else (the surname Her) it is.
+const POSSESSIVE = new RegExp(`(?<!\\p{L})(my|his|her|their|our|your)(?= +(son|daughter|child|kid|boy|girl|stepson|stepdaughter|stepchild|grandson|granddaughter|grandchild|wife|husband|spouse|partner|boyfriend|girlfriend|fiance|fiancee|mom|mum|mother|dad|father|parent|stepparent|grandparent|stepdad|stepmom|stepfather|stepmother|grandmother|grandfather|grandma|grandpa|brother|sister|sibling|aunt|uncle|niece|nephew|cousin|friend|best|loved|family|client|patient)s?(?!\\p{L}))`, 'gu');
+
 // The words of a case title, client label, or contact name that could be a
 // name: three or more letters, or two letters that are not an everyday word
 // or an abbreviation, and not a word on the never-a-name list.
 export function nameWords(values: readonly string[]): string[] {
   const words = new Set<string>();
   for (const value of values) {
-    for (const word of letterWords(fold(value))) {
+    for (const word of letterWords(fold(value).replace(POSSESSIVE, ' '))) {
       const length = characters(word);
       const counts = length >= 3 || (length === 2 && !EVERYDAY_TWO.has(word) && !ABBREVIATIONS.has(word));
       if (counts && !NEVER_A_NAME.has(word)) words.add(word);
@@ -176,12 +187,14 @@ export function labelInitials(label: string | null | undefined): string[] {
 }
 
 // A date: day/month/year with a real day and month, an ISO date, month
-// then day, day then month (14th March; "14 may" only with a year), dob or
-// born, or a birthday followed by a number.
+// then day, day then month (14th March; "14 may" only with a year), a
+// compact date with a year (14-Mar-1985, 14Mar85, Mar-14-1985), dob or born
+// (not born-again or born and raised), or a birthday followed by a number.
 function mentionsDate(plain: string): boolean {
   return DATE_NUMBERS.test(plain) || DATE_ISO.test(plain) || DATE_MONTH_DAY.test(plain) || DATE_DAY_MONTH.test(plain)
+    || DATE_DMY_COMPACT.test(plain) || DATE_MDY_COMPACT.test(plain)
     || /(?<![0-9])[0-9]{1,2}(st|nd|rd|th)?( +of)? +may +[0-9]{2,4}(?![0-9])/u.test(plain)
-    || /(?<![a-z])(dob|d\.o\.b\.?|born)(?![a-z])/u.test(plain)
+    || /(?<![a-z])(dob|d\.o\.b\.?|born)(?![a-z])(?![- ]+again(?![a-z])| +and +raised(?![a-z]))/u.test(plain)
     || /(?<![a-z])(birth ?day|b-?day|birth ?date)[^0-9a-z]*((is|on|of|the) +)*[0-9]/u.test(plain);
 }
 

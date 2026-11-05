@@ -255,6 +255,24 @@
     {"text":"Stepchild and grandchild both at home; mother supportive","expect":null,"names":["Stepchild","Grandchild","Myself","Themselves","Herself","Themself"],"label":null,"tag":"relationship"},
     {"text":"Rivera prefers mornings","expect":"name","word":"rivera","names":["Loved one","Rivera"],"label":null,"tag":"name"},
     {"text":"Rivera and Lopez both asked","expect":"name","word":"lopez","tag":"name-first"},
-    {"text":"Lopez and Jake both asked","expect":"name","word":"jake","tag":"name-first"}
+    {"text":"Lopez and Jake both asked","expect":"name","word":"jake","tag":"name-first"},
+    {"text":"Her mom is supportive","expect":null,"names":["Sarah Mitchell — her son Kyle"],"label":null,"tag":"possessive"},
+    {"text":"Our team will coordinate transport","expect":null,"names":["Rosa Garcia — our son Mateo"],"label":null,"tag":"possessive"},
+    {"text":"His family wants him close to home","expect":null,"names":["Calling about their son","His dad Tom Reyes"],"label":null,"tag":"possessive"},
+    {"text":"Her family agrees","expect":"name","word":"her","names":["Kao Her — son Tou"],"label":null,"tag":"possessive"},
+    {"text":"Pt 14-Mar-1985, needs detox","expect":"date","tag":"compact date"},
+    {"text":"14Mar1985","expect":"date","tag":"compact date"},
+    {"text":"DOB 14/Mar/85","expect":"date","tag":"compact date"},
+    {"text":"Mar-14-1985","expect":"date","tag":"compact date"},
+    {"text":"March.14.85","expect":"date","tag":"compact date"},
+    {"text":"Sober since Oct-2023","expect":null,"tag":"compact date"},
+    {"text":"Relapsed Dec-24, 30 days sober before","expect":null,"tag":"compact date"},
+    {"text":"Prior stays Jan-Mar 2024 and Start Jan-25","expect":null,"tag":"compact date"},
+    {"text":"Born-again Christian, wants a faith based program","expect":null,"tag":"born"},
+    {"text":"Born and raised in Ohio, wants to stay in state","expect":null,"tag":"born"},
+    {"text":"Born in 1985","expect":"date","tag":"born"},
+    {"text":"Lukasz prefers mornings","expect":"name","word":"lukasz","names":["Łukasz Nowak"],"label":null,"tag":"stroke letter"},
+    {"text":"Soren and Odegard family","expect":"name","word":"odegard","names":["Søren Ødegård"],"label":null,"tag":"stroke letter"},
+    {"text":"Le family wants close to home","expect":"name","word":"le","names":["Le family"],"label":null,"tag":"two-letter surname"}
   ]
 }
