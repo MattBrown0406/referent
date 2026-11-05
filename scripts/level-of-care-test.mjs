@@ -166,6 +166,7 @@ function* everyRatingSet() {
   }
   check('the docs name the same number of cases', (docs.split('### Named cases')[1].split('### The rationale')[0].match(/^\| [0-4] [0-4] [0-4] [0-4] [0-4] [0-4] \|/gm) || []).length, Object.keys(cases).length);
   ok('the docs give the rules version and the date of Matt\'s decisions', /version\s+2\*\*/.test(docs) && docs.includes('2026-11-05'));
+  for (const rule of L.FLAG_RULES) ok(`the docs' flags table has "${rule.title}" as the app words it`, docs.includes(`| ${rule.severity} | ${rule.title} | ${rule.text} |`));
 }
 
 // ─── (b) Every area at every rating ─────────────────────────────────────────
@@ -314,12 +315,27 @@ const DIGEST = createHash('md5').update(lines.join('\n')).digest('hex');
   check('advice: moderate withdrawal, medical and psychiatric care on site', keys('233000'), ['withdrawal_oversight', 'medical_capacity', 'psychiatric_capacity']);
   check('immediate danger comes first, then urgent, then advice', keys('243000', true), ['imminent_danger', 'medical_urgent', 'withdrawal_oversight', 'medical_capacity', 'psychiatric_capacity']);
   // Cumulative: a worse rating never shows less advice.
-  check('withdrawal 2, 3 and 4: detox first, or on-site withdrawal management', ['200000', '300000', '400000'].map((digits) => keys(digits).includes('withdrawal_oversight')), [true, true, true]);
+  check('withdrawal 2, 3 and 4: the withdrawal advice', ['200000', '300000', '400000'].map((digits) => keys(digits).includes('withdrawal_oversight')), [true, true, true]);
+  const withdrawalAdvice = (digits) => L.safetyFlags(ratingsOf(digits), false).filter((flag) => flag.key === 'withdrawal_oversight').map((flag) => flag.title);
+  check('worded for the rating: at 2 a medical provider oversees withdrawal wherever the client goes; at 3 and 4 detox comes first',
+    ['200000', '300000', '400000'].map(withdrawalAdvice),
+    [['Make sure a medical provider oversees withdrawal at whichever level is chosen'],
+      ['Arrange detox first, or a program with on-site withdrawal management'],
+      ['Arrange detox first, or a program with on-site withdrawal management']]);
+  check('the withdrawal-2 advice in plain words', L.safetyFlags(ratingsOf('200000'), false).find((flag) => flag.key === 'withdrawal_oversight').text,
+    'Withdrawal needs medical oversight at this level of risk. Make sure a medical provider oversees withdrawal at whichever level is chosen.');
+  check('inline under withdrawal: the same wording', [L.inlineFlags('withdrawal', 2).map((flag) => flag.title), L.inlineFlags('withdrawal', 4).map((flag) => flag.title)],
+    [['Make sure a medical provider oversees withdrawal at whichever level is chosen'], ['Arrange medically supervised withdrawal today', 'Arrange detox first, or a program with on-site withdrawal management', 'Plan for overdose risk']]);
+  ok('the two wordings split exactly where the rules do (oversight from 2, detox first from 3)', (() => {
+    const [atTwo, detox] = L.FLAG_RULES.filter((rule) => rule.key === 'withdrawal_oversight');
+    return atTwo.triggers[0].when.join(',') === '2' && detox.triggers[0].when.join(',') === '3,4'
+      && L.LEVEL_OF_CARE_RULES.oversight.atOrAbove === 2 && L.LEVEL_OF_CARE_RULES.firstStep.atOrAbove === 3;
+  })());
   check('withdrawal 0 and 1: no withdrawal advice', ['000000', '100000'].map((digits) => keys(digits).includes('withdrawal_oversight')), [false, false]);
   check('medical and psychiatric care on site at 3 and at 4', [keys('030000'), keys('040000'), keys('003000'), keys('004000')],
     [['medical_capacity'], ['medical_urgent', 'medical_capacity'], ['psychiatric_capacity'], ['psychiatric_urgent', 'psychiatric_capacity']]);
-  const oversight = L.FLAG_RULES.find((rule) => rule.key === 'withdrawal_oversight');
-  check('the withdrawal advice in plain words', oversight.title, 'Arrange detox first, or a program with on-site withdrawal management');
+  const oversight = L.FLAG_RULES.filter((rule) => rule.key === 'withdrawal_oversight')[1];
+  check('the withdrawal advice at 3 and 4 in plain words', oversight.title, 'Arrange detox first, or a program with on-site withdrawal management');
   // Overdose risk: relapse 3 or more, or detox as the first step.
   check('overdose risk: relapse 3 or 4, or detox first', [keys('000030'), keys('000040'), keys('300000'), keys('000020'), keys('200000')].map((list) => list.includes('overdose_risk')), [true, true, true, false, false]);
   const overdose = L.FLAG_RULES.find((rule) => rule.key === 'overdose_risk');
@@ -372,7 +388,7 @@ const REASON_FIXTURES = [
   ['2 prior residential stays in 12 months', [], null],
   ['Family can pay 40,000 for a private program', [], 'Leave money out. Programs read this.'],
   ['DOB 3/14/1985, too young for this level', [], 'Leave out dates such as a birth date. Programs read this.'],
-  ['Rivera wants to stay near work', ['Rivera intervention'], 'Leave out names. Programs read this.'],
+  ['Rivera wants to stay near work', ['Rivera intervention'], 'Leave out names ("rivera" is a name on this case). Programs read this.'],
   ['Mother prefers weekly sessions', ['Rivera intervention', 'Mother'], null],
 ];
 {
@@ -388,7 +404,7 @@ const REASON_FIXTURES = [
   const levelSource = readFileSync(path.join(repoRoot, 'src/lib/level-of-care.ts'), 'utf8');
   ok('the app screens it with the shared check, with no ad hoc patterns left', /return identifyingTextProblem\(trimmed, /.test(levelSource) && !/const (EMAIL|LONG_NUMBER|LINK) =/.test(levelSource));
   check('the names: the case title and its contacts', L.reasonNames({ caseTitle: 'Rivera intervention', contactNames: ['Maria Lopez', ' ', null] }), ['Rivera intervention', 'Maria Lopez']);
-  check('a contact\'s name is refused', L.reasonProblem('Maria prefers IOP near home', L.reasonNames({ caseTitle: 'R.', contactNames: ['Maria Lopez'] })), 'Leave out names. Programs read this.');
+  check('a contact\'s name is refused', L.reasonProblem('Maria prefers IOP near home', L.reasonNames({ caseTitle: 'R.', contactNames: ['Maria Lopez'] })), 'Leave out names ("maria" is a name on this case). Programs read this.');
   check('the hint says what to leave out', L.REASON_HINT, 'Leave out names, contact details, dates and money; the program reads this.');
   const rec = L.recommend(ratingsOf('323223')); // Detox, then Inpatient, with Sober Living
   // The reason is needed whenever the level is not (first step ?? level):
@@ -397,7 +413,7 @@ const REASON_FIXTURES = [
   check('skipping the recommended detox for the level after it needs one', L.overrideProblem(rec, 'Inpatient', ''), L.REASON_PROBLEMS.missing);
   check('without a first step, the recommended level needs no reason', L.overrideProblem(L.recommend(ratingsOf('003000')), 'Inpatient', ''), null);
   check('followsRecommendation compares with (first step ?? level)', [L.followsRecommendation(rec, 'Detox'), L.followsRecommendation(rec, 'Inpatient'), L.followsRecommendation({ level: 'Inpatient', firstStep: null }, 'Inpatient')], [true, false, true]);
-  check('a reason is screened with the case\'s names in the full check too', L.overrideProblem(rec, 'Inpatient', 'Rivera wants to stay near work', ['Rivera intervention']), 'Leave out names. Programs read this.');
+  check('a reason is screened with the case\'s names in the full check too', L.overrideProblem(rec, 'Inpatient', 'Rivera wants to stay near work', ['Rivera intervention']), 'Leave out names ("rivera" is a name on this case). Programs read this.');
   check('a different level needs one', L.overrideProblem(rec, 'IOP / PHP', ''), L.REASON_PROBLEMS.missing);
   check('the support level alone is a different level', L.overrideProblem(rec, 'Sober Living', ' '), L.REASON_PROBLEMS.missing);
   check('a different level with a reason', L.overrideProblem(rec, 'IOP / PHP', 'Family declined residential'), null);
@@ -740,7 +756,13 @@ function topLevelStatements(sql) {
   const recreated = created.filter((name) => !['level_of_care_recommendation', 'case_assessment_event_body', 'case_assessment_reason_problem',
     'case_assessment_problem', 'case_assessment_json', 'save_case_assessment'].includes(name));
   check('the only existing function re-created is the workspace-move helper', recreated, ['org_move_workspace_rows']);
-  ok('no existing table is altered and nothing is dropped', !/ALTER TABLE (?!public\.case_assessments)/.test(migration) && !/DROP (TABLE|FUNCTION|COLUMN|TRIGGER)/.test(migration));
+  ok('no existing table is altered and nothing is dropped', !/ALTER TABLE (?!public\.case_assessments)/.test(migration) && !/DROP (TABLE|COLUMN|TRIGGER)/.test(migration));
+  // The only functions dropped are this file's own earlier drafts, with
+  // other signatures (so an older draft never leaves two of a function).
+  check('only superseded drafts of this file\'s own functions are dropped, IF EXISTS',
+    [...migration.matchAll(/DROP FUNCTION[^;]*;/g)].map((match) => match[0]),
+    ['DROP FUNCTION IF EXISTS public.case_assessment_reason_problem(text);',
+     'DROP FUNCTION IF EXISTS public.case_assessment_problem(integer[], text[], integer, text, text, text, text, text);']);
   const previous = readFileSync(path.join(repoRoot, 'supabase/migrations/20261104140000_placement_requests.sql'), 'utf8');
   const move = (sql) => sql.slice(sql.indexOf('CREATE OR REPLACE FUNCTION public.org_move_workspace_rows'), sql.indexOf('REVOKE ALL ON FUNCTION public.org_move_workspace_rows'));
   check('the move helper is the latest definition plus one line',

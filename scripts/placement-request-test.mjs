@@ -108,7 +108,7 @@ const riveraMatch = {
   caseId: 'f1000000-0000-0000-0000-0000000000a7',
 };
 {
-  const prepared = rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: 'this_week', note: '  Prefers a quiet setting  ', names: [riveraMatch.clientLabel, 'Rivera intervention'] });
+  const prepared = rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: 'this_week', note: '  Prefers a quiet setting  ', names: ['Rivera intervention'], label: riveraMatch.clientLabel });
   check('the fixture builds the server\'s payload exactly', prepared.payload, JSON.parse(FIXTURE_JSON));
   check('the note is sent trimmed', prepared.note, 'Prefers a quiet setting');
   check('exactly the ten allowed keys', Object.keys(prepared.payload).sort(), [...rules.PAYLOAD_KEYS].sort());
@@ -175,7 +175,7 @@ check(
   // The note: 300 characters, then the one shared check (identifying-text.ts
   // and its SQL twin public.identifying_text_problem, tested on both sides
   // with scripts/fixtures/identifying-text-cases.json).
-  ok('the server checks the note with the shared identifying-details check', /public\.identifying_text_problem\(p_note, p_identifiers\)/.test(migration));
+  ok('the server checks the note with the shared identifying-details check, the label as the label', /public\.identifying_text_problem\(p_note, p_identifiers, p_label\)/.test(migration));
   for (const message of Object.values(rules.NOTE_PROBLEMS)) ok(`the note message is the server's: ${message}`, migration.includes(message.replace(/'/g, "''")));
   const appRules = readFileSync(path.join(repoRoot, 'src/lib/placement-requests.ts'), 'utf8');
   ok('the app\'s note check is the shared one, with no ad hoc patterns left', appRules.includes("import { identifyingTextProblem } from './identifying-text';")
@@ -197,6 +197,7 @@ check('the note rules (the same table as the pgTAP test)', [
   rules.placementNoteProblem('See www.example.org'),
   rules.placementNoteProblem('Family can pay $30,000'),
   rules.placementNoteProblem('The rivera FAMILY prefers women staff', ['Rivera family', null]),
+  rules.placementNoteProblem('JR prefers women staff', ['Rivera intervention'], 'J.R.'),
   rules.placementNoteProblem('a'.repeat(301)),
   rules.placementNoteProblem('Family can pay 40,000 cash'),
   rules.placementNoteProblem('Seen Nov 12, admit soon'),
@@ -208,7 +209,8 @@ check('the note rules (the same table as the pgTAP test)', [
   'Leave out dates such as a birth date. Programs read this.',
   'Leave out links and web addresses. Programs read this.',
   'Leave money out. Programs read this.',
-  'Leave out names. Programs read this.',
+  'Leave out names ("rivera" is a name on this case). Programs read this.',
+  'Leave out names ("jr" is a name on this case). Programs read this.',
   rules.NOTE_PROBLEMS.tooLong,
   'Leave money out. Programs read this.',
   'Leave out dates such as a birth date. Programs read this.',
@@ -224,21 +226,27 @@ ok('the pgTAP test asserts the same note table', pgtap.includes("placement_note_
   for (const item of cases) {
     const text = item.text;
     const names = item.names ?? fixture.names ?? [];
+    const label = 'label' in item ? item.label : fixture.label ?? null;
     if (typeof text !== 'string' || text.trim() !== text || Array.from(text).length > 300) continue;
-    assert.deepEqual(rules.placementNoteProblem(text, names), identifying.identifyingTextProblem(text, names), `note check = shared check: ${text.slice(0, 40)}`);
+    assert.deepEqual(rules.placementNoteProblem(text, names, label), identifying.identifyingTextProblem(text, names, label), `note check = shared check: ${text.slice(0, 40)}`);
     compared += 1;
   }
   ok(`the note check agrees with the shared check on the fixture (${compared} cases)`, compared > 10);
 }
-check('names: the client label, the case title and its contacts, blanks left out', rules.placementNoteNames({ clientLabel: 'Rivera family', caseTitle: 'Rivera intervention', contactNames: ['Maria Lopez', '  ', null] }), ['Rivera family', 'Rivera intervention', 'Maria Lopez']);
-check('a contact\'s name is refused', rules.placementNoteProblem('Maria prefers mornings', rules.placementNoteNames({ clientLabel: 'J.R.', contactNames: ['Maria Lopez'] })), 'Leave out names. Programs read this.');
-check('a two-letter label never blocks a note', rules.placementNoteProblem('JD prefers mornings', ['JD']), null);
-check('a note naming the case title is refused', 'problem' in rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: 'asap', note: 'See the Rivera intervention notes', names: [riveraMatch.clientLabel, 'Rivera intervention'] }), true);
-check('the admit window is required', rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: null, note: '', names: [] }), { problem: 'Choose when the client could be admitted' });
+check('names besides the label: the case title and its contacts, blanks left out', rules.placementNoteNames({ caseTitle: 'Rivera intervention', contactNames: ['Maria Lopez', '  ', null] }), ['Rivera intervention', 'Maria Lopez']);
+check('a contact\'s name is refused, and the message says which', rules.placementNoteProblem('Maria prefers mornings', rules.placementNoteNames({ contactNames: ['Maria Lopez'] }), 'J.R.'), 'Leave out names ("maria" is a name on this case). Programs read this.');
+check('the label\'s initials block a note ("J.R." and "JD" refuse "JR" and "JD")', [rules.placementNoteProblem('JR prefers mornings', [], 'J.R.'), rules.placementNoteProblem('JD prefers mornings', [], 'JD')],
+  ['Leave out names ("jr" is a name on this case). Programs read this.', 'Leave out names ("jd" is a name on this case). Programs read this.']);
+check('an everyday word in the label never blocks a note', rules.placementNoteProblem('Prefers a program in Oregon', [], 'IN'), null);
+check('a note naming the case title is refused', 'problem' in rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: 'asap', note: 'See the Rivera intervention notes', names: ['Rivera intervention'], label: riveraMatch.clientLabel }), true);
+check('a note naming the label is refused', rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: 'asap', note: 'Rivera family wants a quiet place', names: [], label: riveraMatch.clientLabel }), { problem: 'Leave out names ("rivera" is a name on this case). Programs read this.' });
+check('the admit window is required', rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: null, note: '', names: [], label: null }), { problem: 'Choose when the client could be admitted' });
 ok('the note warning says what to leave out', /names/.test(rules.NOTE_WARNING) && /phone/.test(rules.NOTE_WARNING) && /dates/.test(rules.NOTE_WARNING) && /money/.test(rules.NOTE_WARNING));
 {
   const sheet = readFileSync(path.join(repoRoot, 'src/lib/PlacementRequestSheet.tsx'), 'utf8');
-  ok('the sheet checks the note against the label, the case title and its contacts', /placementNoteNames\(\{ clientLabel: request\.match\.clientLabel, caseTitle: request\.caseTitle, contactNames: request\.contactNames \}\)/.test(sheet));
+  ok('the sheet checks the note against the label (as the label), the case title and its contacts', /placementNoteNames\(\{ caseTitle: request\.caseTitle, contactNames: request\.contactNames \}\)/.test(sheet)
+    && sheet.includes('preparePlacementRequest({ criteria: request.match, admitWindow, note, names, label: request.match.clientLabel })')
+    && sheet.includes('placementNoteProblem(note, names, match.clientLabel)'));
   const app = readFileSync(path.join(repoRoot, 'App.tsx'), 'utf8');
   ok('the app hands the sheet the case\'s contact names', /contactNames: saved\.caseId \? caseContactNames\(saved\.caseId\) : \[\],/.test(app));
 }
@@ -441,19 +449,80 @@ function query(result) {
     (error) => error.message === 'The program already answered in ReferralFit');
   checks += 1;
 
+  // How a failed send ended: only the server's 22023 / P0002 in its own
+  // words is a definite refusal; everything else may have gone out.
+  const failureOf = async (result) => {
+    fake.rpc = () => Promise.resolve(result);
+    try {
+      await api.createPlacementRequest({ id, matchProfileId: 'm1', partnerIds: ['p1'], ranks: [1], respondHours: 4, admitWindow: 'asap', note: '' });
+      return 'sent';
+    } catch (error) {
+      return api.sendFailureOf(error);
+    }
+  };
+  check('a definite refusal (22023, P0002), the already-sent refusal, and everything else unknown', [
+    await failureOf({ data: null, error: { code: '22023', message: 'A request can go to at most 8 programs' }, status: 400 }),
+    await failureOf({ data: null, error: { code: 'P0002', message: 'Save the match first, then ask programs' }, status: 404 }),
+    await failureOf({ data: null, error: { code: '22023', message: rules.ALREADY_SENT_PROBLEM }, status: 400 }),
+    await failureOf({ data: null, error: { message: 'TypeError: Network request failed' }, status: 0 }),
+    await failureOf({ data: null, error: { message: '<html><body>504 Gateway Time-out</body></html>' }, status: 504 }),
+    await failureOf({ data: null, error: { code: '57014', message: 'canceling statement due to statement timeout' }, status: 500 }),
+    await failureOf({ data: null, error: { code: '42501', message: 'permission denied' }, status: 403 }),
+    await failureOf({ data: null, error: null, status: 200 }),
+  ], ['refused', 'refused', 'already_sent', 'unknown', 'unknown', 'unknown', 'unknown', 'unknown']);
+  fake.rpc = () => Promise.resolve({ data: null, error: { code: '22023', message: 'A request can go to at most 8 programs' }, status: 400 });
+  await assert.rejects(api.createPlacementRequest({ id, matchProfileId: 'm1', partnerIds: ['p1'], ranks: [1], respondHours: 4, admitWindow: 'asap', note: '' }),
+    (error) => error instanceof api.PlacementRefusal && error.sqlState === '22023' && errors.describeError(error) === 'A request can go to at most 8 programs');
+  checks += 1;
+
+  // The request id across sends (SendKey): kept after an unknown outcome,
+  // whatever changes; new only after a definite refusal or a cancel.
+  {
+    let minted = 0;
+    const mint = () => `id${++minted}`;
+    const first = rules.sendKeyId(rules.NEW_SEND_KEY, mint);
+    let key = rules.nextSendKey(first, { type: 'failed', failure: 'unknown', signature: 'S1' });
+    check('after an unknown outcome the same id goes out again, even after the review changed', [rules.sendKeyId(key, mint), minted], ['id1', 1]);
+    check('"Try again" only while the review is the one whose send is unknown', [
+      rules.showsTryAgain(key, 'S1', 'You are offline'), rules.showsTryAgain(key, 'S2', 'You are offline'), rules.showsTryAgain(key, 'S1', ''), rules.showsTryAgain(key, null, 'x'),
+    ], [true, false, false, false]);
+    key = rules.nextSendKey(rules.sendKeyId(key, mint), { type: 'failed', failure: 'unknown', signature: 'S2' });
+    check('a second unknown outcome after a change still keeps the id, and "Try again" follows the new review', [key.id, rules.showsTryAgain(key, 'S2', 'x'), rules.showsTryAgain(key, 'S1', 'x')], ['id1', true, false]);
+    key = rules.nextSendKey(key.id, { type: 'failed', failure: 'already_sent', signature: 'S3' });
+    check('already sent: the id stays with that request, and no "Try again"', [key.id, rules.showsTryAgain(key, 'S3', 'x')], ['id1', false]);
+    check('a confirmed cancel: the next send is a new request', rules.sendKeyId(rules.nextSendKey(key.id, { type: 'cancelled' }), mint), 'id2');
+    check('a definite refusal: the next send is a new request', rules.sendKeyId(rules.nextSendKey('id2', { type: 'failed', failure: 'refused', signature: 'S4' }), mint), 'id3');
+  }
+
   const sheet = readFileSync(path.join(repoRoot, 'src/lib/PlacementRequestSheet.tsx'), 'utf8');
-  ok('one id per request as reviewed, reused only for that exact request (a retry is a no-op on the server)',
-    /const signature = placementRequestSignature\(reviewed\);\s*const id = requestKeyRef\.current\?\.signature === signature \? requestKeyRef\.current\.id : newPlacementRequestId\(\);\s*requestKeyRef\.current = \{ id, signature \};/.test(sheet));
+  ok('the sheet takes the kept id, else a new one, and never makes one anywhere else',
+    sheet.includes('const id = sendKeyId(sendKeyRef.current, newPlacementRequestId);') && (sheet.match(/newPlacementRequestId/g) || []).length === 2);
+  ok('a failed send keeps or drops the id as the server answered, a cancel drops it',
+    /const failure = sendFailureOf\(error\);[\s\S]{0,400}keepSendKey\(match\.id, nextSendKey\(id, \{ type: 'failed', failure, signature \}\)\);\s*if \(failure === 'already_sent'\) \{\s*setConflict\(\{ requestId: id, cancelling: false \}\);/.test(sheet)
+    && sheet.includes("keepSendKey(match.id, nextSendKey(conflict.requestId, { type: 'cancelled' }));"));
+  ok('an unanswered id outlives the sheet for that match: kept from the moment it is sent, cleared only by a definite answer',
+    /const id = sendKeyId\(sendKeyRef\.current, newPlacementRequestId\);\s*\/\/[^\n]*\n\s*keepSendKey\(match\.id, \{ id, retryFor: null \}\);/.test(sheet)
+    && /keepSendKey\(match\.id, NEW_SEND_KEY\);\s*setSent\(view\);/.test(sheet)
+    && sheet.includes('setSendKey(unansweredSendKeys.get(request.match.id.toLowerCase()) ?? NEW_SEND_KEY);')
+    && (sheet.match(/keepSendKey\(match\.id, /g) || []).length === 4);
+  ok('"Try again" only while the review is unchanged', sheet.includes("showsTryAgain(sendKey, reviewedSignature, sendNotice) ? 'Try again'") && !/requestKeyRef/.test(sheet));
+  ok('the sheet cannot be dismissed while a send or a cancel is on its way', sheet.includes("const busyClose = stage === 'sending' || Boolean(conflict?.cancelling);")
+    && sheet.includes('onRequestClose={busyClose ? () => undefined : onClose}') && sheet.includes('disabled={busyClose} onPress={onClose}'));
+  ok('once the sheet is gone, an answer still on its way shows nothing (no Alert during the dismiss)',
+    /useEffect\(\(\) => \{\s*if \(request\) return;\s*generationRef\.current \+= 1;\s*releaseComposeOverlay\(\);\s*\}, \[request\]\);/.test(sheet)
+    && /if \(generationRef\.current !== generation\) return;\s*setConflict\(\(current\) => \(current \? \{ \.\.\.current, cancelling: false \} : current\)\);\s*Alert\.alert\('Not cancelled'/.test(sheet));
   ok('the sheet sends what it reviewed, with each program\'s place on the match screen', /partnerIds: reviewed\.partnerIds,/.test(sheet) && /ranks: chosen\.map\(\(option\) => option\.rank\),/.test(sheet)
     && /respondHours: reviewed\.respondHours,/.test(sheet) && /admitWindow: reviewed\.admitWindow,/.test(sheet) && /note: reviewed\.note,/.test(sheet));
-  ok('a request the server kept as first written is said, with Cancel offered', /if \(sentDiffersFromReview\(view, reviewed\)\) \{/.test(sheet) && /error\.message === ALREADY_SENT_PROBLEM/.test(sheet)
+  ok('a request the server kept as first written is said, with Cancel offered', /if \(sentDiffersFromReview\(view, reviewed\)\) \{/.test(sheet) && /if \(failure === 'already_sent'\)/.test(sheet)
     && sheet.includes('cancelPlacementRequest(conflict.requestId)') && sheet.includes('Cancel the earlier request'));
   ok('the review lists each program by its number on the match screen', /\{option\.rank\}\. \{option\.partner\.organization \|\| option\.partner\.name\}/.test(sheet));
 
-  // Any change to what was reviewed is a new request with a new id.
+  // Any change to what was reviewed reads as another request: "Try again"
+  // is only for the same one (the id itself is kept until the server
+  // answers definitely).
   const reviewed = { partnerIds: ['P1', 'p2'], note: 'Prefers a quiet setting', respondHours: 24, admitWindow: 'this_week' };
   const same = rules.placementRequestSignature(reviewed);
-  check('the same request reads the same (a retry keeps its id)', rules.placementRequestSignature({ ...reviewed, partnerIds: ['p1', 'P2'], note: ' Prefers a quiet setting ' }), same);
+  check('the same review reads the same ("Try again" stays)', rules.placementRequestSignature({ ...reviewed, partnerIds: ['p1', 'P2'], note: ' Prefers a quiet setting ' }), same);
   check('every reviewed input changes the request', [
     rules.placementRequestSignature({ ...reviewed, partnerIds: ['p1'] }),
     rules.placementRequestSignature({ ...reviewed, partnerIds: ['p2', 'p1'] }),
@@ -636,7 +705,14 @@ function topLevelStatements(sql) {
     'log_manual_response', 'list_center_placement_requests', 'mark_placement_request_viewed', 'respond_to_placement_request'].includes(name));
   ok('the workspace-move helpers are re-created', recreated.includes('org_merge_linked_partner_copies') && recreated.includes('org_move_workspace_rows'));
   check('and no other existing function but merge_global_partners', recreated.filter((name) => !['org_merge_linked_partner_copies', 'org_move_workspace_rows', 'merge_global_partners'].includes(name)), []);
-  ok('no existing table is altered and nothing is dropped', !/ALTER TABLE (?!public\.placement_request)/.test(migration) && !/DROP (TABLE|FUNCTION|COLUMN|TRIGGER)/.test(migration));
+  ok('no existing table is altered and nothing is dropped', !/ALTER TABLE (?!public\.placement_request)/.test(migration) && !/DROP (TABLE|COLUMN|TRIGGER)/.test(migration));
+  // The only functions dropped are this file's own earlier drafts, with
+  // other signatures (so an older draft never leaves two of a function).
+  check('only superseded drafts of this file\'s own functions are dropped, IF EXISTS',
+    [...migration.matchAll(/DROP FUNCTION[^;]*;/g)].map((match) => match[0]),
+    ['DROP FUNCTION IF EXISTS public.identifying_text_problem(text, text[]);',
+     'DROP FUNCTION IF EXISTS public.placement_note_problem(text, text[]);',
+     'DROP FUNCTION IF EXISTS public.create_placement_request(uuid, uuid, jsonb, uuid[], integer, text, text, uuid);']);
   const previous = readFileSync(path.join(repoRoot, 'supabase/migrations/20261104130000_program_integrity.sql'), 'utf8');
   const merge = (sql) => sql.slice(sql.indexOf('CREATE OR REPLACE FUNCTION public.org_merge_linked_partner_copies'), sql.indexOf('REVOKE ALL ON FUNCTION public.org_merge_linked_partner_copies'));
   check('the merge helper is the latest definition plus one line',

@@ -412,9 +412,11 @@ REVOKE ALL ON FUNCTION public.program_credential_store_notes(uuid, text, text) F
 -- Internal (save_program_credential). Writes an edit: p_old is the stored
 -- row, n the new fields. Any change resets the review to pending, except a
 -- claimant's edit of a rejected listing credential: it stays rejected,
--- with ReferralFit's note, until ReferralFit reviews it again. The NPI
--- Registry hint stays only while the NPI is unchanged. A listing's note
--- goes to its private notes, never on the row.
+-- with ReferralFit's note, until ReferralFit reviews it again, and it can
+-- only be corrected (its number, date, link or note): another kind,
+-- accreditor or issuing state is a different credential, so it is refused
+-- with the way forward. The NPI Registry hint stays only while the NPI is
+-- unchanged. A listing's note goes to its private notes, never on the row.
 CREATE OR REPLACE FUNCTION public.program_credential_write_edit(p_old public.program_credentials, n public.program_credentials, p_user uuid)
 RETURNS public.program_credentials
 LANGUAGE plpgsql
@@ -426,6 +428,11 @@ DECLARE
   v_keep_hint boolean := n.kind = 'npi' AND p_old.kind = 'npi' AND p_old.identifier = n.identifier;
   v_sticks boolean := p_old.global_partner_id IS NOT NULL AND p_old.status = 'rejected' AND NOT public.is_platform_admin();
 BEGIN
+  IF v_sticks AND (n.kind, n.accreditor, n.accreditor_name, n.issuing_state)
+                  IS DISTINCT FROM (p_old.kind, p_old.accreditor, p_old.accreditor_name, p_old.issuing_state) THEN
+    RAISE EXCEPTION 'ReferralFit could not confirm this credential. Correct its number, date or link, or add a new credential.'
+      USING ERRCODE = '22023';
+  END IF;
   UPDATE public.program_credentials c
      SET kind = n.kind, accreditor = n.accreditor, accreditor_name = n.accreditor_name, identifier = n.identifier,
          issuing_state = n.issuing_state, expires_on = n.expires_on, proof_url = n.proof_url,

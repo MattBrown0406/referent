@@ -210,7 +210,7 @@ SELECT is(
     'ok',
     'Leave money out. Programs read this.',
     'Leave out dates such as a birth date. Programs read this.',
-    'Leave out names. Programs read this.',
+    'Leave out names ("rivera" is a name on this case). Programs read this.',
     'ok'],
   'the override reason: one line, then the shared identifying-details check against the case''s names'
 );
@@ -278,12 +278,12 @@ SELECT throws_ok(
 SELECT throws_ok(
   $$ SELECT public.save_case_assessment(gen_random_uuid(), 'c1000000-0000-0000-0000-0000000000b8', ARRAY[0, 3, 0, 0, 0, 0], NULL, false, 2,
        'Inpatient', NULL, NULL, 'IOP / PHP', 'Rivera works nights and needs evening groups') $$,
-  '22023', 'Leave out names. Programs read this.',
+  '22023', 'Leave out names ("rivera" is a name on this case). Programs read this.',
   'a reason naming the case (its title) is refused');
 SELECT throws_ok(
   $$ SELECT public.save_case_assessment(gen_random_uuid(), 'c1000000-0000-0000-0000-0000000000b8', ARRAY[0, 3, 0, 0, 0, 0], NULL, false, 2,
        'Inpatient', NULL, NULL, 'IOP / PHP', 'Dolores can drive to daily IOP') $$,
-  '22023', 'Leave out names. Programs read this.',
+  '22023', 'Leave out names ("dolores" is a name on this case). Programs read this.',
   'a reason naming one of the case''s contacts is refused');
 SELECT throws_ok(
   $$ SELECT public.save_case_assessment(gen_random_uuid(), 'c1000000-0000-0000-0000-0000000000b8', ARRAY[3, 3, 0, 0, 0, 0], NULL, false, 2,

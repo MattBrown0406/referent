@@ -100,7 +100,13 @@ All SECURITY DEFINER with a pinned `search_path`, revoked from `PUBLIC` and
   rejection sticks.** When a claimant (not an admin) edits a listing
   credential ReferralFit rejected, the new values are saved but it stays
   `rejected`, with ReferralFit's note, until ReferralFit reviews it again (it
-  goes back into the review queue). The NPI Registry hint survives only
+  goes back into the review queue). Such a credential can only be
+  corrected (its number, date, link or note): another kind, accreditor
+  (or other body's name) or issuing state is a different credential, and
+  the edit is refused with 22023 "ReferralFit could not confirm this
+  credential. Correct its number, date or link, or add a new credential."
+  The app and the portal show that sentence calmly in the editor, as
+  information. The NPI Registry hint survives only
   while the NPI is unchanged. A listing's note goes to its private notes.
   Plain-words errors (`program_credential_problem`), e.g. "An NPI is 10
   digits and its last digit must check out. Check the number."
@@ -215,7 +221,9 @@ place), `Verified` (the badge), otherwise `Needs review`.
   add, edit, remove. After a change it says "pending ReferralFit review";
   a rejection shows ReferralFit's note (read with
   `fetch_listing_credential_notes`), stays rejected after an edit until
-  ReferralFit looks again, and cannot be removed.
+  ReferralFit looks again, can only be corrected (number, date or link; the
+  form says so calmly when another kind, accreditor or state is tried), and
+  cannot be removed.
 - **ReferralFit's review:** Workspace, "Program credentials" (platform admins
   only, next to "Directory submissions"): every pending listing credential,
   and every rejected one the program has edited since, oldest first, with
@@ -292,8 +300,10 @@ order itself: if `20261104120000`'s columns (`case_benefits.in_deductible`,
 1. Paste `supabase/migrations/20261104130000_program_integrity.sql` into the
    SQL editor and run it. It is ASCII only, has no backslashes, every
    top-level statement is under 3,700 characters, and it runs in one
-   BEGIN/COMMIT. Running it twice is harmless (CREATE TABLE / INDEX IF NOT
-   EXISTS, DROP POLICY IF EXISTS, CREATE OR REPLACE).
+   BEGIN/COMMIT. Re-running a file before the next one is pasted is harmless
+   (CREATE TABLE / INDEX IF NOT EXISTS, DROP POLICY IF EXISTS, CREATE OR
+   REPLACE). Once a later file is in, do not re-run an earlier one: it would
+   put back older copies of the shared helpers the later file re-creates.
 2. Record it:
 
    ```sql

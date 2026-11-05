@@ -59,6 +59,7 @@ const {
 } = fc;
 // The wire format lives beside the types (cases.ts reads and writes with it).
 const insurance = require(path.join(tmpDir, 'lib', 'insurance.js'));
+const data = require(path.join(tmpDir, 'data.js'));
 const {
   planCostsFromRow, planCostsToPatch, vobCostsFromRow, vobCostsToPatch, PLAN_COST_COLUMNS, VOB_COST_COLUMNS,
 } = insurance;
@@ -470,6 +471,26 @@ const vobRow = (over) => ({
   ok('the case file\'s panel passes it too', /planCarrier: plan \? plan\.carrier : undefined,/.test(panelSource));
   ok('Find placement takes the carrier from the plan on file before any words in the title or summary',
     /const planCarrier = \(benefitsByCase\[record\.id\]\?\.carrier \|\| ''\)\.trim\(\);\s*const insuranceHint = planCarrier \|\| nationalInsuranceProviders\.find/.test(appSource));
+  // The form shows that carrier, whatever the state: never "Cash pay" for
+  // a match that ranks by a carrier (the dropdown shows its first option
+  // for a value it does not list).
+  const shownPayment = (state, value) => {
+    const options = data.paymentOptionsForState(state, value);
+    return options.find((option) => option === value) || options[0];
+  };
+  const carriers = ['Aetna', 'Oregon Health Plan', 'Acme Health Plan', ...Object.values(data.medicaidPlansByState).flat().slice(0, 40)];
+  const states = ['ANY', ...data.stateOptions.map((state) => state.code)];
+  let shownWrong = 0;
+  for (const state of states) for (const carrier of carriers) if (shownPayment(state, carrier) !== carrier) shownWrong += 1;
+  check(`the form shows the match's carrier in every state (${states.length} states x ${carriers.length} carriers)`, shownWrong, 0);
+  check('a carrier the state lists is not added twice; Cash pay stays first', [
+    data.paymentOptionsForState('OR', 'Aetna').filter((option) => option === 'Aetna').length,
+    data.paymentOptionsForState('TX', 'Oregon Health Plan').slice(0, 2),
+    data.paymentOptionsForState('OR', 'Cash pay'), data.paymentOptionsForState('OR', ''),
+  ], [1, ['Cash pay', 'Oregon Health Plan'], data.insuranceProvidersForState('OR'), data.insuranceProvidersForState('OR')]);
+  ok('the match form lists the match\'s own payment', appSource.includes('const insuranceOptions = useMemo(() => paymentOptionsForState(matchState, matchInsurance), [matchState, matchInsurance]);')
+    && /label="PAYMENT \/ INSURANCE"\s*value=\{matchInsurance\}[\s\S]{0,120}options=\{insuranceDropdownOptions\}/.test(appSource)
+    && /const insuranceDropdownOptions = useMemo\(\(\) => \{[\s\S]{0,200}return insuranceOptions\.map\(/.test(appSource));
 
   // The plan editor opens only on what the server holds now.
   ok('the plan editor is blocked unless benefits loaded from the server', /function openBenefitsEditor\(record: CaseRecord\) \{\s*const blocked = benefitsEditorBlock\(record\.id\);\s*if \(blocked\) \{/.test(appSource)
@@ -485,6 +506,20 @@ const vobRow = (over) => ({
   check('"No" out-of-network benefits clears every out-of-network amount', insurance.changedPlanCostsPatch({ ...plan, outOfNetwork: none, oonBenefits: null }, { ...plan, outOfNetwork: none, oonBenefits: false }),
     { oon_benefits: false, oon_deductible: null, oon_deductible_met: null, oon_oop_max: null, oon_oop_met: null, oon_coinsurance_pct: null });
   check('a new plan sends what was typed', insurance.changedPlanCostsPatch(null, { inNetwork: { ...none, deductible: 500 }, outOfNetwork: none, oonBenefits: null }), { in_deductible: 500 });
+  check('"Yes" changed to "No" clears every out-of-network amount', insurance.changedPlanCostsPatch({ ...plan, outOfNetwork: { ...none, deductible: 9000 }, oonBenefits: true }, { ...plan, outOfNetwork: { ...none, deductible: 9000 }, oonBenefits: false }),
+    { oon_benefits: false, oon_deductible: null, oon_deductible_met: null, oon_oop_max: null, oon_oop_met: null, oon_coinsurance_pct: null });
+  check('a new plan saved with "No" clears them too', insurance.changedPlanCostsPatch(null, { inNetwork: none, outOfNetwork: none, oonBenefits: false }),
+    { oon_benefits: false, oon_deductible: null, oon_deductible_met: null, oon_oop_max: null, oon_oop_met: null, oon_coinsurance_pct: null });
+  {
+    // Opened as "No"; this editor changed only an in-network amount. A
+    // teammate meanwhile set "Yes" with an out-of-network deductible.
+    const openedNo = { ...plan, outOfNetwork: none, oonBenefits: false };
+    const editedNo = { ...openedNo, inNetwork: { ...inNet, deductibleMet: 2000 } };
+    check('a plan that opened as "No" sends only what changed', insurance.changedPlanCostsPatch(openedNo, editedNo), { in_deductible_met: 2000 });
+    const teammateYes = { ...plan, outOfNetwork: { ...none, deductible: 9000 }, oonBenefits: true };
+    const merged = insurance.mergePlanCostsChanges(teammateYes, openedNo, editedNo);
+    check('so a teammate\'s "Yes" and its amounts survive this save', [merged.oonBenefits, merged.outOfNetwork.deductible, merged.inNetwork.deductibleMet], [true, 9000, 2000]);
+  }
   // A teammate raised the out-of-pocket met meanwhile; this editor changed the deductible met.
   const teammate = { ...plan, inNetwork: { ...inNet, oopMet: 2500 } };
   check('the teammate\'s change survives this save', insurance.mergePlanCostsChanges(teammate, opened, edited).inNetwork, { ...inNet, oopMet: 2500, deductibleMet: 2000 });

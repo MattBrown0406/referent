@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { newUuid } from './cases';
 import { OfflineError, StoreError, asOfflineError, describeError, errorCode, isServerUnreachable, withHttpStatus } from './errors';
 import {
+  ALREADY_SENT_PROBLEM,
   RECIPIENT_COLUMNS,
   REQUEST_COLUMNS,
   isMissingPlacementSchema,
@@ -19,6 +20,7 @@ import {
   type PlacementRequestView,
   type PlacementSeen,
   type ResponseWindowHours,
+  type SendFailure,
   placementPracticeName,
 } from './placement-requests';
 import { supabase } from './supabase';
@@ -52,6 +54,19 @@ function isMissing(error: unknown): boolean {
   return isMissingPlacementSchema(errorCode(error));
 }
 
+// The server definitely refused, in its own plain words (22023 checks,
+// P0002 not found, 42501): nothing was written. `sqlState` is its code (not
+// `code`, so describeError shows the words alone, as before).
+export class PlacementRefusal extends StoreError {
+  readonly sqlState: string;
+
+  constructor(message: string, sqlState: string) {
+    super(message, false);
+    this.name = 'PlacementRefusal';
+    this.sqlState = sqlState;
+  }
+}
+
 // Every failure as a readable StoreError; one that never got an answer is an
 // OfflineError (nothing was refused; a write may or may not have landed).
 function placementFailure(error: unknown, status: number | undefined, fallback: string): StoreError {
@@ -61,11 +76,22 @@ function placementFailure(error: unknown, status: number | undefined, fallback: 
   if (offline instanceof OfflineError) return offline;
   const code = errorCode(error);
   const message = (error as { message?: unknown } | null)?.message;
-  // The server's own plain words (22023 checks, P0002 not found, 42501).
   if ((code === '22023' || code === 'P0002' || code === '42501') && typeof message === 'string' && message) {
-    return new StoreError(message, false);
+    return new PlacementRefusal(message, code);
   }
   return new StoreError(describeError(failure, fallback), false);
+}
+
+/**
+ * How a failed createPlacementRequest ended (placement-requests.ts
+ * SendFailure): a definite refusal is the server's 22023 or P0002 in its own
+ * words; the already-sent refusal is told apart; anything else (offline, a
+ * timeout, a server failure, an answer that could not be read back) is
+ * unknown, so the sheet keeps the request id.
+ */
+export function sendFailureOf(error: unknown): SendFailure {
+  if (!(error instanceof PlacementRefusal) || (error.sqlState !== '22023' && error.sqlState !== 'P0002')) return 'unknown';
+  return error.message === ALREADY_SENT_PROBLEM ? 'already_sent' : 'refused';
 }
 
 export type PlacementRequestsRead = { available: boolean; requests: PlacementRequestView[] };

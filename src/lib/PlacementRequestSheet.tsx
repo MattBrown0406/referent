@@ -25,12 +25,14 @@ import {
   fetchPlacementChannels,
   fetchPlacementPracticeName,
   newPlacementRequestId,
+  sendFailureOf,
 } from './placement-api';
 import {
   ADMIT_WINDOWS,
   ALREADY_SENT_PROBLEM,
   DEFAULT_RESPONSE_HOURS,
   MAX_RECIPIENTS,
+  NEW_SEND_KEY,
   NOTE_MAX,
   NOTE_WARNING,
   NOT_SHARED_LINE,
@@ -38,18 +40,22 @@ import {
   RESPONSE_WINDOW_HOURS,
   UNNAMED_PRACTICE,
   deadlineLabel,
+  nextSendKey,
   placementNoteNames,
   placementNoteProblem,
   placementRequestMessage,
   placementRequestSignature,
   placementSummaryLines,
   preparePlacementRequest,
+  sendKeyId,
   sentDiffersFromReview,
+  showsTryAgain,
   type AdmitWindow,
   type PlacementChannel,
   type PlacementRequestView,
   type ResponseWindowHours,
   type ReviewedRequest,
+  type SendKey,
 } from './placement-requests';
 
 // "Ask programs": from a saved match's ranked results, send ONE
@@ -115,6 +121,13 @@ const COLORS = {
 const OPTIONS_SHOWN = 15;
 const PRESELECTED = 3;
 
+// A request id the server has not definitely answered for, by saved match
+// (lower case), kept while the app runs: closing and reopening the sheet
+// for that match sends the next request under the same id, so one that did
+// go out (the sheet closed, or the answer was lost) is never sent twice.
+// Cleared by a definite answer: sent, refused, or the earlier one cancelled.
+const unansweredSendKeys = new Map<string, SendKey>();
+
 function hoursLabel(hours: ResponseWindowHours): string {
   return `${hours} hours`;
 }
@@ -136,18 +149,37 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
   // practitioner is told, and offered Cancel before sending a new one.
   const [conflict, setConflict] = useState<{ requestId: string; cancelling: boolean } | null>(null);
   const generationRef = useRef(0);
-  // One id per request as reviewed: a retry of exactly what was reviewed
-  // reuses it (a no-op on the server); any change to the programs, the note
-  // or either window is a new request with a new id.
-  const requestKeyRef = useRef<{ id: string; signature: string } | null>(null);
+  // The request id (placement-requests.ts SendKey): kept after a send whose
+  // outcome is unknown, whatever is changed before the next send, so a
+  // request that did go out is never sent twice; new only after a definite
+  // refusal or a confirmed cancel. A ref for the id the next send uses; the
+  // state copy decides whether the button says "Try again".
+  const sendKeyRef = useRef<SendKey>(NEW_SEND_KEY);
+  const [sendKey, setSendKeyState] = useState<SendKey>(NEW_SEND_KEY);
   const sendingRef = useRef(false);
   const composingRef = useRef(false);
 
   const options = useMemo(() => (request?.options || []).slice(0, OPTIONS_SHOWN), [request]);
 
-  // Closed (or gone): no Messages / Mail sheet can still be up over it.
+  function setSendKey(key: SendKey) {
+    sendKeyRef.current = key;
+    setSendKeyState(key);
+  }
+
+  // The key, and whether this match keeps an unanswered id beyond the sheet.
+  function keepSendKey(matchId: string, key: SendKey) {
+    setSendKey(key);
+    if (key.id) unansweredSendKeys.set(matchId.toLowerCase(), { id: key.id, retryFor: null });
+    else unansweredSendKeys.delete(matchId.toLowerCase());
+  }
+
+  // Closed (or gone): no Messages / Mail sheet can still be up over it, and
+  // a send or cancel still in flight is ignored when it answers, so no
+  // Alert ever appears while the sheet is going away.
   useEffect(() => {
-    if (!request) releaseComposeOverlay();
+    if (request) return;
+    generationRef.current += 1;
+    releaseComposeOverlay();
   }, [request]);
   useEffect(() => () => {
     generationRef.current += 1;
@@ -169,7 +201,7 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
     setSent(null);
     setOutreach({});
     setConflict(null);
-    requestKeyRef.current = null;
+    setSendKey(unansweredSendKeys.get(request.match.id.toLowerCase()) ?? NEW_SEND_KEY);
     sendingRef.current = false;
     composingRef.current = false;
     void fetchPlacementPracticeName().then((name) => { if (generationRef.current === generation) setPracticeName(name); });
@@ -184,20 +216,21 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
       });
   }, [request]);
 
-  // The note may not name the client: the match's label, the linked case's
-  // title, or any of its contacts (identifying-text.ts, as the server checks).
+  // The note may not name the client: the match's label (its words and its
+  // initials), the linked case's title, or any of its contacts
+  // (identifying-text.ts, as the server checks).
   const names = useMemo(
-    () => (request ? placementNoteNames({ clientLabel: request.match.clientLabel, caseTitle: request.caseTitle, contactNames: request.contactNames }) : []),
+    () => (request ? placementNoteNames({ caseTitle: request.caseTitle, contactNames: request.contactNames }) : []),
     [request],
   );
   const prepared = useMemo(() => {
     if (!request) return null;
-    return preparePlacementRequest({ criteria: request.match, admitWindow, note, names });
+    return preparePlacementRequest({ criteria: request.match, admitWindow, note, names, label: request.match.clientLabel });
   }, [request, admitWindow, note, names]);
 
   if (!request) return null;
   const match = request.match;
-  const noteProblem = note.trim() ? placementNoteProblem(note, names) : null;
+  const noteProblem = note.trim() ? placementNoteProblem(note, names, match.clientLabel) : null;
   const chosen = options.filter((option) => selected.includes(option.partner.id)); // ranked order
   // What programs read as the sender (public.placement_practice_name); ''
   // only while it loads or when it could not be read.
@@ -205,6 +238,7 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
   const reviewed: ReviewedRequest | null = prepared && !('problem' in prepared)
     ? { partnerIds: chosen.map((option) => option.partner.id), note: prepared.note, respondHours: hours, admitWindow }
     : null;
+  const reviewedSignature = reviewed ? placementRequestSignature(reviewed) : null;
 
   function toggle(partnerId: string) {
     if (stage !== 'pick') return;
@@ -241,8 +275,9 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
     sendingRef.current = true;
     const generation = generationRef.current;
     const signature = placementRequestSignature(reviewed);
-    const id = requestKeyRef.current?.signature === signature ? requestKeyRef.current.id : newPlacementRequestId();
-    requestKeyRef.current = { id, signature };
+    const id = sendKeyId(sendKeyRef.current, newPlacementRequestId);
+    // Unanswered until the server answers: kept even if the sheet goes away.
+    keepSendKey(match.id, { id, retryFor: null });
     setStage('sending');
     setSendNotice('');
     try {
@@ -266,12 +301,18 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
         setConflict({ requestId: view.request.id, cancelling: false });
         return;
       }
+      keepSendKey(match.id, NEW_SEND_KEY);
       setSent(view);
       setStage('sent');
     } catch (error) {
       if (generationRef.current !== generation) return;
       setStage('review');
-      if (!(error instanceof OfflineError) && error instanceof Error && error.message === ALREADY_SENT_PROBLEM) {
+      const failure = sendFailureOf(error);
+      // Refused: nothing went out, and the next send is a new request.
+      // Already sent: the id stays with that request until it is cancelled.
+      // Unknown: it may have gone out, so the next send keeps this id.
+      keepSendKey(match.id, nextSendKey(id, { type: 'failed', failure, signature }));
+      if (failure === 'already_sent') {
         setConflict({ requestId: id, cancelling: false });
         return;
       }
@@ -293,7 +334,7 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
       const view = await cancelPlacementRequest(conflict.requestId);
       if (generationRef.current !== generation) return;
       onSent(view);
-      requestKeyRef.current = null;
+      keepSendKey(match.id, nextSendKey(conflict.requestId, { type: 'cancelled' }));
       setConflict(null);
       setSendNotice('The earlier request is cancelled. Send this one when you are ready.');
     } catch (error) {
@@ -444,7 +485,7 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
           <>
             {sendNotice ? <Text style={styles.notice}>{sendNotice}</Text> : null}
             <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void send(); }} style={[styles.primaryButton, busy && styles.buttonBusy]}>
-              {busy ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.primaryButtonText}>{sendNotice && requestKeyRef.current ? 'Try again' : `Send to ${chosen.length} ${chosen.length === 1 ? 'program' : 'programs'}`}</Text>}
+              {busy ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.primaryButtonText}>{showsTryAgain(sendKey, reviewedSignature, sendNotice) ? 'Try again' : `Send to ${chosen.length} ${chosen.length === 1 ? 'program' : 'programs'}`}</Text>}
             </TouchableOpacity>
           </>
         )}
@@ -505,7 +546,8 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
     );
   }
 
-  const busyClose = stage === 'sending';
+  // Not while a send or a cancel is on its way: its answer must land here.
+  const busyClose = stage === 'sending' || Boolean(conflict?.cancelling);
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={busyClose ? () => undefined : onClose}>
       <SafeAreaView style={styles.page}>

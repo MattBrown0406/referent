@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(131);
+SELECT plan(141);
 
 -- Actors
 --   s1  platform admin (ReferralFit)
@@ -550,6 +550,59 @@ SELECT is(
   'rejected:CARF-2:true',
   'a center''s edit of a rejected credential is saved, but it stays rejected until ReferralFit reviews it again'
 );
+-- It can only be corrected (its number, date, link or note): another kind,
+-- accreditor or issuing state is a different credential, refused with the
+-- way forward, and nothing changes.
+SELECT throws_ok(
+  $$ SELECT public.save_program_credential('f1600000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
+       'accreditation', 'joint_commission', '', 'CARF-2', '', DATE '2027-05-31', NULL, 'corrected number') $$,
+  '22023', 'ReferralFit could not confirm this credential. Correct its number, date or link, or add a new credential.',
+  'a rejected credential keeps its accreditor'
+);
+SELECT throws_ok(
+  $$ SELECT public.save_program_credential('f1600000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
+       'accreditation', 'other', 'State Recovery Board', 'CARF-2', '', DATE '2027-05-31', NULL, 'corrected number') $$,
+  '22023', 'ReferralFit could not confirm this credential. Correct its number, date or link, or add a new credential.',
+  'or another body''s name in its place'
+);
+SELECT throws_ok(
+  $$ SELECT public.save_program_credential('f1600000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
+       'state_license', NULL, '', 'CARF-2', 'OR', DATE '2027-05-31', NULL, 'corrected number') $$,
+  '22023', 'ReferralFit could not confirm this credential. Correct its number, date or link, or add a new credential.',
+  'and its kind'
+);
+SELECT is(
+  (SELECT status || ':' || kind || ':' || accreditor || ':' || identifier FROM public.program_credentials WHERE id = 'f1600000-0000-0000-0000-000000c7ed01'),
+  'rejected:accreditation:carf:CARF-2',
+  'a refused change leaves the credential as it was'
+);
+SELECT lives_ok(
+  $$ SELECT public.save_program_credential('f1700000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
+       'state_license', NULL, '', 'OR-9001', 'OR', DATE '2027-05-31', NULL, '') $$,
+  'a center adds a state license'
+);
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
+SELECT lives_ok(
+  $$ SELECT public.verify_program_credential('f1700000-0000-0000-0000-000000c7ed01', 'rejected', 'No such license in Oregon') $$,
+  'ReferralFit could not confirm that one either'
+);
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
+SELECT throws_ok(
+  $$ SELECT public.save_program_credential('f1700000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
+       'state_license', NULL, '', 'OR-9001', 'WA', DATE '2027-05-31', NULL, '') $$,
+  '22023', 'ReferralFit could not confirm this credential. Correct its number, date or link, or add a new credential.',
+  'a rejected license keeps its issuing state'
+);
+SELECT is(
+  (SELECT status || ':' || identifier || ':' || coalesce(proof_url, '') FROM public.save_program_credential('f1700000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
+     'state_license', NULL, '', 'OR-9002', 'OR', DATE '2028-05-31', 'https://oregon.example.gov/lookup/9002', '')),
+  'rejected:OR-9002:https://oregon.example.gov/lookup/9002',
+  'its number, date and link can still be corrected (it stays rejected for ReferralFit to review)'
+);
 SELECT is(
   (SELECT n.note || '|' || n.verification_note FROM public.fetch_listing_credential_notes('d1000000-0000-0000-0000-000000c7ed01') AS n
     WHERE n.id = 'f1600000-0000-0000-0000-000000c7ed01'),
@@ -581,6 +634,7 @@ SELECT lives_ok(
   'ReferralFit rejects it again'
 );
 SELECT is(public.delete_program_credential('f1600000-0000-0000-0000-000000c7ed01'), true, 'ReferralFit can remove a rejected credential');
+SELECT is(public.delete_program_credential('f1700000-0000-0000-0000-000000c7ed01'), true, 'and the rejected license');
 RESET ROLE;
 SELECT is((SELECT count(*)::integer FROM public.program_credential_listing_notes WHERE credential_id = 'f1600000-0000-0000-0000-000000c7ed01'), 0,
   'its private notes go with it');
@@ -718,8 +772,26 @@ SELECT is(
   'verified:true:true:Called the state board',
   'a practitioner records their own check: who, when, and the note, on the row'
 );
-SELECT is((SELECT count(*)::integer FROM public.fetch_listing_credential_notes(NULL)), 0,
-  'the listing notes reader never returns a practice''s own credentials');
+SELECT is(
+  (SELECT p.global_partner_id::text FROM public.program_credentials c JOIN public.partners p ON p.id = c.partner_id
+    WHERE c.id = 'f2100000-0000-0000-0000-000000c7ed01'),
+  'd1000000-0000-0000-0000-000000c7ed01',
+  'the practice''s own check f2100000 sits on its partner linked to the listing'
+);
+RESET ROLE;
+-- The listing's own reader of notes, as ReferralFit (who sees every
+-- listing's notes): the listing's credentials, never the practice's checks
+-- (f2000000, and f2100000 on the partner linked to that very listing).
+SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
+SELECT ok(
+  (SELECT count(*) > 0 AND count(*) FILTER (WHERE n.id IN ('f2000000-0000-0000-0000-000000c7ed01', 'f2100000-0000-0000-0000-000000c7ed01')) = 0
+     FROM public.fetch_listing_credential_notes('d1000000-0000-0000-0000-000000c7ed01') AS n),
+  'the listing notes reader never returns a practice''s own credentials, even on a partner linked to the listing'
+);
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', 'b2000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
 SELECT is(
   (SELECT status FROM public.save_program_credential('f2000000-0000-0000-0000-000000c7ed01', NULL, 'e2000000-0000-0000-0000-000000c7ed01',
      'state_license', NULL, '', 'OR-556', 'OR', CURRENT_DATE + 10, NULL, 'Looked up on the state site')),

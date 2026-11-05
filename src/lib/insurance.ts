@@ -202,11 +202,14 @@ const OON_AMOUNT_KEYS = ['oon_deductible', 'oon_deductible_met', 'oon_oop_max', 
 /**
  * The save_case_benefits p_patch keys for only the amounts the editor
  * changed from what it opened with (`opened`), so a teammate's update to
- * another amount made meanwhile is never sent back over. "No" out-of-network
- * benefits always clears those amounts.
+ * another amount made meanwhile is never sent back over. Changing
+ * out-of-network benefits to "No" clears those amounts; a plan that already
+ * read "No" when the editor opened sends only what changed, so a teammate
+ * who switched it back to "Yes" meanwhile (with amounts) is not undone.
  */
 export function changedPlanCostsPatch(opened: PlanCosts | null | undefined, edited: PlanCosts): Row {
-  return changedKeys(planCostsToPatch(opened ?? EMPTY_PLAN_COSTS), planCostsToPatch(edited), edited.oonBenefits === false ? ['oon_benefits', ...OON_AMOUNT_KEYS] : []);
+  const clearsOutOfNetwork = edited.oonBenefits === false && opened?.oonBenefits !== false;
+  return changedKeys(planCostsToPatch(opened ?? EMPTY_PLAN_COSTS), planCostsToPatch(edited), clearsOutOfNetwork ? ['oon_benefits', ...OON_AMOUNT_KEYS] : []);
 }
 
 /** `current` (what the case holds now) with the editor's changes from `opened` laid over it: the optimistic copy of a changed-keys save. */

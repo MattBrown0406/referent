@@ -41,6 +41,7 @@ import {
   nationalInsuranceProviders,
   Partner,
   partnerTypes,
+  paymentOptionsForState,
   PlacementReason,
   placementReasonOptions,
   Referral,
@@ -2214,7 +2215,10 @@ export default function App() {
       .sort((a, b) => Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)) || a.organization.localeCompare(b.organization));
   }, [partners, directoryType, search, directoryPlan, directoryPlanStatuses]);
 
-  const insuranceOptions = useMemo(() => insuranceProvidersForState(matchState), [matchState]);
+  // The match's own payment stays listed even when this state's list lacks
+  // it (paymentOptionsForState), so the form never shows Cash pay for a
+  // match that ranks by a carrier.
+  const insuranceOptions = useMemo(() => paymentOptionsForState(matchState, matchInsurance), [matchState, matchInsurance]);
 
   const insuranceDropdownOptions = useMemo(() => {
     const stateName = stateOptions.find((state) => state.code === matchState)?.name;
@@ -2228,6 +2232,8 @@ export default function App() {
         detail = `Regional commercial plan in ${stateName}`;
       } else if (provider !== 'Cash pay' && nationalInsuranceProviders.includes(provider)) {
         detail = 'Major national provider';
+      } else if (provider !== 'Cash pay' && !insuranceProvidersForState(matchState).includes(provider)) {
+        detail = 'This match\'s payment (not on this state\'s list)';
       }
       return { label: provider, value: provider, detail };
     });

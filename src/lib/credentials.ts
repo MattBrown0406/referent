@@ -53,10 +53,14 @@ function credentialFailure(error: unknown, status: number | undefined, fallback:
   const failure = withHttpStatus(error, status);
   const offline = asOfflineError(failure);
   if (offline instanceof OfflineError) return offline;
-  if (errorCode(error) === '42501') {
-    const message = (error as { message?: unknown }).message;
+  const code = errorCode(error);
+  const message = (error as { message?: unknown }).message;
+  if (code === '42501') {
     return new StoreError(typeof message === 'string' && message ? message : 'You cannot change these credentials.', false);
   }
+  // The server's own plain words for a check (22023) or a missing row
+  // (P0002), without a code after them.
+  if ((code === '22023' || code === 'P0002') && typeof message === 'string' && message) return new StoreError(message, false);
   return new StoreError(describeError(failure, fallback), false);
 }
 
@@ -159,7 +163,12 @@ export async function saveCredential(owner: CredentialOwner, fields: CredentialF
     p_proof_url: fields.proofUrl,
     p_note: fields.note,
   });
-  if (error) throw credentialFailure(error, status, 'Could not save the credential.');
+  if (error) {
+    // A credential ReferralFit could not confirm keeps its kind, accreditor
+    // and state: the server's way forward, said calmly.
+    if (errorCode(error) === '22023' && (error as { message?: unknown }).message === CREDENTIAL_CORRECT_ONLY) throw new CredentialKeptError(CREDENTIAL_CORRECT_ONLY);
+    throw credentialFailure(error, status, 'Could not save the credential.');
+  }
   const saved = credentialFromRow((Array.isArray(data) ? data[0] : data) as CredentialRow);
   if (!saved) throw new StoreError('Saved, but the credential could not be read back. Pull to refresh.', false);
   return saved;
@@ -192,6 +201,12 @@ export class CredentialKeptError extends StoreError {
 }
 
 export const CREDENTIAL_KEPT_TITLE = 'Kept on record';
+
+// save_program_credential's 22023 when a claimant edits a listing credential
+// ReferralFit could not confirm into another kind, accreditor or issuing
+// state (program_credential_write_edit): it can only be corrected. The
+// editor shows it as information, not as a failure.
+export const CREDENTIAL_CORRECT_ONLY = 'ReferralFit could not confirm this credential. Correct its number, date or link, or add a new credential.';
 
 export async function deleteCredential(id: string): Promise<void> {
   const { error, status } = await supabase.rpc('delete_program_credential', { p_id: id });

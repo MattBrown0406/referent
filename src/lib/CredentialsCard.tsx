@@ -221,7 +221,9 @@ type Props = {
 
 type NotesState = { status: 'idle' | 'loading' | 'ready' | 'error'; byId: ListingCredentialNotes };
 
-type Editing = { id?: string; scope: 'listing' | 'local'; draft: CredentialDraft; problem: string; busy: boolean };
+// `calm`: the problem is the server's way forward (CredentialKeptError),
+// shown as information rather than as a failure.
+type Editing = { id?: string; scope: 'listing' | 'local'; draft: CredentialDraft; problem: string; busy: boolean; calm?: boolean };
 type NpiCheck = { busy: boolean; result?: NpiLookupResult };
 
 function openLink(url: string) {
@@ -248,16 +250,25 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
 
   const listingId = program.globalPartnerId ? program.globalPartnerId.toLowerCase() : '';
   const listingRowsKey = listingId ? (state.index.listing[listingId] || []).map((item) => `${item.id}:${item.updatedAt}`).join(',') : '';
+  // Each read is numbered; only the newest one's answer is kept, so a slow
+  // earlier read (another listing, or rows since changed) never lands over
+  // a newer one, and the editor never opens on notes that are not this
+  // listing's own (saving would send that note back).
+  const notesReadRef = useRef(0);
   const loadNotes = useCallback(async () => {
-    if (!canEditListing || !listingId) return;
+    const read = ++notesReadRef.current;
+    if (!canEditListing || !listingId) {
+      setNotes((current) => (current.status === 'idle' && !Object.keys(current.byId).length ? current : { status: 'idle', byId: {} }));
+      return;
+    }
     setNotes((current) => ({ status: 'loading', byId: current.byId }));
     try {
       const byId = await fetchListingCredentialNotes(listingId);
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || notesReadRef.current !== read) return;
       // null: an older server, which still sends the notes on the rows.
       setNotes({ status: 'ready', byId: byId ?? {} });
     } catch {
-      if (mountedRef.current) setNotes((current) => ({ status: 'error', byId: current.byId }));
+      if (mountedRef.current && notesReadRef.current === read) setNotes((current) => ({ status: 'error', byId: current.byId }));
     }
   }, [canEditListing, listingId]);
   useEffect(() => {
@@ -299,7 +310,7 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
   }
 
   function updateDraft(patch: Partial<CredentialDraft>) {
-    setEditing((current) => (current ? { ...current, problem: '', draft: { ...current.draft, ...patch } } : current));
+    setEditing((current) => (current ? { ...current, problem: '', calm: false, draft: { ...current.draft, ...patch } } : current));
     if ('identifier' in patch || 'kind' in patch) setDraftNpi(null);
   }
 
@@ -310,7 +321,7 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
       setEditing({ ...editing, problem: normalized.problem });
       return;
     }
-    setEditing({ ...editing, busy: true, problem: '' });
+    setEditing({ ...editing, busy: true, problem: '', calm: false });
     try {
       const owner = editing.scope === 'listing' && program.globalPartnerId
         ? { globalPartnerId: program.globalPartnerId }
@@ -327,7 +338,10 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
       onChanged();
     } catch (error) {
       if (!mountedRef.current) return;
-      setEditing((current) => (current ? { ...current, busy: false, problem: writeFailure(error) } : current));
+      // A credential ReferralFit could not confirm can only be corrected:
+      // the server's way forward, said calmly in the editor.
+      const calm = error instanceof CredentialKeptError;
+      setEditing((current) => (current ? { ...current, busy: false, problem: calm ? (error as Error).message : writeFailure(error), calm } : current));
     }
   }
 
@@ -580,7 +594,7 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
         <Text style={styles.fieldLabel}>{current.scope === 'listing' ? 'Note for ReferralFit (only ReferralFit and the program see it)' : 'Note (optional, your practice only)'}</Text>
         <TextInput style={[styles.input, styles.noteInput]} value={draft.note} onChangeText={(note) => updateDraft({ note })} placeholder="Who you spoke with, what you saw" placeholderTextColor={COLORS.gray} multiline maxLength={1000} accessibilityLabel="Note" />
         {current.id ? <Text style={styles.meta}>{current.scope === 'listing' ? 'Saving a change sends it back for ReferralFit review.' : 'Saving a change marks it not checked again, so check it once more afterwards.'}</Text> : null}
-        {current.problem ? <Text accessibilityRole="alert" style={styles.problem}>{current.problem}</Text> : null}
+        {current.problem ? <Text accessibilityRole={current.calm ? undefined : 'alert'} accessibilityLiveRegion="polite" style={current.calm ? styles.calmNote : styles.problem}>{current.problem}</Text> : null}
         <View style={styles.actionRow}>
           <TouchableOpacity accessibilityRole="button" disabled={current.busy} onPress={() => { setEditing(null); setDraftNpi(null); }} style={styles.smallButton}><Text style={styles.smallButtonText}>Cancel</Text></TouchableOpacity>
           <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: current.busy, disabled: current.busy }} disabled={current.busy} onPress={() => { void save(); }} style={[styles.smallButton, styles.primaryButton]}>
@@ -685,4 +699,5 @@ const styles = StyleSheet.create({
   pillText: { color: COLORS.inkSoft, fontSize: 12, fontWeight: '700' },
   pillTextActive: { color: COLORS.white },
   problem: { color: COLORS.coral, fontSize: 12, fontWeight: '700', marginTop: 4 },
+  calmNote: { color: COLORS.inkSoft, fontSize: 12, lineHeight: 17, marginTop: 6 },
 });

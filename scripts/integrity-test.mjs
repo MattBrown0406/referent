@@ -596,6 +596,26 @@ function respond(body, { ok: isOk = true, status = 200 } = {}) {
   check('the kept credential is information, under a calm title', credentialsApi.CREDENTIAL_KEPT_TITLE, 'Kept on record');
   check('the portal says the same when the server sends no words', portal.KEPT_ON_RECORD_FALLBACK, KEPT);
 
+  // Editing a credential ReferralFit could not confirm into another kind,
+  // accreditor or state: the server's way forward (22023), said calmly.
+  const CORRECT_ONLY = 'ReferralFit could not confirm this credential. Correct its number, date or link, or add a new credential.';
+  check('the app and the portal have the server\'s sentence', [credentialsApi.CREDENTIAL_CORRECT_ONLY, portal.CORRECT_ONLY_MESSAGE], [CORRECT_ONLY, CORRECT_ONLY]);
+  const integrityMigration = readFileSync(path.join(repoRoot, 'supabase/migrations/20261104130000_program_integrity.sql'), 'utf8');
+  ok('the migration refuses with that sentence when a rejection sticks', integrityMigration.includes(`RAISE EXCEPTION '${CORRECT_ONLY}'`)
+    && /IF v_sticks AND \(n\.kind, n\.accreditor, n\.accreditor_name, n\.issuing_state\)\s*IS DISTINCT FROM \(p_old\.kind, p_old\.accreditor, p_old\.accreditor_name, p_old\.issuing_state\) THEN/.test(integrityMigration));
+  const fields = { kind: 'state_license', accreditor: null, accreditorName: '', identifier: 'OR-1', issuingState: 'WA', expiresOn: null, proofUrl: null, note: '' };
+  fakeSupabase.rpc = async () => ({ data: null, error: { code: '22023', message: CORRECT_ONLY }, status: 400 });
+  await assert.rejects(credentialsApi.saveCredential({ globalPartnerId: 'G1' }, fields, 'C1'), (error) => error instanceof credentialsApi.CredentialKeptError && error.message === CORRECT_ONLY);
+  checks += 1;
+  fakeSupabase.rpc = async () => ({ data: null, error: { code: '22023', message: 'Add the license number' }, status: 400 });
+  await assert.rejects(credentialsApi.saveCredential({ globalPartnerId: 'G1' }, fields, 'C1'),
+    (error) => !(error instanceof credentialsApi.CredentialKeptError) && error.message === 'Add the license number');
+  checks += 1;
+  check('the portal tells the kept sentence apart from other refusals', [
+    portal.keptCredentialMessage({ code: '22023', message: CORRECT_ONLY }), portal.keptCredentialMessage({ code: '22023', message: 'Add the license number' }),
+    portal.keptCredentialMessage({ code: '42501', message: CORRECT_ONLY }), portal.keptCredentialMessage(null),
+  ], [CORRECT_ONLY, null, null, null]);
+
   // NPI Registry hints on a listing's credential: platform admins only.
   check('who keeps an NPI Registry hint', [
     credentialsApi.mayKeepNpiHint('local', false), credentialsApi.mayKeepNpiHint('local', true),
@@ -605,9 +625,13 @@ function respond(body, { ok: isOk = true, status = 200 } = {}) {
   const card = readFileSync(path.join(repoRoot, 'src/lib/CredentialsCard.tsx'), 'utf8');
   ok('both NPI hint paths ask mayKeepNpiHint (the card\'s and the editor\'s)', (card.match(/mayKeepNpiHint\(/g) || []).length === 2 && !/result\.ok && \(credential\.scope === 'local'/.test(card));
   ok('the card never renders a row\'s own note or verification note for a listing', !/credential\.note \?/.test(card) && !/credential\.verificationNote \?/.test(card) && /credential\.scope === 'listing' \? listingNote\(credential\) : credential/.test(card));
-  ok('ReferralFit\'s notes come from fetch_listing_credential_notes, only with canEditListing', /if \(!canEditListing \|\| !listingId\) return;\s*setNotes/.test(card) && card.includes('fetchListingCredentialNotes(listingId)'));
+  ok('ReferralFit\'s notes come from fetch_listing_credential_notes, only with canEditListing', /if \(!canEditListing \|\| !listingId\) \{\s*setNotes\(\(current\) => \(current\.status === 'idle' && !Object\.keys\(current\.byId\)\.length \? current : \{ status: 'idle', byId: \{\} \}\)\);\s*return;\s*\}/.test(card) && card.includes('fetchListingCredentialNotes(listingId)'));
   ok('a listing\'s credential is edited only once its notes have loaded (the note is never wiped)', /credential\.scope === 'listing' && notes\.status !== 'ready'/.test(card));
   ok('a kept credential is shown calmly, not as a failure', /error instanceof CredentialKeptError\) Alert\.alert\(CREDENTIAL_KEPT_TITLE, error\.message\)/.test(card));
+  ok('in the editor too: the way forward in calm words, not as an alert', /const calm = error instanceof CredentialKeptError;/.test(card)
+    && card.includes("accessibilityRole={current.calm ? undefined : 'alert'}") && card.includes('style={current.calm ? styles.calmNote : styles.problem}'));
+  ok('the notes are read in order: an older read never lands over a newer one', /const read = \+\+notesReadRef\.current;/.test(card)
+    && /if \(!mountedRef\.current \|\| notesReadRef\.current !== read\) return;/.test(card) && /if \(mountedRef\.current && notesReadRef\.current === read\) setNotes/.test(card));
 
   // The portal: the claimant's own notes come back from their own call.
   const rows = [{ id: 'C1', note: null, verification_note: null }, { id: 'C2', note: 'old row note', verification_note: '' }];
@@ -619,6 +643,8 @@ function respond(body, { ok: isOk = true, status = 200 } = {}) {
   ok('the portal labels the note for ReferralFit only', portalUi.includes('Note for ReferralFit (only ReferralFit sees this)'));
   ok('the portal reads the notes with their own call', portalUi.includes("rpc('fetch_listing_credential_notes', { p_global_partner_id: listingId })"));
   ok('the portal shows a kept credential as information, not an error', /error\.code === '42501'\) \{ setInfo\(/.test(portalUi));
+  ok('and the way forward for an edit it will not take, in the form', /const kept = keptCredentialMessage\(error\);\s*if \(kept\) \{ setFormInfo\(kept\); return; \}/.test(portalUi)
+    && portalUi.includes('{formInfo ? <p className="help" role="status">{formInfo}</p> : null}'));
   const queue = readFileSync(path.join(repoRoot, 'src/lib/CredentialReviewQueue.tsx'), 'utf8');
   ok('the review queue says who reads a rejection note', queue.includes("'The program sees this note; practitioners do not'") && queue.includes('{REJECTION_NOTE_LABEL}'));
 

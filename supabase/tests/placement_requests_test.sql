@@ -152,12 +152,12 @@ SELECT ok(
 );
 SELECT ok(
   NOT has_function_privilege('authenticated', 'public.placement_request_payload(text, text, text[], text[], text, text, text, text, text)', 'EXECUTE')
-  AND NOT has_function_privilege('authenticated', 'public.placement_note_problem(text, text[])', 'EXECUTE')
+  AND NOT has_function_privilege('authenticated', 'public.placement_note_problem(text, text[], text)', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_allowed_needs(text[])', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_request_partner_ids(uuid, uuid[])', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_request_ranks(uuid[], uuid[], integer[])', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_request_replay_differs(uuid, uuid[], integer, text, text)', 'EXECUTE')
-  AND NOT has_function_privilege('authenticated', 'public.identifying_text_problem(text, text[])', 'EXECUTE')
+  AND NOT has_function_privilege('authenticated', 'public.identifying_text_problem(text, text[], text)', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.identifying_case_names(uuid, uuid)', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_request_build(uuid, uuid, jsonb, uuid, text, text)', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_request_json(uuid)', 'EXECUTE')
@@ -219,6 +219,7 @@ SELECT is(
     public.placement_note_problem('See www.example.org', ARRAY[]::text[]),
     public.placement_note_problem('Family can pay $30,000', ARRAY[]::text[]),
     public.placement_note_problem('The rivera FAMILY prefers women staff', ARRAY['Rivera family', NULL]),
+    public.placement_note_problem('JR prefers women staff', ARRAY['Rivera intervention'], 'J.R.'),
     public.placement_note_problem(repeat('a', 301), ARRAY[]::text[]),
     public.placement_note_problem('Family can pay 40,000 cash', ARRAY[]::text[]),
     public.placement_note_problem('Seen Nov 12, admit soon', ARRAY[]::text[]),
@@ -230,7 +231,8 @@ SELECT is(
         'Leave out dates such as a birth date. Programs read this.',
         'Leave out links and web addresses. Programs read this.',
         'Leave money out. Programs read this.',
-        'Leave out names. Programs read this.',
+        'Leave out names ("rivera" is a name on this case). Programs read this.',
+        'Leave out names ("jr" is a name on this case). Programs read this.',
         'Keep the note to 300 characters',
         'Leave money out. Programs read this.',
         'Leave out dates such as a birth date. Programs read this.',
@@ -362,19 +364,19 @@ SELECT is(
 SELECT throws_ok(
   $$ SELECT public.create_placement_request(gen_random_uuid(), NULL, '{"client_label":"Rivera family","level_of_care":"Detox"}'::jsonb,
        ARRAY['e1000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', 'Rivera family needs detox first') $$,
-  '22023', 'Leave out names. Programs read this.',
+  '22023', 'Leave out names ("rivera" is a name on this case). Programs read this.',
   'a note naming the client''s label is refused'
 );
 SELECT throws_ok(
   $$ SELECT public.create_placement_request(gen_random_uuid(), 'f2000000-0000-0000-0000-0000000000a7', NULL,
        ARRAY['e1000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', 'See the Rivera intervention notes') $$,
-  '22023', 'Leave out names. Programs read this.',
+  '22023', 'Leave out names ("rivera" is a name on this case). Programs read this.',
   'a note naming the case title is refused'
 );
 SELECT throws_ok(
   $$ SELECT public.create_placement_request(gen_random_uuid(), 'f2000000-0000-0000-0000-0000000000a7', NULL,
        ARRAY['e1000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', 'Dolores asked for a women-only program') $$,
-  '22023', 'Leave out names. Programs read this.',
+  '22023', 'Leave out names ("dolores" is a name on this case). Programs read this.',
   'a note naming one of the case''s contacts is refused'
 );
 SELECT throws_ok(

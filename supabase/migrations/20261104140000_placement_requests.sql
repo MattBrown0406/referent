@@ -14,7 +14,8 @@
 --      name (never a member id) or self-pay (never a budget), home state
 --      and location preference, the admit window, and a short note that is
 --      refused if it carries contact details, money, dates, numbers, or a
---      name from the match's label, the case's title or its contacts.
+--      name from the match's label (or its initials), the case's title or
+--      its contacts.
 --      A CHECK refuses any other key, whoever writes the row.
 --   2. placement_request_recipients: one row per program asked, at its
 --      place on the practice's own match screen (rank). channel 'portal'
@@ -64,59 +65,232 @@ END
 $$;
 
 -- ===========================================================================
--- 0. The identifying-details check
+-- 0. The identifying-details check (rules version 2)
 -- ===========================================================================
+--
+-- The SQL twin of src/lib/identifying-text.ts: the same rules, the same
+-- lists in the same order, the same messages. Both test suites run the same
+-- cases (scripts/fixtures/identifying-text-cases.json). Special characters
+-- are written with chr(): this file is pasted by hand.
+
+-- Accents off (NFKD, combining marks removed), then compatibility forms
+-- folded (NFKC) and lower case: Jose, JOSE and the accented spelling are
+-- one word, and a full-width digit is a digit. fold() in the app.
+CREATE OR REPLACE FUNCTION public.identifying_fold(p text)
+RETURNS text
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT lower(normalize(regexp_replace(normalize(coalesce(p, ''), NFKD), '[' || chr(768) || '-' || chr(879) || ']', '', 'g'), NFKC))
+$$;
+REVOKE ALL ON FUNCTION public.identifying_fold(text) FROM PUBLIC, anon, authenticated;
+
+-- Words in a case's title, client label or contact names that are never a
+-- name: every word of the app's relationship lists (lead_caller_relationship
+-- and cases.ts, what is typed and what is saved), the app's placeholders,
+-- the ordinary words case titles are made of, and substances and kinds of
+-- care. NEVER_A_NAME in the app, in the same order.
+CREATE OR REPLACE FUNCTION public.identifying_ordinary_words()
+RETURNS text[]
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT ARRAY[
+    'self', 'myself', 'himself', 'herself', 'themself', 'themselves', 'son', 'daughter', 'child', 'kid', 'boy',
+    'girl', 'stepson', 'stepdaughter', 'stepchild', 'grandson', 'granddaughter', 'grandchild', 'wife',
+    'husband', 'spouse', 'partner', 'boyfriend', 'girlfriend', 'fiance', 'fiancee', 'mom', 'mum', 'mother',
+    'dad', 'father', 'parent', 'stepparent', 'grandparent', 'stepdad', 'stepmom', 'stepfather', 'stepmother',
+    'grandmother', 'grandfather', 'grandma', 'grandpa', 'brother', 'sister', 'sibling', 'aunt', 'uncle',
+    'niece', 'nephew', 'cousin', 'friend', 'best', 'family', 'member', 'client', 'patient', 'referring',
+    'professional', 'referent', 'subject', 'loved', 'one', 'the', 'and', 'for', 'about', 'intervention',
+    'interventions', 'placement', 'case', 'lead', 'call', 'calls', 'consult', 'inquiry', 'referral', 'program',
+    'treatment', 'rehab', 'detox', 'inpatient', 'outpatient', 'sober', 'living', 'aftercare', 'recovery',
+    'new', 'first', 'follow', 'check', 'update', 'plan', 'family''s', 'client''s', 'alcohol', 'opioid',
+    'opioids', 'opiate', 'opiates', 'fentanyl', 'heroin', 'meth', 'cocaine', 'benzo', 'benzos', 'cannabis',
+    'marijuana', 'gambling', 'drug', 'drugs', 'use', 'relapse', 'iop', 'php', 'mat', 'dual', 'diagnosis']::text[]
+$$;
+REVOKE ALL ON FUNCTION public.identifying_ordinary_words() FROM PUBLIC, anon, authenticated;
+
+-- Two-letter everyday words, never a name or initials (EVERYDAY_TWO).
+CREATE OR REPLACE FUNCTION public.identifying_everyday_two()
+RETURNS text[]
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT ARRAY[
+    'am', 'an', 'as', 'at', 'be', 'by', 'do', 'dr', 'ed', 'er', 'ex', 'go', 'he', 'hi', 'if', 'in', 'is', 'it',
+    'iv', 'me', 'mo', 'mr', 'ms', 'my', 'no', 'of', 'oh', 'ok', 'on', 'or', 'pm', 're', 'so', 'to', 'tv', 'up',
+    'us', 'vs', 'we', 'de', 'el', 'en', 'es', 'la', 'le', 'lo', 'mi', 'se', 'si', 'su', 'te', 'tu', 'un', 'ya',
+    'yo']::text[]
+$$;
+REVOKE ALL ON FUNCTION public.identifying_everyday_two() FROM PUBLIC, anon, authenticated;
+
+-- Two-letter abbreviations a title or contact name often carries that are
+-- not a name: state codes (Al and Ma stay names), care shorthand, ordinal
+-- endings (3rd splits into rd) and units. Never applied to the client
+-- label's initials (ABBREVIATIONS).
+CREATE OR REPLACE FUNCTION public.identifying_abbreviations()
+RETURNS text[]
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT ARRAY[
+    'ak', 'az', 'ar', 'ca', 'co', 'ct', 'dc', 'fl', 'ga', 'ia', 'id', 'il', 'ks', 'ky', 'md', 'mn', 'mt', 'nc',
+    'nd', 'ne', 'nh', 'nj', 'nm', 'nv', 'ny', 'pa', 'pr', 'ri', 'sc', 'sd', 'tn', 'tx', 'ut', 'va', 'vt', 'wa',
+    'wi', 'wv', 'wy', 'aa', 'na', 'rn', 'np', 'pt', 'ot', 'bp', 'hr', 'dx', 'rx', 'hx', 'ua', 'ii', 'st', 'rd',
+    'th', 'mg', 'ml', 'kg', 'lb', 'cc', 'mm', 'oz', 'yr', 'wk']::text[]
+$$;
+REVOKE ALL ON FUNCTION public.identifying_abbreviations() FROM PUBLIC, anon, authenticated;
 
 -- The words of a case title, client label or contact name that could be a
--- name: split on anything that is not a letter, three or more letters, and
--- not on the never-a-name list: who someone is to the client (son, mom,
--- family...) and the ordinary words case titles are made of (intervention,
--- first call, detox...). The same list, in the same order, as NEVER_A_NAME
--- in src/lib/identifying-text.ts (family's and client's are listed as
--- written; the split already reads them as family and client).
+-- name: split on anything that is not a letter; three or more letters, or
+-- two that are not an everyday word or an abbreviation; never an ordinary
+-- word. Sorted by code point. nameWords in the app.
 CREATE OR REPLACE FUNCTION public.identifying_name_words(p_names text[])
 RETURNS text[]
 LANGUAGE sql IMMUTABLE
 SET search_path = pg_catalog
 AS $$
-  SELECT coalesce(array_agg(DISTINCT w.word ORDER BY w.word), ARRAY[]::text[])
+  SELECT coalesce(array_agg(DISTINCT w.word COLLATE "C" ORDER BY w.word COLLATE "C"), ARRAY[]::text[])
     FROM unnest(coalesce(p_names, ARRAY[]::text[])) AS n(v),
-         regexp_split_to_table(lower(normalize(coalesce(n.v, ''), NFKC)), '[^[:alpha:]]+') AS w(word)
-   WHERE length(w.word) >= 3
-     AND NOT (w.word = ANY (ARRAY['son', 'daughter', 'child', 'kid', 'boy', 'girl', 'wife', 'husband', 'spouse', 'partner',
-       'mom', 'mum', 'mother', 'dad', 'father', 'parent', 'brother', 'sister', 'sibling',
-       'grandson', 'granddaughter', 'grandmother', 'grandfather', 'aunt', 'uncle', 'niece',
-       'nephew', 'cousin', 'friend', 'family', 'client', 'self', 'the', 'and', 'for', 'about',
-       'stepson', 'stepdaughter', 'boyfriend', 'girlfriend', 'fiance', 'fiancee',
-       'intervention', 'interventions', 'placement', 'case', 'lead', 'call', 'calls', 'consult',
-       'inquiry', 'referral', 'program', 'treatment', 'rehab', 'detox', 'inpatient', 'outpatient',
-       'sober', 'living', 'aftercare', 'recovery', 'new', 'first', 'follow', 'check', 'update',
-       'plan', 'family''s', 'client''s']))
+         regexp_split_to_table(public.identifying_fold(n.v), '[^[:alpha:]]+') AS w(word)
+   WHERE (length(w.word) >= 3
+          OR (length(w.word) = 2 AND NOT (w.word = ANY (public.identifying_everyday_two()))
+                                 AND NOT (w.word = ANY (public.identifying_abbreviations()))))
+     AND NOT (w.word = ANY (public.identifying_ordinary_words()))
 $$;
 REVOKE ALL ON FUNCTION public.identifying_name_words(text[]) FROM PUBLIC, anon, authenticated;
 
+-- Letter-or-digit tokens of folded text, dotted initials collapsed: j.r. is
+-- jr, jr. is jr, 34m stays 34m. tokens() in the app.
+CREATE OR REPLACE FUNCTION public.identifying_tokens(p_folded text)
+RETURNS text[]
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT coalesce(array_agg(t.token), ARRAY[]::text[])
+    FROM regexp_split_to_table(coalesce(p_folded, ''), '[^[:alpha:]0-9.]+') AS c(chunk),
+         unnest(CASE WHEN c.chunk ~ '^[[:alpha:]]([.][[:alpha:]])+[.]?$' THEN ARRAY[replace(c.chunk, '.', '')]
+                     ELSE string_to_array(c.chunk, '.') END) AS t(token)
+   WHERE t.token <> ''
+$$;
+REVOKE ALL ON FUNCTION public.identifying_tokens(text) FROM PUBLIC, anon, authenticated;
+
+-- The client label's own initials and tags, refused as whole tokens besides
+-- its name words: two or more letters or digits with at least one letter,
+-- never an everyday word or an ordinary word ("J.R." gives jr; "JR 34M"
+-- gives jr and 34m). labelInitials in the app.
+CREATE OR REPLACE FUNCTION public.identifying_label_initials(p_label text)
+RETURNS text[]
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT coalesce(array_agg(DISTINCT t.token COLLATE "C" ORDER BY t.token COLLATE "C"), ARRAY[]::text[])
+    FROM unnest(public.identifying_tokens(public.identifying_fold(p_label))) AS t(token)
+   WHERE length(t.token) >= 2 AND t.token ~ '[[:alpha:]]'
+     AND NOT (t.token = ANY (public.identifying_everyday_two()))
+     AND NOT (t.token = ANY (public.identifying_ordinary_words()))
+$$;
+REVOKE ALL ON FUNCTION public.identifying_label_initials(text) FROM PUBLIC, anon, authenticated;
+
+-- A date in folded text: day/month/year with a real day and month (so
+-- 30/60/90 is a program length), an ISO date, month then day, day then
+-- month (14th March; "14 may" only with a year), dob or born, and a
+-- birthday followed by a number. mentionsDate in the app.
+CREATE OR REPLACE FUNCTION public.identifying_mentions_date(p_plain text)
+RETURNS boolean
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT p_plain ~ ('(?<![0-9])' || k.d || '[/.-]' || k.d || '[/.-]([0-9]{2}|[0-9]{4})(?![0-9])')
+      OR p_plain ~ ('(?<![0-9])(19|20)[0-9]{2}[/.-]' || k.d || '[/.-]' || k.d || '(?![0-9])')
+      OR p_plain ~ ('(?<![a-z])(' || k.m || '|may)[.]? +[0-9]{1,2}(?![0-9])')
+      OR p_plain ~ ('(?<![0-9])[0-9]{1,2}(st|nd|rd|th)?( +of)? +' || k.m || '(?![a-z])')
+      OR p_plain ~ '(?<![0-9])[0-9]{1,2}(st|nd|rd|th)?( +of)? +may +[0-9]{2,4}(?![0-9])'
+      OR p_plain ~ '(?<![a-z])(dob|d[.]o[.]b[.]?|born)(?![a-z])'
+      OR p_plain ~ '(?<![a-z])(birth ?day|b-?day|birth ?date)[^0-9a-z]*((is|on|of|the) +)*[0-9]'
+    FROM (SELECT '(0?[1-9]|[12][0-9]|3[01])'::text AS d,
+                 '(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|june?|july?|aug(ust)?|sep(t)?(ember)?|oct(ober)?|nov(ember)?|dec(ember)?)'::text AS m) AS k
+$$;
+REVOKE ALL ON FUNCTION public.identifying_mentions_date(text) FROM PUBLIC, anon, authenticated;
+
+-- A phone or ID number in folded text: five digits in a row; a phone
+-- number (7 or 10 digits in groups, separated by 1 to 3 characters that are
+-- not a digit, a letter or a colon) that is not a dose range; an SSN; or
+-- nine or more digits with spaces, dots, brackets or dashes. Clock times,
+-- blood pressure, year, dose and level ranges stay. mentionsIdNumber.
+CREATE OR REPLACE FUNCTION public.identifying_mentions_id_number(p_plain text)
+RETURNS boolean
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT p_plain ~ '[0-9]{5}'
+      OR p_plain ~ ('(?<![0-9])([0-9]{3}' || k.sep || ')?[0-9]{3}' || k.sep || '[0-9]{4}(?![0-9])(?! *(mg|mcg|ml|cc|g|l|kg|lbs?|units?|mm)(?![a-z]))')
+      OR p_plain ~ ('(?<![0-9])[0-9]{3}' || k.sep || '[0-9]{2}' || k.sep || '[0-9]{4}(?![0-9])')
+      OR p_plain ~ '[0-9]([ .()_-]{0,3}[0-9]){8,}'
+    FROM (SELECT '[^0-9a-z:]{1,3}'::text AS sep) AS k
+$$;
+REVOKE ALL ON FUNCTION public.identifying_mentions_id_number(text) FROM PUBLIC, anon, authenticated;
+
+-- An amount in folded text: thousands with commas, 40k, money words, or an
+-- amount in words (40 grand, forty thousand, 1.5 million). "Grand" counts
+-- only after a number: grand mal seizures stay. mentionsMoney in the app.
+CREATE OR REPLACE FUNCTION public.identifying_mentions_money(p_plain text)
+RETURNS boolean
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT p_plain ~ '[0-9]{1,3}(,[0-9]{3})+' OR p_plain ~ '[0-9]+ ?k(?![a-z])'
+      OR p_plain ~ '(?<![a-z])(dollars?|usd|budget|afford[a-z0-9_]*|out[ -]of[ -]pocket|can pay|cash pay)(?![a-z])'
+      OR p_plain ~ '[0-9] *(thousand|grand|mil|million)(?![a-z])'
+      OR p_plain ~ '(?<![a-z])(thousands?|(ten|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred) +grand)(?![a-z])'
+$$;
+REVOKE ALL ON FUNCTION public.identifying_mentions_money(text) FROM PUBLIC, anon, authenticated;
+
+-- The alphabetically first (by code point) name folded text carries, or
+-- NULL: a name word of p_names or the label as a whole word, or its plural
+-- (n+s, n+es), or one of the label's initials as a whole token. nameFound.
+CREATE OR REPLACE FUNCTION public.identifying_name_found(p_plain text, p_names text[], p_label text)
+RETURNS text
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT min(f.word COLLATE "C")
+    FROM (SELECT n.word
+            FROM unnest(public.identifying_name_words(coalesce(p_names, ARRAY[]::text[]) || ARRAY[p_label])) AS n(word),
+                 regexp_split_to_array(p_plain, '[^[:alpha:]]+') AS w(words)
+           WHERE n.word = ANY (w.words) OR n.word || 's' = ANY (w.words) OR n.word || 'es' = ANY (w.words)
+          UNION ALL
+          SELECT l.word
+            FROM unnest(public.identifying_label_initials(p_label)) AS l(word)
+           WHERE l.word = ANY (public.identifying_tokens(p_plain))) AS f
+$$;
+REVOKE ALL ON FUNCTION public.identifying_name_found(text, text[], text) FROM PUBLIC, anon, authenticated;
+
 -- The one identifying-details check for free text a program reads (the
 -- placement-request note, the level-of-care reason): NULL when the text is
--- fine, else a plain message saying what to take out. The SQL twin of
--- identifyingTextProblem in src/lib/identifying-text.ts (rules version 1):
--- same order, same words; both test suites run the same cases
--- (scripts/fixtures/identifying-text-cases.json). p_names: the case's own
--- title, client label and contact names (whole words, ignoring case).
--- Special characters are written with chr(): this file is pasted by hand.
-CREATE OR REPLACE FUNCTION public.identifying_text_problem(p_text text, p_names text[])
+-- fine, else a plain message saying what to take out. p_names: the case's
+-- own title and contact names; p_label: the match's client label (its
+-- initials count too). An older draft took (text, text[]): dropped first,
+-- so a call never finds two.
+DROP FUNCTION IF EXISTS public.identifying_text_problem(text, text[]);
+CREATE OR REPLACE FUNCTION public.identifying_text_problem(p_text text, p_names text[], p_label text DEFAULT NULL)
 RETURNS text
 LANGUAGE plpgsql IMMUTABLE
 SET search_path = pg_catalog
 AS $$
 DECLARE
-  v_plain text := lower(normalize(coalesce(p_text, ''), NFKC));
-  v_months constant text := '(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|july?|aug(ust)?|sep(t)?(ember)?|oct(ober)?|nov(ember)?|dec(ember)?)';
+  v_plain text := public.identifying_fold(p_text);
   v_endings constant text := '(com|net|org|edu|gov|io|co|me|ly|us|app|info|biz)(?![a-z0-9])';
+  v_found text;
 BEGIN
-  -- Control characters, line and paragraph separators, zero-width
-  -- characters and direction overrides (checked before normalizing).
-  IF coalesce(p_text, '') ~ ('[' || chr(1) || '-' || chr(31) || chr(127) || chr(8203) || '-' || chr(8207) || chr(8232) || chr(8233)
-                             || chr(8234) || '-' || chr(8238) || chr(8294) || '-' || chr(8297) || ']') THEN
+  -- C0 and C1 controls, soft hyphen, Arabic letter mark, Mongolian vowel
+  -- separator, byte order mark, zero-width characters, line and paragraph
+  -- separators, direction overrides, word joiner to the isolates (checked
+  -- before folding).
+  IF coalesce(p_text, '') ~ ('[' || chr(1) || '-' || chr(31) || chr(127) || '-' || chr(159) || chr(173) || chr(1564) || chr(6158) || chr(65279)
+                             || chr(8203) || '-' || chr(8207) || chr(8232) || chr(8233)
+                             || chr(8234) || '-' || chr(8238) || chr(8288) || '-' || chr(8297) || ']') THEN
     RETURN 'Remove line breaks and hidden characters.';
   END IF;
   IF strpos(v_plain, '@') > 0
@@ -126,33 +300,28 @@ BEGIN
   IF v_plain ~ '(https?:|www[.])' OR v_plain ~ ('[a-z0-9-]+[.]' || v_endings) THEN
     RETURN 'Leave out links and web addresses. Programs read this.';
   END IF;
-  -- Which message shows: a currency sign is money, a date pattern is a
-  -- date, six or more digits are a phone or ID number, then the rest of
-  -- the money patterns. A month is a whole word or its standard
-  -- abbreviation (dec, sept, december) that starts a word ((?<![a-z])),
-  -- then an optional period, a space and a day: decent 12 is not a date.
+  -- Which message shows: a currency sign is money, then a date, then an ID
+  -- number, then the rest of the money patterns, then a name.
   IF v_plain ~ ('[' || chr(36) || chr(8364) || chr(163) || chr(165) || ']') THEN
     RETURN 'Leave money out. Programs read this.';
   END IF;
-  IF v_plain ~ '(?<![0-9])[0-9]{1,2}[/.-][0-9]{1,2}[/.-][0-9]{2,4}(?![0-9])'
-     OR v_plain ~ ('(?<![a-z])' || v_months || '[.]? +[0-9]{1,2}(?![0-9])')
-     OR v_plain ~ '(?<![a-z])(dob|d[.]o[.]b[.]?|born)(?![a-z])' THEN
+  IF public.identifying_mentions_date(v_plain) THEN
     RETURN 'Leave out dates such as a birth date. Programs read this.';
   END IF;
-  IF v_plain ~ '[0-9]([^0-9a-z]{0,3}[0-9]){5,}' THEN
+  IF public.identifying_mentions_id_number(v_plain) THEN
     RETURN 'Leave out phone and ID numbers. Programs read this.';
   END IF;
-  IF v_plain ~ '[0-9]{1,3}(,[0-9]{3})+' OR v_plain ~ '[0-9]+ ?k(?![a-z])'
-     OR v_plain ~ '(?<![a-z])(dollars?|usd|budget|afford[a-z0-9_]*|out[ -]of[ -]pocket|can pay|cash pay)(?![a-z])' THEN
+  IF public.identifying_mentions_money(v_plain) THEN
     RETURN 'Leave money out. Programs read this.';
   END IF;
-  IF public.identifying_name_words(p_names) && regexp_split_to_array(v_plain, '[^[:alpha:]]+') THEN
-    RETURN 'Leave out names. Programs read this.';
+  v_found := public.identifying_name_found(v_plain, p_names, p_label);
+  IF v_found IS NOT NULL THEN
+    RETURN 'Leave out names ("' || v_found || '" is a name on this case). Programs read this.';
   END IF;
   RETURN NULL;
 END
 $$;
-REVOKE ALL ON FUNCTION public.identifying_text_problem(text, text[]) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.identifying_text_problem(text, text[], text) FROM PUBLIC, anon, authenticated;
 
 -- What a program must never read about a case: its title and its contacts'
 -- names (the check above takes their name words). Empty for no case.
@@ -173,19 +342,22 @@ REVOKE ALL ON FUNCTION public.identifying_case_names(uuid, uuid) FROM PUBLIC, an
 -- The first thing wrong with a request's note, in plain words, or NULL: at
 -- most 300 characters, then the identifying-details check (no email
 -- addresses, links, money, dates, phone or ID numbers, hidden characters,
--- or a name word from p_identifiers: the match's client label, the case's
--- title and its contact names). Mirrored in src/lib/placement-requests.ts.
-CREATE OR REPLACE FUNCTION public.placement_note_problem(p_note text, p_identifiers text[])
+-- or a name: a name word from p_identifiers, the case's title and its
+-- contact names, or from p_label, the match's client label, or one of the
+-- label's initials). Mirrored in src/lib/placement-requests.ts. An older
+-- draft took (text, text[]): dropped first, so a call never finds two.
+DROP FUNCTION IF EXISTS public.placement_note_problem(text, text[]);
+CREATE OR REPLACE FUNCTION public.placement_note_problem(p_note text, p_identifiers text[], p_label text DEFAULT NULL)
 RETURNS text
 LANGUAGE sql IMMUTABLE
 SET search_path = pg_catalog
 AS $$
   SELECT CASE
     WHEN length(btrim(coalesce(p_note, ''))) > 300 THEN 'Keep the note to 300 characters'
-    ELSE public.identifying_text_problem(p_note, p_identifiers)
+    ELSE public.identifying_text_problem(p_note, p_identifiers, p_label)
   END
 $$;
-REVOKE ALL ON FUNCTION public.placement_note_problem(text, text[]) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.placement_note_problem(text, text[], text) FROM PUBLIC, anon, authenticated;
 
 -- The payload a program sees has these ten keys and nothing else. Each
 -- value is checked against the app's own choices; anything unknown is
@@ -482,8 +654,8 @@ REVOKE ALL ON FUNCTION public.placement_request_json(uuid) FROM PUBLIC, anon, au
 -- level_of_care, population, therapies, must_have_therapies, insurance,
 -- state and location_preference are read. Any other key (a label, a
 -- budget, a name) is ignored; a client_label there only screens the note.
--- The note is screened against the label, the case's title and the names
--- of the case's contacts.
+-- The note is screened against the label (its words and its initials),
+-- the case's title and the names of the case's contacts.
 CREATE OR REPLACE FUNCTION public.placement_request_build(
   p_org uuid, p_match_profile_id uuid, p_criteria jsonb, p_case_id uuid, p_admit_window text, p_note text)
 RETURNS TABLE (o_payload jsonb, o_case_id uuid)
@@ -514,7 +686,7 @@ BEGIN
       RAISE EXCEPTION 'Case not found in your workspace' USING ERRCODE = 'P0002';
     END IF;
   END IF;
-  v_problem := public.placement_note_problem(btrim(coalesce(p_note, '')), ARRAY[v_label] || public.identifying_case_names(v_case, p_org));
+  v_problem := public.placement_note_problem(btrim(coalesce(p_note, '')), public.identifying_case_names(v_case, p_org), v_label);
   IF v_problem IS NOT NULL THEN
     RAISE EXCEPTION '%', v_problem USING ERRCODE = '22023';
   END IF;
@@ -616,6 +788,10 @@ REVOKE ALL ON FUNCTION public.placement_request_replay_differs(uuid, uuid[], int
 -- ===========================================================================
 -- 5. The practice's writers
 -- ===========================================================================
+
+-- An older draft took eight arguments (no p_ranks): dropped first, so a
+-- call never finds two.
+DROP FUNCTION IF EXISTS public.create_placement_request(uuid, uuid, jsonb, uuid[], integer, text, text, uuid);
 
 -- Ask up to 8 of the practice's own programs at once, in its ranked order
 -- (p_ranks: each one's place on the match screen; else 1, 2, 3). Answers

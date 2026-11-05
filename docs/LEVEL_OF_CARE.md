@@ -204,11 +204,13 @@ step (placing straight there skips the detox the rules called for), sober
 living alone, or a lower or higher level. The reason is 3 to 200
 characters on one line, and because it is printed in the program's packet
 it goes through the shared identifying-details check
-(`identifying_text_problem`, the same one as the placement-request note;
-see docs/PLACEMENT_REQUESTS.md): no hidden characters, email addresses,
-links, money, dates, phone or ID numbers, or a name word from the case's
-title or its contacts' names. The server's refusal is the RPC's 22023
-error message, e.g. "Leave out names. Programs read this."
+(`identifying_text_problem`, rules version 2, the same one as the
+placement-request note; see docs/PLACEMENT_REQUESTS.md for the rules): no
+hidden characters, email addresses, links, money, dates, phone or ID
+numbers, or a name word from the case's title or its contacts' names (there
+is no client label here). The server's refusal is the RPC's 22023 error
+message, e.g. "Leave out names ("rivera" is a name on this case). Programs
+read this."
 
 ### Named cases
 
@@ -286,13 +288,19 @@ rationale is not rebuilt.
 | Physical health 4 | urgent | Arrange an urgent medical evaluation | Arrange an urgent medical evaluation before placement: the client's doctor today, urgent care, or an emergency department. Programs may need a doctor's clearance to admit. If symptoms are life-threatening, call 911. |
 | Emotional, behavioral or cognitive 4 | urgent | Arrange an urgent psychiatric evaluation | Arrange an urgent psychiatric evaluation before placement. If there are thoughts of suicide, call or text 988. If anyone is in danger now, call 911. |
 | Recovery environment 4 | urgent | Plan a safe place to stay until admission | The living situation is unsafe. Plan where the client can stay safely until admission. If anyone is being hurt or threatened, call 911. |
-| Withdrawal risk 2, 3 or 4 | advice | Arrange detox first, or a program with on-site withdrawal management | Withdrawal needs medical oversight at this level of risk. Arrange detox first, or choose a program that manages withdrawal on site, with medical staff. |
+| Withdrawal risk 2 | advice | Make sure a medical provider oversees withdrawal at whichever level is chosen | Withdrawal needs medical oversight at this level of risk. Make sure a medical provider oversees withdrawal at whichever level is chosen. |
+| Withdrawal risk 3 or 4 | advice | Arrange detox first, or a program with on-site withdrawal management | Withdrawal needs medical oversight at this level of risk. Arrange detox first, or choose a program that manages withdrawal on site, with medical staff. |
 | Physical health 3 or 4 | advice | Ask about medical care on site | Ask each program whether it can manage these medical needs on site, with nursing. |
 | Emotional, behavioral or cognitive 3 or 4 | advice | Look for psychiatric care on site | Look for programs with psychiatric care on site (the "Dual diagnosis" need on the match). |
 | Relapse risk 3 or 4, or detox as the first step | advice | Plan for overdose risk | After detox or any break from use, tolerance drops, so using the same amount as before can cause an overdose. Make sure the family has naloxone (Narcan) and knows how to use it, and to call 911 if someone may be overdosing. |
 
 Flags are cumulative: a higher rating keeps every flag a lower one raised
-(physical 4 shows the urgent evaluation and the on-site advice of 3).
+(physical 4 shows the urgent evaluation and the on-site advice of 3). The
+withdrawal advice is one flag (`withdrawal_oversight`) worded for the
+rating: at 2, where the rules ask for medical oversight and leave the level
+open, a medical provider oversees withdrawal at whichever level is chosen;
+at 3 and 4, where detox is the first step, it says to arrange detox first.
+The wording is all that differs: the rules and their digest are unchanged.
 
 Emergency and urgent flags show on the result screen (and as soon as the
 rating is chosen); the card keeps a short "Safety notes from this
@@ -431,8 +439,11 @@ nothing.
 1. Paste `supabase/migrations/20261104150000_level_of_care.sql` into the SQL
    editor and run it. It is ASCII only, has no backslashes, every top-level
    statement is under 3,700 characters, and it runs in one BEGIN/COMMIT.
-   Running it twice is harmless (CREATE TABLE / INDEX IF NOT EXISTS, DROP
-   POLICY IF EXISTS, CREATE OR REPLACE).
+   Re-running a file before the next one is pasted is harmless (CREATE TABLE /
+   INDEX IF NOT EXISTS, DROP POLICY IF EXISTS, DROP FUNCTION IF EXISTS for an
+   older draft's signature, CREATE OR REPLACE). Once a later file is in, do not
+   re-run an earlier one: it would put back older copies of the shared helpers
+   the later file re-creates.
 2. Record it:
 
    ```sql

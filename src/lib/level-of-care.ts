@@ -437,6 +437,11 @@ export const EMERGENCY_FLAG: SafetyFlag = {
 // shows less. They are words only: the recommendation rules above (and the
 // digest both test suites share) never read them.
 const DETOX_FIRST: FlagTrigger = { dimension: LEVEL_OF_CARE_RULES.firstStep.dimension, when: RATINGS.filter((rating) => rating >= LEVEL_OF_CARE_RULES.firstStep.atOrAbove) };
+// Withdrawal that needs medical oversight but not detox first (rating 2).
+const OVERSIGHT_ONLY: FlagTrigger = {
+  dimension: LEVEL_OF_CARE_RULES.oversight.dimension,
+  when: RATINGS.filter((rating) => rating >= LEVEL_OF_CARE_RULES.oversight.atOrAbove && rating < LEVEL_OF_CARE_RULES.firstStep.atOrAbove),
+};
 
 export const FLAG_RULES: FlagRule[] = [
   {
@@ -459,8 +464,17 @@ export const FLAG_RULES: FlagRule[] = [
     title: 'Plan a safe place to stay until admission',
     text: 'The living situation is unsafe. Plan where the client can stay safely until admission. If anyone is being hurt or threatened, call 911.',
   },
+  // One withdrawal advice (one key, so a higher rating never shows less),
+  // worded for the rating: at 2 the level is open and a medical provider
+  // oversees withdrawal wherever the client goes; at 3 and 4 detox comes
+  // first (the rules' first step).
   {
-    key: 'withdrawal_oversight', triggers: [{ dimension: 'withdrawal', when: [2, 3, 4] }], severity: 'advice',
+    key: 'withdrawal_oversight', triggers: [OVERSIGHT_ONLY], severity: 'advice',
+    title: 'Make sure a medical provider oversees withdrawal at whichever level is chosen',
+    text: 'Withdrawal needs medical oversight at this level of risk. Make sure a medical provider oversees withdrawal at whichever level is chosen.',
+  },
+  {
+    key: 'withdrawal_oversight', triggers: [DETOX_FIRST], severity: 'advice',
     title: 'Arrange detox first, or a program with on-site withdrawal management',
     text: 'Withdrawal needs medical oversight at this level of risk. Arrange detox first, or choose a program that manages withdrawal on site, with medical staff.',
   },

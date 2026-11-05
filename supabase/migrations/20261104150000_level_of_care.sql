@@ -47,7 +47,7 @@ BEGIN;
 DO $$
 BEGIN
   IF to_regclass('public.placement_requests') IS NULL OR to_regclass('public.placement_request_recipients') IS NULL
-     OR to_regprocedure('public.identifying_text_problem(text, text[])') IS NULL
+     OR to_regprocedure('public.identifying_text_problem(text, text[], text)') IS NULL
      OR to_regprocedure('public.identifying_case_names(uuid, uuid)') IS NULL THEN
     RAISE EXCEPTION 'Paste 20261104140000_placement_requests.sql first: the placement request tables or the identifying-details check are missing.';
   END IF;
@@ -120,6 +120,10 @@ AS $$
 $$;
 REVOKE ALL ON FUNCTION public.case_assessment_event_body(text, text, text, text) FROM PUBLIC, anon, authenticated;
 
+-- An older draft of the reason check took the reason only: dropped first,
+-- so a call never finds two.
+DROP FUNCTION IF EXISTS public.case_assessment_reason_problem(text);
+
 -- The first thing wrong with the reason for choosing a different level, or
 -- NULL. It goes into the program's copy of the packet: 3 to 200 characters,
 -- one line, then the identifying-details check (no email addresses, links,
@@ -138,6 +142,10 @@ AS $$
   END
 $$;
 REVOKE ALL ON FUNCTION public.case_assessment_reason_problem(text, text[]) FROM PUBLIC, anon, authenticated;
+
+-- An older draft took eight arguments (no p_names): dropped first, so a
+-- call never finds two.
+DROP FUNCTION IF EXISTS public.case_assessment_problem(integer[], text[], integer, text, text, text, text, text);
 
 -- The first thing wrong with an assessment, in plain words, or NULL: six
 -- ratings 0-4, six notes (or none) of at most 200 characters, a level of

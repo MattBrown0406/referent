@@ -10,6 +10,7 @@ import {
   emptyForm,
   formFromRow,
   isMissingSchema,
+  keptCredentialMessage,
   newId,
   notesFromRows,
   savedNotice,
@@ -43,6 +44,9 @@ export default function Credentials({ listingId, listingState, onNotice, onError
   const [available, setAvailable] = useState(true);
   const [editing, setEditing] = useState<Editing | null>(null);
   const [problem, setProblem] = useState('');
+  // The server's way forward for an edit it will not take (a credential
+  // ReferralFit could not confirm is only corrected), said calmly in the form.
+  const [formInfo, setFormInfo] = useState('');
   const [busy, setBusy] = useState(false);
   // Information, said calmly in the card (not as an error): for example a
   // credential ReferralFit could not confirm stays on record.
@@ -77,6 +81,7 @@ export default function Credentials({ listingId, listingState, onNotice, onError
     if ('problem' in checked) { setProblem(checked.problem); return; }
     setBusy(true);
     setProblem('');
+    setFormInfo('');
     setInfo('');
     try {
       const { data, error } = await supabase.rpc('save_program_credential', {
@@ -85,7 +90,11 @@ export default function Credentials({ listingId, listingState, onNotice, onError
         p_partner_id: null,
         ...checked.payload,
       });
-      if (error) throw error;
+      if (error) {
+        const kept = keptCredentialMessage(error);
+        if (kept) { setFormInfo(kept); return; }
+        throw error;
+      }
       const saved = (Array.isArray(data) ? data[0] : data) as { status?: unknown } | null;
       setEditing(null);
       onNotice(savedNotice(saved?.status));
@@ -122,6 +131,7 @@ export default function Credentials({ listingId, listingState, onNotice, onError
   const form = editing?.form;
   const setForm = (patch: Partial<CredentialForm>) => {
     setProblem('');
+    setFormInfo('');
     setEditing((current) => (current ? { ...current, form: { ...current.form, ...patch } } : current));
   };
 
@@ -154,7 +164,7 @@ export default function Credentials({ listingId, listingState, onNotice, onError
                 </div>
                 <span className={`badge credential-${status}`}>{STATUS_LABELS[status]}</span>
                 <div className="credential-actions">
-                  <button type="button" className="ghost small" disabled={busy || Boolean(editing)} onClick={() => { setProblem(''); setInfo(''); setEditing({ id: row.id, form: formFromRow(row), rejected: row.status === 'rejected' }); }}>Edit</button>
+                  <button type="button" className="ghost small" disabled={busy || Boolean(editing)} onClick={() => { setProblem(''); setFormInfo(''); setInfo(''); setEditing({ id: row.id, form: formFromRow(row), rejected: row.status === 'rejected' }); }}>Edit</button>
                   <button type="button" className="ghost small" disabled={busy} onClick={() => { void remove(row); }}>Remove</button>
                 </div>
               </li>
@@ -198,17 +208,18 @@ export default function Credentials({ listingId, listingState, onNotice, onError
           <label>Note for ReferralFit (only ReferralFit sees this)</label>
           <textarea value={form.note} maxLength={1000} placeholder="Optional" onChange={(e) => setForm({ note: e.target.value })} />
           {problem ? <div className="error">{problem}</div> : null}
+          {formInfo ? <p className="help" role="status">{formInfo}</p> : null}
           <div className="actions">
             <button type="submit" disabled={busy}>{busy ? 'Saving' : 'Save credential'}</button>
-            <button type="button" className="ghost" disabled={busy} onClick={() => { setEditing(null); setProblem(''); }}>Cancel</button>
+            <button type="button" className="ghost" disabled={busy} onClick={() => { setEditing(null); setProblem(''); setFormInfo(''); }}>Cancel</button>
           </div>
           <p className="footnote">{editing.rejected
-            ? 'ReferralFit could not confirm this one, so it stays marked that way after a change. To have it reviewed again, add an updated credential.'
+            ? 'ReferralFit could not confirm this one, so it stays marked that way after a change. You can correct its number, date or link here; for another kind, accreditor or state, or to have it reviewed again, add an updated credential.'
             : 'Saving sends it to ReferralFit for review. It shows as pending ReferralFit review until then.'}</p>
         </form>
       ) : (
         <div className="actions">
-          <button type="button" disabled={busy || rows === null || rows.length >= 20} onClick={() => { setProblem(''); setInfo(''); setEditing({ form: emptyForm(listingState) }); }}>Add a credential</button>
+          <button type="button" disabled={busy || rows === null || rows.length >= 20} onClick={() => { setProblem(''); setFormInfo(''); setInfo(''); setEditing({ form: emptyForm(listingState) }); }}>Add a credential</button>
         </div>
       )}
     </div>

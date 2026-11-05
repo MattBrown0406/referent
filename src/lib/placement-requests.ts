@@ -100,9 +100,9 @@ export const NOTE_PROBLEMS = {
 // Shown under the note field, always: what identifyingTextProblem refuses.
 export const NOTE_WARNING = 'Programs read this note. Leave out names, contact details (phone, email, links), dates, ID numbers and money.';
 
-/** The names a note may not carry: the match's client label, the linked case's title and its contact names. */
-export function placementNoteNames(input: { clientLabel?: string | null; caseTitle?: string | null; contactNames?: (string | null | undefined)[] }): string[] {
-  return [input.clientLabel, input.caseTitle, ...(input.contactNames || [])]
+/** The names a note may not carry besides the client label: the linked case's title and its contact names. */
+export function placementNoteNames(input: { caseTitle?: string | null; contactNames?: (string | null | undefined)[] }): string[] {
+  return [input.caseTitle, ...(input.contactNames || [])]
     .filter((value): value is string => typeof value === 'string' && value.trim() !== '');
 }
 
@@ -110,13 +110,14 @@ export function placementNoteNames(input: { clientLabel?: string | null; caseTit
  * The first thing wrong with a request's note, or null: at most 300
  * characters, then the one shared check for text programs read
  * (identifying-text.ts, the same rules and words as the server's
- * public.identifying_text_problem). `names` are the match's client label,
- * the linked case's title and its contact names (placementNoteNames).
+ * public.identifying_text_problem). `names` are the linked case's title and
+ * its contact names (placementNoteNames); `label` is the match's client
+ * label, whose initials count too ("J.R." refuses "JR"), as on the server.
  */
-export function placementNoteProblem(note: string, names: (string | null | undefined)[] = []): string | null {
+export function placementNoteProblem(note: string, names: (string | null | undefined)[] = [], label: string | null = null): string | null {
   const text = note.trim();
   if (charLength(text) > NOTE_MAX) return NOTE_PROBLEMS.tooLong;
-  return identifyingTextProblem(text, names.filter((value): value is string => typeof value === 'string' && value.trim() !== ''));
+  return identifyingTextProblem(text, names.filter((value): value is string => typeof value === 'string' && value.trim() !== ''), label);
 }
 
 // ─── The payload (mirror of public.placement_request_payload) ───────────────
@@ -184,11 +185,13 @@ export function preparePlacementRequest(input: {
   criteria: PayloadCriteria;
   admitWindow: AdmitWindow | null | undefined;
   note: string;
-  /** The client label, the case title and its contact names (placementNoteNames). */
+  /** The case title and its contact names (placementNoteNames). */
   names: (string | null | undefined)[];
+  /** The match's client label (its words and its initials). */
+  label: string | null;
 }): PreparedRequest | { problem: string } {
   const note = input.note.trim();
-  const problem = placementNoteProblem(note, input.names);
+  const problem = placementNoteProblem(note, input.names, input.label);
   if (problem) return { problem };
   if (!input.admitWindow || !ADMIT_VALUES.includes(input.admitWindow)) return { problem: 'Choose when the client could be admitted' };
   return { payload: buildPlacementPayload(input.criteria, input.admitWindow, note), note };
@@ -205,9 +208,10 @@ export type ReviewedRequest = {
 };
 
 /**
- * One string for everything reviewed. The request id is reused only while
- * this stays the same (a retry); any change (a program, the note, either
- * window) is a new request with a new id.
+ * One string for everything reviewed (the programs, the note, either
+ * window). "Try again" shows only while this is still the review whose send
+ * had an unknown outcome (showsTryAgain); the request id itself is kept
+ * across changes until the server answers definitely (SendKey).
  */
 export function placementRequestSignature(reviewed: ReviewedRequest): string {
   return JSON.stringify([reviewed.partnerIds.map((id) => id.toLowerCase()), reviewed.note.trim(), reviewed.respondHours, reviewed.admitWindow]);
@@ -215,6 +219,49 @@ export function placementRequestSignature(reviewed: ReviewedRequest): string {
 
 /** The words for a replayed id the server keeps as first written (its 22023 refusal). */
 export const ALREADY_SENT_PROBLEM = 'This request already went out as first written. Cancel it and send a new one.';
+
+/**
+ * How a send that did not come back with a request ended:
+ *   'refused'       the server definitely said no (22023 or P0002 in its own
+ *                   words): nothing went out under this id
+ *   'already_sent'  the id already carries a request as first written
+ *   'unknown'       anything else (offline, a timeout, a server failure, an
+ *                   answer that could not be read): it may have gone out
+ */
+export type SendFailure = 'refused' | 'already_sent' | 'unknown';
+
+/**
+ * The request id across sends while the sheet is open. ONE id until the
+ * server has definitely answered: after a send whose outcome is unknown the
+ * next send keeps it, whatever was changed meanwhile, so a request that did
+ * go out is never sent twice (the server returns it, or refuses a changed
+ * one as already sent and the sheet offers Cancel). A new id only after a
+ * definite refusal or a confirmed cancel. `retryFor` is the reviewed
+ * request (placementRequestSignature) whose send is unknown: "Try again"
+ * shows only while the review is still that one.
+ */
+export type SendKey = { id: string | null; retryFor: string | null };
+export const NEW_SEND_KEY: SendKey = { id: null, retryFor: null };
+
+export type SendEvent = { type: 'failed'; failure: SendFailure; signature: string } | { type: 'cancelled' };
+
+/** The id this send uses: the one kept, else a new one (`mint`). */
+export function sendKeyId(key: SendKey, mint: () => string): string {
+  return key.id ?? mint();
+}
+
+/** The key after a send with `id` failed, or after the earlier request was cancelled. */
+export function nextSendKey(id: string, event: SendEvent): SendKey {
+  if (event.type === 'cancelled') return NEW_SEND_KEY;
+  if (event.failure === 'refused') return NEW_SEND_KEY;
+  if (event.failure === 'already_sent') return { id, retryFor: null };
+  return { id, retryFor: event.signature };
+}
+
+/** "Try again" on the send button: the last send's outcome is unknown and the review has not changed since. */
+export function showsTryAgain(key: SendKey, signature: string | null, notice: string): boolean {
+  return Boolean(notice) && key.retryFor !== null && signature !== null && key.retryFor === signature;
+}
 
 /** Hours the server gave programs to answer (respond_by minus created_at), or null. */
 export function responseHoursOf(request: Pick<PlacementRequest, 'createdAt' | 'respondBy'>): number | null {

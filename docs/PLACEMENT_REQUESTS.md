@@ -69,30 +69,51 @@ The rules hold whatever the client sends:
   criteria from `p_criteria`; anything else (a label, a budget, an email, a
   phone, a name, an address) is ignored. Tested.
 - The note (at most 300 characters) goes through the one identifying-details
-  check every free-text field a program reads shares:
-  `public.identifying_text_problem(p_text, p_names)`, the SQL twin of
-  `identifyingTextProblem` in `src/lib/identifying-text.ts` (both test
-  suites run every case in `scripts/fixtures/identifying-text-cases.json`;
-  `supabase/tests/identifying_text_test.sql` on the server). In order, it
-  refuses hidden or reordering characters and line breaks, email addresses
-  (including "at ... dot com" and a fullwidth @), links and bare domains,
-  money (currency signs, comma thousands, "40k", budget words), dates and a
-  date of birth (numeric dates, and a month as a whole word or its standard
-  abbreviation followed by a day: "Dec 12", "december 3" and "Sept. 14" are
-  refused, "decent 12" and "marvel 3" are not), phone and ID numbers (six
-  or more digits with any separators; fullwidth digits fold to ASCII under
-  NFKC), and the **name words** of the saved match's client label, the
-  case's title and the names of the case's contacts (words of three or more
-  letters, ignoring case, relationship words such as son, mom or family,
-  and the ordinary words case titles are made of, such as intervention,
-  placement, case, lead, call, consult, inquiry, referral, program,
-  treatment, rehab, detox, inpatient, outpatient, sober, living, aftercare,
-  recovery, new, first, follow, check, update and plan: with the title
-  "Rivera intervention", "rivera" is refused and "intervention planned for
-  next week" is fine). The refusal is
-  the RPC's 22023 error message, e.g. "Leave out names. Programs read
-  this." The app still warns under the field: "Programs read this note.
-  Leave out names, initials, dates of birth, phone numbers and money."
+  check every free-text field a program reads shares (rules version 2):
+  `public.identifying_text_problem(p_text, p_names, p_label)`, the SQL twin
+  of `identifyingTextProblem(text, names, label)` in
+  `src/lib/identifying-text.ts` (both test suites run every case in
+  `scripts/fixtures/identifying-text-cases.json`;
+  `supabase/tests/identifying_text_test.sql` on the server, written from the
+  fixture by `node scripts/identifying-text-test.mjs --write`; a
+  differential fuzz compares the two). Text is folded first (accents off,
+  NFKD then NFKC, lower case). In order, it refuses:
+  - hidden or reordering characters and line breaks (C0 and C1 controls,
+    the soft hyphen, the Arabic letter mark, the Mongolian vowel separator,
+    zero-width characters, direction overrides and isolates, the word
+    joiner and invisible operators, the byte order mark);
+  - email addresses (including "at ... dot com" and a fullwidth @), links
+    and bare domains;
+  - a currency sign;
+  - dates: day/month/year with a real day and month ("30/60/90 day
+    program" is fine), ISO dates (1985-03-14), month then day ("Dec 12",
+    "december 3", "Sept. 14"; "decent 12" is not), day first ("14th March",
+    "3rd of March"; "14 May" only with a year), "DOB" or "born", and a
+    birthday or bday followed by a number;
+  - phone and ID numbers: five digits in a row, a phone number in groups
+    (not a dose range such as "100-120 mg"), an SSN, or nine or more digits
+    with spaces, dots, brackets or dashes. Ordinary clinical text stays:
+    year ranges, BP 160/100, HR 110-120, clock times, "3.1, 3.5, 3.7";
+  - money: comma thousands, "40k", budget words, and amounts in words
+    ("40 grand", "40 thousand", "forty thousand", "1.5 million"; "grand"
+    only after a number, so "grand mal seizures" is fine);
+  - a **name**: a name word of the case's title or its contacts' names
+    (`p_names`) or of the saved match's client label (`p_label`), as a whole
+    word or its plural (n+s, n+es). Name words are three or more letters, or
+    two (Li, Wu, Ng) unless an everyday word, a state code or a care
+    abbreviation; never a word for a relationship (every word of the app's
+    relationship lists: son, mother, myself, stepchild, best friend, loved
+    one, family member, patient...), the app's placeholders, the ordinary
+    words case titles are made of (intervention, first call, detox...), or a
+    substance or kind of care (alcohol, opioids, fentanyl, IOP, MAT...).
+    For the **label** only, its initials and tags count too: tokens of two
+    or more letters or digits with a letter, dotted initials collapsed
+    ("J.R." refuses "JR" and "J.R."; "JR 34M" refuses "jr" and "34m").
+  The refusal is the RPC's 22023 error message, and a name refusal says
+  which word (the alphabetically first): "Leave out names ("rivera" is a
+  name on this case). Programs read this." The app still warns under the
+  field: "Programs read this note. Leave out names, contact details (phone,
+  email, links), dates, ID numbers and money."
 - Programs see the practice's **name** (the workspace name; its directory
   profile's name if the workspace was never named; otherwise "A ReferralFit
   practice"), never a person's email.
@@ -200,8 +221,18 @@ follow-up sheet's do and are released when they close.
 
 Reads are online only and never cached. Offline, the answers screen says
 "Answers load when you're online". Writes are online-only RPCs that throw
-the app's `OfflineError`; the send keeps its id, so "Try again" never sends
-twice.
+the app's `OfflineError`. After any send whose outcome is unknown (offline,
+a timeout, a server failure, an answer that could not be read back) the
+next send keeps the same request id, whatever was changed meanwhile, so a
+request that did go out is never sent twice: the server returns it, or, if
+the review changed, refuses it as already sent and the sheet offers to
+cancel the earlier one. A new id is made only after a definite refusal
+(22023 or P0002 in the server's words) or a confirmed cancel ("SendKey" in
+`placement-requests.ts`); an unanswered id is kept for its saved match even
+when the sheet is closed and opened again (while the app runs). "Try
+again" shows only while the review is the one whose send is unknown. The
+sheet cannot be dismissed while a send or a cancel is on its way, and once
+it is gone an answer still on its way shows nothing.
 
 Against a server **without** this migration the reads get PGRST202 /
 PGRST205 / 42P01 / 42703 / 42883, report `available: false`, and the whole
@@ -232,8 +263,11 @@ itself: without `public.program_credentials` it stops at once with "Paste
 1. Paste `supabase/migrations/20261104140000_placement_requests.sql` into the
    SQL editor and run it. It is ASCII only, has no backslashes, every
    top-level statement is under 3,700 characters, and it runs in one
-   BEGIN/COMMIT. Running it twice is harmless (CREATE TABLE / INDEX IF NOT
-   EXISTS, DROP POLICY IF EXISTS, CREATE OR REPLACE).
+   BEGIN/COMMIT. Re-running a file before the next one is pasted is harmless
+   (CREATE TABLE / INDEX IF NOT EXISTS, DROP POLICY IF EXISTS, DROP FUNCTION IF
+   EXISTS for an older draft's signature, CREATE OR REPLACE). Once a later file
+   is in, do not re-run an earlier one: it would put back older copies of the
+   shared helpers the later file re-creates.
 2. Record it:
 
    ```sql
@@ -272,6 +306,7 @@ itself: without `public.program_credentials` it stops at once with "Paste
 
    -- The identifying-details check, spot-checked.
    SELECT public.identifying_text_problem('Jake prefers a quiet program', ARRAY['Rivera family - son Jake']) AS name_check,
+          public.identifying_text_problem('JR prefers mornings', ARRAY['Rivera family'], 'J.R.') AS initials_check,
           public.identifying_text_problem('Needs a 30 day stay', ARRAY['Rivera family']) AS fine;
    ```
 
@@ -280,8 +315,13 @@ itself: without `public.program_credentials` it stops at once with "Paste
    `anon_ok = false`; `authenticated_ok = true` for the seven RPCs plus
    `placement_request_channels`, `placement_recipient_status` and
    `merge_global_partners` (it checks for a platform admin itself), false
-   for the internal helpers (`identifying_text_problem`,
-   `identifying_name_words`, `identifying_case_names`,
+   for the internal helpers (`identifying_text_problem` and its helpers
+   `identifying_fold`, `identifying_ordinary_words`,
+   `identifying_everyday_two`, `identifying_abbreviations`,
+   `identifying_name_words`, `identifying_tokens`,
+   `identifying_label_initials`, `identifying_mentions_date`,
+   `identifying_mentions_id_number`, `identifying_mentions_money`,
+   `identifying_name_found`; `identifying_case_names`,
    `placement_note_problem`, `placement_allowed_needs`,
    `placement_request_payload`, `placement_answer_problem`,
    `placement_request_partner_ids`, `placement_request_ranks`,
@@ -291,7 +331,9 @@ itself: without `public.program_credentials` it stops at once with "Paste
    `placement_request_finish`, `org_move_workspace_rows`,
    `org_merge_linked_partner_copies`). The payload has
    `"insurance_carrier": null` and `"payment": "insurance"`;
-   `name_check = 'Leave out names. Programs read this.'`, `fine` is NULL.
+   `name_check = 'Leave out names ("jake" is a name on this case). Programs read this.'`,
+   `initials_check = 'Leave out names ("jr" is a name on this case). Programs read this.'`,
+   `fine` is NULL.
 
 4. Rebuild and deploy the center portal (`cd portal && npm run build`, as
    in `portal/README.md`).

@@ -73,6 +73,19 @@ export function notesFromRows(data: unknown): ListingNotes {
 // calmly, as information.
 export const KEPT_ON_RECORD_FALLBACK = 'ReferralFit could not confirm this credential, so it stays on record. Add an updated one and we will review it.';
 
+// save_program_credential's 22023 when such a credential is edited into
+// another kind, accreditor or issuing state: it can only be corrected (its
+// number, date, link or note). Said calmly too, in the form. The app's
+// CREDENTIAL_CORRECT_ONLY is the same sentence.
+export const CORRECT_ONLY_MESSAGE = 'ReferralFit could not confirm this credential. Correct its number, date or link, or add a new credential.';
+
+/** The server's way forward for a credential it keeps as is (information, not an error), or null. */
+export function keptCredentialMessage(error: { code?: unknown; message?: unknown } | null | undefined): string | null {
+  if (!error) return null;
+  if (error.code === '22023' && error.message === CORRECT_ONLY_MESSAGE) return CORRECT_ONLY_MESSAGE;
+  return null;
+}
+
 // What the program is told after it saves: an edit of a credential
 // ReferralFit could not confirm stays "could not confirm" (the server keeps
 // it so); anything else waits for review.
