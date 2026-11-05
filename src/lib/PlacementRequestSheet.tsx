@@ -25,6 +25,7 @@ import {
   fetchPlacementChannels,
   fetchPlacementPracticeName,
   newPlacementRequestId,
+  placementRequestExists,
   sendFailureOf,
 } from './placement-api';
 import {
@@ -39,6 +40,7 @@ import {
   PROGRAM_INTRO,
   RESPONSE_WINDOW_HOURS,
   UNNAMED_PRACTICE,
+  acceptingAnswers,
   deadlineLabel,
   nextSendKey,
   placementNoteNames,
@@ -126,7 +128,14 @@ const PRESELECTED = 3;
 // for that match sends the next request under the same id, so one that did
 // go out (the sheet closed, or the answer was lost) is never sent twice.
 // Cleared by a definite answer: sent, refused, or the earlier one cancelled.
+// Kept only until it is known to have gone out (it exists on the server),
+// and cleared on sign-out and workspace changes (clearUnansweredSendKeys).
 const unansweredSendKeys = new Map<string, SendKey>();
+
+/** Forget every kept id: called when the account or workspace changes. */
+export function clearUnansweredSendKeys(): void {
+  unansweredSendKeys.clear();
+}
 
 function hoursLabel(hours: ResponseWindowHours): string {
   return `${hours} hours`;
@@ -201,7 +210,21 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
     setSent(null);
     setOutreach({});
     setConflict(null);
-    setSendKey(unansweredSendKeys.get(request.match.id.toLowerCase()) ?? NEW_SEND_KEY);
+    const kept = unansweredSendKeys.get(request.match.id.toLowerCase());
+    setSendKey(kept ?? NEW_SEND_KEY);
+    if (kept?.id) {
+      // If the request it was kept for is on the server, it went out: the
+      // next request is a new one. If the server can't be asked, keep it.
+      const keptId = kept.id;
+      const matchKey = request.match.id.toLowerCase();
+      void placementRequestExists(keptId).then((exists) => {
+        if (exists !== true) return;
+        if (unansweredSendKeys.get(matchKey)?.id === keptId) unansweredSendKeys.delete(matchKey);
+        if (generationRef.current !== generation || sendKeyRef.current.id !== keptId) return;
+        setSendKey(NEW_SEND_KEY);
+        setSendNotice('Your earlier request went out. Its answers are on Today; this one will be a new request.');
+      });
+    }
     sendingRef.current = false;
     composingRef.current = false;
     void fetchPlacementPracticeName().then((name) => { if (generationRef.current === generation) setPracticeName(name); });
@@ -293,6 +316,15 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
         note: reviewed.note,
       });
       if (generationRef.current !== generation) return;
+      if (!acceptingAnswers(view.request, new Date())) {
+        // The id was kept for a request that has since been cancelled,
+        // closed, or has expired: nothing new went out. The next send is a
+        // new request.
+        keepSendKey(match.id, NEW_SEND_KEY);
+        setStage('review');
+        setSendNotice('Your earlier request is already closed, so nothing new went out. Tap Send to ask again.');
+        return;
+      }
       onSent(view);
       if (sentDiffersFromReview(view, reviewed)) {
         // The server kept what this id first carried: not what was just

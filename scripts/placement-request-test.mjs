@@ -503,8 +503,18 @@ function query(result) {
   ok('an unanswered id outlives the sheet for that match: kept from the moment it is sent, cleared only by a definite answer',
     /const id = sendKeyId\(sendKeyRef\.current, newPlacementRequestId\);\s*\/\/[^\n]*\n\s*keepSendKey\(match\.id, \{ id, retryFor: null \}\);/.test(sheet)
     && /keepSendKey\(match\.id, NEW_SEND_KEY\);\s*setSent\(view\);/.test(sheet)
-    && sheet.includes('setSendKey(unansweredSendKeys.get(request.match.id.toLowerCase()) ?? NEW_SEND_KEY);')
-    && (sheet.match(/keepSendKey\(match\.id, /g) || []).length === 4);
+    && sheet.includes('const kept = unansweredSendKeys.get(request.match.id.toLowerCase());')
+    && sheet.includes('setSendKey(kept ?? NEW_SEND_KEY);')
+    && (sheet.match(/keepSendKey\(match\.id, /g) || []).length === 5);
+  ok('a kept id whose request is on the server went out: the next send is a new request',
+    /void placementRequestExists\(keptId\)\.then\(\(exists\) => \{\s*if \(exists !== true\) return;[\s\S]{0,300}setSendKey\(NEW_SEND_KEY\);/.test(sheet));
+  ok('a replay that returns a closed, cancelled, or expired request never says "Request sent"',
+    /if \(!acceptingAnswers\(view\.request, new Date\(\)\)\) \{[\s\S]{0,300}keepSendKey\(match\.id, NEW_SEND_KEY\);[\s\S]{0,200}return;\s*\}\s*onSent\(view\);/.test(sheet));
+  {
+    const app = readFileSync(path.join(repoRoot, 'App.tsx'), 'utf8');
+    ok('kept ids are forgotten when the account or workspace changes',
+      /const resetAccountState = useCallback\(\(\) => \{\s*clearUnansweredSendKeys\(\);/.test(app) && sheet.includes('export function clearUnansweredSendKeys(): void {'));
+  }
   ok('"Try again" only while the review is unchanged', sheet.includes("showsTryAgain(sendKey, reviewedSignature, sendNotice) ? 'Try again'") && !/requestKeyRef/.test(sheet));
   ok('the sheet cannot be dismissed while a send or a cancel is on its way', sheet.includes("const busyClose = stage === 'sending' || Boolean(conflict?.cancelling);")
     && sheet.includes('onRequestClose={busyClose ? () => undefined : onClose}') && sheet.includes('disabled={busyClose} onPress={onClose}'));

@@ -156,7 +156,7 @@ import {
 import FamilyCostPanel from './src/lib/FamilyCostPanel';
 import CredentialsCard, { ShieldChip, credentialProgramForPartner, credentialsForPartner, useCredentialIndex } from './src/lib/CredentialsCard';
 import { credentialWatchItems, credentialWatchSubtitle, licenseConcernAlert, licenseOverrideNote, programIntegrity, type LicenseConcern, type ProgramIntegrity } from './src/lib/integrity';
-import PlacementRequestSheet, { type PlacementSheetRequest } from './src/lib/PlacementRequestSheet';
+import PlacementRequestSheet, { clearUnansweredSendKeys, type PlacementSheetRequest } from './src/lib/PlacementRequestSheet';
 import PlacementCompare, { type CompareChoice } from './src/lib/PlacementCompare';
 import { usePlacementRequests } from './src/lib/placement-api';
 import { latestRequestForMatch, placementTodayItems, requestProgress, type PlacementRequest, type PlacementRequestView } from './src/lib/placement-requests';
@@ -1474,6 +1474,7 @@ export default function App() {
   }, [applyMatchToForm]);
 
   const resetAccountState = useCallback(() => {
+    clearUnansweredSendKeys();
     setOutreach(null);
     setAssessmentCaseId(null);
     setPlacementSheet(null);

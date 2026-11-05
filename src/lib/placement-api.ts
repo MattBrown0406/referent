@@ -96,6 +96,22 @@ export function sendFailureOf(error: unknown): SendFailure {
 
 export type PlacementRequestsRead = { available: boolean; requests: PlacementRequestView[] };
 
+/**
+ * Whether a request with this id is on the server (RLS: this workspace
+ * only). true or false when the server answered; null when it could not be
+ * asked. A request the sheet kept an id for after an unknown outcome that
+ * exists definitely went out.
+ */
+export async function placementRequestExists(id: string): Promise<boolean | null> {
+  try {
+    const { data, error } = await supabase.from('placement_requests').select('id').eq('id', id).maybeSingle();
+    if (error) return null;
+    return Boolean(data);
+  } catch {
+    return null;
+  }
+}
+
 /** The practice's newest requests with their programs (RLS: this workspace only). */
 export async function fetchPlacementRequests(): Promise<PlacementRequestsRead> {
   let requestRows: unknown[] = [];
