@@ -109,3 +109,25 @@ button.small { padding: 6px 10px; font-size: 13px; }
 .history ul { list-style: none; margin: 0; padding: 0; }
 .history li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 14px; }
 .history li span:first-child { color: var(--gray); }
+
+/* Credentials (Program Integrity Watch). */
+select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 15px;
+  font-family: inherit;
+  background: var(--bg);
+  color: var(--ink);
+}
+.credentials { list-style: none; margin: 0 0 4px; padding: 0; }
+.credentials li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+.credential-main { flex: 1 1 240px; display: flex; flex-direction: column; gap: 3px; font-size: 15px; }
+.credential-main a { font-size: 13px; color: var(--blue); }
+.credential-main .warn { color: var(--coral); font-size: 13px; }
+.credential-actions { display: flex; gap: 6px; }
+.badge.credential-verified { background: var(--green-soft); color: var(--green); }
+.badge.credential-pending { background: var(--blue-soft); color: var(--blue); }
+.badge.credential-expiring { background: #fffaeb; color: #b54708; }
+.badge.credential-expired, .badge.credential-rejected { background: var(--coral-soft); color: var(--coral); }

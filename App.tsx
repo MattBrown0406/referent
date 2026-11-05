@@ -147,6 +147,8 @@ import {
   type VobCostsDraft,
 } from './src/lib/family-cost-form';
 import FamilyCostPanel from './src/lib/FamilyCostPanel';
+import CredentialsCard, { ShieldChip, credentialProgramForPartner, credentialsForPartner, useCredentialIndex } from './src/lib/CredentialsCard';
+import { credentialWatchItems, credentialWatchSubtitle, licenseConcernAlert, licenseOverrideNote, programIntegrity, type LicenseConcern, type ProgramIntegrity } from './src/lib/integrity';
 import {
   assignMatchReferral,
   completeFollowUpWithNext,
@@ -902,12 +904,15 @@ function PartnerCard({
   onShare,
   compact = false,
   lastReferralOn,
+  integrity,
 }: {
   partner: Partner;
   onPress: () => void;
   onShare?: () => void;
   compact?: boolean;
   lastReferralOn?: string;
+  // Credentials on file (Program Integrity Watch); undefined hides the chip.
+  integrity?: ProgramIntegrity;
 }) {
   const insurancePlanCount = partner.insurance.filter((plan) => plan !== 'Cash pay').length;
   return (
@@ -939,6 +944,7 @@ function PartnerCard({
               {hasFinancialRelationship(partner) ? (
                 <View style={[styles.disclosureBadge, { alignSelf: 'flex-start', marginTop: 6 }]}><AppIcon name="information-circle-outline" size={12} color={COLORS.coral} /><Text style={styles.disclosureBadgeText}>Disclosed relationship · {financialRelationshipLabel(partner.financialRelationship)}</Text></View>
               ) : null}
+              {integrity ? <View style={styles.credentialChipRow}><ShieldChip integrity={integrity} /></View> : null}
             </View>
             {onShare ? (
               <TouchableOpacity accessibilityLabel={`Share ${partner.organization}`} accessibilityRole="button" onPress={onShare} style={styles.cardShareButton}>
@@ -1114,7 +1120,9 @@ export default function App() {
   const [docView, setDocView] = useState<{ url: string; mimeType: string; label: string } | null>(null);
   // Match Packet compose state: which partner + which match profile the
   // packet is for, and whether the assign-on-send flow should run.
-  const [packetTarget, setPacketTarget] = useState<{ partner: Partner; match: ReferralMatch; assignOnSend: boolean } | null>(null);
+  // licenseOverride: the practitioner went ahead past a license concern
+  // (Program Integrity Watch); the packet's timeline entry says so.
+  const [packetTarget, setPacketTarget] = useState<{ partner: Partner; match: ReferralMatch; assignOnSend: boolean; licenseOverride?: LicenseConcern | null } | null>(null);
   const [packetAudience, setPacketAudience] = useState<PacketAudience>('family');
   const [packetText, setPacketText] = useState('');
   // The financial-relationship disclosure was missing from the edited packet
@@ -1243,6 +1251,9 @@ export default function App() {
   const [bedFilterOn, setBedFilterOn] = useState(false);
   const [bedFor, setBedFor] = useState<BedFor>('any');
   const [listingBeds, setListingBeds] = useState<Record<string, ListingBedsStatus>>({});
+  // Program Integrity Watch: bumped by every full refresh so credentials
+  // (online only, never cached) are read again with everything else.
+  const [credentialsNonce, setCredentialsNonce] = useState(0);
   // The shortlist the clinician saw when they started an assignment, so the
   // placement record can say what was shown and at what rank the pick sat.
   const [pendingPlacement, setPendingPlacement] = useState<{ matchProfileId: string; rankedIds: string[]; candidates: PlacementCandidate[] } | null>(null);
@@ -1935,6 +1946,7 @@ export default function App() {
       } catch {
         // Keep the last known member list.
       }
+      setCredentialsNonce((nonce) => nonce + 1);
       // A change that landed meanwhile saves its own copy; never overwrite it with this read.
       if (!changedMeanwhile()) await syncDerived(refreshed, caseLoad.list.cases);
       if (stillCurrent()) setRefreshNotice('');
@@ -2257,6 +2269,34 @@ export default function App() {
 
   const bedOptions = useMemo((): BedOptions => ({ bedFor: bedFilterOn ? bedFor : null, beds: listingBeds }), [bedFilterOn, bedFor, listingBeds]);
 
+  // Program Integrity Watch (src/lib/integrity.ts): each partner's
+  // credentials, its directory listing's plus the practice's own checks.
+  // DISPLAY ONLY: rankPrograms below never reads them. Online only; on a
+  // server without 20261104130000 the index is 'unavailable' and every
+  // credential chip, card and prompt stays hidden.
+  const credentialIndex = useCredentialIndex(session?.user?.id, linkedListingIds, credentialsNonce + workspaceEpoch);
+  const integrityByPartner = useMemo(() => {
+    const result = new Map<string, ProgramIntegrity>();
+    if (credentialIndex.state.status !== 'ready') return result;
+    for (const partner of partners) result.set(partner.id, programIntegrity(credentialsForPartner(credentialIndex.state.index, partner), todayStamp));
+    return result;
+  }, [partners, credentialIndex.state, todayStamp]);
+  // The Directory list's chip: programs always; an interventionist or
+  // therapist only once something is on file (no accreditation to expect).
+  function directoryChipFor(partner: Partner): ProgramIntegrity | undefined {
+    const integrity = integrityByPartner.get(partner.id);
+    if (!integrity) return undefined;
+    return integrity.onFile > 0 || !isIndividualProfessional(typesForPartner(partner)) ? integrity : undefined;
+  }
+  // Today's one card: programs referred to in the last 12 months whose
+  // license or accreditation has expired or expires within 30 days.
+  const credentialWatch = useMemo(
+    () => (credentialIndex.state.status === 'ready'
+      ? credentialWatchItems({ partners, referrals, integrityFor: (id) => integrityByPartner.get(id) ?? null, today: todayStamp })
+      : []),
+    [credentialIndex.state.status, partners, referrals, integrityByPartner, todayStamp],
+  );
+
   function bedLineForPartner(partner: Partner): string {
     return partner.globalPartnerId ? bedsLine(listingBeds[partner.globalPartnerId]) : '';
   }
@@ -2562,10 +2602,37 @@ export default function App() {
     );
   }
 
+  // Program Integrity Watch: a program whose state license shows expired or
+  // could not be confirmed needs one more tap before a referral or a packet.
+  // An Alert, never a sheet. `proceed` gets the concern so the referral can
+  // record that the practitioner went ahead anyway. No concern (or no
+  // credentials loaded): proceed runs at once, exactly as before.
+  function licenseConcernFor(partner: Partner): LicenseConcern | null {
+    return integrityByPartner.get(partner.id)?.licenseConcern ?? null;
+  }
+
+  function confirmLicenseConcern(partner: Partner, action: 'refer' | 'packet', proceed: (concern: LicenseConcern | null) => void) {
+    const concern = licenseConcernFor(partner);
+    if (!concern) {
+      proceed(null);
+      return;
+    }
+    const prompt = licenseConcernAlert(partner.organization || partner.name, concern, action);
+    Alert.alert(prompt.title, prompt.message, [
+      { text: 'Go back', style: 'cancel' },
+      { text: prompt.proceed, onPress: () => proceed(concern) },
+    ]);
+  }
+
   // From a recommended match card: the profile only gets assigned (status →
   // Referred) if the packet is actually sent. The shortlist is captured now,
   // while the card order the clinician saw is still on screen.
-  async function openPacketComposer(partner: Partner, score: ProgramScore) {
+  async function openPacketComposer(partner: Partner, score: ProgramScore, licenseChecked = false, licenseOverride: LicenseConcern | null = null) {
+    if (!licenseChecked && licenseConcernFor(partner)) {
+      // The composer presents once the Alert has finished going away.
+      confirmLicenseConcern(partner, 'packet', (concern) => afterSheetCloses(() => { void openPacketComposer(partner, score, true, concern); }));
+      return;
+    }
     const openings = screenOpenings();
     const matchProfile = await currentOrSavedMatch();
     if (!matchProfile) return;
@@ -2581,20 +2648,24 @@ export default function App() {
     else setPendingPlacement({ matchProfileId: matchProfile.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
     const reasons = buildFitReasons(matchProfile, partner, packetFitInput(score, matchProfile));
     setPacketDisclosureRestored(false);
-    setPacketTarget({ partner, match: matchProfile, assignOnSend: !alreadyReferred });
+    setPacketTarget({ partner, match: matchProfile, assignOnSend: !alreadyReferred, licenseOverride });
     setPacketAudience('family');
     setPacketText(buildPacket(matchProfile, partner, reasons, 'family', packetCostLines(matchProfile, partner, score.networkStatus)));
   }
 
   // From a Referred profile (assigned partner): the assignment already
   // exists, so sending only logs the packet + follow-up on that referral.
-  function openPacketForAssigned(matchProfile: ReferralMatch) {
+  function openPacketForAssigned(matchProfile: ReferralMatch, licenseChecked = false, licenseOverride: LicenseConcern | null = null) {
     const partner = partners.find((item) => item.id === matchProfile.assignedPartnerId);
     if (!partner) return;
+    if (!licenseChecked && licenseConcernFor(partner)) {
+      confirmLicenseConcern(partner, 'packet', (concern) => afterSheetCloses(() => openPacketForAssigned(matchProfile, true, concern)));
+      return;
+    }
     const fitInput = fitInputForMatch(matchProfile, partner);
     const reasons = buildFitReasons(matchProfile, partner, fitInput);
     setPacketDisclosureRestored(false);
-    setPacketTarget({ partner, match: matchProfile, assignOnSend: false });
+    setPacketTarget({ partner, match: matchProfile, assignOnSend: false, licenseOverride });
     setPacketAudience('family');
     setPacketText(buildPacket(matchProfile, partner, reasons, 'family', packetCostLines(matchProfile, partner, fitInput.networkStatus)));
   }
@@ -2736,7 +2807,8 @@ export default function App() {
       matchMustHave, matchPopulation, matchLocationPreference,
       tab, packetTarget, packetSendConfirm, packetAudience, packetText,
     };
-    const { partner, match, assignOnSend } = packetTarget;
+    const { partner, match, assignOnSend, licenseOverride } = packetTarget;
+    const overrideNote = licenseOverride ? licenseOverrideNote(partner.organization || partner.name, licenseOverride, 'packet') : '';
     const now = new Date();
     const todayStamp = localDateStamp();
     // A packet sent on a case-linked profile links everything it creates.
@@ -2754,7 +2826,8 @@ export default function App() {
         date: todayStamp,
         clientLabel: match.clientLabel,
         outcome: 'Introduced',
-        note: 'Match packet sent',
+        // With no case file to hold it, the override stays with the referral.
+        note: overrideNote && !match.caseId ? `Match packet sent. ${overrideNote}` : 'Match packet sent',
         packetSentAt: now.toISOString(),
         matchProfileId: match.id,
         caseId,
@@ -2836,7 +2909,7 @@ export default function App() {
         id: eventId,
         caseId,
         kind: 'referral',
-        body: `Sent packet to ${partner.organization}`,
+        body: overrideNote ? `Sent packet to ${partner.organization}. ${overrideNote}` : `Sent packet to ${partner.organization}`,
         referralId,
         occurredAt: now.toISOString(),
       };
@@ -5566,7 +5639,7 @@ export default function App() {
     }
   }
 
-  function addReferral(disclosureConfirmed = false) {
+  function addReferral(disclosureConfirmed = false, licenseOverride: LicenseConcern | null = null) {
     if (!referralForm.partnerId || !referralForm.clientLabel.trim()) {
       Alert.alert('A little more detail', 'Choose a partner and add a client or family label.');
       return;
@@ -5584,6 +5657,13 @@ export default function App() {
         return;
       }
     }
+    // Referring a client out (Assign & refer, or an outbound referral) to a
+    // program whose state license shows expired or could not be confirmed:
+    // one more tap, and the referral records that it went ahead anyway.
+    if (chosenPartner && !licenseOverride && (activeReferralMatchId || referralForm.direction === 'Outbound') && licenseConcernFor(chosenPartner)) {
+      confirmLicenseConcern(chosenPartner, 'refer', (concern) => addReferral(disclosureConfirmed, concern));
+      return;
+    }
     if (!mutationSlotAvailable('The referral')) return;
     const previousReferralUi = {
       referralForm, showAddReferral, activeReferralMatchId, tab,
@@ -5597,6 +5677,10 @@ export default function App() {
     // offered on that form: admission is recorded through the admit check
     // below (record_placement_outcome), never typed onto the referral.
     const matchForReferral = activeReferralMatchId ? referralMatches.find((item) => item.id === activeReferralMatchId) || null : null;
+    // A license override goes on the case timeline when there is a case,
+    // otherwise on the referral's own note.
+    const overrideNote = licenseOverride && chosenPartner ? licenseOverrideNote(chosenPartner.organization || chosenPartner.name, licenseOverride) : '';
+    const overrideCaseId = overrideNote ? matchForReferral?.caseId : undefined;
     const referral: Referral = {
       id: makeId('r'),
       partnerId: referralForm.partnerId,
@@ -5604,9 +5688,17 @@ export default function App() {
       date: localDateStamp(),
       clientLabel: referralForm.clientLabel.trim(),
       outcome: matchForReferral && referralForm.outcome === 'Placed' ? 'Introduced' : referralForm.outcome,
-      note: referralForm.note.trim(),
+      note: [referralForm.note.trim(), overrideNote && !overrideCaseId ? overrideNote : ''].filter(Boolean).join('\n'),
       ...(matchForReferral ? { matchProfileId: matchForReferral.id, caseId: matchForReferral.caseId } : {}),
     };
+    const overrideEvent: CaseEvent | null = overrideCaseId ? {
+      id: makeId('e'),
+      caseId: overrideCaseId,
+      kind: 'referral',
+      body: overrideNote,
+      referralId: referral.id,
+      occurredAt: new Date().toISOString(),
+    } : null;
     // The same "did they admit?" check the packet path sets, so Today asks
     // and the outcome lands on the referral and the partner's track record.
     const admitCheck: FollowUp | null = matchForReferral ? {
@@ -5651,6 +5743,7 @@ export default function App() {
         }
       : partner);
     setPartners(nextPartners);
+    if (overrideEvent) applyCaseEvent(overrideEvent);
     setShowAddReferral(false);
     setReferralForm(emptyReferral);
     if (activeReferralMatchId) setTab('referrals');
@@ -5670,11 +5763,19 @@ export default function App() {
         } else {
           await createReferral(referral, activeUserId);
         }
+        // After the referral it names (queued behind it offline). Best
+        // effort: the referral stands even if the timeline entry does not.
+        if (overrideEvent) {
+          await logContactActivity(overrideEvent, null, activeUserId).catch(() => {
+            setCaseEvents((current) => current.filter((item) => item.id !== overrideEvent.id));
+          });
+        }
       },
       snapshot,
       { partners, referrals, referralMatches, touches, followUps, scorecards },
       () => {
         setPartners(partners); setReferrals(referrals); setReferralMatches(referralMatches);
+        if (overrideEvent) setCaseEvents((current) => current.filter((item) => item.id !== overrideEvent.id));
         if (admitCheck) setFollowUps(followUps);
         setReferralForm(previousReferralUi.referralForm);
         // The form reopens once its sheet has finished closing and nothing
@@ -6107,6 +6208,30 @@ export default function App() {
             </View>
           ) : null}
 
+          {credentialWatch.length ? (
+            <View style={styles.todaySection}>
+              <Text style={styles.todaySectionHeader}>🛡️ CREDENTIALS TO CHECK</Text>
+              <View style={styles.credentialWatchCard}>
+                <Text style={styles.credentialWatchIntro}>{credentialWatchSubtitle(credentialWatch)}</Text>
+                {credentialWatch.map((item) => (
+                  <TouchableOpacity
+                    key={item.partnerId}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${item.name}: ${item.lines.join(', ')}. Open the profile.`}
+                    onPress={() => { const partner = partnerById.get(item.partnerId); if (partner) setSelectedPartner(partner); }}
+                    style={styles.credentialWatchRow}
+                  >
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.credentialWatchName}>{item.name}</Text>
+                      <Text style={item.worst === 'expired' ? styles.credentialWatchLineExpired : styles.credentialWatchLine}>{item.lines.join(' · ')}</Text>
+                    </View>
+                    <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+          ) : null}
+
           {todayCounts.actions === 0 ? (
             <EmptyState icon="checkmark-circle-outline" title="List is clear" body="No actions due and no partners past cadence. Log a touch, or capture the next thing with + below." />
           ) : teamWorkspace && todayScope === 'mine' && !todaySections.newLeads.length && !todaySections.overdue.length && !todaySections.today.length && !todaySections.partnersDue.length ? (
@@ -6450,6 +6575,8 @@ export default function App() {
                   const cost = familyCostFor(matchCaseId, matchInsurance, match.partner, match.networkStatus);
                   return cost ? <Text numberOfLines={2} style={cost.known ? styles.familyCostLine : styles.bedLineUnconfirmed}>{familyCostCardLine(cost)}{cost.known && cost.balanceBilling ? ' · balance billing possible' : ''}</Text> : null;
                 })()}
+                {/* Credentials on file (Program Integrity Watch). Shown only; the score and the order never read it. */}
+                {integrityByPartner.has(match.partner.id) ? <View style={styles.credentialChipRow}><ShieldChip integrity={integrityByPartner.get(match.partner.id)} /></View> : null}
                 {match.verifyBenefits || match.disclosure || matchInsurance !== 'Cash pay' ? (
                   <View style={styles.matchFlags}>
                     {match.verifyBenefits ? <View style={styles.verifyBadge}><AppIcon name="alert-circle-outline" size={12} color={COLORS.inkSoft} /><Text style={styles.verifyBadgeText}>Verify benefits</Text></View> : null}
@@ -6665,7 +6792,7 @@ export default function App() {
           </View>
         ) : null}
         <View style={styles.directoryCountRow}><Text style={styles.directoryCount}>{directoryPartners.length} RESULTS</Text><AppIcon name="options-outline" size={18} color={COLORS.gray} /></View>
-        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} lastReferralOn={lastReferralByPartner[partner.id]} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
+        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} lastReferralOn={lastReferralByPartner[partner.id]} integrity={directoryChipFor(partner)} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
         {!directoryPartners.length ? <EmptyState icon="people-outline" title={directoryPlan ? `Nobody lists ${directoryPlan} in-network` : 'No partners found'} body={directoryPlan ? 'Programs report their own networks and lists are often incomplete. Clear the plan filter, or request a VOB from the case to find out for sure.' : 'Try another search or add a new relationship.'} /> : null}
       </ScrollView>
     );
@@ -7510,7 +7637,7 @@ export default function App() {
             <Text style={styles.modalHeaderTitle}>Partner profile</Text>
             <TouchableOpacity accessibilityRole="button" accessibilityLabel={selectedPartner.favorite ? 'Remove partner from favorites' : 'Add partner to favorites'} accessibilityState={{ selected: selectedPartner.favorite }} onPress={() => toggleFavorite(selectedPartner.id)} style={styles.closeButton}><AppIcon name={selectedPartner.favorite ? 'heart' : 'heart-outline'} size={21} color={selectedPartner.favorite ? COLORS.coral : COLORS.ink} /></TouchableOpacity>
           </View>
-          <ScrollView contentContainerStyle={styles.modalContent}>
+          <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
             <View style={styles.profileHero}>
               <Initials name={selectedPartner.organization} size={68} />
               <Text style={styles.profileOrg}>{selectedPartner.organization}</Text>
@@ -7567,6 +7694,15 @@ export default function App() {
                 </View>
               );
             })()}
+            <CredentialsCard
+              key={selectedPartner.id}
+              program={credentialProgramForPartner(selectedPartner)}
+              state={credentialIndex.state}
+              today={todayStamp}
+              whoLabel={(userId) => (!userId ? '' : userId === activeUserId.toLowerCase() ? 'you' : memberDisplayName(members, userId))}
+              onChanged={credentialIndex.reload}
+              canEditListing={credentialIndex.isPlatformAdmin}
+            />
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Staying in touch</Text>
               <View style={styles.infoLine}><AppIcon name="calendar-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Cadence</Text><Text style={styles.infoValue}>{selectedPartner.touchCadenceDays ? `Every ${selectedPartner.touchCadenceDays} days` : 'No cadence set'}</Text></View></View>
@@ -9396,6 +9532,13 @@ const styles = StyleSheet.create({
   matchInsuranceText: { flex: 1, flexShrink: 1, marginRight: 8 },
   matchPriceText: { flexShrink: 0, color: COLORS.gray, fontSize: 10, fontWeight: '600', textAlign: 'right' },
   matchFlags: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 9 },
+  credentialChipRow: { flexDirection: 'row', marginTop: 7 },
+  credentialWatchCard: { backgroundColor: COLORS.white, borderRadius: 18, borderWidth: 1, borderColor: COLORS.line, padding: 14, gap: 4 },
+  credentialWatchIntro: { color: COLORS.inkSoft, fontSize: 12, lineHeight: 17, marginBottom: 4 },
+  credentialWatchRow: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8, borderTopWidth: 1, borderTopColor: '#EEF0EE' },
+  credentialWatchName: { color: COLORS.ink, fontSize: 13, fontWeight: '800' },
+  credentialWatchLine: { color: COLORS.inkSoft, fontSize: 12, marginTop: 2 },
+  credentialWatchLineExpired: { color: COLORS.coral, fontSize: 12, fontWeight: '700', marginTop: 2 },
   bedLineOpen: { color: COLORS.forest, fontSize: 11, fontWeight: '700', marginTop: 7 },
   bedLineUnconfirmed: { color: COLORS.gray, fontSize: 11, fontWeight: '700', marginTop: 7 },
   familyCostLine: { color: COLORS.inkSoft, fontSize: 11, fontWeight: '700', marginTop: 7 },

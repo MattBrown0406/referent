@@ -32,6 +32,8 @@ import { SUPABASE_URL } from './supabase';
 import { type Entitlement, type EntitlementState } from './entitlements';
 import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySubmissions, type OrgDirectoryProfileState } from './directory';
 import DirectoryReviewQueue from './DirectoryReviewQueue';
+import CredentialReviewQueue from './CredentialReviewQueue';
+import { fetchPendingListingCredentials } from './credentials';
 import { prepareForWorkspaceChange } from './store';
 import { deleteOwnAccount } from './account';
 import { AiDraftsCard } from './AiDraftKey';
@@ -120,6 +122,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   // for everyone else, which hides the card), and whether the queue is open.
   const [pendingSubmissions, setPendingSubmissions] = useState<number | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
+  // Program Integrity Watch: listing credentials waiting for ReferralFit
+  // (null hides the card: not an admin, or the server has no credentials yet).
+  const [pendingCredentials, setPendingCredentials] = useState<number | null>(null);
+  const [credentialReviewOpen, setCredentialReviewOpen] = useState(false);
   // "Notify me about..." (server-sent push). null while loading; available
   // false when the server does not have push yet, in which case the card
   // explains instead of offering switches.
@@ -155,16 +161,24 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       setDirectoryProfileError((error as Error).message);
     }
     // Display-only check; the queue RPCs enforce platform-admin status.
+    let admin = false;
     try {
-      setPendingSubmissions(await fetchIsPlatformAdmin() ? (await fetchPendingDirectorySubmissions()).length : null);
+      admin = await fetchIsPlatformAdmin();
+      setPendingSubmissions(admin ? (await fetchPendingDirectorySubmissions()).length : null);
     } catch {
       setPendingSubmissions(null);
+    }
+    try {
+      const pending = admin ? await fetchPendingListingCredentials() : null;
+      setPendingCredentials(pending?.available ? pending.items.length : null);
+    } catch {
+      setPendingCredentials(null);
     }
   }, [userId]);
 
   useEffect(() => {
     if (visible) void load();
-    else setReviewOpen(false);
+    else { setReviewOpen(false); setCredentialReviewOpen(false); }
   }, [visible, load]);
 
   const isOwner = workspace?.myRole === 'owner';
@@ -385,6 +399,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       <SafeAreaView style={styles.safe}>
         {reviewOpen && pendingSubmissions !== null ? (
           <DirectoryReviewQueue onBack={() => setReviewOpen(false)} onCountChange={setPendingSubmissions} />
+        ) : credentialReviewOpen && pendingCredentials !== null ? (
+          <CredentialReviewQueue onBack={() => setCredentialReviewOpen(false)} onCountChange={setPendingCredentials} />
         ) : (
         <>
         <View style={styles.header}>
@@ -637,6 +653,25 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 </View>
                 <TouchableOpacity accessibilityRole="button" onPress={() => setReviewOpen(true)} style={styles.primaryButton}>
                   <Text style={styles.primaryButtonText}>Review submissions</Text>
+                </TouchableOpacity>
+                <Text style={styles.helpText}>Only ReferralFit platform admins see this card.</Text>
+              </View>
+            ) : null}
+
+            {pendingCredentials !== null ? (
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>Program credentials</Text>
+                <View style={styles.memberRow}>
+                  <View style={styles.memberInfo}>
+                    <Text style={styles.memberName}>{pendingCredentials === 0 ? 'Nothing waiting' : `${pendingCredentials} waiting for review`}</Text>
+                    <Text style={styles.memberRole}>Licenses, accreditations, LegitScript and NPIs that programs added to their directory listings</Text>
+                  </View>
+                  <View style={pendingCredentials > 0 ? styles.planBadgeActive : styles.planBadge}>
+                    <Text accessibilityLabel={`${pendingCredentials} pending`} style={pendingCredentials > 0 ? styles.planBadgeActiveText : styles.planBadgeText}>{pendingCredentials}</Text>
+                  </View>
+                </View>
+                <TouchableOpacity accessibilityRole="button" onPress={() => setCredentialReviewOpen(true)} style={styles.primaryButton}>
+                  <Text style={styles.primaryButtonText}>Review credentials</Text>
                 </TouchableOpacity>
                 <Text style={styles.helpText}>Only ReferralFit platform admins see this card.</Text>
               </View>

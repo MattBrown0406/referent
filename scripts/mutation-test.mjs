@@ -41,7 +41,9 @@ assert.doesNotMatch(matchingSource, /\.(inbound|outbound)\b|['"](inbound|outboun
 assert.match(matchingSource, /disclosure: hasFinancialRelationship\(partner\),/, 'the disclosure is a flag on the result');
 assert.doesNotMatch(matchingSource.slice(matchingSource.indexOf('export function compareScored'), matchingSource.indexOf('export function rankPrograms')), /disclosure|financialRelationship/, 'ties never look at the disclosure');
 // A pick below the top needs a reason; a disclosed relationship needs one more tap, in both assignment flows.
-assert.match(source, /function addReferral\(disclosureConfirmed = false\)/);
+assert.match(source, /function addReferral\(disclosureConfirmed = false, licenseOverride: LicenseConcern \| null = null\)/);
+// Program Integrity Watch: a license shown expired or not confirmed also needs one more tap (an Alert), in both flows.
+assert.match(source, /confirmLicenseConcern\(chosenPartner, 'refer', \(concern\) => addReferral\(disclosureConfirmed, concern\)\)/);
 assert.match(source, /function finalizePacketSend\(disclosureConfirmed = false\)/);
 assert.ok((source.match(/confirmDisclosedRelationship\(/g) || []).length >= 3, 'both assignment flows must route through the disclosure confirmation');
 assert.ok((source.match(/await recordPlacementDecision\(decision, activeUserId\)/g) || []).length === 2, 'both assignment flows must write the placement record after the assignment');
@@ -160,7 +162,7 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
 
 // ─── Round 11: placement integrity ──────────────────────────────────────────
 {
-  const addReferralBody = source.slice(source.indexOf('function addReferral(disclosureConfirmed = false)'), source.indexOf('function openTouchLogger('));
+  const addReferralBody = source.slice(source.indexOf('function addReferral(disclosureConfirmed = false'), source.indexOf('function openTouchLogger('));
   assert.match(addReferralBody, /\.\.\.\(matchForReferral \? \{ matchProfileId: matchForReferral\.id, caseId: matchForReferral\.caseId \} : \{\}\)/, 'Assign & refer links the referral to its match and case');
   assert.match(addReferralBody, /title: 'Check in — did they admit\?'/, 'Assign & refer sets the same admit check as the packet path');
   assert.match(addReferralBody, /await assignMatchReferral\([\s\S]{0,300}if \(admitCheck\) await createFollowUp\(admitCheck, activeUserId\);[\s\S]{0,80}if \(decision\) await recordPlacementDecision/, 'the admit check is written after the assignment, before the placement record');

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 
+import Credentials from './Credentials';
 import { supabase } from './supabase';
 
 // ReferralFit for Programs — the treatment-center side of the platform.
@@ -591,6 +592,7 @@ export default function App() {
               ) : null}
             </form>
           ) : null}
+          <Credentials listingId={listing.id} listingState={listing.state} onNotice={setNotice} onError={setError} />
           <form className="card" onSubmit={saveListing}>
             <h2>Listing details</h2>
             <label>Organization</label>
