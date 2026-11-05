@@ -19,16 +19,17 @@ import {
   DIMENSIONS,
   DIMENSION_KEYS,
   EMERGENCY_FLAG,
-  FLAG_RULES,
   LEVEL_LABELS,
   NOTE_MAX,
   PLACEMENT_LEVELS,
   RATINGS,
+  REASON_HINT,
   REASON_MAX,
   completeRatings,
   defaultChoice,
   emptyDraft,
   followsRecommendation,
+  inlineFlags,
   pathLabel,
   prepareAssessment,
   rationale,
@@ -60,6 +61,8 @@ import { newAssessmentId, saveCaseAssessment, type SavedAssessment } from './lev
 
 type Props = {
   caseId: string;
+  /** The case's title and contact names: the override reason, which the program reads, may not carry them. */
+  names: string[];
   /** The case's current assessment, for "Last time" hints. */
   previous: CaseAssessment | null;
   /** The app's Modal onRequestClose (Android back) calls this, so leaving asks first. */
@@ -93,7 +96,7 @@ const SAVED = DIMENSION_KEYS.length + 1;
 
 type ChoiceMode = 'recommended' | 'different';
 
-export default function LevelOfCareSheet({ caseId, previous, backRef, onClose, onSaved, onFindPlacement }: Props) {
+export default function LevelOfCareSheet({ caseId, names, previous, backRef, onClose, onSaved, onFindPlacement }: Props) {
   const [step, setStep] = useState(INTRO);
   const [draft, setDraft] = useState<AssessmentDraft>(emptyDraft);
   const [mode, setMode] = useState<ChoiceMode>('recommended');
@@ -177,7 +180,7 @@ export default function LevelOfCareSheet({ caseId, previous, backRef, onClose, o
 
   async function save() {
     if (saving) return;
-    const prepared = prepareAssessment(draft);
+    const prepared = prepareAssessment(draft, names);
     if ('problem' in prepared) {
       Alert.alert('Before you save', prepared.problem);
       return;
@@ -267,7 +270,7 @@ export default function LevelOfCareSheet({ caseId, previous, backRef, onClose, o
     const chosen = draft.ratings[key];
     const note = draft.notes[key] || '';
     const last = previous ? previous.ratings[key] : null;
-    const inline = chosen === undefined ? [] : FLAG_RULES.filter((rule) => rule.dimension === key && rule.when.includes(chosen));
+    const inline = inlineFlags(key, chosen);
     return (
       <>
         <Text style={styles.progress}>AREA {info.number} OF {DIMENSION_KEYS.length}</Text>
@@ -331,13 +334,13 @@ export default function LevelOfCareSheet({ caseId, previous, backRef, onClose, o
     const sentences = rationale(ratings, recommendation);
     const flags = safetyFlags(ratings, Boolean(draft.imminentDanger));
     const followed = draft.chosenLevel ? followsRecommendation(recommendation, draft.chosenLevel) : mode === 'recommended';
-    const reasonIssue = mode === 'different' && draft.chosenLevel && !followed && draft.overrideReason.trim() ? reasonProblem(draft.overrideReason) : null;
+    const reasonIssue = mode === 'different' && draft.chosenLevel && !followed && draft.overrideReason.trim() ? reasonProblem(draft.overrideReason, names) : null;
     const otherLevels = PLACEMENT_LEVELS.filter((level) => !followsRecommendation(recommendation, level));
+    // "Use recommended" is where the recommendation sends the client now:
+    // the first step when there is one. Going straight to the level after
+    // a recommended detox is a different level, with a reason.
     const followOptions: { level: PlacementLevel; label: string }[] = recommendation.firstStep
-      ? [
-        { level: recommendation.firstStep, label: `${LEVEL_LABELS[recommendation.firstStep]}: the recommended first step` },
-        { level: recommendation.level, label: `${LEVEL_LABELS[recommendation.level]}: the recommended level after it` },
-      ]
+      ? [{ level: defaultChoice(recommendation), label: `${LEVEL_LABELS[recommendation.firstStep]}: the recommended first step, then ${LEVEL_LABELS[recommendation.level]}` }]
       : [{ level: recommendation.level, label: LEVEL_LABELS[recommendation.level] }];
     return (
       <>
@@ -403,7 +406,7 @@ export default function LevelOfCareSheet({ caseId, previous, backRef, onClose, o
               maxLength={REASON_MAX}
               accessibilityLabel="Why a different level"
             />
-            <Text style={reasonIssue ? styles.notice : styles.hint}>{reasonIssue || 'One line. It goes in the program\'s copy of the packet with the rationale, so leave names out.'}</Text>
+            <Text style={reasonIssue ? styles.notice : styles.hint}>{reasonIssue || REASON_HINT}</Text>
           </>
         )}
         <Text style={styles.hint}>The rationale goes in the program's copy of the packet. The family's copy never shows ratings.</Text>

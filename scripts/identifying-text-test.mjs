@@ -27,4 +27,21 @@ for (const { text, expect } of fixture.cases) {
 }
 assert.deepEqual(nameWords(['Rivera family — son Jake']).sort(), ['jake', 'rivera']);
 passed += 1;
+// A case title's ordinary words are never a name; the name in it still is.
+assert.deepEqual(nameWords(['Rivera intervention', "Lopez family's first call", 'New inquiry - detox follow-up']).sort(), ['lopez', 'rivera']);
+passed += 1;
+// The pgTAP twin (supabase/tests/identifying_text_test.sql) runs every case
+// of the fixture against public.identifying_text_problem, with the same
+// names list. Hidden characters are labelled <U+XXXX> there.
+const pgtap = readFileSync(path.join(repoRoot, 'supabase/tests/identifying_text_test.sql'), 'utf8');
+const sqlText = (value) => value.replace(/'/g, "''");
+assert.ok(pgtap.includes(`(ARRAY[${fixture.names.map((name) => `'${sqlText(name)}'`).join(', ')}])::text`), 'the pgTAP test uses the fixture\'s names list');
+passed += 1;
+for (const { text, expect } of fixture.cases) {
+  // eslint-disable-next-line no-control-regex
+  const label = text.replace(/[\u0000-\u001f\u007f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, (char) => `<U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}>`);
+  const name = expect === null ? `allowed: ${label}` : `refused as ${expect}: ${label}`;
+  assert.ok(pgtap.includes(`'${sqlText(name)}');`), `the pgTAP test runs the fixture case ${JSON.stringify(text)}`);
+  passed += 1;
+}
 console.log(`All ${passed} identifying-text checks passed.`);

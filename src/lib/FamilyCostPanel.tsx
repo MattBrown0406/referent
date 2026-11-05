@@ -91,6 +91,9 @@ export default function FamilyCostPanel({ plan, requests, partners, insurance, a
         const result = familyCostForProgram({
           insurance,
           plan,
+          // The linked match may pay with another plan than the one on file:
+          // then nothing is estimated from this plan's numbers.
+          planCarrier: plan ? plan.carrier : undefined,
           requests,
           partner: partner || null,
           programName: program.programName,

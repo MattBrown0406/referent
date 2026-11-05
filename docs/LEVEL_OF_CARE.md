@@ -125,10 +125,16 @@ Where the client lives, the people around them, work or school, and who supports
 
 ## The rules (for a clinician reviewer)
 
-One table, in `LEVEL_OF_CARE_RULES` (`src/lib/level-of-care.ts`), version 1.
+One table, in `LEVEL_OF_CARE_RULES` (`src/lib/level-of-care.ts`), **version
+2**. Version 2 is version 1 plus Matt's clinical decisions of **2026-11-05**,
+marked "(v2)" below: withdrawal oversight (rule 3), several moderate risks
+together (rule 2b), the step down after detox (rule 4), and no emergency
+first step (rule 6). Only version 2 is accepted by the server; no
+assessment was ever saved under version 1.
 
-**1. The treatment level.** Areas 2 to 6 each ask for a level on their own;
-the recommended level is the most intensive any area asks for.
+The recommended level is the **most intensive level any rule asks for**.
+
+**1. Each area on its own.** Areas 2 to 6 each ask for a level:
 
 | Area | 0 | 1 | 2 | 3 | 4 |
 | --- | --- | --- | --- | --- | --- |
@@ -141,19 +147,46 @@ the recommended level is the most intensive any area asks for.
 "Therapist" is outpatient therapy. Low readiness on its own asks for more
 structure and engagement work (IOP / PHP), never residential care.
 
-**2. Risks together.** When **two or more** of readiness, relapse and
-environment are rated **3 or 4**, Inpatient is recommended (24-hour
-structure), whatever each asks for alone.
+**2. Risks together.** Risks that each ask for less add up to 24-hour
+structure (Inpatient), whatever each asks for alone:
 
-**3. Detox first.** Withdrawal risk **3 or 4**: medically supervised
-withdrawal (Detox) is the **first step**, and the level after it comes from
-areas 2 to 6. Withdrawal never sets the level itself. A withdrawal risk of 2
-adds advice (medical oversight at whichever level is chosen), not detox.
+| Rule | When | Level |
+| --- | --- | --- |
+| 2a. Serious risks together | **Two or more** of readiness, relapse and environment rated **3 or 4** | Inpatient |
+| 2b. Several moderate risks together (v2) | **Four or more** of physical, emotional, readiness, relapse and environment rated **2 or more** | Inpatient |
 
-**4. Sober living as support.** Recovery environment **3 or 4**: sober
+Three of the five at 2 or more is not enough for 2b (for example 0 2 2 2 1 0
+is IOP / PHP; 0 2 2 2 2 0 is Inpatient).
+
+**3. Withdrawal oversight (v2).** Withdrawal risk **2**: withdrawal needs
+medical oversight, so the level is **at least IOP / PHP**. Withdrawal never
+asks for more than that on its own, and a rating of 2 is not detox.
+
+**4. Detox first, then step down no lower than IOP / PHP (v2).** Withdrawal
+risk **3 or 4**: medically supervised withdrawal (Detox) is the **first
+step**. The level after it comes from the rules above, and is **never lower
+than IOP / PHP**.
+
+**5. Sober living as support.** Recovery environment **3 or 4**: sober
 living is added as a **support level** (during outpatient or IOP / PHP
 treatment, or after residential care). At 4 the environment also asks for
-Inpatient (row 1).
+Inpatient (rule 1).
+
+**6. Severe physical or emotional needs (v2, unchanged levels).** Physical
+health 4 and emotional, behavioral or cognitive 4 stay **Inpatient**
+(rule 1), with their urgent flags (an urgent medical or psychiatric
+evaluation; see Safety flags). There is **no emergency first step**: Matt
+chose this explicitly. Emergencies go to 911 / 988 through the immediate
+danger question and the flags, not through the recommendation.
+
+| Rule | Where in `LEVEL_OF_CARE_RULES` | In the server's `level_of_care_recommendation` |
+| --- | --- | --- |
+| 1 | `primary` | `p >= 3 OR m >= 3 OR u >= 4 OR e >= 4` (Inpatient); `p >= 2 OR m >= 2 OR u >= 2 OR r >= 3` (IOP / PHP) |
+| 2a | `together` (`serious`) | `(r >= 3) + (u >= 3) + (e >= 3) >= 2` |
+| 2b | `together` (`moderate`) | `(p >= 2) + (m >= 2) + (r >= 2) + (u >= 2) + (e >= 2) >= 4` |
+| 3, 4 | `oversight`, `firstStep.stepDownAtLeast` | `w >= 2` (IOP / PHP) |
+| 4 | `firstStep` | `first_step` Detox when `w >= 3` |
+| 5 | `support` | `support` Sober Living when `e >= 3` |
 
 **The recommendation** is therefore: an optional first step (Detox), a level
 (Therapist, IOP / PHP or Inpatient), and an optional support (Sober Living),
@@ -163,28 +196,34 @@ written "Detox, then Inpatient, with Sober Living".
 rating can never lower the level, remove detox or remove sober living. The
 test checks all 15,625 possible rating sets and every raise.
 
-**Choosing the level to place at.** "Use recommended" picks the first step
-when there is one (where the client goes now), else the level; the
-practitioner can switch between the two. Either follows the recommendation
-and needs no reason. Any other level (including sober living alone, or a
-lower or higher level) is "a different level" and needs a one-line reason:
-3 to 200 characters, one line, no email addresses, no phone or ID numbers
-(7 or more digits), no links. The reason is printed in the program's packet,
-so the app asks for names to be left out.
+**Choosing the level to place at.** "Use recommended" picks where the
+recommendation starts: the first step when there is one (where the client
+goes now, Detox), else the level. That choice needs no reason. **Any other
+level needs a one-line reason**, including the level after a Detox first
+step (placing straight there skips the detox the rules called for), sober
+living alone, or a lower or higher level. The reason is 3 to 200
+characters on one line, and because it is printed in the program's packet
+it goes through the shared identifying-details check
+(`identifying_text_problem`, the same one as the placement-request note;
+see docs/PLACEMENT_REQUESTS.md): no hidden characters, email addresses,
+links, money, dates, phone or ID numbers, or a name word from the case's
+title or its contacts' names. The server's refusal is the RPC's 22023
+error message, e.g. "Leave out names. Programs read this."
 
 ### Named cases
 
 W P E R U Env = withdrawal, physical, emotional/behavioral/cognitive,
 readiness, relapse, environment. The rationale is exactly what the app
-writes (the test asserts these cases).
+writes (the test asserts every row of this table, word for word).
 
 | W P E R U Env | Recommended | Rationale (as generated) |
 | --- | --- | --- |
 | 0 0 0 0 0 0 | Therapist | Outpatient therapy is recommended: no area calls for more structure than regular sessions. No area shows a concern. |
 | 1 1 1 1 1 1 | Therapist | Outpatient therapy is recommended: no area calls for more structure than regular sessions. Every area is rated mild or none. |
-| 3 0 0 0 0 0 | Detox, then Therapist | Withdrawal risk is significant (3 of 4), so medically supervised withdrawal (detox) comes first. After detox, outpatient therapy is recommended: no other area calls for more structure than regular sessions. |
-| 4 0 0 0 0 0 | Detox, then Therapist | Withdrawal risk is severe (4 of 4), so medically supervised withdrawal (detox) comes first. After detox, outpatient therapy is recommended: no other area calls for more structure than regular sessions. |
-| 2 0 0 0 0 0 | Therapist | Outpatient therapy is recommended: no area calls for more structure than regular sessions. Also noted: moderate withdrawal risk (2 of 4). |
+| 3 0 0 0 0 0 | Detox, then IOP / PHP | Withdrawal risk is significant (3 of 4), so medically supervised withdrawal (detox) comes first. After detox, step down no lower than intensive outpatient or day treatment (IOP / PHP). No other area shows a concern. |
+| 4 0 0 0 0 0 | Detox, then IOP / PHP | Withdrawal risk is severe (4 of 4), so medically supervised withdrawal (detox) comes first. After detox, step down no lower than intensive outpatient or day treatment (IOP / PHP). No other area shows a concern. |
+| 3 1 1 1 1 1 | Detox, then IOP / PHP | Withdrawal risk is significant (3 of 4), so medically supervised withdrawal (detox) comes first. After detox, step down no lower than intensive outpatient or day treatment (IOP / PHP). Other areas are rated mild or none. |
+| 2 0 0 0 0 0 | IOP / PHP | Withdrawal risk is moderate (2 of 4) and needs medical oversight, so at least intensive outpatient or day treatment (IOP / PHP) is recommended. No other area shows a concern. |
 | 0 2 0 0 0 0 | IOP / PHP | Intensive outpatient or day treatment (IOP / PHP) is recommended because of moderate physical health needs (2 of 4). No other area shows a concern. |
 | 0 0 3 0 0 0 | Inpatient | Inpatient (residential) care is recommended because of significant emotional, behavioral or cognitive needs (3 of 4). No other area shows a concern. |
 | 0 3 0 0 0 0 | Inpatient | Inpatient (residential) care is recommended because of significant physical health needs (3 of 4). No other area shows a concern. |
@@ -199,17 +238,41 @@ writes (the test asserts these cases).
 | 0 0 0 0 3 3 | Inpatient, with Sober Living | Inpatient (residential) care is recommended because serious risks occur together: significant relapse or continued-use risk (3 of 4) and significant recovery environment concerns (3 of 4). Sober living is also recommended as a stable, substance-free place to live after residential care. No other area shows a concern. |
 | 0 0 0 3 0 3 | Inpatient, with Sober Living | Inpatient (residential) care is recommended because serious risks occur together: significant readiness and engagement concerns (3 of 4) and significant recovery environment concerns (3 of 4). Sober living is also recommended as a stable, substance-free place to live after residential care. No other area shows a concern. |
 | 0 0 0 2 2 3 | IOP / PHP, with Sober Living | Intensive outpatient or day treatment (IOP / PHP) is recommended because of moderate relapse or continued-use risk (2 of 4). Recovery environment concerns are significant (3 of 4), so sober living is recommended as a stable, substance-free place to live during treatment. Also noted: moderate readiness and engagement concerns (2 of 4). |
-| 3 2 2 2 2 3 | Detox, then IOP / PHP, with Sober Living | Withdrawal risk is significant (3 of 4), so medically supervised withdrawal (detox) comes first. After detox, intensive outpatient or day treatment (IOP / PHP) is recommended because of moderate physical health needs (2 of 4), moderate emotional, behavioral or cognitive needs (2 of 4) and moderate relapse or continued-use risk (2 of 4). Recovery environment concerns are significant (3 of 4), so sober living is recommended as a stable, substance-free place to live during treatment. Also noted: moderate readiness and engagement concerns (2 of 4). |
+| 0 2 2 2 2 0 | Inpatient | Several areas are at moderate risk together, which calls for inpatient (residential) care: moderate physical health needs (2 of 4), moderate emotional, behavioral or cognitive needs (2 of 4), moderate readiness and engagement concerns (2 of 4) and moderate relapse or continued-use risk (2 of 4). No other area shows a concern. |
+| 0 2 2 2 1 0 | IOP / PHP | Intensive outpatient or day treatment (IOP / PHP) is recommended because of moderate physical health needs (2 of 4) and moderate emotional, behavioral or cognitive needs (2 of 4). Also noted: moderate readiness and engagement concerns (2 of 4). |
+| 0 0 2 2 2 2 | Inpatient | Several areas are at moderate risk together, which calls for inpatient (residential) care: moderate emotional, behavioral or cognitive needs (2 of 4), moderate readiness and engagement concerns (2 of 4), moderate relapse or continued-use risk (2 of 4) and moderate recovery environment concerns (2 of 4). No other area shows a concern. |
+| 3 2 2 2 2 3 | Detox, then Inpatient, with Sober Living | Withdrawal risk is significant (3 of 4), so medically supervised withdrawal (detox) comes first. Several areas are at moderate risk or higher together, which calls for inpatient (residential) care after detox: moderate physical health needs (2 of 4), moderate emotional, behavioral or cognitive needs (2 of 4), moderate readiness and engagement concerns (2 of 4), moderate relapse or continued-use risk (2 of 4) and significant recovery environment concerns (3 of 4). Sober living is also recommended as a stable, substance-free place to live after residential care. |
+| 0 4 0 0 0 0 | Inpatient | Inpatient (residential) care is recommended because of severe physical health needs (4 of 4). No other area shows a concern. |
+| 0 0 4 0 0 0 | Inpatient | Inpatient (residential) care is recommended because of severe emotional, behavioral or cognitive needs (4 of 4). No other area shows a concern. |
 | 4 3 2 1 2 3 | Detox, then Inpatient, with Sober Living | Withdrawal risk is severe (4 of 4), so medically supervised withdrawal (detox) comes first. After detox, inpatient (residential) care is recommended because of significant physical health needs (3 of 4). Recovery environment concerns are significant (3 of 4), so sober living is recommended as a stable, substance-free place to live after residential care. Also noted: moderate emotional, behavioral or cognitive needs (2 of 4) and moderate relapse or continued-use risk (2 of 4). |
 | 4 4 4 4 4 4 | Detox, then Inpatient, with Sober Living | Withdrawal risk is severe (4 of 4), so medically supervised withdrawal (detox) comes first. After detox, inpatient (residential) care is recommended because of severe physical health needs (4 of 4), severe emotional, behavioral or cognitive needs (4 of 4), severe readiness and engagement concerns (4 of 4), severe relapse or continued-use risk (4 of 4) and severe recovery environment concerns (4 of 4). Sober living is also recommended as a stable, substance-free place to live after residential care. |
 
 ### The rationale
 
 Two to four short sentences, built **only from the ratings and fixed
-words**: the first step and why, the level and the areas that asked for it
-(or "serious risks occur together"), sober living and why, then anything
-else rated moderate or higher ("Also noted: ..."). Ratings appear as
-"(3 of 4)". It never includes a note, a name, the case title or anything
+words**: the first step and why, the level and why, sober living and why,
+then anything else rated moderate or higher ("Also noted: ..."). Ratings
+appear as "(3 of 4)". The level's reason is the most specific rule that
+gives it:
+
+- areas that ask for it on their own: "Inpatient (residential) care is
+  recommended because of significant physical health needs (3 of 4)."
+- rule 2a: "... is recommended because serious risks occur together: ..."
+- rule 2b: "Several areas are at moderate risk together, which calls for
+  inpatient (residential) care: ..." ("or higher" when one of them is rated
+  above 2; "after detox" when detox comes first)
+- rule 3: "Withdrawal risk is moderate (2 of 4) and needs medical oversight,
+  so at least intensive outpatient or day treatment (IOP / PHP) is
+  recommended."
+- rule 4: "After detox, step down no lower than intensive outpatient or day
+  treatment (IOP / PHP)."
+
+When an area already asks for the level on its own, a rule that gives the
+same level is not repeated: rule 2b's and the withdrawal floor's areas
+appear under "Also noted" (rule 2a's areas, as in version 1, are named with
+the area).
+
+The rationale never includes a note, a name, the case title or anything
 else about the client. An assessment saved under rules that would now
 recommend something different keeps its stored recommendation; its
 rationale is not rebuilt.
@@ -223,9 +286,13 @@ rationale is not rebuilt.
 | Physical health 4 | urgent | Arrange an urgent medical evaluation | Arrange an urgent medical evaluation before placement: the client's doctor today, urgent care, or an emergency department. Programs may need a doctor's clearance to admit. If symptoms are life-threatening, call 911. |
 | Emotional, behavioral or cognitive 4 | urgent | Arrange an urgent psychiatric evaluation | Arrange an urgent psychiatric evaluation before placement. If there are thoughts of suicide, call or text 988. If anyone is in danger now, call 911. |
 | Recovery environment 4 | urgent | Plan a safe place to stay until admission | The living situation is unsafe. Plan where the client can stay safely until admission. If anyone is being hurt or threatened, call 911. |
-| Withdrawal risk 2 | advice | Medical oversight of withdrawal | Moderate withdrawal risk: make sure a medical provider oversees withdrawal at whichever level is chosen. |
-| Physical health 3 | advice | Ask about medical care on site | Ask each program whether it can manage these medical needs on site, with nursing. |
-| Emotional, behavioral or cognitive 3 | advice | Look for psychiatric care on site | Look for programs with psychiatric care on site (the "Dual diagnosis" need on the match). |
+| Withdrawal risk 2, 3 or 4 | advice | Arrange detox first, or a program with on-site withdrawal management | Withdrawal needs medical oversight at this level of risk. Arrange detox first, or choose a program that manages withdrawal on site, with medical staff. |
+| Physical health 3 or 4 | advice | Ask about medical care on site | Ask each program whether it can manage these medical needs on site, with nursing. |
+| Emotional, behavioral or cognitive 3 or 4 | advice | Look for psychiatric care on site | Look for programs with psychiatric care on site (the "Dual diagnosis" need on the match). |
+| Relapse risk 3 or 4, or detox as the first step | advice | Plan for overdose risk | After detox or any break from use, tolerance drops, so using the same amount as before can cause an overdose. Make sure the family has naloxone (Narcan) and knows how to use it, and to call 911 if someone may be overdosing. |
+
+Flags are cumulative: a higher rating keeps every flag a lower one raised
+(physical 4 shows the urgent evaluation and the on-site advice of 3).
 
 Emergency and urgent flags show on the result screen (and as soon as the
 rating is chosen); the card keeps a short "Safety notes from this
@@ -281,7 +348,10 @@ packet is always the rules' answer, never a phone's.
   of care: X" line already names the level in plain words; ratings and the
   rationale never appear (tested, whatever is passed in).
 - **Timeline**: "Level-of-care assessment: recommended Detox, then
-  Inpatient, with Sober Living; chosen Detox". Levels only, never a rating.
+  Inpatient, with Sober Living", plus "; chosen X" whenever the chosen level
+  is not where the recommendation starts (its first step, else its level):
+  e.g. "recommended Detox, then Inpatient; chosen Inpatient". Levels only,
+  never a rating.
 - **Placement requests**: untouched. Nothing from an assessment is added to
   their payload; the ten-key allow-list in 20261104140000 is unchanged.
 
@@ -299,8 +369,8 @@ and the newest (`assessed_at`, then `id`) is current.
 | `imminent_danger` | The answer to the safety question |
 | `recommended_level`, `recommended_first_step`, `recommended_support` | The recommendation (Therapist / IOP / PHP / Inpatient; Detox or none; Sober Living or none) |
 | `chosen_level` | Detox, Inpatient, IOP / PHP, Sober Living or Therapist |
-| `override_reason` | Empty exactly when the chosen level follows the recommendation (a CHECK) |
-| `rules_version` | The rules the recommendation came from (1) |
+| `override_reason` | Empty exactly when the chosen level is where the recommendation starts, `coalesce(recommended_first_step, recommended_level)` (a CHECK) |
+| `rules_version` | The rules the recommendation came from (2; the server accepts only the current version) |
 | `assessed_by`, `assessed_at`, `created_at` | Who (set to NULL if that account is deleted) and when, both server-set |
 
 ## Who reads and writes what
@@ -312,7 +382,8 @@ and the newest (`assessed_at`, then `id`) is current.
 - **Writes**: only `save_case_assessment` (SECURITY DEFINER, `search_path`
   pinned, org-fenced). It checks the six ratings, the notes, the level, that
   the recommendation matches the server's rules for that rules version, and
-  the reason for a different level, all in plain words; writes the row and
+  the reason for a different level (against the case's title and its
+  contacts' names), all in plain words; writes the row and
   the timeline entry; and returns the row with `event_body`. Replaying an id
   returns the saved row unchanged; another workspace's id is "not found".
 - **Deleting a case** deletes its assessments and their timeline entries.
@@ -342,7 +413,9 @@ Purely additive: one new table and new functions. The only existing function
 re-created is the internal `org_move_workspace_rows` (called only by
 `accept_org_invite`), from its latest definition plus one line, with the
 same signature. No existing table, column, policy, trigger or callable
-function changes; the 1.0.4 app never sees the table.
+function changes; the 1.0.4 app never sees the table. It uses
+`identifying_text_problem` and `identifying_case_names` from
+20261104140000.
 
 ## Applying to production
 
@@ -350,7 +423,10 @@ Production has every migration through 20261024130000. Apply, in order,
 `20261104120000_family_cost.sql`, `20261104130000_program_integrity.sql`,
 `20261104140000_placement_requests.sql`, then this one, **before** shipping
 an app build with the feature (the app copes without it, but the feature
-stays hidden).
+stays hidden). The file checks the order itself: without the placement
+request tables or the identifying-details check it stops at once with
+"Paste 20261104140000_placement_requests.sql first: ..." and changes
+nothing.
 
 1. Paste `supabase/migrations/20261104150000_level_of_care.sql` into the SQL
    editor and run it. It is ASCII only, has no backslashes, every top-level
@@ -384,15 +460,23 @@ stays hidden).
       AND (p.proname LIKE 'case_assessment%' OR p.proname IN ('level_of_care_recommendation', 'save_case_assessment', 'org_move_workspace_rows'))
     ORDER BY p.proname;
 
-   -- The rules, spot-checked: detox first, then inpatient, with sober living.
-   SELECT public.level_of_care_recommendation(ARRAY[3, 2, 3, 2, 2, 3], 1) AS recommendation;
+   -- The rules (version 2), spot-checked: detox first, then inpatient,
+   -- with sober living; and detox first, then no lower than IOP / PHP.
+   SELECT public.level_of_care_recommendation(ARRAY[3, 2, 3, 2, 2, 3], 2) AS recommendation,
+          public.level_of_care_recommendation(ARRAY[3, 0, 0, 0, 0, 0], 2) AS step_down;
+
+   -- Skipping the detox first step needs a reason.
+   SELECT public.case_assessment_problem(ARRAY[3, 3, 0, 0, 0, 0], NULL, 2, 'Inpatient', 'Detox', NULL, 'Inpatient', '', NULL) AS skip_detox;
    ```
 
    Expected: `rls = true`, `authenticated_select = true`,
    `authenticated_writes = false`, `anon_select = false`. Every function
    `anon_ok = false`; `authenticated_ok = true` for `save_case_assessment`
    only. The recommendation is
-   `{"level": "Inpatient", "support": "Sober Living", "first_step": "Detox"}`.
+   `{"level": "Inpatient", "support": "Sober Living", "first_step": "Detox"}`
+   and `step_down` is `{"level": "IOP / PHP", "support": null, "first_step": "Detox"}`;
+   `skip_detox` is "Say why you chose a different level. The reason goes in
+   the program's packet."
 4. Ship the app build. Nothing else to deploy: no Edge Function, cron,
    secret or portal change.
 

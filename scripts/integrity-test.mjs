@@ -43,13 +43,20 @@ function transpileTo(relSrc, outName) {
 
 mkdirSync(path.join(tmpDir, 'lib'), { recursive: true });
 transpileTo('src/data.ts', 'data.js');
-for (const name of ['beds', 'matching', 'integrity', 'npi']) transpileTo(`src/lib/${name}.ts`, `lib/${name}.js`);
+for (const name of ['beds', 'matching', 'integrity', 'npi', 'errors', 'paging', 'credentials']) transpileTo(`src/lib/${name}.ts`, `lib/${name}.js`);
 transpileTo('portal/src/credential-rules.ts', 'portal/credential-rules.js');
+// credentials.ts with its network edges stubbed: a fake Supabase client the
+// tests drive, and a uuid.
+writeFileSync(path.join(tmpDir, 'lib', 'supabase.js'), 'exports.supabase = globalThis.__credentialSupabase;');
+writeFileSync(path.join(tmpDir, 'lib', 'cases.js'), "let n = 0; exports.newUuid = () => `00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`;");
+const fakeSupabase = { rpc: null, from: null };
+globalThis.__credentialSupabase = { rpc: (name, args) => fakeSupabase.rpc(name, args), from: (table) => fakeSupabase.from(table) };
 
 // The tests never reach the network: any real fetch fails loudly.
 globalThis.fetch = () => { throw new Error('integrity-test: the real network must never be called'); };
 
 const integrity = require(path.join(tmpDir, 'lib', 'integrity.js'));
+const credentialsApi = require(path.join(tmpDir, 'lib', 'credentials.js'));
 const npi = require(path.join(tmpDir, 'lib', 'npi.js'));
 const matching = require(path.join(tmpDir, 'lib', 'matching.js'));
 const portal = require(path.join(tmpDir, 'portal', 'credential-rules.js'));
@@ -174,9 +181,33 @@ check('stamps read plainly', formatStamp('2026-10-01'), 'Oct 1, 2026');
   check('license expired label', FLAG_LABELS.license_expired, 'License expired');
 
   const rejected = programIntegrity([cred({ review: 'rejected', verifiedAt: 'x', verificationNote: 'not found' }), accreditation], TODAY);
-  check('license rejected: needs review, concern rejected', [rejected.chip, rejected.licenseConcern?.status, rejected.flags], ['needs_review', 'rejected', ['license_rejected']]);
+  check('license rejected: the coral concern chip, concern rejected', [rejected.chip, CHIP_LABELS[rejected.chip], rejected.licenseConcern?.status, rejected.flags], ['concern', 'Check license', 'rejected', ['license_rejected']]);
   const rejectedButRenewed = programIntegrity([cred({ review: 'rejected', verifiedAt: 'x' }), license, accreditation], TODAY);
   check('a verified license next to a rejected one: no concern', [rejectedButRenewed.licenseConcern, rejectedButRenewed.badge], [null, true]);
+
+  // The concern looks at every license row: a lapsed license with its
+  // renewal still waiting for ReferralFit is still a concern (the renewal
+  // speaks for the kind, but it is not verified yet).
+  const lapsedLicense = cred({ review: 'verified', expiresOn: '2026-10-01', verifiedAt: 'x' });
+  const renewalLicense = cred({ review: 'pending', expiresOn: '2027-10-01', identifier: 'LIC-2' });
+  const renewing = programIntegrity([lapsedLicense, renewalLicense, accreditation], TODAY);
+  check('lapsed + pending renewal: the renewal speaks for the kind, and the concern stays', [renewing.license.status, renewing.licenseConcern?.status, renewing.licenseConcern?.credential.id, renewing.licenseConcern?.renewal?.id], ['pending', 'expired', lapsedLicense.id, renewalLicense.id]);
+  check('lapsed + pending renewal: coral, never the amber "Needs review"', [renewing.chip, renewing.chip === 'needs_review'], ['expired', false]);
+  check('lapsed + pending renewal: the words name the renewal', integrityHeadline(renewing), 'Its state license shows expired (Oct 1, 2026). Renewal pending ReferralFit review. Check with the program before referring.');
+  check('the renewal line by who checks it', [integrity.renewalLine({ renewal: renewalLicense }), integrity.renewalLine({ renewal: { ...renewalLicense, scope: 'local' } }), integrity.renewalLine({ renewal: null })],
+    ['Renewal pending ReferralFit review', 'Renewal on file, not checked yet', '']);
+  const rejectedRenewal = programIntegrity([cred({ review: 'rejected', verifiedAt: 'x' }), cred({ review: 'pending', identifier: 'LIC-3' })], TODAY);
+  check('rejected + pending: a concern, coral, with the renewal named', [rejectedRenewal.license.status, rejectedRenewal.licenseConcern?.status, rejectedRenewal.chip, Boolean(rejectedRenewal.licenseConcern?.renewal)], ['pending', 'rejected', 'concern', true]);
+  const expiredAndRejected = programIntegrity([cred({ review: 'rejected', verifiedAt: 'x' }), cred({ review: 'verified', expiresOn: '2026-09-01', verifiedAt: 'x' })], TODAY);
+  check('expired and rejected: expired speaks for the concern', [expiredAndRejected.licenseConcern?.status, expiredAndRejected.chip], ['expired', 'expired']);
+  const verifiedExpiring = programIntegrity([lapsedLicense, cred({ review: 'verified', expiresOn: '2026-11-20', verifiedAt: 'x' })], TODAY);
+  check('a verified license that is only expiring lifts the concern', verifiedExpiring.licenseConcern, null);
+  const pendingOnlyRenewal = programIntegrity([renewalLicense], TODAY);
+  check('a pending license alone is not a concern (nothing expired or rejected)', [pendingOnlyRenewal.licenseConcern, pendingOnlyRenewal.chip], [null, 'needs_review']);
+  const expiredPending = programIntegrity([lapsedLicense, cred({ review: 'pending', expiresOn: '2026-10-15' })], TODAY);
+  check('a pending row that has itself run out is not a renewal', [expiredPending.licenseConcern?.status, expiredPending.licenseConcern?.renewal], ['expired', null]);
+  check('the concern helper agrees with programIntegrity', integrity.licenseConcernFor([lapsedLicense, renewalLicense], TODAY)?.renewal?.id, renewalLicense.id);
+  check('every concern is coral (expired or concern), every time', [renewing, rejected, rejectedRenewal, expiredAndRejected].map((item) => ['expired', 'concern'].includes(item.chip)), [true, true, true, true]);
 
   const accExpiring = cred({ kind: 'accreditation', accreditor: 'carf', issuingState: '', identifier: 'CARF-1', review: 'verified', expiresOn: '2026-11-20', verifiedAt: 'x' });
   const soon = programIntegrity([license, accExpiring], TODAY);
@@ -191,7 +222,9 @@ check('stamps read plainly', formatStamp('2026-10-01'), 'Oct 1, 2026');
   check('pending only: needs review, license pending', [pendingOnly.chip, pendingOnly.flags, pendingOnly.licenseConcern], ['needs_review', ['license_pending'], null]);
   const npiOnly = programIntegrity([cred({ kind: 'npi', identifier: '1234567893', issuingState: '', review: 'verified', verifiedAt: 'x' })], TODAY);
   check('an NPI alone is not enough', [npiOnly.chip, npiOnly.badge, npiOnly.flags], ['needs_review', false, ['no_license']]);
-  check('chip labels', CHIP_LABELS, { verified: 'Verified', needs_review: 'Needs review', expired: 'Expired', none: 'None on file' });
+  check('chip labels', CHIP_LABELS, { verified: 'Verified', needs_review: 'Needs review', expired: 'Expired', concern: 'Check license', none: 'None on file' });
+  const cardSource = readFileSync(path.join(repoRoot, 'src/lib/CredentialsCard.tsx'), 'utf8');
+  ok('the concern chip is coral like expired, not amber', /concern: \{ icon: 'shield-outline', color: COLORS\.coral, background: COLORS\.coralPale \}/.test(cardSource));
 
   // A practice's own check counts in its own view (listing + local together).
   const listingPending = cred({ review: 'pending', expiresOn: '2027-06-30' });
@@ -407,6 +440,7 @@ function respond(body, { ok: isOk = true, status = 200 } = {}) {
     { id: 'p-old', organization: 'Old Referral', name: '' },
     { id: 'p-in', organization: 'Inbound Only', name: '' },
     { id: 'p-renewed', organization: 'Renewed Hall', name: '' },
+    { id: 'p-rejected', organization: 'Unconfirmed Oaks', name: '' },
     { id: 'p-none', organization: 'Never Referred', name: '' },
   ];
   const lic = (expiresOn, review = 'verified') => cred({ review, verifiedAt: review === 'pending' ? null : 'x', expiresOn });
@@ -419,6 +453,7 @@ function respond(body, { ok: isOk = true, status = 200 } = {}) {
     'p-old': [lic('2026-10-01')],
     'p-in': [lic('2026-10-01')],
     'p-renewed': [lic('2026-10-01'), lic('2027-10-01', 'pending')],
+    'p-rejected': [cred({ review: 'rejected', verifiedAt: 'x' })],
     'p-none': [lic('2026-10-01')],
   };
   const referrals = [
@@ -429,15 +464,18 @@ function respond(body, { ok: isOk = true, status = 200 } = {}) {
     { partnerId: 'p-old', direction: 'Outbound', date: '2025-11-03' },
     { partnerId: 'p-in', direction: 'Inbound', date: '2026-10-01' },
     { partnerId: 'p-renewed', direction: 'Outbound', date: '2026-10-01' },
+    { partnerId: 'p-rejected', direction: 'Outbound', date: '2026-10-02' },
   ];
   const items = credentialWatchItems({ partners, referrals, integrityFor: (id) => programIntegrity(byPartner[id] || [], TODAY), today: TODAY });
-  check('one card: referred-to programs with an expired or expiring license or accreditation, expired first', items.map((item) => [item.name, item.worst, item.lines]), [
+  check('one card: referred-to programs with a license concern or an expired or expiring license or accreditation, the concerns first', items.map((item) => [item.name, item.worst, item.lines]), [
+    ['Unconfirmed Oaks', 'expired', ['state license could not be confirmed']],
     ['Accred Ranch', 'expired', ['accreditation expired Sep 30, 2026']],
     ['Expired House', 'expired', ['state license expired Oct 1, 2026', 'accreditation expires Nov 10, 2026']],
+    ['Renewed Hall', 'expired', ['state license expired Oct 1, 2026 (renewal pending ReferralFit review)']],
     ['Soon Lodge', 'expiring', ['state license expires Nov 20, 2026']],
   ]);
   check('nothing to show without credentials', credentialWatchItems({ partners, referrals, integrityFor: () => null, today: TODAY }), []);
-  check('the card says how many, plainly', credentialWatchSubtitle(items), "3 programs you referred to in the last 12 months. Check with them for the renewal, then add it in the program's Credentials.");
+  check('the card says how many, plainly', credentialWatchSubtitle(items), "5 programs you referred to in the last 12 months. Check with them for the renewal, then add it in the program's Credentials.");
   check('one program', credentialWatchSubtitle(items.slice(0, 1)).startsWith('1 program you referred to'), true);
   const app = readFileSync(path.join(repoRoot, 'App.tsx'), 'utf8');
   ok('Today renders one card for the list, not one per item', (app.match(/credentialWatchSubtitle\(credentialWatch\)/g) || []).length === 1 && app.includes('CREDENTIALS TO CHECK'));
@@ -446,7 +484,7 @@ function respond(body, { ok: isOk = true, status = 200 } = {}) {
 // ─── (j) The Alert and the timeline note ────────────────────────────────────
 
 {
-  const expiredConcern = { status: 'expired', credential: cred({ expiresOn: '2026-10-01' }) };
+  const expiredConcern = { status: 'expired', credential: cred({ expiresOn: '2026-10-01' }), renewal: null };
   const alert = licenseConcernAlert('Juniper Ridge', expiredConcern, 'refer');
   check('the refer Alert', alert, {
     title: 'Check the license first',
@@ -454,8 +492,12 @@ function respond(body, { ok: isOk = true, status = 200 } = {}) {
     proceed: 'Refer anyway',
   });
   check('the packet Alert asks about the packet', licenseConcernAlert('Juniper Ridge', expiredConcern, 'packet').proceed, 'Send anyway');
-  ok('a rejected license is "could not be confirmed"', licenseConcernAlert('X', { status: 'rejected', credential: cred({ review: 'rejected' }) }, 'refer').message.includes('could not be confirmed'));
+  ok('a rejected license is "could not be confirmed"', licenseConcernAlert('X', { status: 'rejected', credential: cred({ review: 'rejected' }), renewal: null }, 'refer').message.includes('could not be confirmed'));
   check('the timeline note', licenseOverrideNote('Juniper Ridge', expiredConcern), 'Referred anyway: the state license for Juniper Ridge showed expired (Oct 1, 2026), and the practitioner confirmed going ahead.');
+  const renewingConcern = { ...expiredConcern, renewal: cred({ review: 'pending', expiresOn: '2027-10-01' }) };
+  check('the Refer anyway? prompt names a renewal waiting for ReferralFit', licenseConcernAlert('Juniper Ridge', renewingConcern, 'refer').message,
+    'Juniper Ridge: Its state license shows expired (Oct 1, 2026). Renewal pending ReferralFit review. Check with the program before referring. Refer anyway?');
+  check('and the timeline note says so too', licenseOverrideNote('Juniper Ridge', renewingConcern), 'Referred anyway: the state license for Juniper Ridge showed expired (Oct 1, 2026) (renewal pending ReferralFit review), and the practitioner confirmed going ahead.');
   check('the packet note', licenseOverrideNote('Juniper Ridge', expiredConcern, 'packet').startsWith('Sent anyway:'), true);
   const words = [alert.message, licenseOverrideNote('J', expiredConcern), integrityHeadline(programIntegrity([], TODAY)), ...Object.values(FLAG_LABELS)].join(' ');
   ok('calm words: never fraud, scam, danger, warning or illegal', !/fraud|scam|danger|warning|illegal|bad actor/i.test(words));
@@ -518,6 +560,76 @@ function respond(body, { ok: isOk = true, status = 200 } = {}) {
   }
   const portalUi = readFileSync(path.join(repoRoot, 'portal/src/Credentials.tsx'), 'utf8');
   ok('the portal says "pending ReferralFit review" after a change', portalUi.includes('pending ReferralFit review'));
+}
+
+// ─── (l2) Notes, NPI hints, removals, workspaces ────────────────────────────
+
+{
+  // A listing's notes never reach a practitioner: whatever an older server
+  // still sends on the rows is dropped, and only fetch_listing_credential_notes
+  // (claimant or platform admin) returns them.
+  const row = (fields) => ({
+    id: 'C1', global_partner_id: 'G1', org_id: null, partner_id: null, kind: 'state_license', accreditor: null, accreditor_name: '',
+    identifier: 'L', issuing_state: 'OR', expires_on: null, proof_url: null, note: 'Call our intake director', status: 'rejected',
+    verified_by: null, verified_at: '2026-11-01T00:00:00Z', verification_note: 'Number not found', npi_lookup_name: null, npi_checked_at: null,
+    updated_by: null, updated_at: '2026-11-01T00:00:00Z', ...fields,
+  });
+  fakeSupabase.rpc = async (name) => (name === 'fetch_listing_credentials' ? { data: [row({}), row({ id: 'C2', note: null, verification_note: null })], error: null, status: 200 } : { data: null, error: { code: 'X' }, status: 400 });
+  const read = await credentialsApi.fetchListingCredentials(['g1']);
+  check('listing rows reach the app without their notes, even from an older server', read.byListing.g1.map((item) => [item.note, item.verificationNote]), [['', ''], ['', '']]);
+  const local = credentialsApi.withoutListingNotes(credentialFromRow(row({ global_partner_id: null, partner_id: 'P1' })));
+  check('a practice\'s own row keeps its notes', [local.note, local.verificationNote], ['Call our intake director', 'Number not found']);
+
+  let asked = null;
+  fakeSupabase.rpc = async (name, args) => { asked = { name, args }; return { data: [{ id: 'C1', note: 'n1', verification_note: 'v1' }, { id: 'C2', note: null, verification_note: null }], error: null, status: 200 }; };
+  check('the notes call: ReferralFit\'s and the claimant\'s own', await credentialsApi.fetchListingCredentialNotes('G1'), { c1: { note: 'n1', verificationNote: 'v1' }, c2: { note: '', verificationNote: '' } });
+  check('it asks for one listing by id', asked, { name: 'fetch_listing_credential_notes', args: { p_global_partner_id: 'g1' } });
+  fakeSupabase.rpc = async () => ({ data: null, error: { code: 'PGRST202', message: 'Could not find the function' }, status: 404 });
+  check('an older server without the call: no notes, no failure', await credentialsApi.fetchListingCredentialNotes('G1'), null);
+
+  // A claimant removing a credential ReferralFit could not confirm: the
+  // server keeps it (42501) and its words are shown calmly.
+  const KEPT = 'ReferralFit could not confirm this credential, so it stays on record. Add an updated one and we will review it.';
+  fakeSupabase.rpc = async () => ({ data: null, error: { code: '42501', message: KEPT }, status: 403 });
+  await assert.rejects(credentialsApi.deleteCredential('C1'), (error) => error instanceof credentialsApi.CredentialKeptError && error.message === KEPT);
+  checks += 1;
+  check('the kept credential is information, under a calm title', credentialsApi.CREDENTIAL_KEPT_TITLE, 'Kept on record');
+  check('the portal says the same when the server sends no words', portal.KEPT_ON_RECORD_FALLBACK, KEPT);
+
+  // NPI Registry hints on a listing's credential: platform admins only.
+  check('who keeps an NPI Registry hint', [
+    credentialsApi.mayKeepNpiHint('local', false), credentialsApi.mayKeepNpiHint('local', true),
+    credentialsApi.mayKeepNpiHint('listing', false), credentialsApi.mayKeepNpiHint('listing', true),
+  ], [true, true, false, true]);
+
+  const card = readFileSync(path.join(repoRoot, 'src/lib/CredentialsCard.tsx'), 'utf8');
+  ok('both NPI hint paths ask mayKeepNpiHint (the card\'s and the editor\'s)', (card.match(/mayKeepNpiHint\(/g) || []).length === 2 && !/result\.ok && \(credential\.scope === 'local'/.test(card));
+  ok('the card never renders a row\'s own note or verification note for a listing', !/credential\.note \?/.test(card) && !/credential\.verificationNote \?/.test(card) && /credential\.scope === 'listing' \? listingNote\(credential\) : credential/.test(card));
+  ok('ReferralFit\'s notes come from fetch_listing_credential_notes, only with canEditListing', /if \(!canEditListing \|\| !listingId\) return;\s*setNotes/.test(card) && card.includes('fetchListingCredentialNotes(listingId)'));
+  ok('a listing\'s credential is edited only once its notes have loaded (the note is never wiped)', /credential\.scope === 'listing' && notes\.status !== 'ready'/.test(card));
+  ok('a kept credential is shown calmly, not as a failure', /error instanceof CredentialKeptError\) Alert\.alert\(CREDENTIAL_KEPT_TITLE, error\.message\)/.test(card));
+
+  // The portal: the claimant's own notes come back from their own call.
+  const rows = [{ id: 'C1', note: null, verification_note: null }, { id: 'C2', note: 'old row note', verification_note: '' }];
+  check('the portal puts the notes back on the claimant\'s rows', portal.withListingNotes(rows, portal.notesFromRows([{ id: 'c1', note: 'mine', verification_note: 'fix the number' }])).map((item) => [item.note, item.verification_note]),
+    [['mine', 'fix the number'], ['old row note', '']]);
+  check('a row with no notes edits as an empty note', portal.formFromRow({ ...rows[0], kind: 'npi', accreditor: null, accreditor_name: '', identifier: '1234567893', issuing_state: '', expires_on: null, proof_url: null, status: 'pending', verified_at: null, updated_at: '' }).note, '');
+  check('after a save: pending, or still not confirmed for an edited rejected one', [portal.savedNotice('pending').includes('pending ReferralFit review'), portal.savedNotice('rejected').includes('not confirmed')], [true, true]);
+  const portalUi = readFileSync(path.join(repoRoot, 'portal/src/Credentials.tsx'), 'utf8');
+  ok('the portal labels the note for ReferralFit only', portalUi.includes('Note for ReferralFit (only ReferralFit sees this)'));
+  ok('the portal reads the notes with their own call', portalUi.includes("rpc('fetch_listing_credential_notes', { p_global_partner_id: listingId })"));
+  ok('the portal shows a kept credential as information, not an error', /error\.code === '42501'\) \{ setInfo\(/.test(portalUi));
+  const queue = readFileSync(path.join(repoRoot, 'src/lib/CredentialReviewQueue.tsx'), 'utf8');
+  ok('the review queue says who reads a rejection note', queue.includes("'The program sees this note; practitioners do not'") && queue.includes('{REJECTION_NOTE_LABEL}'));
+
+  // A failed read after a workspace change never shows the last workspace's rows.
+  ok('the index belongs to one account and one workspace', /export function credentialScopeKey\(userId: string \| undefined, workspaceKey: string \| number\): string \{\s*return `\$\{userId \|\| ''\}\|\$\{workspaceKey\}`;/.test(card));
+  ok('the hook drops the last workspace\'s rows (scope-held state, not only on a user change)', /const state = held\.scope === scope \? held\.state : INITIAL_STATE;/.test(card)
+    && /current\.scope === readScope && current\.state\.status === 'ready'/.test(card));
+  const app = readFileSync(path.join(repoRoot, 'App.tsx'), 'utf8');
+  ok('App scopes credentials, placement requests and assessments to the workspace', app.includes('useCredentialIndex(session?.user?.id, linkedListingIds, credentialsNonce, workspaceEpoch)')
+    && app.includes('usePlacementRequests(session?.user?.id, credentialsNonce, workspaceEpoch)')
+    && /useCaseAssessments\(session\?\.user\?\.id, credentialsNonce, \[[^\]]+\], workspaceEpoch\)/.test(app));
 }
 
 // ─── (m) Matching integrity ─────────────────────────────────────────────────

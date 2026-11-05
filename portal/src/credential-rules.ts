@@ -32,12 +32,55 @@ export type CredentialRow = {
   issuing_state: string;
   expires_on: string | null;
   proof_url: string | null;
-  note: string;
+  // The listing's notes come from fetch_listing_credential_notes (the
+  // claimant and ReferralFit only); fetch_listing_credentials leaves them
+  // null. withListingNotes puts them back on the rows.
+  note: string | null;
   status: CredentialReview;
   verified_at: string | null;
-  verification_note: string;
+  verification_note: string | null;
   updated_at: string;
 };
+
+export type ListingNotes = Record<string, { note: string; verification_note: string }>;
+
+// The rows with their notes: the claimant's own copy (an older server that
+// still sends them on the rows keeps those).
+export function withListingNotes(rows: CredentialRow[], notes: ListingNotes | null): CredentialRow[] {
+  return rows.map((row) => {
+    const extra = notes?.[row.id.toLowerCase()];
+    return {
+      ...row,
+      note: extra ? extra.note : row.note ?? '',
+      verification_note: extra ? extra.verification_note : row.verification_note ?? '',
+    };
+  });
+}
+
+export function notesFromRows(data: unknown): ListingNotes {
+  const notes: ListingNotes = {};
+  for (const row of (Array.isArray(data) ? data : []) as { id?: unknown; note?: unknown; verification_note?: unknown }[]) {
+    if (typeof row.id !== 'string') continue;
+    notes[row.id.toLowerCase()] = {
+      note: typeof row.note === 'string' ? row.note : '',
+      verification_note: typeof row.verification_note === 'string' ? row.verification_note : '',
+    };
+  }
+  return notes;
+}
+
+// The server keeps a credential ReferralFit could not confirm (42501): said
+// calmly, as information.
+export const KEPT_ON_RECORD_FALLBACK = 'ReferralFit could not confirm this credential, so it stays on record. Add an updated one and we will review it.';
+
+// What the program is told after it saves: an edit of a credential
+// ReferralFit could not confirm stays "could not confirm" (the server keeps
+// it so); anything else waits for review.
+export function savedNotice(status: unknown): string {
+  return status === 'rejected'
+    ? 'Saved. ReferralFit still shows this one as not confirmed. To have it reviewed again, add an updated credential.'
+    : 'Credential saved. It shows as pending ReferralFit review until we check it with the issuer.';
+}
 
 export type CredentialForm = {
   kind: CredentialKind;
@@ -130,7 +173,7 @@ export function formFromRow(row: CredentialRow): CredentialForm {
     issuingState: row.issuing_state,
     expiresOn: row.expires_on || '',
     proofUrl: row.proof_url || '',
-    note: row.note,
+    note: row.note ?? '',
   };
 }
 

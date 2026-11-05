@@ -92,7 +92,7 @@ export default function LevelOfCareCard({ entry, nameFor, onStart, onFindPlaceme
           <Text style={styles.label}>EARLIER</Text>
           {earlier.map((item) => (
             <Text key={item.id} style={styles.earlierLine}>
-              {formatAssessedDate(item.assessedAt)} · recommended {pathLabel(item.recommendation)}{item.chosenLevel !== item.recommendation.level ? ` · chose ${item.chosenLevel}` : ''}
+              {formatAssessedDate(item.assessedAt)} · recommended {pathLabel(item.recommendation)}{followsRecommendation(item.recommendation, item.chosenLevel) ? '' : ` · chose ${item.chosenLevel}`}
             </Text>
           ))}
         </View>

@@ -1,4 +1,5 @@
 import type { PartnerType, ReferralMatch } from '../data';
+import { identifyingTextProblem } from './identifying-text';
 
 // ─── Level-of-care assessment: the pure rules ───────────────────────────────
 // A short, structured intake across six areas gives a recommended level of
@@ -165,19 +166,31 @@ export function isPlacementLevel(value: unknown): value is PlacementLevel {
 
 // ─── THE RULES (one table; a clinician can review and adjust it here) ───────
 //
-// Read it like this. Every area is rated 0 (none) to 4 (severe).
+// Read it like this. Every area is rated 0 (none) to 4 (severe). Version 2:
+// Matt's clinical decisions of 2026-11-05 (oversight, the moderate rule in
+// together, and firstStep.stepDownAtLeast) on top of version 1.
 //
-//   primary   Areas 2-6: the treatment level each rating asks for ON ITS
-//             OWN. The recommended level is the most intensive any area asks
-//             for. Withdrawal (area 1) never sets it: detox comes first and
-//             the level after it comes from the other areas.
-//   together  Some risks that each ask for less add up: when two or more of
-//             readiness, relapse and environment are rated 3 or 4, 24-hour
-//             structure (Inpatient) is recommended.
-//   firstStep Withdrawal rated 3 or 4: medically supervised withdrawal
-//             (Detox) comes first, then the primary level.
-//   support   Environment rated 3 or 4: sober living is added as a support
-//             level (a stable place to live, during or after treatment).
+//   primary    Areas 2-6: the treatment level each rating asks for ON ITS
+//              OWN. The recommended level is the most intensive any rule
+//              asks for.
+//   together   Some risks that each ask for less add up to 24-hour structure
+//              (Inpatient):
+//                serious   two or more of readiness, relapse and environment
+//                          rated 3 or 4;
+//                moderate  four or more of physical, emotional, readiness,
+//                          relapse and environment rated 2 or more.
+//   oversight  Withdrawal rated 2 or more needs medical oversight, so the
+//              level is at least IOP / PHP.
+//   firstStep  Withdrawal rated 3 or 4: medically supervised withdrawal
+//              (Detox) comes first, then the level, which is never lower
+//              than stepDownAtLeast (IOP / PHP): after detox, step down no
+//              lower than intensive outpatient.
+//   support    Environment rated 3 or 4: sober living is added as a support
+//              level (a stable place to live, during or after treatment).
+//
+// Physical 4 and emotional 4 stay Inpatient (the primary table), with their
+// urgent safety flags below. There is no emergency first step (Matt's
+// decision): emergencies go to 911 / 988 through the flags.
 //
 // Every rule only ever moves UP as a rating rises, so raising any rating can
 // never lower what is recommended (the test checks all 15,625 rating sets).
@@ -191,16 +204,20 @@ const OP: PrimaryLevel = 'Therapist';
 const IOP: PrimaryLevel = 'IOP / PHP';
 const IN: PrimaryLevel = 'Inpatient';
 
+/** Areas that add up: when `count` or more of `dimensions` are rated `atOrAbove` or higher, `level` at least. */
+export type TogetherRule = { key: 'serious' | 'moderate'; dimensions: readonly DimensionKey[]; atOrAbove: Rating; count: number; level: PrimaryLevel };
+
 export type RulesTable = {
   version: number;
   primary: Record<Exclude<DimensionKey, 'withdrawal'>, readonly [PrimaryLevel, PrimaryLevel, PrimaryLevel, PrimaryLevel, PrimaryLevel]>;
-  together: { dimensions: readonly DimensionKey[]; atOrAbove: Rating; count: number; level: PrimaryLevel };
-  firstStep: { dimension: DimensionKey; atOrAbove: Rating; level: 'Detox' };
+  together: readonly TogetherRule[];
+  oversight: { dimension: DimensionKey; atOrAbove: Rating; level: PrimaryLevel };
+  firstStep: { dimension: DimensionKey; atOrAbove: Rating; level: 'Detox'; stepDownAtLeast: PrimaryLevel };
   support: { dimension: DimensionKey; atOrAbove: Rating; level: 'Sober Living' };
 };
 
 export const LEVEL_OF_CARE_RULES: RulesTable = {
-  version: 1,
+  version: 2,
   primary: {
     //            rated 0   1    2    3    4
     // Medical needs that need monitoring or nursing call for 24-hour care.
@@ -216,8 +233,12 @@ export const LEVEL_OF_CARE_RULES: RulesTable = {
     // one (4) also calls for 24-hour care away from it.
     environment: [OP, OP, OP, OP, IN],
   },
-  together: { dimensions: ['readiness', 'relapse', 'environment'], atOrAbove: 3, count: 2, level: IN },
-  firstStep: { dimension: 'withdrawal', atOrAbove: 3, level: 'Detox' },
+  together: [
+    { key: 'serious', dimensions: ['readiness', 'relapse', 'environment'], atOrAbove: 3, count: 2, level: IN },
+    { key: 'moderate', dimensions: ['physical', 'emotional', 'readiness', 'relapse', 'environment'], atOrAbove: 2, count: 4, level: IN },
+  ],
+  oversight: { dimension: 'withdrawal', atOrAbove: 2, level: IOP },
+  firstStep: { dimension: 'withdrawal', atOrAbove: 3, level: 'Detox', stepDownAtLeast: IOP },
   support: { dimension: 'environment', atOrAbove: 3, level: 'Sober Living' },
 };
 
@@ -232,10 +253,18 @@ export type Recommendation = {
   firstStep: 'Detox' | null;
   /** 'Sober Living' as a support level, else null. */
   support: 'Sober Living' | null;
-  /** The areas that asked for `level` (empty for outpatient therapy). */
+  /**
+   * The areas the rationale names as the reason for `level`, in area order:
+   * the areas that ask for it on their own (with the areas of a serious
+   * `together` rule that also gives it); else the areas of the `together`
+   * rule that gives it; else withdrawal, when only its floor (oversight, or
+   * the step down after detox) gives it. Empty for outpatient therapy.
+   */
   drivers: DimensionKey[];
-  /** True when `together` raised (or also gave) the level. */
-  together: boolean;
+  /** The `together` rule the level sentence names (no area asks for `level` on its own), else null. */
+  together: TogetherRule['key'] | null;
+  /** 'oversight' or 'stepDown' when only a withdrawal floor gives `level`, else null. */
+  floor: 'oversight' | 'stepDown' | null;
 };
 
 const PRIMARY_RANK: Record<PrimaryLevel, number> = { Therapist: 1, 'IOP / PHP': 2, Inpatient: 3 };
@@ -248,31 +277,53 @@ export function isRating(value: unknown): value is Rating {
   return value === 0 || value === 1 || value === 2 || value === 3 || value === 4;
 }
 
+function byArea(a: DimensionKey, b: DimensionKey): number {
+  return DIMENSION_KEYS.indexOf(a) - DIMENSION_KEYS.indexOf(b);
+}
+
 export function recommend(ratings: Ratings, rules: RulesTable = LEVEL_OF_CARE_RULES): Recommendation {
   let level: PrimaryLevel = OP;
-  for (const key of Object.keys(rules.primary) as (keyof RulesTable['primary'])[]) {
-    const asked = rules.primary[key][ratings[key]];
-    if (PRIMARY_RANK[asked] > PRIMARY_RANK[level]) level = asked;
-  }
-  const raised = rules.together.dimensions.filter((key) => ratings[key] >= rules.together.atOrAbove);
-  const together = raised.length >= rules.together.count;
-  if (together && PRIMARY_RANK[rules.together.level] > PRIMARY_RANK[level]) level = rules.together.level;
-  const drivers: DimensionKey[] = [];
+  const raise = (asked: PrimaryLevel) => { if (PRIMARY_RANK[asked] > PRIMARY_RANK[level]) level = asked; };
+  const primaryKeys = Object.keys(rules.primary) as (keyof RulesTable['primary'])[];
+  for (const key of primaryKeys) raise(rules.primary[key][ratings[key]]);
+  const fired = rules.together
+    .map((rule) => ({ rule, raised: rule.dimensions.filter((key) => ratings[key] >= rule.atOrAbove) }))
+    .filter(({ rule, raised }) => raised.length >= rule.count);
+  for (const { rule } of fired) raise(rule.level);
+  const firstStep = ratings[rules.firstStep.dimension] >= rules.firstStep.atOrAbove ? rules.firstStep.level : null;
+  const oversight = ratings[rules.oversight.dimension] >= rules.oversight.atOrAbove;
+  if (oversight) raise(rules.oversight.level);
+  if (firstStep) raise(rules.firstStep.stepDownAtLeast);
+
+  // What the rationale names as the reason, most specific first.
+  let drivers: DimensionKey[] = [];
+  let together: Recommendation['together'] = null;
+  let floor: Recommendation['floor'] = null;
   if (level !== OP) {
-    for (const key of Object.keys(rules.primary) as (keyof RulesTable['primary'])[]) {
-      if (rules.primary[key][ratings[key]] === level) drivers.push(key);
+    const atLevel = fired.filter(({ rule }) => rule.level === level);
+    const individual: DimensionKey[] = primaryKeys.filter((key) => rules.primary[key][ratings[key]] === level);
+    if (individual.length) {
+      drivers = individual;
+      for (const { rule, raised } of atLevel) {
+        if (rule.key === 'serious') for (const key of raised) if (!drivers.includes(key)) drivers.push(key);
+      }
+    } else if (atLevel.length) {
+      const named = atLevel.find(({ rule }) => rule.key === 'serious') || atLevel[0];
+      drivers = named.raised.slice();
+      together = named.rule.key;
+    } else {
+      floor = firstStep && rules.firstStep.stepDownAtLeast === level ? 'stepDown' : 'oversight';
+      drivers = [floor === 'stepDown' ? rules.firstStep.dimension : rules.oversight.dimension];
     }
-    if (together && level === rules.together.level) {
-      for (const key of raised) if (!drivers.includes(key)) drivers.push(key);
-    }
-    drivers.sort((a, b) => DIMENSION_KEYS.indexOf(a) - DIMENSION_KEYS.indexOf(b));
+    drivers.sort(byArea);
   }
   return {
     level,
-    firstStep: ratings[rules.firstStep.dimension] >= rules.firstStep.atOrAbove ? rules.firstStep.level : null,
+    firstStep,
     support: ratings[rules.support.dimension] >= rules.support.atOrAbove ? rules.support.level : null,
     drivers,
-    together: together && level === rules.together.level,
+    together,
+    floor,
   };
 }
 
@@ -281,14 +332,20 @@ export function pathLabel(rec: Pick<Recommendation, 'level' | 'firstStep' | 'sup
   return `${rec.firstStep ? `${rec.firstStep}, then ` : ''}${rec.level}${rec.support ? `, with ${rec.support}` : ''}`;
 }
 
-/** The chosen level follows the recommendation: it is the recommended level or its first step. */
-export function followsRecommendation(rec: Pick<Recommendation, 'level' | 'firstStep'>, chosen: PlacementLevel): boolean {
-  return chosen === rec.level || (rec.firstStep !== null && chosen === rec.firstStep);
-}
-
 /** What "Use recommended" picks: the first step when there is one (where the client goes now). */
 export function defaultChoice(rec: Pick<Recommendation, 'level' | 'firstStep'>): PlacementLevel {
   return rec.firstStep ?? rec.level;
+}
+
+/**
+ * The chosen level follows the recommendation: it is where the
+ * recommendation sends the client now, the first step when there is one
+ * (recommended_first_step ?? recommended_level, as the server reads it).
+ * Skipping a recommended detox for the level after it is a different level
+ * and needs a reason.
+ */
+export function followsRecommendation(rec: Pick<Recommendation, 'level' | 'firstStep'>, chosen: PlacementLevel): boolean {
+  return chosen === defaultChoice(rec);
 }
 
 // ─── The rationale (2-4 short sentences; never anything about who) ──────────
@@ -322,16 +379,23 @@ export function rationale(ratings: Ratings, rec: Recommendation = recommend(rati
     mentioned.add('withdrawal');
   }
   const lead = rec.firstStep ? `After detox, ${LEVEL_PHRASES[rec.level]}` : capitalize(LEVEL_PHRASES[rec.level]);
+  const named = listJoin(rec.drivers.map((key) => rated(key, ratings)));
   if (rec.level === OP) {
     sentences.push(`${lead} is recommended: no ${rec.firstStep ? 'other ' : ''}area calls for more structure than regular sessions.`);
+  } else if (rec.floor === 'stepDown') {
+    sentences.push(`After detox, step down no lower than ${LEVEL_PHRASES[rec.level]}.`);
+  } else if (rec.floor === 'oversight') {
+    sentences.push(`Withdrawal risk is ${RATING_WORDS[ratings.withdrawal]} (${ratings.withdrawal} of 4) and needs medical oversight, so at least ${LEVEL_PHRASES[rec.level]} is recommended.`);
+  } else if (rec.together === 'serious') {
+    sentences.push(`${lead} is recommended because serious risks occur together: ${named}.`);
+  } else if (rec.together === 'moderate') {
+    const least = Math.min(...rec.drivers.map((key) => ratings[key])) as Rating;
+    const higher = rec.drivers.some((key) => ratings[key] > least) ? ' or higher' : '';
+    sentences.push(`Several areas are at ${RATING_WORDS[least]} risk${higher} together, which calls for ${LEVEL_PHRASES[rec.level]}${rec.firstStep ? ' after detox' : ''}: ${named}.`);
   } else {
-    const individual = rec.drivers.filter((key) => key !== 'withdrawal' && (LEVEL_OF_CARE_RULES.primary as Record<string, readonly PrimaryLevel[]>)[key]?.[ratings[key]] === rec.level);
-    const reason = individual.length
-      ? `because of ${listJoin(rec.drivers.map((key) => rated(key, ratings)))}`
-      : `because serious risks occur together: ${listJoin(rec.drivers.map((key) => rated(key, ratings)))}`;
-    sentences.push(`${lead} is recommended ${reason}.`);
-    for (const key of rec.drivers) mentioned.add(key);
+    sentences.push(`${lead} is recommended because of ${named}.`);
   }
+  for (const key of rec.drivers) mentioned.add(key);
   if (rec.support) {
     const when = rec.level === IN ? 'after residential care' : 'during treatment';
     sentences.push(mentioned.has('environment')
@@ -356,6 +420,9 @@ export function rationale(ratings: Ratings, rec: Recommendation = recommend(rati
 
 export type FlagSeverity = 'emergency' | 'urgent' | 'advice';
 export type SafetyFlag = { key: string; severity: FlagSeverity; title: string; text: string };
+/** A flag rule: raised when ANY of its triggers holds (an area at one of the listed ratings). */
+export type FlagTrigger = { dimension: DimensionKey; when: readonly Rating[] };
+export type FlagRule = SafetyFlag & { triggers: readonly FlagTrigger[] };
 
 export const EMERGENCY_FLAG: SafetyFlag = {
   key: 'imminent_danger',
@@ -364,56 +431,84 @@ export const EMERGENCY_FLAG: SafetyFlag = {
   text: 'If anyone is in immediate danger, call 911 now. For thoughts of suicide or an emotional crisis, call or text 988 (the Suicide & Crisis Lifeline). Stay with the person, or keep a safe adult with them, until help arrives. Placement can wait until everyone is safe.',
 };
 
-// Which ratings raise which flag. Our own wording; plain and calm.
-export const FLAG_RULES: (SafetyFlag & { dimension: DimensionKey; when: readonly Rating[] })[] = [
+// Which ratings raise which flag. Our own wording; plain and calm. The flags
+// are CUMULATIVE: a higher rating keeps every flag a lower one raised (an
+// urgent flag at 4 comes with the advice for 3), so a worse picture never
+// shows less. They are words only: the recommendation rules above (and the
+// digest both test suites share) never read them.
+const DETOX_FIRST: FlagTrigger = { dimension: LEVEL_OF_CARE_RULES.firstStep.dimension, when: RATINGS.filter((rating) => rating >= LEVEL_OF_CARE_RULES.firstStep.atOrAbove) };
+
+export const FLAG_RULES: FlagRule[] = [
   {
-    key: 'withdrawal_urgent', dimension: 'withdrawal', when: [4], severity: 'urgent',
+    key: 'withdrawal_urgent', triggers: [{ dimension: 'withdrawal', when: [4] }], severity: 'urgent',
     title: 'Arrange medically supervised withdrawal today',
     text: 'Severe withdrawal risk: the client should not stop on their own. Arrange a medically supervised setting today. Seizures, confusion or hallucinations during withdrawal are an emergency: call 911.',
   },
   {
-    key: 'medical_urgent', dimension: 'physical', when: [4], severity: 'urgent',
+    key: 'medical_urgent', triggers: [{ dimension: 'physical', when: [4] }], severity: 'urgent',
     title: 'Arrange an urgent medical evaluation',
     text: 'Arrange an urgent medical evaluation before placement: the client\'s doctor today, urgent care, or an emergency department. Programs may need a doctor\'s clearance to admit. If symptoms are life-threatening, call 911.',
   },
   {
-    key: 'psychiatric_urgent', dimension: 'emotional', when: [4], severity: 'urgent',
+    key: 'psychiatric_urgent', triggers: [{ dimension: 'emotional', when: [4] }], severity: 'urgent',
     title: 'Arrange an urgent psychiatric evaluation',
     text: 'Arrange an urgent psychiatric evaluation before placement. If there are thoughts of suicide, call or text 988. If anyone is in danger now, call 911.',
   },
   {
-    key: 'environment_unsafe', dimension: 'environment', when: [4], severity: 'urgent',
+    key: 'environment_unsafe', triggers: [{ dimension: 'environment', when: [4] }], severity: 'urgent',
     title: 'Plan a safe place to stay until admission',
     text: 'The living situation is unsafe. Plan where the client can stay safely until admission. If anyone is being hurt or threatened, call 911.',
   },
   {
-    key: 'withdrawal_oversight', dimension: 'withdrawal', when: [2], severity: 'advice',
-    title: 'Medical oversight of withdrawal',
-    text: 'Moderate withdrawal risk: make sure a medical provider oversees withdrawal at whichever level is chosen.',
+    key: 'withdrawal_oversight', triggers: [{ dimension: 'withdrawal', when: [2, 3, 4] }], severity: 'advice',
+    title: 'Arrange detox first, or a program with on-site withdrawal management',
+    text: 'Withdrawal needs medical oversight at this level of risk. Arrange detox first, or choose a program that manages withdrawal on site, with medical staff.',
   },
   {
-    key: 'medical_capacity', dimension: 'physical', when: [3], severity: 'advice',
+    key: 'medical_capacity', triggers: [{ dimension: 'physical', when: [3, 4] }], severity: 'advice',
     title: 'Ask about medical care on site',
     text: 'Ask each program whether it can manage these medical needs on site, with nursing.',
   },
   {
-    key: 'psychiatric_capacity', dimension: 'emotional', when: [3], severity: 'advice',
+    key: 'psychiatric_capacity', triggers: [{ dimension: 'emotional', when: [3, 4] }], severity: 'advice',
     title: 'Look for psychiatric care on site',
     text: 'Look for programs with psychiatric care on site (the "Dual diagnosis" need on the match).',
   },
+  {
+    // Relapse risk 3 or more, or detox as the first step.
+    key: 'overdose_risk', triggers: [{ dimension: 'relapse', when: [3, 4] }, DETOX_FIRST], severity: 'advice',
+    title: 'Plan for overdose risk',
+    text: 'After detox or any break from use, tolerance drops, so using the same amount as before can cause an overdose. Make sure the family has naloxone (Narcan) and knows how to use it, and to call 911 if someone may be overdosing.',
+  },
 ];
+
+/** The rule's triggers that hold for these ratings. */
+export function flagRuleApplies(rule: Pick<FlagRule, 'triggers'>, ratings: Partial<Record<DimensionKey, Rating>>): boolean {
+  return rule.triggers.some((trigger) => {
+    const rating = ratings[trigger.dimension];
+    return rating !== undefined && trigger.when.includes(rating);
+  });
+}
 
 /** The flags for these answers: an emergency first, then urgent, then advice. */
 export function safetyFlags(ratings: Ratings, imminentDanger: boolean): SafetyFlag[] {
   const flags: SafetyFlag[] = imminentDanger ? [EMERGENCY_FLAG] : [];
   for (const severity of ['urgent', 'advice'] as FlagSeverity[]) {
     for (const rule of FLAG_RULES) {
-      if (rule.severity === severity && rule.when.includes(ratings[rule.dimension])) {
+      if (rule.severity === severity && flagRuleApplies(rule, ratings)) {
         flags.push({ key: rule.key, severity: rule.severity, title: rule.title, text: rule.text });
       }
     }
   }
   return flags;
+}
+
+/** The flags one area's rating raises on its own, shown under that area as it is rated. */
+export function inlineFlags(key: DimensionKey, rating: Rating | undefined): SafetyFlag[] {
+  if (rating === undefined) return [];
+  return FLAG_RULES
+    .filter((rule) => rule.triggers.some((trigger) => trigger.dimension === key && trigger.when.includes(rating)))
+    .map((rule) => ({ key: rule.key, severity: rule.severity, title: rule.title, text: rule.text }));
 }
 
 // ─── Validation (the server applies the same rules: case_assessment_problem) ─
@@ -422,35 +517,42 @@ export const REASON_PROBLEMS = {
   missing: 'Say why you chose a different level. The reason goes in the program\'s packet.',
   tooLong: `Keep the reason to ${REASON_MAX} characters`,
   multiline: 'Keep the reason to one line',
-  email: 'Leave email addresses out of the reason',
-  number: 'Leave phone and ID numbers out of the reason',
-  link: 'Leave links out of the reason',
 } as const;
 
-const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}/;
-const LONG_NUMBER = /[0-9]([ ().-]*[0-9]){6,}/;
-const LINK = /(https?:|www[.])/i;
+/** Under the reason field: the program reads it, so what identifyingTextProblem refuses stays out. */
+export const REASON_HINT = 'Leave out names, contact details, dates and money; the program reads this.';
+
 // Line breaks, tabs and other control characters (Postgres [[:cntrl:]]).
 // eslint-disable-next-line no-control-regex
 const CONTROL = /[\u0000-\u001F\u007F-\u009F]/;
 
-/** The first thing wrong with an override reason, or null. Mirrors case_assessment_reason_problem. */
-export function reasonProblem(reason: string): string | null {
+/** The names a reason may not carry: the case's title and its contact names. */
+export function reasonNames(input: { caseTitle?: string | null; contactNames?: (string | null | undefined)[] }): string[] {
+  return [input.caseTitle, ...(input.contactNames || [])].filter((value): value is string => typeof value === 'string' && value.trim() !== '');
+}
+
+/**
+ * The first thing wrong with an override reason, or null. Mirrors
+ * case_assessment_reason_problem: 3 to 200 characters on one line, then the
+ * one shared check for text programs read (identifying-text.ts: no names,
+ * contact details, dates, ID numbers or money). `names` are the case's title
+ * and its contact names (reasonNames).
+ */
+export function reasonProblem(reason: string, names: (string | null | undefined)[] = []): string | null {
   const trimmed = reason.trim();
-  if (trimmed.length < REASON_MIN) return REASON_PROBLEMS.missing;
-  if (trimmed.length > REASON_MAX) return REASON_PROBLEMS.tooLong;
+  // Characters as the server counts them (length()), not UTF-16 units.
+  const length = Array.from(trimmed).length;
+  if (length < REASON_MIN) return REASON_PROBLEMS.missing;
+  if (length > REASON_MAX) return REASON_PROBLEMS.tooLong;
   if (CONTROL.test(reason)) return REASON_PROBLEMS.multiline;
-  if (EMAIL.test(reason)) return REASON_PROBLEMS.email;
-  if (LONG_NUMBER.test(reason)) return REASON_PROBLEMS.number;
-  if (LINK.test(reason)) return REASON_PROBLEMS.link;
-  return null;
+  return identifyingTextProblem(trimmed, names.filter((value): value is string => typeof value === 'string' && value.trim() !== ''));
 }
 
 /** null when the chosen level follows the recommendation (no reason needed), else the reason's first problem. */
-export function overrideProblem(rec: Pick<Recommendation, 'level' | 'firstStep'>, chosen: PlacementLevel | null, reason: string): string | null {
+export function overrideProblem(rec: Pick<Recommendation, 'level' | 'firstStep'>, chosen: PlacementLevel | null, reason: string, names: (string | null | undefined)[] = []): string | null {
   if (!chosen || !isPlacementLevel(chosen)) return 'Choose a level of care';
   if (followsRecommendation(rec, chosen)) return null;
-  return reasonProblem(reason);
+  return reasonProblem(reason, names);
 }
 
 export function noteProblem(note: string): string | null {
@@ -495,7 +597,7 @@ export type AssessmentInput = {
   overrideReason: string;
 };
 
-export function prepareAssessment(draft: AssessmentDraft): { input: AssessmentInput; recommendation: Recommendation } | { problem: string } {
+export function prepareAssessment(draft: AssessmentDraft, names: (string | null | undefined)[] = []): { input: AssessmentInput; recommendation: Recommendation } | { problem: string } {
   if (draft.imminentDanger === null) return { problem: 'Answer the safety question first' };
   const ratings = completeRatings(draft.ratings);
   if (!ratings) {
@@ -507,7 +609,7 @@ export function prepareAssessment(draft: AssessmentDraft): { input: AssessmentIn
     if (problem) return { problem: `${DIMENSIONS[key].title}: ${problem.toLowerCase()}` };
   }
   const rec = recommend(ratings);
-  const problem = overrideProblem(rec, draft.chosenLevel, draft.overrideReason);
+  const problem = overrideProblem(rec, draft.chosenLevel, draft.overrideReason, names);
   if (problem) return { problem };
   const chosen = draft.chosenLevel as PlacementLevel;
   return {
@@ -599,9 +701,9 @@ export function currentAssessment(list: CaseAssessment[] | null | undefined): Ca
   return list && list.length ? sortAssessments(list)[0] : null;
 }
 
-/** The timeline entry: the levels only, never a rating. Mirrors case_assessment_event_body. */
+/** The timeline entry: the levels only, never a rating. "; chosen X" whenever X is not where the recommendation sends the client now (followsRecommendation). Mirrors case_assessment_event_body. */
 export function assessmentEventBody(rec: Pick<Recommendation, 'level' | 'firstStep' | 'support'>, chosen: PlacementLevel): string {
-  return `Level-of-care assessment: recommended ${pathLabel(rec)}${chosen !== rec.level ? `; chosen ${chosen}` : ''}`;
+  return `Level-of-care assessment: recommended ${pathLabel(rec)}${followsRecommendation(rec, chosen) ? '' : `; chosen ${chosen}`}`;
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];

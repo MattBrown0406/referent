@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(97);
+SELECT plan(131);
 
 -- Actors
 --   s1  platform admin (ReferralFit)
@@ -96,6 +96,7 @@ SELECT ok(
                     'public.list_pending_listing_credentials()'::regprocedure,
                     'public.program_credential_writer_scope(uuid, uuid)'::regprocedure,
                     'public.program_credentials_listing_visible(uuid)'::regprocedure,
+                    'public.fetch_listing_credential_notes(uuid)'::regprocedure,
                     'public.org_merge_linked_partner_copies(uuid, uuid)'::regprocedure)),
   'every privileged function is SECURITY DEFINER with a pinned search_path'
 );
@@ -111,7 +112,8 @@ SELECT ok(
        AND p.proname IN ('is_valid_proof_url', 'is_valid_npi', 'program_credential_status', 'program_credentials_listing_visible',
                          'program_credential_problem', 'program_credential_writer_scope', 'save_program_credential',
                          'verify_program_credential', 'delete_program_credential', 'record_npi_lookup', 'fetch_listing_credentials',
-                         'listing_credentials_verified', 'list_pending_listing_credentials', 'org_merge_linked_partner_copies')
+                         'listing_credentials_verified', 'list_pending_listing_credentials', 'org_merge_linked_partner_copies',
+                         'fetch_listing_credential_notes', 'program_credential_store_notes', 'program_credential_write_edit')
        AND has_function_privilege('anon', p.oid, 'EXECUTE')),
   'anon can run none of the new functions'
 );
@@ -121,14 +123,54 @@ SELECT ok(
   AND has_function_privilege('authenticated', 'public.delete_program_credential(uuid)', 'EXECUTE')
   AND has_function_privilege('authenticated', 'public.record_npi_lookup(uuid, text)', 'EXECUTE')
   AND has_function_privilege('authenticated', 'public.fetch_listing_credentials(uuid[])', 'EXECUTE')
-  AND has_function_privilege('authenticated', 'public.list_pending_listing_credentials()', 'EXECUTE'),
+  AND has_function_privilege('authenticated', 'public.list_pending_listing_credentials()', 'EXECUTE')
+  AND has_function_privilege('authenticated', 'public.fetch_listing_credential_notes(uuid)', 'EXECUTE'),
   'signed-in users can call the RPCs (each checks who is calling)'
 );
 SELECT ok(
   NOT has_function_privilege('authenticated', 'public.program_credential_problem(text, text, text, text, text, date, text, text)', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.program_credential_writer_scope(uuid, uuid)', 'EXECUTE')
-  AND NOT has_function_privilege('authenticated', 'public.org_merge_linked_partner_copies(uuid, uuid)', 'EXECUTE'),
+  AND NOT has_function_privilege('authenticated', 'public.org_merge_linked_partner_copies(uuid, uuid)', 'EXECUTE')
+  AND NOT has_function_privilege('authenticated', 'public.program_credential_store_notes(uuid, text, text)', 'EXECUTE')
+  AND NOT has_function_privilege('authenticated', 'public.program_credential_write_edit(public.program_credentials, public.program_credentials, uuid)', 'EXECUTE'),
   'the internal helpers stay internal'
+);
+
+-- A listing credential's notes are private: their own table, no client grants.
+SELECT has_table('public', 'program_credential_listing_notes', 'program_credential_listing_notes exists');
+SELECT ok(
+  (SELECT relrowsecurity FROM pg_class WHERE oid = 'public.program_credential_listing_notes'::regclass)
+  AND NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = 'program_credential_listing_notes')
+  AND (SELECT bool_and(NOT has_table_privilege(r, 'public.program_credential_listing_notes', p))
+         FROM unnest(ARRAY['anon', 'authenticated']) AS r, unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) AS p),
+  'the private notes table: RLS on, no policy, and no privilege at all for anon or signed-in users'
+);
+SELECT throws_ok(
+  $$ INSERT INTO public.program_credentials (global_partner_id, kind, identifier, issuing_state, note)
+     VALUES ('d1000000-0000-0000-0000-000000c7ed01', 'state_license', 'X', 'OR', 'a note on the readable row') $$,
+  '23514', NULL,
+  'a listing credential can never carry its notes on the readable row, whoever writes it'
+);
+SELECT throws_ok(
+  $$ INSERT INTO public.program_credentials (org_id, partner_id, kind, identifier, issuing_state)
+     VALUES (current_setting('test.org_p')::uuid, 'e2000000-0000-0000-0000-000000c7ed01', 'state_license', 'X', 'OR') $$,
+  '23514', NULL,
+  'a partner credential keeps its notes on its row (never NULL)'
+);
+
+-- The paste-order guard, as pasted (the local reset records each
+-- statement): without 20261104120000's columns the file stops at once.
+SELECT throws_ok(
+  format('DO $t$ BEGIN ALTER TABLE public.case_benefits RENAME COLUMN in_deductible TO in_deductible_gone; EXECUTE %L; END $t$',
+         (SELECT x FROM supabase_migrations.schema_migrations m, unnest(m.statements) AS x
+           WHERE m.version = '20261104130000' AND x LIKE '%DO $$%Paste 20261104120000_family_cost.sql first%')),
+  'P0001', 'Paste 20261104120000_family_cost.sql first: the case_benefits and vob_requests cost columns are missing.',
+  'pasted without the family cost migration, this file stops before changing anything'
+);
+SELECT lives_ok(
+  (SELECT x FROM supabase_migrations.schema_migrations m, unnest(m.statements) AS x
+    WHERE m.version = '20261104130000' AND x LIKE '%DO $$%Paste 20261104120000_family_cost.sql first%'),
+  'with the family cost columns in place, the guard passes'
 );
 SELECT is(
   (SELECT array_agg(pg_get_function_identity_arguments(p.oid) || ' -> ' || pg_get_function_result(p.oid))
@@ -208,9 +250,17 @@ SELECT is(
   'a center adds a license to its own listing: pending, normalized, no accreditor kept'
 );
 SELECT is(
-  (SELECT identifier || '|' || coalesce(accreditor, 'none') || '|' || proof_url || '|' || note FROM public.program_credentials WHERE id = 'f1000000-0000-0000-0000-000000c7ed01'),
-  'LIC-100|none|https://oha.example.gov/lookup?id=LIC-100|renewed',
-  'values are trimmed and an accreditor never sticks to a license'
+  (SELECT identifier || '|' || coalesce(accreditor, 'none') || '|' || proof_url || '|' || coalesce(note, 'not on the row')
+          || '|' || coalesce(verification_note, 'not on the row')
+     FROM public.program_credentials WHERE id = 'f1000000-0000-0000-0000-000000c7ed01'),
+  'LIC-100|none|https://oha.example.gov/lookup?id=LIC-100|not on the row|not on the row',
+  'values are trimmed, an accreditor never sticks to a license, and a listing''s notes are not on the readable row'
+);
+SELECT is(
+  (SELECT n.note || '|' || n.verification_note FROM public.fetch_listing_credential_notes('d1000000-0000-0000-0000-000000c7ed01') AS n
+    WHERE n.id = 'f1000000-0000-0000-0000-000000c7ed01'),
+  'renewed|',
+  'the center reads its own note (trimmed) through fetch_listing_credential_notes'
 );
 SELECT throws_ok(
   $$ SELECT public.save_program_credential('f1100000-0000-0000-0000-000000c7ed01', 'd2000000-0000-0000-0000-000000c7ed01', NULL,
@@ -269,16 +319,10 @@ SELECT lives_ok(
        'legitscript', NULL, '', 'LS-77', '', DATE '2027-01-31', 'https://www.legitscript.com/websites/?checker_keywords=juniper.example.org', '') $$,
   'a center adds its LegitScript certification'
 );
-SELECT is(
-  (SELECT npi_lookup_name || ':' || (npi_checked_at IS NOT NULL)::text || ':' || status
-     FROM public.record_npi_lookup('f1300000-0000-0000-0000-000000c7ed01', '  JUNIPER RIDGE RECOVERY LLC  ')),
-  'JUNIPER RIDGE RECOVERY LLC:true:pending',
-  'the NPI Registry name is kept as a hint and never verifies anything'
-);
 SELECT throws_ok(
-  $$ SELECT public.record_npi_lookup('f1000000-0000-0000-0000-000000c7ed01', 'x') $$,
-  '22023', NULL,
-  'only an NPI takes an NPI Registry name'
+  $$ SELECT public.record_npi_lookup('f1300000-0000-0000-0000-000000c7ed01', 'JUNIPER RIDGE RECOVERY LLC') $$,
+  '42501', 'Only ReferralFit can record the NPI Registry name on a directory listing',
+  'a center cannot vouch for its own NPI: only ReferralFit records the registry name on a listing'
 );
 RESET ROLE;
 
@@ -317,6 +361,16 @@ SELECT throws_ok(
   '42501', NULL,
   'a practice member cannot open the review queue'
 );
+SELECT is(
+  (SELECT count(*)::integer || ':' || count(*) FILTER (WHERE note IS NULL AND verification_note IS NULL)::integer
+     FROM public.program_credentials WHERE global_partner_id = 'd1000000-0000-0000-0000-000000c7ed01'),
+  '3:3',
+  'a practitioner reads the listing''s credentials, but never its notes'
+);
+SELECT is((SELECT count(*)::integer FROM public.fetch_listing_credential_notes('d1000000-0000-0000-0000-000000c7ed01')), 0,
+  'and fetch_listing_credential_notes gives a practitioner nothing');
+SELECT throws_ok($$ SELECT count(*) FROM public.program_credential_listing_notes $$, '42501', NULL,
+  'nor can a practitioner read the private notes table');
 RESET ROLE;
 
 SELECT set_config('request.jwt.claim.sub', 'c2000000-0000-0000-0000-000000c7ed01', true);
@@ -337,6 +391,8 @@ SELECT throws_ok(
   '42501', NULL,
   'a center cannot open the review queue'
 );
+SELECT is((SELECT count(*)::integer FROM public.fetch_listing_credential_notes('d1000000-0000-0000-0000-000000c7ed01')), 0,
+  'another center reads none of the listing''s notes');
 RESET ROLE;
 
 -- ReferralFit reviews.
@@ -347,6 +403,22 @@ SELECT is(
     WHERE global_partner_id = 'd1000000-0000-0000-0000-000000c7ed01'),
   ARRAY['Juniper Ridge Recovery:legitscript:pending', 'Juniper Ridge Recovery:npi:pending', 'Juniper Ridge Recovery:state_license:pending'],
   'the admin queue lists every pending listing credential with its listing'
+);
+SELECT is(
+  (SELECT note FROM public.list_pending_listing_credentials() WHERE id = 'f1000000-0000-0000-0000-000000c7ed01'),
+  'renewed',
+  'the queue shows ReferralFit the program''s private note'
+);
+SELECT is(
+  (SELECT npi_lookup_name || ':' || (npi_checked_at IS NOT NULL)::text || ':' || status
+     FROM public.record_npi_lookup('f1300000-0000-0000-0000-000000c7ed01', '  JUNIPER RIDGE RECOVERY LLC  ')),
+  'JUNIPER RIDGE RECOVERY LLC:true:pending',
+  'ReferralFit keeps the NPI Registry name on a listing''s NPI as a hint; it never verifies anything'
+);
+SELECT throws_ok(
+  $$ SELECT public.record_npi_lookup('f1000000-0000-0000-0000-000000c7ed01', 'x') $$,
+  '22023', NULL,
+  'only an NPI takes an NPI Registry name'
 );
 SELECT throws_ok(
   $$ SELECT public.verify_program_credential('f1000000-0000-0000-0000-000000c7ed01', 'verified', '', '2001-01-01'::timestamptz) $$,
@@ -366,9 +438,16 @@ SELECT throws_ok(
   'rejecting a listing''s credential needs a note the program can act on'
 );
 SELECT is(
-  (SELECT status || ':' || verification_note FROM public.verify_program_credential('f1400000-0000-0000-0000-000000c7ed01', 'rejected', 'Not found on LegitScript')),
-  'rejected:Not found on LegitScript',
-  'a platform admin rejects with a note'
+  (SELECT status || ':' || coalesce(verification_note, 'not on the row')
+     FROM public.verify_program_credential('f1400000-0000-0000-0000-000000c7ed01', 'rejected', 'Not found on LegitScript')),
+  'rejected:not on the row',
+  'a platform admin rejects with a note, which is not on the readable row'
+);
+SELECT is(
+  (SELECT n.verification_note FROM public.fetch_listing_credential_notes('d1000000-0000-0000-0000-000000c7ed01') AS n
+    WHERE n.id = 'f1400000-0000-0000-0000-000000c7ed01'),
+  'Not found on LegitScript',
+  'the review note is kept privately, and ReferralFit reads it back'
 );
 SELECT throws_ok(
   $$ SELECT public.verify_program_credential('f1000000-0000-0000-0000-000000c7ed01', 'approved', '') $$,
@@ -403,11 +482,18 @@ SELECT is(
   'saving the same values again changes nothing (a retry after a timeout is safe)'
 );
 SELECT is(
-  (SELECT status || ':' || (verified_by IS NULL)::text || ':' || (verified_at IS NULL)::text || ':' || verification_note || ':' || (updated_by = 'c1000000-0000-0000-0000-000000c7ed01')::text
+  (SELECT status || ':' || (verified_by IS NULL)::text || ':' || (verified_at IS NULL)::text || ':' || coalesce(verification_note, 'not on the row')
+          || ':' || (updated_by = 'c1000000-0000-0000-0000-000000c7ed01')::text
      FROM public.save_program_credential('f1000000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
           'state_license', NULL, '', 'LIC-100', 'OR', DATE '2028-06-30', 'https://oha.example.gov/lookup?id=LIC-100', 'renewed')),
-  'pending:true:true::true',
+  'pending:true:true:not on the row:true',
   'a center''s change resets the verification to pending'
+);
+SELECT is(
+  (SELECT n.note || '|' || n.verification_note FROM public.fetch_listing_credential_notes('d1000000-0000-0000-0000-000000c7ed01') AS n
+    WHERE n.id = 'f1000000-0000-0000-0000-000000c7ed01'),
+  'renewed|',
+  'and clears ReferralFit''s note on a credential that was verified'
 );
 SELECT is(
   (SELECT status FROM public.save_program_credential('f1400000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
@@ -428,6 +514,76 @@ SELECT is(
   'a new NPI drops the old registry hint'
 );
 RESET ROLE;
+
+-- A rejection sticks: a center's edit of a credential ReferralFit could not
+-- confirm is saved but stays rejected, with ReferralFit's note, until
+-- ReferralFit reviews it again; and the center cannot remove it.
+SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
+SELECT lives_ok(
+  $$ SELECT public.save_program_credential('f1600000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
+       'accreditation', 'carf', '', 'CARF-1', '', DATE '2027-05-31', NULL, 'first try') $$,
+  'a center adds its CARF accreditation'
+);
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
+SELECT lives_ok(
+  $$ SELECT public.verify_program_credential('f1600000-0000-0000-0000-000000c7ed01', 'rejected', 'CARF has no record of CARF-1') $$,
+  'ReferralFit could not confirm it'
+);
+RESET ROLE;
+-- It was added two days ago and reviewed yesterday.
+UPDATE public.program_credentials SET updated_at = now() - interval '2 days', verified_at = now() - interval '1 day'
+ WHERE id = 'f1600000-0000-0000-0000-000000c7ed01';
+SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
+SELECT is((SELECT count(*)::integer FROM public.list_pending_listing_credentials() WHERE id = 'f1600000-0000-0000-0000-000000c7ed01'), 0,
+  'a rejected credential nobody changed is not in the queue');
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
+SELECT is(
+  (SELECT status || ':' || identifier || ':' || (verified_by = 'a1000000-0000-0000-0000-000000c7ed01')::text
+     FROM public.save_program_credential('f1600000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
+          'accreditation', 'carf', '', 'CARF-2', '', DATE '2027-05-31', NULL, 'corrected number')),
+  'rejected:CARF-2:true',
+  'a center''s edit of a rejected credential is saved, but it stays rejected until ReferralFit reviews it again'
+);
+SELECT is(
+  (SELECT n.note || '|' || n.verification_note FROM public.fetch_listing_credential_notes('d1000000-0000-0000-0000-000000c7ed01') AS n
+    WHERE n.id = 'f1600000-0000-0000-0000-000000c7ed01'),
+  'corrected number|CARF has no record of CARF-1',
+  'ReferralFit''s note stays with it'
+);
+SELECT throws_ok(
+  $$ SELECT public.delete_program_credential('f1600000-0000-0000-0000-000000c7ed01') $$,
+  '42501', 'ReferralFit could not confirm this credential, so it stays on record. Add an updated one and we will review it.',
+  'a center cannot remove a credential ReferralFit rejected'
+);
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
+SELECT is(
+  (SELECT status_today || ':' || identifier || ':' || note FROM public.list_pending_listing_credentials()
+    WHERE id = 'f1600000-0000-0000-0000-000000c7ed01'),
+  'rejected:CARF-2:corrected number',
+  'the edited rejection is back in ReferralFit''s queue'
+);
+SELECT is(
+  (SELECT status FROM public.save_program_credential('f1600000-0000-0000-0000-000000c7ed01', 'd1000000-0000-0000-0000-000000c7ed01', NULL,
+     'accreditation', 'carf', '', 'CARF-3', '', DATE '2027-05-31', NULL, 'corrected number')),
+  'pending',
+  'an admin''s edit of a rejected credential resets it like any other'
+);
+SELECT lives_ok(
+  $$ SELECT public.verify_program_credential('f1600000-0000-0000-0000-000000c7ed01', 'rejected', 'Still no record') $$,
+  'ReferralFit rejects it again'
+);
+SELECT is(public.delete_program_credential('f1600000-0000-0000-0000-000000c7ed01'), true, 'ReferralFit can remove a rejected credential');
+RESET ROLE;
+SELECT is((SELECT count(*)::integer FROM public.program_credential_listing_notes WHERE credential_id = 'f1600000-0000-0000-0000-000000c7ed01'), 0,
+  'its private notes go with it');
 
 -- ===========================================================================
 -- C. Who reads a listing's credentials
@@ -491,9 +647,19 @@ RESET ROLE;
 -- Production's default ACL grants ALL on new tables. Even with every
 -- privilege granted, RLS keeps anon out and refuses every client write.
 GRANT ALL ON TABLE public.program_credentials TO anon, authenticated;
+GRANT ALL ON TABLE public.program_credential_listing_notes TO anon, authenticated;
 SET LOCAL ROLE anon;
 SELECT is((SELECT count(*)::integer FROM public.program_credentials), 0, 'production grants: anon still reads no rows');
+SELECT is((SELECT count(*)::integer FROM public.program_credential_listing_notes), 0, 'production grants: anon reads no private notes');
 RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', 'b3000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
+SELECT is((SELECT count(*)::integer FROM public.program_credential_listing_notes), 0,
+  'production grants: a signed-in practitioner reads no private notes either (RLS, no policy)');
+UPDATE public.program_credential_listing_notes SET note = 'changed directly';
+RESET ROLE;
+SELECT is((SELECT count(*)::integer FROM public.program_credential_listing_notes WHERE note = 'changed directly'), 0,
+  'production grants: and writes none');
 SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-000000c7ed01', true);
 SET LOCAL ROLE authenticated;
 SELECT throws_ok(
@@ -510,6 +676,7 @@ SELECT is(
   'production grants: a direct update or delete changes nothing (a center cannot verify itself)'
 );
 REVOKE ALL ON TABLE public.program_credentials FROM anon, authenticated;
+REVOKE ALL ON TABLE public.program_credential_listing_notes FROM anon, authenticated;
 GRANT SELECT ON TABLE public.program_credentials TO authenticated;
 
 -- ===========================================================================
@@ -524,6 +691,11 @@ SELECT is(
           'state_license', NULL, '', 'OR-555', 'OR', CURRENT_DATE + 10, NULL, 'Looked up on the state site')),
   'true:pending:true',
   'a practice member adds a credential to its own partner'
+);
+SELECT is(
+  (SELECT note || '|' || verification_note FROM public.program_credentials WHERE id = 'f2000000-0000-0000-0000-000000c7ed01'),
+  'Looked up on the state site|',
+  'a practice''s own credential keeps its note on the row, inside the workspace'
 );
 SELECT lives_ok(
   $$ SELECT public.save_program_credential('f2100000-0000-0000-0000-000000c7ed01', NULL, 'e1000000-0000-0000-0000-000000c7ed01',
@@ -541,11 +713,13 @@ SELECT set_config('request.jwt.claim.sub', 'b2000000-0000-0000-0000-000000c7ed01
 SET LOCAL ROLE authenticated;
 SELECT is((SELECT count(*)::integer FROM public.program_credentials WHERE partner_id IS NOT NULL), 2, 'a teammate sees the practice''s checks');
 SELECT is(
-  (SELECT status || ':' || (verified_by = 'b2000000-0000-0000-0000-000000c7ed01')::text || ':' || (verified_at IS NOT NULL)::text
-     FROM public.verify_program_credential('f2000000-0000-0000-0000-000000c7ed01', 'verified', '')),
-  'verified:true:true',
-  'a practitioner records their own check: who and when'
+  (SELECT status || ':' || (verified_by = 'b2000000-0000-0000-0000-000000c7ed01')::text || ':' || (verified_at IS NOT NULL)::text || ':' || verification_note
+     FROM public.verify_program_credential('f2000000-0000-0000-0000-000000c7ed01', 'verified', 'Called the state board')),
+  'verified:true:true:Called the state board',
+  'a practitioner records their own check: who, when, and the note, on the row'
 );
+SELECT is((SELECT count(*)::integer FROM public.fetch_listing_credential_notes(NULL)), 0,
+  'the listing notes reader never returns a practice''s own credentials');
 SELECT is(
   (SELECT status FROM public.save_program_credential('f2000000-0000-0000-0000-000000c7ed01', NULL, 'e2000000-0000-0000-0000-000000c7ed01',
      'state_license', NULL, '', 'OR-556', 'OR', CURRENT_DATE + 10, NULL, 'Looked up on the state site')),
@@ -679,8 +853,18 @@ SELECT throws_ok(
   $$ SELECT public.save_program_credential(gen_random_uuid(), 'd2000000-0000-0000-0000-000000c7ed01', NULL,
        'state_license', NULL, '', 'LIC-200', 'OR', NULL, NULL, '') $$,
   '22023', 'This listing was merged into another. Update the credentials there.',
-  'a merged listing takes no new credentials'
+  'a merged listing takes no new credentials from its center'
 );
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-000000c7ed01', true);
+SET LOCAL ROLE authenticated;
+SELECT is(
+  (SELECT status FROM public.save_program_credential('f6000000-0000-0000-0000-000000c7ed01', 'd2000000-0000-0000-0000-000000c7ed01', NULL,
+     'state_license', NULL, '', 'LIC-200', 'OR', NULL, NULL, 'kept for the record')),
+  'pending',
+  'ReferralFit can still change the credentials of a merged listing'
+);
+SELECT is(public.delete_program_credential('f6000000-0000-0000-0000-000000c7ed01'), true, 'and remove them');
 RESET ROLE;
 
 -- The SQL editor (no signed-in user) can review, like the other admin queues.
@@ -693,6 +877,11 @@ SELECT is(
 SELECT ok(
   (SELECT count(*) FROM public.list_pending_listing_credentials()) >= 1,
   'and read the queue'
+);
+SELECT is(
+  (SELECT npi_lookup_name FROM public.record_npi_lookup('f1300000-0000-0000-0000-000000c7ed01', 'JUNIPER RIDGE RECOVERY LLC')),
+  'JUNIPER RIDGE RECOVERY LLC',
+  'and record the NPI Registry name on a listing''s NPI'
 );
 
 SELECT * FROM finish();

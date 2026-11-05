@@ -18,14 +18,17 @@ import type { Partner, ReferralMatch } from '../data';
 import { ShieldChip } from './CredentialsCard';
 import { OfflineError, describeError } from './errors';
 import type { ProgramIntegrity } from './integrity';
-import { fetchPracticeName, releaseComposeOverlay, sendEmailMessage, sendTextMessage } from './outreach-api';
+import { releaseComposeOverlay, sendEmailMessage, sendTextMessage } from './outreach-api';
 import {
+  cancelPlacementRequest,
   createPlacementRequest,
   fetchPlacementChannels,
+  fetchPlacementPracticeName,
   newPlacementRequestId,
 } from './placement-api';
 import {
   ADMIT_WINDOWS,
+  ALREADY_SENT_PROBLEM,
   DEFAULT_RESPONSE_HOURS,
   MAX_RECIPIENTS,
   NOTE_MAX,
@@ -33,16 +36,20 @@ import {
   NOT_SHARED_LINE,
   PROGRAM_INTRO,
   RESPONSE_WINDOW_HOURS,
+  UNNAMED_PRACTICE,
   deadlineLabel,
+  placementNoteNames,
   placementNoteProblem,
   placementRequestMessage,
+  placementRequestSignature,
   placementSummaryLines,
-  practiceNameForMessage,
   preparePlacementRequest,
+  sentDiffersFromReview,
   type AdmitWindow,
   type PlacementChannel,
   type PlacementRequestView,
   type ResponseWindowHours,
+  type ReviewedRequest,
 } from './placement-requests';
 
 // "Ask programs": from a saved match's ranked results, send ONE
@@ -71,6 +78,8 @@ export type PlacementSheetRequest = {
   match: ReferralMatch;
   /** The linked case's title: the note may not mention it. */
   caseTitle?: string;
+  /** The linked case's contact names: the note may not mention them either. */
+  contactNames?: string[];
   /** The ranked results, best first. */
   options: PlacementOption[];
 };
@@ -123,8 +132,14 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
   const [sendNotice, setSendNotice] = useState('');
   const [sent, setSent] = useState<PlacementRequestView | null>(null);
   const [outreach, setOutreach] = useState<Record<string, Outreach>>({});
+  // The server kept an earlier request under this id as first written: the
+  // practitioner is told, and offered Cancel before sending a new one.
+  const [conflict, setConflict] = useState<{ requestId: string; cancelling: boolean } | null>(null);
   const generationRef = useRef(0);
-  const requestIdRef = useRef<string | null>(null); // one id per request: a retry is a no-op on the server
+  // One id per request as reviewed: a retry of exactly what was reviewed
+  // reuses it (a no-op on the server); any change to the programs, the note
+  // or either window is a new request with a new id.
+  const requestKeyRef = useRef<{ id: string; signature: string } | null>(null);
   const sendingRef = useRef(false);
   const composingRef = useRef(false);
 
@@ -153,10 +168,11 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
     setSendNotice('');
     setSent(null);
     setOutreach({});
-    requestIdRef.current = null;
+    setConflict(null);
+    requestKeyRef.current = null;
     sendingRef.current = false;
     composingRef.current = false;
-    void fetchPracticeName().then((name) => { if (generationRef.current === generation) setPracticeName(name); });
+    void fetchPlacementPracticeName().then((name) => { if (generationRef.current === generation) setPracticeName(name); });
     fetchPlacementChannels(request.options.slice(0, OPTIONS_SHOWN).map((option) => option.partner.id))
       .then((result) => { if (generationRef.current === generation) setChannels(result || {}); })
       .catch((error) => {
@@ -168,21 +184,27 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
       });
   }, [request]);
 
+  // The note may not name the client: the match's label, the linked case's
+  // title, or any of its contacts (identifying-text.ts, as the server checks).
+  const names = useMemo(
+    () => (request ? placementNoteNames({ clientLabel: request.match.clientLabel, caseTitle: request.caseTitle, contactNames: request.contactNames }) : []),
+    [request],
+  );
   const prepared = useMemo(() => {
     if (!request) return null;
-    return preparePlacementRequest({
-      criteria: request.match,
-      admitWindow,
-      note,
-      identifiers: [request.match.clientLabel, request.caseTitle],
-    });
-  }, [request, admitWindow, note]);
+    return preparePlacementRequest({ criteria: request.match, admitWindow, note, names });
+  }, [request, admitWindow, note, names]);
 
   if (!request) return null;
   const match = request.match;
-  const noteProblem = note.trim() ? placementNoteProblem(note, [match.clientLabel, request.caseTitle]) : null;
+  const noteProblem = note.trim() ? placementNoteProblem(note, names) : null;
   const chosen = options.filter((option) => selected.includes(option.partner.id)); // ranked order
-  const practiceShown = practiceNameForMessage(practiceName);
+  // What programs read as the sender (public.placement_practice_name); ''
+  // only while it loads or when it could not be read.
+  const practiceShown = practiceName || UNNAMED_PRACTICE;
+  const reviewed: ReviewedRequest | null = prepared && !('problem' in prepared)
+    ? { partnerIds: chosen.map((option) => option.partner.id), note: prepared.note, respondHours: hours, admitWindow }
+    : null;
 
   function toggle(partnerId: string) {
     if (stage !== 'pick') return;
@@ -191,7 +213,6 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
       if (current.length >= MAX_RECIPIENTS) return current;
       return [...current, partnerId];
     });
-    requestIdRef.current = null; // a different request now
   }
 
   function channelLine(partner: Partner): { text: string; portal: boolean } {
@@ -216,34 +237,69 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
   }
 
   async function send() {
-    if (!prepared || 'problem' in prepared || sendingRef.current) return;
+    if (!prepared || 'problem' in prepared || !reviewed || sendingRef.current || conflict) return;
     sendingRef.current = true;
     const generation = generationRef.current;
-    const id = requestIdRef.current || newPlacementRequestId();
-    requestIdRef.current = id;
+    const signature = placementRequestSignature(reviewed);
+    const id = requestKeyRef.current?.signature === signature ? requestKeyRef.current.id : newPlacementRequestId();
+    requestKeyRef.current = { id, signature };
     setStage('sending');
     setSendNotice('');
     try {
       const view = await createPlacementRequest({
         id,
         matchProfileId: match.id,
-        partnerIds: chosen.map((option) => option.partner.id),
-        respondHours: hours,
-        admitWindow,
-        note: prepared.note,
+        partnerIds: reviewed.partnerIds,
+        // Each program's place on the match screen: the answers screen
+        // numbers them the same way.
+        ranks: chosen.map((option) => option.rank),
+        respondHours: reviewed.respondHours,
+        admitWindow: reviewed.admitWindow,
+        note: reviewed.note,
       });
       if (generationRef.current !== generation) return;
+      onSent(view);
+      if (sentDiffersFromReview(view, reviewed)) {
+        // The server kept what this id first carried: not what was just
+        // reviewed. Say so, and offer to cancel it.
+        setStage('review');
+        setConflict({ requestId: view.request.id, cancelling: false });
+        return;
+      }
       setSent(view);
       setStage('sent');
-      onSent(view);
     } catch (error) {
       if (generationRef.current !== generation) return;
       setStage('review');
+      if (!(error instanceof OfflineError) && error instanceof Error && error.message === ALREADY_SENT_PROBLEM) {
+        setConflict({ requestId: id, cancelling: false });
+        return;
+      }
       setSendNotice(error instanceof OfflineError
         ? 'You are offline, so it may not have gone out. Try again when you are back online; it will not be sent twice.'
         : describeError(error, 'Could not send the request.'));
     } finally {
       sendingRef.current = false;
+    }
+  }
+
+  // Cancel the request the server kept, then this one can go out as a new
+  // request (a new id).
+  async function cancelEarlier() {
+    if (!conflict || conflict.cancelling) return;
+    const generation = generationRef.current;
+    setConflict({ ...conflict, cancelling: true });
+    try {
+      const view = await cancelPlacementRequest(conflict.requestId);
+      if (generationRef.current !== generation) return;
+      onSent(view);
+      requestKeyRef.current = null;
+      setConflict(null);
+      setSendNotice('The earlier request is cancelled. Send this one when you are ready.');
+    } catch (error) {
+      if (generationRef.current !== generation) return;
+      setConflict((current) => (current ? { ...current, cancelling: false } : current));
+      Alert.alert('Not cancelled', error instanceof OfflineError ? 'You are offline. Try again when you are back online.' : describeError(error));
     }
   }
 
@@ -333,6 +389,10 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
           placeholder="e.g. Prefers a smaller program; open to out of state"
           placeholderTextColor="#99A6A1"
           multiline
+          // One line of text (it wraps): Return closes the keyboard rather
+          // than adding a line break the shared check would refuse.
+          submitBehavior="blurAndSubmit"
+          returnKeyType="done"
           maxLength={NOTE_MAX}
           accessibilityLabel="A short note for the programs"
         />
@@ -354,7 +414,7 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
       <>
         <Text style={styles.sectionTitle}>What programs will see</Text>
         <View style={styles.previewCard}>
-          <Text style={styles.previewFrom}>From {practiceShown || 'A ReferralFit practice'}</Text>
+          <Text style={styles.previewFrom}>From {practiceShown}</Text>
           <Text style={styles.previewIntro}>{PROGRAM_INTRO}</Text>
           {lines.map((line) => (
             <View key={line.label} style={styles.previewLine}>
@@ -364,20 +424,31 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
           ))}
           <Text style={styles.previewAsk}>They answer: a bed (yes, no or waitlist), likely to accept, the earliest admit date, and the daily rate or cost.</Text>
         </View>
-        {!practiceShown ? <Text style={styles.hint}>Your workspace has no name yet, so programs see "A ReferralFit practice". You can name it in Workspace settings.</Text> : null}
+        {practiceShown === UNNAMED_PRACTICE ? <Text style={styles.hint}>Your workspace has no name or directory profile yet, so programs see "{UNNAMED_PRACTICE}". You can name it in Workspace settings.</Text> : null}
         <Text style={styles.notShared}>{NOT_SHARED_LINE}</Text>
 
         <Text style={styles.label}>GOING TO {chosen.length} {chosen.length === 1 ? 'PROGRAM' : 'PROGRAMS'}, IN YOUR ORDER</Text>
-        {chosen.map((option, index) => (
-          <Text key={option.partner.id} style={styles.reviewProgram}>{index + 1}. {option.partner.organization || option.partner.name} · {channelLine(option.partner).portal ? 'answers in ReferralFit' : 'you send the summary'}</Text>
+        {chosen.map((option) => (
+          <Text key={option.partner.id} style={styles.reviewProgram}>{option.rank}. {option.partner.organization || option.partner.name} · {channelLine(option.partner).portal ? 'answers in ReferralFit' : 'you send the summary'}</Text>
         ))}
-        <Text style={styles.hint}>Answers are due within {hoursLabel(hours)}.</Text>
+        <Text style={styles.hint}>Numbers are each program's place in your match results. Answers are due within {hoursLabel(hours)}.</Text>
 
-        {sendNotice ? <Text style={styles.notice}>{sendNotice}</Text> : null}
-        <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void send(); }} style={[styles.primaryButton, busy && styles.buttonBusy]}>
-          {busy ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.primaryButtonText}>{sendNotice ? 'Try again' : `Send to ${chosen.length} ${chosen.length === 1 ? 'program' : 'programs'}`}</Text>}
-        </TouchableOpacity>
-        <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => setStage('pick')} style={styles.textButton}>
+        {conflict ? (
+          <>
+            <Text accessibilityRole="alert" style={styles.notice}>{ALREADY_SENT_PROBLEM}</Text>
+            <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: conflict.cancelling, disabled: conflict.cancelling }} disabled={conflict.cancelling} onPress={() => { void cancelEarlier(); }} style={[styles.primaryButton, conflict.cancelling && styles.buttonBusy]}>
+              {conflict.cancelling ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.primaryButtonText}>Cancel the earlier request</Text>}
+            </TouchableOpacity>
+          </>
+        ) : (
+          <>
+            {sendNotice ? <Text style={styles.notice}>{sendNotice}</Text> : null}
+            <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void send(); }} style={[styles.primaryButton, busy && styles.buttonBusy]}>
+              {busy ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.primaryButtonText}>{sendNotice && requestKeyRef.current ? 'Try again' : `Send to ${chosen.length} ${chosen.length === 1 ? 'program' : 'programs'}`}</Text>}
+            </TouchableOpacity>
+          </>
+        )}
+        <TouchableOpacity accessibilityRole="button" disabled={busy || Boolean(conflict?.cancelling)} onPress={() => setStage('pick')} style={styles.textButton}>
           <Text style={styles.textButtonText}>Back</Text>
         </TouchableOpacity>
       </>

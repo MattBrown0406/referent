@@ -139,51 +139,59 @@ export type CaseAssessmentsHook = {
 const LOADING: CaseAssessmentsEntry = { status: 'loading', assessments: [], error: '' };
 
 // `refreshKey` changes on every full refresh of the app (pull to refresh,
-// foreground, workspace change); `watched` are the cases on screen (the open
-// case file, the match's case). Each is read when it appears and on every
-// refresh; any other case only when load() asks.
-export function useCaseAssessments(userId: string | undefined, refreshKey: number, watched: (string | null | undefined)[]): CaseAssessmentsHook {
-  const [entries, setEntries] = useState<Record<string, CaseAssessmentsEntry>>({});
-  const [available, setAvailable] = useState<boolean | null>(null);
+// foreground); `workspaceKey` when the account moves to another workspace
+// (App's workspaceEpoch), which drops every assessment read for the last
+// one. `watched` are the cases on screen (the open case file, the match's
+// case). Each is read when it appears and on every refresh; any other case
+// only when load() asks.
+export function useCaseAssessments(userId: string | undefined, refreshKey: number, watched: (string | null | undefined)[], workspaceKey: string | number = 0): CaseAssessmentsHook {
+  const scope = `${userId || ''}|${workspaceKey}`;
+  const [held, setHeld] = useState<{ scope: string; entries: Record<string, CaseAssessmentsEntry>; available: boolean | null }>({ scope, entries: {}, available: null });
+  // Another account's or workspace's assessments never show for this one.
+  const entries = held.scope === scope ? held.entries : {};
+  const available = held.scope === scope ? held.available : null;
   const generationRef = useRef<Record<string, number>>({});
-  const userRef = useRef(userId);
+  const scopeRef = useRef(scope);
   const entriesRef = useRef(entries);
   entriesRef.current = entries;
-
-  // Another account's assessments never show for this one.
-  useEffect(() => {
-    if (userRef.current === userId) return;
-    userRef.current = userId;
+  if (scopeRef.current !== scope) {
+    scopeRef.current = scope;
     generationRef.current = {};
-    setEntries({});
-    setAvailable(null);
-  }, [userId]);
+  }
+
+  // Updates for this account and workspace only; anything else starts empty.
+  const setEntries = useCallback((into: string, update: (current: Record<string, CaseAssessmentsEntry>) => Record<string, CaseAssessmentsEntry>, nextAvailable?: boolean) => {
+    setHeld((current) => {
+      const base = current.scope === into ? current : { scope: into, entries: {}, available: null };
+      return { scope: into, entries: update(base.entries), available: nextAvailable ?? base.available };
+    });
+  }, []);
 
   const load = useCallback(async (caseId: string): Promise<void> => {
     if (!userId || !caseId) return;
     const key = caseId.toLowerCase();
+    const into = scope;
     const generation = (generationRef.current[key] || 0) + 1;
     generationRef.current[key] = generation;
-    const stillCurrent = () => userRef.current === userId && generationRef.current[key] === generation;
-    if (!entriesRef.current[key]) setEntries((current) => (current[key] ? current : { ...current, [key]: LOADING }));
+    const stillCurrent = () => scopeRef.current === into && generationRef.current[key] === generation;
+    if (!entriesRef.current[key]) setEntries(into, (current) => (current[key] ? current : { ...current, [key]: LOADING }));
     try {
       const read = await fetchCaseAssessments(key);
       if (!stillCurrent()) return;
-      setAvailable(read.available);
-      setEntries((current) => ({
+      setEntries(into, (current) => ({
         ...current,
         [key]: read.available ? { status: 'ready', assessments: read.assessments, error: '' } : { status: 'unavailable', assessments: [], error: '' },
-      }));
+      }), read.available);
     } catch (error) {
       if (!stillCurrent()) return;
       const offline = isServerUnreachable(error);
       // Keep what is on screen after a failed refresh; with nothing loaded
       // yet, say why.
-      setEntries((current) => (current[key]?.status === 'ready'
+      setEntries(into, (current) => (current[key]?.status === 'ready'
         ? current
         : { ...current, [key]: { status: offline ? 'offline' : 'error', assessments: [], error: describeError(error) } }));
     }
-  }, [userId]);
+  }, [userId, scope, setEntries]);
 
   const watchedKey = watched.filter((id): id is string => Boolean(id)).map((id) => id.toLowerCase()).join(',');
   useEffect(() => {
@@ -195,15 +203,14 @@ export function useCaseAssessments(userId: string | undefined, refreshKey: numbe
     const key = assessment.caseId.toLowerCase();
     // A read already on its way began before this save: ignore it.
     generationRef.current[key] = (generationRef.current[key] || 0) + 1;
-    setAvailable(true);
-    setEntries((current) => {
+    setEntries(scopeRef.current, (current) => {
       const previous = current[key]?.status === 'ready' ? current[key].assessments : [];
       return {
         ...current,
         [key]: { status: 'ready', assessments: sortAssessments([assessment, ...previous.filter((item) => item.id !== assessment.id)]), error: '' },
       };
-    });
-  }, []);
+    }, true);
+  }, [setEntries]);
 
   const entryFor = useCallback((caseId: string | null | undefined) => (caseId ? entries[caseId.toLowerCase()] : undefined), [entries]);
   const currentFor = useCallback((caseId: string | null | undefined) => {

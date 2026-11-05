@@ -12,6 +12,8 @@ import {
   VOB_COST_COLUMNS,
   memberIdLast4,
   planCostsFromRow,
+  changedPlanCostsPatch,
+  changedVobCostsPatch,
   planCostsToPatch,
   vobCostsFromRow,
   vobCostsToPatch,
@@ -1004,9 +1006,12 @@ export async function fetchCaseBenefits(caseId: string): Promise<CaseBenefitsFil
   });
 }
 
-// `costs`, when given, is the plan's whole cost sharing (null amounts clear
-// them). Leave it out on a server without 20261104120000 (costsAvailable).
-export type CaseBenefitsPatch = Partial<Pick<CaseBenefits, 'carrier' | 'planName' | 'memberIdLast4' | 'subscriberRelationship'>> & { costs?: PlanCosts };
+// `costs`, when given, is the plan's cost sharing (null amounts clear them);
+// with `costsOpened` (what the editor opened with) only the amounts that
+// changed are sent, so a teammate's update to another amount made
+// meanwhile is kept. Leave both out on a server without 20261104120000
+// (costsAvailable).
+export type CaseBenefitsPatch = Partial<Pick<CaseBenefits, 'carrier' | 'planName' | 'memberIdLast4' | 'subscriberRelationship'>> & { costs?: PlanCosts; costsOpened?: PlanCosts | null };
 
 export type SavedCaseBenefits = Pick<CaseBenefits, 'carrier' | 'planName' | 'memberIdLast4' | 'subscriberRelationship'> & {
   eventBody: string; // '' when nothing changed (no timeline entry was written)
@@ -1020,7 +1025,7 @@ export async function saveCaseBenefits(caseId: string, eventId: string, patch: C
     if ('planName' in patch) rpcPatch.plan_name = patch.planName;
     if ('memberIdLast4' in patch) rpcPatch.member_id_last4 = memberIdLast4(patch.memberIdLast4 || '');
     if ('subscriberRelationship' in patch) rpcPatch.subscriber_relationship = patch.subscriberRelationship;
-    if (patch.costs) Object.assign(rpcPatch, planCostsToPatch(patch.costs));
+    if (patch.costs) Object.assign(rpcPatch, 'costsOpened' in patch ? changedPlanCostsPatch(patch.costsOpened, patch.costs) : planCostsToPatch(patch.costs));
     const { data, error, status } = await supabase.rpc('save_case_benefits', { p_case_id: caseId, p_patch: rpcPatch, p_event_id: eventId });
     if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {
@@ -1096,9 +1101,10 @@ export async function requestVob(input: VobRequestInput): Promise<RequestedVob> 
 }
 
 // `costs`, when given, is the answer's daily rates and pre-authorization
-// (null clears). Stored as sent or refused, so the optimistic copy is what
-// landed; the return columns are the 1.0.4 ones.
-export type VobStatusPatch = Partial<Pick<VobRequest, 'status' | 'answeredBy' | 'note' | 'quotedOutOfPocket'>> & { costs?: VobCosts };
+// (null clears); with `costsOpened` only the ones that changed from it are
+// sent. Stored as sent or refused, so the optimistic copy is what landed;
+// the return columns are the 1.0.4 ones.
+export type VobStatusPatch = Partial<Pick<VobRequest, 'status' | 'answeredBy' | 'note' | 'quotedOutOfPocket'>> & { costs?: VobCosts; costsOpened?: VobCosts | null };
 
 export type UpdatedVob = Pick<VobRequest, 'status' | 'answeredAt' | 'answeredBy' | 'note' | 'quotedOutOfPocket'> & {
   eventBody: string; // '' when the status did not change (no timeline entry)
@@ -1112,7 +1118,7 @@ export async function updateVobStatus(id: string, eventId: string, patch: VobSta
     if ('answeredBy' in patch) rpcPatch.answered_by = patch.answeredBy;
     if ('note' in patch) rpcPatch.note = patch.note;
     if ('quotedOutOfPocket' in patch) rpcPatch.quoted_out_of_pocket = patch.quotedOutOfPocket;
-    if (patch.costs) Object.assign(rpcPatch, vobCostsToPatch(patch.costs));
+    if (patch.costs) Object.assign(rpcPatch, 'costsOpened' in patch ? changedVobCostsPatch(patch.costsOpened, patch.costs) : vobCostsToPatch(patch.costs));
     const { data, error, status } = await supabase.rpc('update_vob_status', { p_id: id, p_patch: rpcPatch, p_event_id: eventId });
     if (error) throw caseFailure(error, status);
     const row = (Array.isArray(data) ? data[0] : data) as {

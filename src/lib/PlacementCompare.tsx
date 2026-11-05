@@ -18,10 +18,11 @@ import type { Partner } from '../data';
 import { ShieldChip } from './CredentialsCard';
 import { OfflineError, describeError } from './errors';
 import { formatStamp, type ProgramIntegrity } from './integrity';
-import { fetchPracticeName, releaseComposeOverlay, sendEmailMessage, sendTextMessage } from './outreach-api';
+import { releaseComposeOverlay, sendEmailMessage, sendTextMessage } from './outreach-api';
 import {
   cancelPlacementRequest,
   closePlacementRequest,
+  fetchPlacementPracticeName,
   logManualAnswer,
   type PlacementRequestsHook,
 } from './placement-api';
@@ -55,7 +56,9 @@ import {
 } from './placement-requests';
 
 // The answers, side by side: one row per program in the practice's own
-// ranked order (rank, fixed when the request went out), with its status,
+// ranked order (rank: its place on the match screen when the request went
+// out, sent as p_ranks, so the numbers here are the ones the practitioner
+// saw there; never changed by an answer), with its status,
 // bed, likely to accept, earliest admit, cost, and note. "Log answer" for a
 // program that answered by phone or text; "Choose this program" hands off to
 // the app's own Assign & refer / Send packet flow (this screen never refers
@@ -150,7 +153,7 @@ export default function PlacementCompare({
     setOffline(false);
     setLoading(true);
     setNow(new Date());
-    void fetchPracticeName().then((name) => { if (generationRef.current === generation) setPracticeName(name); });
+    void fetchPlacementPracticeName().then((name) => { if (generationRef.current === generation) setPracticeName(name); });
     void placementRef.current.reload().then((status) => {
       if (generationRef.current !== generation) return;
       setLoading(false);
@@ -415,7 +418,7 @@ export default function PlacementCompare({
         <View style={styles.pillRow}>
           {COMPARE_SORTS.map((option) => <Choice key={option.value} label={option.label} selected={sort === option.value} onPress={() => setSort(option.value)} />)}
         </View>
-        <Text style={styles.hint}>Numbers are your ranking when you asked. Answers never change it; sorting only reorders this list.</Text>
+        <Text style={styles.hint}>Numbers are each program's place in your match results when you asked. Answers never change it; sorting only reorders this list.</Text>
         {loading ? <ActivityIndicator style={styles.inlineLoading} color={COLORS.forest} /> : null}
         {rows.map(renderRow)}
         <Text style={styles.label}>WHAT YOU ASKED</Text>

@@ -49,6 +49,8 @@ export const ESTIMATE_FOOTNOTE = 'Estimates, not quotes: the carrier and the pro
 export const PACKET_COST_DISCLAIMER = 'Estimate only, not a quote: your insurance company and the program confirm the actual cost.';
 export const BALANCE_BILLING_WARNING = 'Out-of-network, the program can bill the family the difference between its price and what the plan allows (balance billing). That part is not capped by the out-of-pocket max.';
 export const PRECERT_WARNING = 'The plan needs pre-authorization before admission. Without it, the plan may pay nothing.';
+/** The server's words for an allowed or billed daily rate of 0 (a copay of 0 is fine). */
+export const DAILY_RATE_ZERO_PROBLEM = 'Enter the daily rate in dollars, or leave it blank if you do not know it.';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -107,6 +109,8 @@ const NEED = {
   network: { text: 'whether this program is in-network for the plan (request a VOB)', step: 'request a VOB' },
   cash: { text: 'the program’s cash cost', step: 'add the cash cost' },
   fullCostRate: { text: 'the program’s billed daily rate or cash cost', step: 'add the daily rate' },
+  paymentMismatch: { text: 'a plan on file that is the match’s payment (the match and the case file name different plans)', step: "the match's payment isn't the plan on file" },
+  planCarrier: { text: 'the carrier on the plan on file, to know it is the match’s payment', step: 'add the carrier to the plan on file' },
 } satisfies Record<string, Need>;
 
 // ─── Small helpers ──────────────────────────────────────────────────────────
@@ -138,7 +142,7 @@ export function hasPlanCosts(plan: PlanCosts | null | undefined): boolean {
 
 function hasVobCosts(vob: Partial<VobCosts> | null | undefined): boolean {
   if (!vob) return false;
-  return vob.allowedDailyRate != null || vob.billedDailyRate != null || vob.copayPerDay != null || vob.precertRequired != null;
+  return positive(vob.allowedDailyRate) != null || positive(vob.billedDailyRate) != null || vob.copayPerDay != null || vob.precertRequired != null;
 }
 
 function networkLine(label: string, confirmedByVob: boolean | undefined): string {
@@ -269,7 +273,8 @@ function cashEstimate(program: ProgramCashCost | null, days: number): FamilyCost
 // ─── Full cost: insured, but the plan pays nothing at this program ──────────
 
 function fullCostEstimate(input: FamilyCostInput, days: number, reason: string, note: string): FamilyCostEstimate {
-  const billed = input.vob?.billedDailyRate ?? null;
+  // A rate of 0 is never a price: it reads as not known.
+  const billed = positive(input.vob?.billedDailyRate);
   const basis = [reason];
   if (billed != null) {
     const total = billed * days;
@@ -295,8 +300,9 @@ function inNetworkEstimate(input: FamilyCostInput, days: number, common: Partial
     if (benefits?.deductible == null) needs.push(NEED.inDeductible);
     if (benefits?.coinsurancePct == null) needs.push(NEED.inCoinsurance);
   }
-  const allowed = input.vob?.allowedDailyRate ?? null;
-  const billed = input.vob?.billedDailyRate ?? null;
+  // A daily rate of 0 is never a price: it reads as not known (positive()).
+  const allowed = positive(input.vob?.allowedDailyRate);
+  const billed = positive(input.vob?.billedDailyRate);
   const rate = allowed ?? billed;
   if (rate == null) needs.push(NEED.rate);
   const basis = [networkLine('In-network', input.confirmedByVob)];
@@ -345,8 +351,9 @@ function outOfNetworkEstimate(input: FamilyCostInput, days: number, common: Part
     if (benefits?.deductible == null) needs.push(NEED.oonDeductible);
     if (benefits?.coinsurancePct == null) needs.push(NEED.oonCoinsurance);
   }
-  const allowed = input.vob?.allowedDailyRate ?? null;
-  const billed = input.vob?.billedDailyRate ?? null;
+  // A daily rate of 0 is never a price: it reads as not known (positive()).
+  const allowed = positive(input.vob?.allowedDailyRate);
+  const billed = positive(input.vob?.billedDailyRate);
   const rate = allowed ?? billed;
   if (rate == null) needs.push(NEED.rate);
   const basis = [networkLine('Out-of-network', input.confirmedByVob)];
@@ -479,11 +486,12 @@ export function planCostsProblem(plan: PlanCosts): string | null {
   return null;
 }
 
-/** The first problem with a VOB answer's rates, in plain words, or null. */
+/** The first problem with a VOB answer's rates, in plain words, or null. An allowed or billed rate of 0 is refused (the server's words); a copay of 0 is a real answer. */
 export function vobCostsProblem(costs: VobCosts): string | null {
   const fields: [keyof VobCosts, string][] = [['allowedDailyRate', 'Allowed rate per day'], ['billedDailyRate', 'Billed rate per day'], ['copayPerDay', 'Copay per day']];
   for (const [key, label] of fields) {
     if (!wholeWithin(costs[key] as number | null, MAX_DAILY_DOLLARS)) return `${label}: enter whole dollars from $0 to ${formatMoney(MAX_DAILY_DOLLARS)}.`;
+    if (key !== 'copayPerDay' && costs[key] === 0) return DAILY_RATE_ZERO_PROBLEM;
   }
   return null;
 }
@@ -519,10 +527,29 @@ export function vobForProgram<T extends VobForCost>(requests: T[], program: { pa
   return mine.filter(hasVobCosts).sort((a, b) => b.requestedAt.localeCompare(a.requestedAt))[0] || null;
 }
 
+/**
+ * The match's payment is the plan on file: the same carrier, ignoring case
+ * and spaces at the ends. 'Cash pay' is never a plan, and a plan with no
+ * carrier cannot be told apart, so neither matches.
+ */
+export function paymentMatchesPlan(insurance: string | null | undefined, carrier: string | null | undefined): boolean {
+  const payment = (insurance || '').trim().toLowerCase();
+  const plan = (carrier || '').trim().toLowerCase();
+  if (!payment || !plan || payment === 'cash pay' || plan === 'cash pay') return false;
+  return payment === plan;
+}
+
 export type ProgramCostArgs = {
   /** The family's payment: a plan name, or 'Cash pay'. */
   insurance: string;
   plan: PlanCosts | null;
+  /**
+   * The carrier of the plan on file (case_benefits.carrier). When given, an
+   * insured payment that is not this carrier gets no plan-based estimate:
+   * the plan's benefits are someone else's plan's. Left out, the plan is
+   * taken to be the payment's (the case file's own plan).
+   */
+  planCarrier?: string | null;
   requests: VobForCost[];
   partner?: (ProgramCashCost & Pick<Partner, 'id' | 'organization'>) | null;
   /** A program outside the network (a VOB typed by name). */
@@ -535,6 +562,12 @@ export type ProgramCostArgs = {
 export function familyCostForProgram(args: ProgramCostArgs): FamilyCostEstimate {
   if (args.insurance === 'Cash pay') {
     return estimateFamilyCost({ payment: 'cash', network: 'unknown', benefits: null, vob: null, program: args.partner ?? null, days: args.days });
+  }
+  if (args.planCarrier !== undefined && !paymentMatchesPlan(args.insurance, args.planCarrier)) {
+    // Not this family's plan for this payment: no estimate from its numbers.
+    const days = normalizeStayDays(args.days);
+    const need = (args.planCarrier || '').trim() ? NEED.paymentMismatch : NEED.planCarrier;
+    return unknownEstimate('unknown', days, [need], [`The match’s payment is ${args.insurance.trim() || 'not set'}; the plan on file is ${(args.planCarrier || '').trim() || 'not named'}`]);
   }
   const vob = vobForProgram(args.requests, { partnerId: args.partner?.id, programName: args.partner?.organization || args.programName || '' });
   const answered = vob && isVobAnswered(vob.status) && vob.answeredAt ? vob.status as NetworkAnswer : null;

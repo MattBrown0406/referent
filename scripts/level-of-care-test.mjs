@@ -48,7 +48,7 @@ function transpileTo(relSrc, outName, rewrite = (js) => js) {
 
 mkdirSync(path.join(tmpDir, 'lib'), { recursive: true });
 transpileTo('src/data.ts', 'data.js');
-for (const name of ['beds', 'matching', 'packet', 'errors', 'level-of-care']) transpileTo(`src/lib/${name}.ts`, `lib/${name}.js`);
+for (const name of ['beds', 'matching', 'packet', 'errors', 'identifying-text', 'level-of-care']) transpileTo(`src/lib/${name}.ts`, `lib/${name}.js`);
 
 // level-of-care-api.ts with its network edges stubbed: a fake Supabase
 // client the tests drive, a uuid, and React hooks it never calls here.
@@ -98,7 +98,7 @@ function* everyRatingSet() {
 
 {
   const rules = L.LEVEL_OF_CARE_RULES;
-  check('rules version 1', rules.version, 1);
+  check('rules version 2 (Matt\'s decisions of 2026-11-05)', [rules.version, L.RULES_VERSION], [2, 2]);
   check('the six areas, in the order the server stores them', KEYS, ['withdrawal', 'physical', 'emotional', 'readiness', 'relapse', 'environment']);
   check('areas 2-6 each map every rating to a treatment level', Object.keys(rules.primary).sort(), ['emotional', 'environment', 'physical', 'readiness', 'relapse']);
   for (const [key, row] of Object.entries(rules.primary)) {
@@ -112,9 +112,13 @@ function* everyRatingSet() {
     relapse: ['Therapist', 'Therapist', 'IOP / PHP', 'IOP / PHP', 'Inpatient'],
     environment: ['Therapist', 'Therapist', 'Therapist', 'Therapist', 'Inpatient'],
   });
-  check('together, first step, support', [rules.together, rules.firstStep, rules.support], [
-    { dimensions: ['readiness', 'relapse', 'environment'], atOrAbove: 3, count: 2, level: 'Inpatient' },
-    { dimension: 'withdrawal', atOrAbove: 3, level: 'Detox' },
+  check('risks together: serious (two of three at 3+) and moderate (four of five at 2+)', rules.together, [
+    { key: 'serious', dimensions: ['readiness', 'relapse', 'environment'], atOrAbove: 3, count: 2, level: 'Inpatient' },
+    { key: 'moderate', dimensions: ['physical', 'emotional', 'readiness', 'relapse', 'environment'], atOrAbove: 2, count: 4, level: 'Inpatient' },
+  ]);
+  check('withdrawal oversight, the first step and its step down, support', [rules.oversight, rules.firstStep, rules.support], [
+    { dimension: 'withdrawal', atOrAbove: 2, level: 'IOP / PHP' },
+    { dimension: 'withdrawal', atOrAbove: 3, level: 'Detox', stepDownAtLeast: 'IOP / PHP' },
     { dimension: 'environment', atOrAbove: 3, level: 'Sober Living' },
   ]);
   check('placement levels: the five levels of care, never Interventionist', L.PLACEMENT_LEVELS, ['Detox', 'Inpatient', 'IOP / PHP', 'Sober Living', 'Therapist']);
@@ -125,9 +129,10 @@ function* everyRatingSet() {
   const cases = {
     '000000': '-|Therapist|-',
     '111111': '-|Therapist|-',
-    '300000': 'Detox|Therapist|-', // detox first, then the level from the other areas
-    '400000': 'Detox|Therapist|-',
-    '200000': '-|Therapist|-', // moderate withdrawal: oversight advice, no detox
+    '300000': 'Detox|IOP / PHP|-', // detox first; after it, step down no lower than IOP / PHP
+    '400000': 'Detox|IOP / PHP|-',
+    '311111': 'Detox|IOP / PHP|-',
+    '200000': '-|IOP / PHP|-', // moderate withdrawal needs medical oversight: at least IOP / PHP, no detox
     '020000': '-|IOP / PHP|-',
     '003000': '-|Inpatient|-',
     '030000': '-|Inpatient|-',
@@ -141,23 +146,33 @@ function* everyRatingSet() {
     '000330': '-|Inpatient|-', // two serious risks together
     '000033': '-|Inpatient|Sober Living',
     '000303': '-|Inpatient|Sober Living',
-    '000223': '-|IOP / PHP|Sober Living',
-    '322223': 'Detox|IOP / PHP|Sober Living',
+    '000223': '-|IOP / PHP|Sober Living', // three areas at 2+ (four are needed for the moderate rule)
+    '022220': '-|Inpatient|-', // four areas at moderate risk together
+    '022210': '-|IOP / PHP|-', // three are not enough
+    '002222': '-|Inpatient|-',
+    '322223': 'Detox|Inpatient|Sober Living', // five areas at 2+ together
+    '040000': '-|Inpatient|-', // severe physical needs: Inpatient with the urgent flag, no emergency first step
+    '004000': '-|Inpatient|-',
     '432123': 'Detox|Inpatient|Sober Living',
     '444444': 'Detox|Inpatient|Sober Living',
   };
   for (const [digits, expected] of Object.entries(cases)) check(`rules: ${digits}`, path3(L.recommend(ratingsOf(digits))), expected);
-  ok('the docs list the same named cases', (() => {
-    const docs = readFileSync(path.join(repoRoot, 'docs/LEVEL_OF_CARE.md'), 'utf8');
-    return Object.keys(cases).every((digits) => docs.includes(`| ${digits.split('').join(' ')} |`));
-  })());
+  // The docs' named-cases table is exactly what the app writes, row by row.
+  const docs = readFileSync(path.join(repoRoot, 'docs/LEVEL_OF_CARE.md'), 'utf8');
+  for (const digits of Object.keys(cases)) {
+    const ratings = ratingsOf(digits);
+    const row = `| ${digits.split('').join(' ')} | ${L.pathLabel(L.recommend(ratings))} | ${L.rationale(ratings).join(' ')} |`;
+    ok(`the docs list the named case ${digits} as the app writes it`, docs.includes(`\n${row}\n`));
+  }
+  check('the docs name the same number of cases', (docs.split('### Named cases')[1].split('### The rationale')[0].match(/^\| [0-4] [0-4] [0-4] [0-4] [0-4] [0-4] \|/gm) || []).length, Object.keys(cases).length);
+  ok('the docs give the rules version and the date of Matt\'s decisions', /version\s+2\*\*/.test(docs) && docs.includes('2026-11-05'));
 }
 
 // ─── (b) Every area at every rating ─────────────────────────────────────────
 
 {
   const expected = {
-    withdrawal: ['-|Therapist|-', '-|Therapist|-', '-|Therapist|-', 'Detox|Therapist|-', 'Detox|Therapist|-'],
+    withdrawal: ['-|Therapist|-', '-|Therapist|-', '-|IOP / PHP|-', 'Detox|IOP / PHP|-', 'Detox|IOP / PHP|-'],
     physical: ['-|Therapist|-', '-|Therapist|-', '-|IOP / PHP|-', '-|Inpatient|-', '-|Inpatient|-'],
     emotional: ['-|Therapist|-', '-|Therapist|-', '-|IOP / PHP|-', '-|Inpatient|-', '-|Inpatient|-'],
     readiness: ['-|Therapist|-', '-|Therapist|-', '-|Therapist|-', '-|IOP / PHP|-', '-|IOP / PHP|-'],
@@ -207,9 +222,25 @@ for (const set of everyRatingSet()) {
 const DIGEST = createHash('md5').update(lines.join('\n')).digest('hex');
 {
   check('15,625 rating sets', lines.length, 15625);
-  check('the rules digest (change it here and in the pgTAP test together)', DIGEST, 'f2eff392d426c177a590815971300850');
-  ok('the pgTAP test asserts the same digest over the server\'s rules', pgtap.includes(`'${DIGEST}'`));
-  ok('the migration states the same version', /IF p_rules_version IS DISTINCT FROM 1 THEN/.test(migration));
+  check('the rules digest (change it here and in the pgTAP test together)', DIGEST, 'a000c8832bb2cf95d732b8cdcf0eae3f');
+  ok('the pgTAP test asserts the same digest over the server\'s rules', pgtap.includes(`'${DIGEST}'`) && pgtap.includes('level_of_care_recommendation(ARRAY[w, p, m, r, u, e], 2)'));
+  ok('the migration accepts only the same version', /IF p_rules_version IS DISTINCT FROM 2 THEN/.test(migration) && L.RULES_VERSION === 2);
+}
+
+{
+  // Version 2, rule by rule, over every rating set.
+  for (const set of everyRatingSet()) {
+    const ratings = ratingsOf(set.join(''));
+    const rec = L.recommend(ratings);
+    const rank = L.primaryRank(rec.level);
+    if (ratings.withdrawal === 2 && rank < 2) assert.fail(`${set.join('')}: withdrawal 2 is at least IOP / PHP`);
+    if (rec.firstStep === 'Detox' && rank < 2) assert.fail(`${set.join('')}: after detox, no lower than IOP / PHP`);
+    const moderate = ['physical', 'emotional', 'readiness', 'relapse', 'environment'].filter((key) => ratings[key] >= 2).length;
+    if (moderate >= 4 && rec.level !== 'Inpatient') assert.fail(`${set.join('')}: four or more areas at 2+ is Inpatient`);
+    if ((ratings.physical === 4 || ratings.emotional === 4) && rec.level !== 'Inpatient') assert.fail(`${set.join('')}: physical or emotional 4 stays Inpatient`);
+    if (rec.firstStep !== null && rec.firstStep !== 'Detox') assert.fail('the only first step is Detox: no emergency first step');
+  }
+  checks += 1;
 }
 
 // ─── (e) The rationale ──────────────────────────────────────────────────────
@@ -237,6 +268,28 @@ const DIGEST = createHash('md5').update(lines.join('\n')).digest('hex');
   ]);
   check('serious risks together are named as such', L.rationale(ratingsOf('011331'))[0],
     'Inpatient (residential) care is recommended because serious risks occur together: significant readiness and engagement concerns (3 of 4) and significant relapse or continued-use risk (3 of 4).');
+  check('moderate withdrawal: medical oversight, at least intensive outpatient', L.rationale(ratingsOf('200000')), [
+    'Withdrawal risk is moderate (2 of 4) and needs medical oversight, so at least intensive outpatient or day treatment (IOP / PHP) is recommended.',
+    'No other area shows a concern.',
+  ]);
+  check('after detox, step down no lower than intensive outpatient', L.rationale(ratingsOf('300000')), [
+    'Withdrawal risk is significant (3 of 4), so medically supervised withdrawal (detox) comes first.',
+    'After detox, step down no lower than intensive outpatient or day treatment (IOP / PHP).',
+    'No other area shows a concern.',
+  ]);
+  check('several moderate risks together call for residential care', L.rationale(ratingsOf('022220')), [
+    'Several areas are at moderate risk together, which calls for inpatient (residential) care: moderate physical health needs (2 of 4), moderate emotional, behavioral or cognitive needs (2 of 4), moderate readiness and engagement concerns (2 of 4) and moderate relapse or continued-use risk (2 of 4).',
+    'No other area shows a concern.',
+  ]);
+  check('after detox, with one of them higher', L.rationale(ratingsOf('322223')), [
+    'Withdrawal risk is significant (3 of 4), so medically supervised withdrawal (detox) comes first.',
+    'Several areas are at moderate risk or higher together, which calls for inpatient (residential) care after detox: moderate physical health needs (2 of 4), moderate emotional, behavioral or cognitive needs (2 of 4), moderate readiness and engagement concerns (2 of 4), moderate relapse or continued-use risk (2 of 4) and significant recovery environment concerns (3 of 4).',
+    'Sober living is also recommended as a stable, substance-free place to live after residential care.',
+  ]);
+  check('a floor that does not set the level is only noted', L.rationale(ratingsOf('220000')), [
+    'Intensive outpatient or day treatment (IOP / PHP) is recommended because of moderate physical health needs (2 of 4).',
+    'Also noted: moderate withdrawal risk (2 of 4).',
+  ]);
   check('nothing to report says so', L.rationale(ratingsOf('000000')), [
     'Outpatient therapy is recommended: no area calls for more structure than regular sessions.',
     'No area shows a concern.',
@@ -250,16 +303,45 @@ const DIGEST = createHash('md5').update(lines.join('\n')).digest('hex');
 {
   const keys = (digits, danger = false) => L.safetyFlags(ratingsOf(digits), danger).map((flag) => flag.key);
   check('nothing to flag', keys('111111'), []);
-  check('physical 4: an urgent medical evaluation', keys('040000'), ['medical_urgent']);
-  check('emotional 4: an urgent psychiatric evaluation', keys('004000'), ['psychiatric_urgent']);
+  check('physical 4: an urgent medical evaluation (and the on-site advice of 3)', keys('040000'), ['medical_urgent', 'medical_capacity']);
+  check('emotional 4: an urgent psychiatric evaluation (and the on-site advice of 3)', keys('004000'), ['psychiatric_urgent', 'psychiatric_capacity']);
   ok('the medical flag says to arrange an urgent medical evaluation', /urgent medical evaluation/.test(L.safetyFlags(ratingsOf('040000'), false)[0].text));
   ok('the psychiatric flag says to arrange an urgent psychiatric evaluation, and gives 988 and 911', (() => {
     const text = L.safetyFlags(ratingsOf('004000'), false)[0].text;
     return /urgent psychiatric evaluation/.test(text) && /988/.test(text) && /911/.test(text);
   })());
-  check('withdrawal 4 and environment 4 are urgent too', keys('400004'), ['withdrawal_urgent', 'environment_unsafe']);
+  check('withdrawal 4 and environment 4 are urgent too, with the advice that comes with them', keys('400004'), ['withdrawal_urgent', 'environment_unsafe', 'withdrawal_oversight', 'overdose_risk']);
   check('advice: moderate withdrawal, medical and psychiatric care on site', keys('233000'), ['withdrawal_oversight', 'medical_capacity', 'psychiatric_capacity']);
-  check('immediate danger comes first, then urgent, then advice', keys('243000', true), ['imminent_danger', 'medical_urgent', 'withdrawal_oversight', 'psychiatric_capacity']);
+  check('immediate danger comes first, then urgent, then advice', keys('243000', true), ['imminent_danger', 'medical_urgent', 'withdrawal_oversight', 'medical_capacity', 'psychiatric_capacity']);
+  // Cumulative: a worse rating never shows less advice.
+  check('withdrawal 2, 3 and 4: detox first, or on-site withdrawal management', ['200000', '300000', '400000'].map((digits) => keys(digits).includes('withdrawal_oversight')), [true, true, true]);
+  check('withdrawal 0 and 1: no withdrawal advice', ['000000', '100000'].map((digits) => keys(digits).includes('withdrawal_oversight')), [false, false]);
+  check('medical and psychiatric care on site at 3 and at 4', [keys('030000'), keys('040000'), keys('003000'), keys('004000')],
+    [['medical_capacity'], ['medical_urgent', 'medical_capacity'], ['psychiatric_capacity'], ['psychiatric_urgent', 'psychiatric_capacity']]);
+  const oversight = L.FLAG_RULES.find((rule) => rule.key === 'withdrawal_oversight');
+  check('the withdrawal advice in plain words', oversight.title, 'Arrange detox first, or a program with on-site withdrawal management');
+  // Overdose risk: relapse 3 or more, or detox as the first step.
+  check('overdose risk: relapse 3 or 4, or detox first', [keys('000030'), keys('000040'), keys('300000'), keys('000020'), keys('200000')].map((list) => list.includes('overdose_risk')), [true, true, true, false, false]);
+  const overdose = L.FLAG_RULES.find((rule) => rule.key === 'overdose_risk');
+  ok('overdose risk: lowered tolerance, naloxone (Narcan), 911', /tolerance/.test(overdose.text) && /naloxone \(Narcan\)/.test(overdose.text) && /911/.test(overdose.text) && overdose.severity === 'advice');
+  for (const set of everyRatingSet()) {
+    const ratings = ratingsOf(set.join(''));
+    const detoxFirst = L.recommend(ratings).firstStep === 'Detox';
+    const has = keys(set.join('')).includes('overdose_risk');
+    if (has !== (ratings.relapse >= 3 || detoxFirst)) assert.fail(`${set.join('')}: overdose flag ${has}, expected ${ratings.relapse >= 3 || detoxFirst}`);
+    // Cumulative: raising any one rating never removes a flag.
+    for (let index = 0; index < 6; index += 1) {
+      if (set[index] === 4) continue;
+      const higher = set.slice();
+      higher[index] += 1;
+      const before = keys(set.join(''));
+      const after = keys(higher.join(''));
+      if (before.some((key) => !after.includes(key))) assert.fail(`${set.join('')} -> ${higher.join('')}: a flag went away`);
+    }
+  }
+  checks += 2;
+  check('inline under an area: the flags its rating raises', [L.inlineFlags('relapse', 3).map((flag) => flag.key), L.inlineFlags('withdrawal', 3).map((flag) => flag.key), L.inlineFlags('relapse', undefined)],
+    [['overdose_risk'], ['withdrawal_oversight', 'overdose_risk'], []]);
   const emergency = L.safetyFlags(ratingsOf('000000'), true);
   check('immediate danger alone', emergency.map((flag) => [flag.key, flag.severity]), [['imminent_danger', 'emergency']]);
   ok('immediate danger: 911 and 988 guidance', /call 911/.test(emergency[0].text) && /988/.test(emergency[0].text));
@@ -279,27 +361,43 @@ const DIGEST = createHash('md5').update(lines.join('\n')).digest('hex');
 // The same fixtures and words are asserted on the server
 // (case_assessment_reason_problem in the pgTAP test).
 const REASON_FIXTURES = [
-  ['', L.REASON_PROBLEMS.missing],
-  ['  ok ', L.REASON_PROBLEMS.missing],
-  ['x'.repeat(201), L.REASON_PROBLEMS.tooLong],
-  ['Family declined residential\nwants IOP', L.REASON_PROBLEMS.multiline],
-  ['Call mom at jane@example.com', L.REASON_PROBLEMS.email],
-  ['Reach her at 541-555-0142', L.REASON_PROBLEMS.number],
-  ['See www.example.org for the plan', L.REASON_PROBLEMS.link],
-  ['Family declined residential; daily IOP near home', null],
-  ['2 prior residential stays in 12 months', null],
+  ['', [], L.REASON_PROBLEMS.missing],
+  ['  ok ', [], L.REASON_PROBLEMS.missing],
+  ['x'.repeat(201), [], L.REASON_PROBLEMS.tooLong],
+  ['Family declined residential\nwants IOP', [], L.REASON_PROBLEMS.multiline],
+  ['Call mom at jane@example.com', [], 'Leave out email addresses. Programs read this.'],
+  ['Reach her at 541-555-0142', [], 'Leave out phone and ID numbers. Programs read this.'],
+  ['See www.example.org for the plan', [], 'Leave out links and web addresses. Programs read this.'],
+  ['Family declined residential; daily IOP near home', [], null],
+  ['2 prior residential stays in 12 months', [], null],
+  ['Family can pay 40,000 for a private program', [], 'Leave money out. Programs read this.'],
+  ['DOB 3/14/1985, too young for this level', [], 'Leave out dates such as a birth date. Programs read this.'],
+  ['Rivera wants to stay near work', ['Rivera intervention'], 'Leave out names. Programs read this.'],
+  ['Mother prefers weekly sessions', ['Rivera intervention', 'Mother'], null],
 ];
 {
-  for (const [reason, expected] of REASON_FIXTURES) check(`reason: ${JSON.stringify(reason.slice(0, 30))}`, L.reasonProblem(reason), expected);
-  for (const [reason, expected] of REASON_FIXTURES) {
+  for (const [reason, names, expected] of REASON_FIXTURES) check(`reason: ${JSON.stringify(reason.slice(0, 30))}`, L.reasonProblem(reason, names), expected);
+  for (const [reason, , expected] of REASON_FIXTURES) {
     if (reason.includes('\n')) continue; // the pgTAP file writes this one with chr(10)
     if (reason.length > 60) continue; // and this one with repeat()
     ok(`the server is tested with the same reason: ${reason.slice(0, 30)}`, pgtap.includes(`'${reason.replace(/'/g, "''")}'`));
+    if (expected) ok(`and the same words: ${expected}`, pgtap.includes(`'${expected.replace(/'/g, "''")}'`));
   }
-  for (const [, expected] of REASON_FIXTURES) if (expected) ok(`the server uses the same words: ${expected}`, migration.includes(expected.replace(/'/g, "''")));
+  for (const expected of Object.values(L.REASON_PROBLEMS)) ok(`the server uses the same words: ${expected}`, migration.includes(expected.replace(/'/g, "''")));
+  ok('the server screens the reason with the shared check and the case\'s names', /public\.identifying_text_problem\(p_reason, p_names\)/.test(migration));
+  const levelSource = readFileSync(path.join(repoRoot, 'src/lib/level-of-care.ts'), 'utf8');
+  ok('the app screens it with the shared check, with no ad hoc patterns left', /return identifyingTextProblem\(trimmed, /.test(levelSource) && !/const (EMAIL|LONG_NUMBER|LINK) =/.test(levelSource));
+  check('the names: the case title and its contacts', L.reasonNames({ caseTitle: 'Rivera intervention', contactNames: ['Maria Lopez', ' ', null] }), ['Rivera intervention', 'Maria Lopez']);
+  check('a contact\'s name is refused', L.reasonProblem('Maria prefers IOP near home', L.reasonNames({ caseTitle: 'R.', contactNames: ['Maria Lopez'] })), 'Leave out names. Programs read this.');
+  check('the hint says what to leave out', L.REASON_HINT, 'Leave out names, contact details, dates and money; the program reads this.');
   const rec = L.recommend(ratingsOf('323223')); // Detox, then Inpatient, with Sober Living
-  check('the recommended level needs no reason', L.overrideProblem(rec, 'Inpatient', ''), null);
-  check('nor its first step', L.overrideProblem(rec, 'Detox', ''), null);
+  // The reason is needed whenever the level is not (first step ?? level):
+  // going straight to the level after a recommended detox is a different level.
+  check('the first step needs no reason', L.overrideProblem(rec, 'Detox', ''), null);
+  check('skipping the recommended detox for the level after it needs one', L.overrideProblem(rec, 'Inpatient', ''), L.REASON_PROBLEMS.missing);
+  check('without a first step, the recommended level needs no reason', L.overrideProblem(L.recommend(ratingsOf('003000')), 'Inpatient', ''), null);
+  check('followsRecommendation compares with (first step ?? level)', [L.followsRecommendation(rec, 'Detox'), L.followsRecommendation(rec, 'Inpatient'), L.followsRecommendation({ level: 'Inpatient', firstStep: null }, 'Inpatient')], [true, false, true]);
+  check('a reason is screened with the case\'s names in the full check too', L.overrideProblem(rec, 'Inpatient', 'Rivera wants to stay near work', ['Rivera intervention']), 'Leave out names. Programs read this.');
   check('a different level needs one', L.overrideProblem(rec, 'IOP / PHP', ''), L.REASON_PROBLEMS.missing);
   check('the support level alone is a different level', L.overrideProblem(rec, 'Sober Living', ' '), L.REASON_PROBLEMS.missing);
   check('a different level with a reason', L.overrideProblem(rec, 'IOP / PHP', 'Family declined residential'), null);
@@ -321,7 +419,7 @@ const NOTES = { withdrawal: '  Daily fifth of vodka; shakes by noon  ', physical
     ratings: [3, 2, 3, 2, 2, 3],
     notes: ['Daily fifth of vodka; shakes by noon', '', 'Maria Lopez says panic attacks nightly', '', '', 'Brother uses at home'],
     imminentDanger: false,
-    rulesVersion: 1,
+    rulesVersion: 2,
     recommendedLevel: 'Inpatient',
     recommendedFirstStep: 'Detox',
     recommendedSupport: 'Sober Living',
@@ -339,7 +437,7 @@ const NOTES = { withdrawal: '  Daily fifth of vodka; shakes by noon  ', physical
     withdrawal_rating: 3, physical_rating: 2, emotional_rating: 3, readiness_rating: 2, relapse_rating: 2, environment_rating: 3,
     withdrawal_note: 'Daily fifth of vodka; shakes by noon', physical_note: '', emotional_note: 'Maria Lopez says panic attacks nightly', readiness_note: '', relapse_note: '', environment_note: 'Brother uses at home',
     imminent_danger: false, recommended_level: 'Inpatient', recommended_first_step: 'Detox', recommended_support: 'Sober Living',
-    chosen_level: 'IOP / PHP', override_reason: 'Family declined residential; daily IOP near home', rules_version: 1,
+    chosen_level: 'IOP / PHP', override_reason: 'Family declined residential; daily IOP near home', rules_version: 2,
     assessed_by: 'B1000000-0000-4000-8000-000000000001', assessed_at: '2026-11-04T18:30:00.000Z', created_at: '2026-11-04T18:30:00.000Z',
   };
   const read = L.assessmentFromRow(row);
@@ -374,7 +472,7 @@ const fit = { networkStatus: 'In-network', verifyBenefits: false, requiredNeeds:
     id: 'a1', case_id: 'c1', withdrawal_rating: 3, physical_rating: 2, emotional_rating: 3, readiness_rating: 2, relapse_rating: 2, environment_rating: 3,
     withdrawal_note: 'Daily fifth of vodka', physical_note: '', emotional_note: 'Maria Lopez says panic attacks nightly', readiness_note: '', relapse_note: '', environment_note: 'Brother uses',
     imminent_danger: true, recommended_level: 'Inpatient', recommended_first_step: 'Detox', recommended_support: 'Sober Living',
-    chosen_level: 'IOP / PHP', override_reason: 'Family declined residential; daily IOP near home', rules_version: 1, assessed_by: null,
+    chosen_level: 'IOP / PHP', override_reason: 'Family declined residential; daily IOP near home', rules_version: 2, assessed_by: null,
     assessed_at: new Date(2026, 10, 4, 12, 0, 0).toISOString(),
   });
   const section = L.levelOfCarePacketLines(assessment, profile.levelOfCare);
@@ -427,7 +525,9 @@ const fit = { networkStatus: 'In-network', verifyBenefits: false, requiredNeeds:
   }
   const placementMigration = readFileSync(path.join(repoRoot, 'supabase/migrations/20261104140000_placement_requests.sql'), 'utf8');
   ok('the placement payload allow-list is untouched (ten keys)', placementMigration.includes("payload - ARRAY['level_of_care', 'population', 'must_haves', 'needs', 'payment', 'insurance_carrier',"));
-  ok('this migration never touches placement requests', !/placement_request(?!_recipients SET org_id|s    SET org_id)/.test(migration.replace(/--[^\n]*/g, '')));
+  // Its paste-order guard may name them (it only checks they exist first).
+  const body = migration.replace(/--[^\n]*/g, '').replace(/to_regclass\('public\.placement_request[a-z_]*'\)/g, '').replace(/20261104140000_placement_requests\.sql/g, '');
+  ok('this migration never touches placement requests', !/placement_request(?!_recipients SET org_id|s    SET org_id)/.test(body));
 
   // The chosen level is the match's level of care, exactly as if set by hand.
   const partners = [
@@ -450,7 +550,7 @@ const fit = { networkStatus: 'In-network', verifyBenefits: false, requiredNeeds:
   const assessment = L.assessmentFromRow({
     id: 'a1', case_id: 'c1', withdrawal_rating: 3, physical_rating: 0, emotional_rating: 3, readiness_rating: 0, relapse_rating: 0, environment_rating: 0,
     imminent_danger: false, recommended_level: 'Inpatient', recommended_first_step: 'Detox', recommended_support: null,
-    chosen_level: 'Detox', override_reason: '', rules_version: 1, assessed_by: null, assessed_at: new Date(2026, 10, 4, 9).toISOString(),
+    chosen_level: 'Detox', override_reason: '', rules_version: 2, assessed_by: null, assessed_at: new Date(2026, 10, 4, 9).toISOString(),
   });
   check('the line on the match', L.assessedLevelLine(assessment), 'Assessed: Detox · Nov 4, 2026');
   check('the same level: no note', L.matchLevelNote(assessment, 'Detox'), null);
@@ -462,8 +562,9 @@ const fit = { networkStatus: 'In-network', verifyBenefits: false, requiredNeeds:
   // The same words are asserted on the server (case_assessment_event_body).
   const bodies = [
     [{ level: 'Inpatient', firstStep: null, support: null }, 'Inpatient', 'Level-of-care assessment: recommended Inpatient'],
-    [{ level: 'Inpatient', firstStep: 'Detox', support: 'Sober Living' }, 'Detox', 'Level-of-care assessment: recommended Detox, then Inpatient, with Sober Living; chosen Detox'],
+    [{ level: 'Inpatient', firstStep: 'Detox', support: 'Sober Living' }, 'Detox', 'Level-of-care assessment: recommended Detox, then Inpatient, with Sober Living'],
     [{ level: 'IOP / PHP', firstStep: null, support: null }, 'Therapist', 'Level-of-care assessment: recommended IOP / PHP; chosen Therapist'],
+    [{ level: 'Inpatient', firstStep: 'Detox', support: null }, 'Inpatient', 'Level-of-care assessment: recommended Detox, then Inpatient; chosen Inpatient'],
   ];
   for (const [rec, chosen, body] of bodies) {
     check(`timeline: ${body}`, L.assessmentEventBody(rec, chosen), body);
@@ -504,7 +605,7 @@ function query(result, seen) {
   const row = {
     id: 'a1', case_id: 'c1', withdrawal_rating: 0, physical_rating: 2, emotional_rating: 0, readiness_rating: 0, relapse_rating: 0, environment_rating: 0,
     imminent_danger: false, recommended_level: 'IOP / PHP', recommended_first_step: null, recommended_support: null, chosen_level: 'IOP / PHP',
-    override_reason: '', rules_version: 1, assessed_by: 'u1', assessed_at: '2026-11-04T10:00:00Z',
+    override_reason: '', rules_version: 2, assessed_by: 'u1', assessed_at: '2026-11-04T10:00:00Z',
   };
   fake.from = (table) => { seen.table = table; return query({ data: [{ ...row, id: 'a0', assessed_at: '2026-10-01T10:00:00Z' }, row, { bogus: true }], error: null, status: 200 }, seen); };
   const read = await api.fetchCaseAssessments('c1');
@@ -570,7 +671,12 @@ function query(result, seen) {
   ok('offline, the card says the assessment loads when online', card.includes("Assessment loads when you\\'re online."));
   ok('a retry of the same answers reuses the id; changed answers get a new one', /const id = attemptRef\.current\?\.signature === signature \? attemptRef\.current\.id : newAssessmentId\(\);\s*attemptRef\.current = \{ id, signature \};/.test(sheet));
   ok('an offline failure keeps the answers and offers Try again', /error instanceof OfflineError/.test(sheet) && /saveNotice \? 'Try again' : 'Save assessment'/.test(sheet));
-  ok('the reason is required for a different level (the save checks it)', /prepareAssessment\(draft\)/.test(sheet) && /WHY A DIFFERENT LEVEL\? \(REQUIRED\)/.test(sheet));
+  ok('the reason is required for a different level (the save checks it, against the case\'s names)', /prepareAssessment\(draft, names\)/.test(sheet) && /WHY A DIFFERENT LEVEL\? \(REQUIRED\)/.test(sheet));
+  ok('the reason field screens and hints as the program reads it', /reasonProblem\(draft\.overrideReason, names\)/.test(sheet) && /\{reasonIssue \|\| REASON_HINT\}/.test(sheet));
+  ok('the app hands the sheet the case\'s title and contact names', /names=\{reasonNames\(\{ caseTitle: record\.title, contactNames: caseContactNames\(record\.id\) \}\)\}/.test(app));
+  ok('"Use recommended" offers only where the client goes now (first step ?? level)', /\[\{ level: defaultChoice\(recommendation\), label: /.test(sheet) && !/the recommended level after it/.test(sheet));
+  ok('the card\'s Earlier line compares with (first step ?? level)', /followsRecommendation\(item\.recommendation, item\.chosenLevel\) \? '' : ` · chose \$\{item\.chosenLevel\}`/.test(card));
+  ok('inline flags use the cumulative rules', /const inline = inlineFlags\(key, chosen\);/.test(sheet));
   ok('the safety question shows 911 / 988 at once', /draft\.imminentDanger \? renderFlag\(EMERGENCY_FLAG\) : null/.test(sheet));
   ok('the match shows the assessed level, still editable', /<AssessedLevelNote assessment=\{matchAssessment\} matchLevel=\{matchType as ReferralMatch\['levelOfCare'\]\} \/>/.test(app) && /onChange=\{setMatchType\}/.test(app));
   ok('the card hides on a server without the feature', /if \(!entry \|\| entry\.status === 'unavailable'\) return null;/.test(card));

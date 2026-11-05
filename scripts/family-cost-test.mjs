@@ -58,9 +58,10 @@ const {
   BALANCE_BILLING_WARNING, PRECERT_WARNING, PACKET_COST_DISCLAIMER, DEFAULT_STAY_DAYS, MAX_STAY_DAYS,
 } = fc;
 // The wire format lives beside the types (cases.ts reads and writes with it).
+const insurance = require(path.join(tmpDir, 'lib', 'insurance.js'));
 const {
   planCostsFromRow, planCostsToPatch, vobCostsFromRow, vobCostsToPatch, PLAN_COST_COLUMNS, VOB_COST_COLUMNS,
-} = require(path.join(tmpDir, 'lib', 'insurance.js'));
+} = insurance;
 
 let checks = 0;
 function check(label, actual, expected) {
@@ -408,13 +409,90 @@ const vobRow = (over) => ({
   check('rules: coinsurance', planCostsProblem({ ...plan, inNetwork: { ...inNet, coinsurancePct: 101 } }), 'In-network coinsurance: enter a whole percent from 0 to 100.');
   check('rules: no OON benefits with OON amounts', planCostsProblem({ ...plan, oonBenefits: false }), 'The plan has no out-of-network benefits, so it has no out-of-network amounts.');
   check('rules: met without a total is fine', planCostsProblem({ ...plan, inNetwork: { ...inNet, deductible: null } }), null);
-  check('rules: VOB', [vobCostsProblem({ allowedDailyRate: 0, billedDailyRate: 100000, copayPerDay: null, precertRequired: null }), vobCostsProblem({ allowedDailyRate: -1, billedDailyRate: null, copayPerDay: null, precertRequired: null }) !== null], [null, true]);
+  check('rules: VOB', [vobCostsProblem({ allowedDailyRate: 1, billedDailyRate: 100000, copayPerDay: null, precertRequired: null }), vobCostsProblem({ allowedDailyRate: -1, billedDailyRate: null, copayPerDay: null, precertRequired: null }) !== null], [null, true]);
+  // A daily rate of 0 is never a price: refused in the server's words. A
+  // copay of 0 is a real answer.
+  const ZERO = 'Enter the daily rate in dollars, or leave it blank if you do not know it.';
+  check('rules: the server\'s words for a 0 rate', fc.DAILY_RATE_ZERO_PROBLEM, ZERO);
+  check('rules: an allowed or billed rate of 0 is refused; a copay of 0 is fine', [
+    vobCostsProblem({ allowedDailyRate: 0, billedDailyRate: null, copayPerDay: null, precertRequired: null }),
+    vobCostsProblem({ allowedDailyRate: null, billedDailyRate: 0, copayPerDay: null, precertRequired: null }),
+    vobCostsProblem({ allowedDailyRate: 600, billedDailyRate: 900, copayPerDay: 0, precertRequired: null }),
+  ], [ZERO, ZERO, null]);
+  check('form: typing 0 for a rate is refused the same way', form.parseVobCostsDraft({ allowedDailyRate: '0', billedDailyRate: '', copayPerDay: '0', precertRequired: null }), { ok: false, message: ZERO });
+  check('form: a $0 copay is kept', form.parseVobCostsDraft({ allowedDailyRate: '600', billedDailyRate: '', copayPerDay: '$0', precertRequired: null }), { ok: true, value: { allowedDailyRate: 600, billedDailyRate: null, copayPerDay: 0, precertRequired: null } });
 
   check('summary: in-network', networkBenefitsSummary(inNet), '$3,000 deductible ($1,000 met) · $6,000 out-of-pocket max ($1,500 met) · 20% coinsurance');
   check('summary: nothing', networkBenefitsSummary(none), 'Not entered');
   check('summary: no OON', outOfNetworkSummary({ ...plan, outOfNetwork: none, oonBenefits: false }), 'No out-of-network benefits');
   check('summary: OON yes, no amounts', outOfNetworkSummary({ ...plan, outOfNetwork: none, oonBenefits: true }), 'Has out-of-network benefits; amounts not entered');
   check('hasPlanCosts', [hasPlanCosts(null), hasPlanCosts({ inNetwork: none, outOfNetwork: none, oonBenefits: null }), hasPlanCosts({ inNetwork: none, outOfNetwork: none, oonBenefits: false }), hasPlanCosts(plan)], [false, false, true, true]);
+}
+
+// ─── (g2) A rate of 0, another plan, a teammate's edit ──────────────────────
+
+{
+  // The estimators read a stored rate of 0 as not known, never as free.
+  const zeroAllowed = est({ vob: vob({ allowedDailyRate: 0 }) });
+  check('in-network, allowed rate 0: unknown, asks for the rate', [zeroAllowed.known, zeroAllowed.nextStep, formatCostRange(zeroAllowed)], [false, 'add the daily rate', 'unknown']);
+  const zeroAllowedBilled = est({ vob: vob({ allowedDailyRate: 0, billedDailyRate: 400 }) });
+  check('in-network, allowed 0 with a billed rate: the billed price, as "up to"', [zeroAllowedBilled.known, zeroAllowedBilled.low, formatCostRange(zeroAllowedBilled)], [true, null, 'up to $4,000']);
+  const zeroOon = est({ network: 'out_of_network', vob: vob({ allowedDailyRate: 0, billedDailyRate: 0 }) });
+  check('out-of-network, both rates 0: unknown, never $0', [zeroOon.known, formatCostRange(zeroOon)], [false, 'unknown']);
+  const zeroFull = est({ network: 'not_accepted', vob: vob({ billedDailyRate: 0 }), program: { monthlyCost: 0, cashMin: 0, cashMax: 0 } });
+  check('full cost, billed 0 and no cash cost: unknown', [zeroFull.known, zeroFull.route], [false, 'full_cost']);
+  const zeroFullCash = est({ network: 'not_accepted', vob: vob({ billedDailyRate: 0 }) });
+  check('full cost, billed 0: falls back to the cash cost', [zeroFullCash.known, zeroFullCash.low], [true, 30000]);
+  const zeroCopay = est({ vob: vob({ allowedDailyRate: 300, copayPerDay: 0 }) });
+  check('a copay of 0 stays a real answer', [zeroCopay.known, zeroCopay.low], [true, 3400]);
+
+  // The match's payment and the plan on file must be the same plan.
+  check('payment and plan: the same carrier, ignoring case and spaces', [
+    fc.paymentMatchesPlan('Aetna', 'Aetna'), fc.paymentMatchesPlan(' aetna ', 'AETNA'), fc.paymentMatchesPlan('Aetna', 'Cigna'),
+    fc.paymentMatchesPlan('Cash pay', 'Aetna'), fc.paymentMatchesPlan('Aetna', ''), fc.paymentMatchesPlan('', 'Aetna'), fc.paymentMatchesPlan('Cash pay', 'Cash pay'),
+  ], [true, true, false, false, false, false, false]);
+  const requests = [vobRow({ id: 'm', partnerId: 'p-a', status: 'in_network', answeredAt: '2026-11-03T00:00:00Z', allowedDailyRate: 300 })];
+  const partner = { id: 'p-a', organization: 'Riverstone', monthlyCost: 30000, cashMin: 30000, cashMax: 30000 };
+  const same = familyCostForProgram({ insurance: 'aetna', plan, planCarrier: 'Aetna', requests, partner, perProgram: 'in_network' });
+  check('the plan on file is the match\'s payment: the estimate', [same.known, same.low], [true, 3400]);
+  const other = familyCostForProgram({ insurance: 'Cigna', plan, planCarrier: 'Aetna', requests, partner, perProgram: 'in_network' });
+  check('another carrier on file: no estimate from that plan', [other.known, other.low, other.high], [false, null, null]);
+  check('and the card says why', familyCostCardLine(other), "Est. family cost (30 days): unknown — the match's payment isn't the plan on file");
+  const unnamed = familyCostForProgram({ insurance: 'Aetna', plan, planCarrier: '', requests, partner, perProgram: 'in_network' });
+  check('a plan on file with no carrier: no estimate either, and what to add', [unnamed.known, unnamed.nextStep], [false, 'add the carrier to the plan on file']);
+  const cash = familyCostForProgram({ insurance: 'Cash pay', plan, planCarrier: 'Aetna', requests, partner, perProgram: 'unknown' });
+  check('Cash pay with a plan on file: the cash estimate, never the plan\'s numbers', [cash.route, cash.known, cash.low], ['cash', true, 30000]);
+  const packet = familyCostPacketLines({ insurance: 'Cigna', plan, planCarrier: 'Aetna', requests, partner, perProgram: 'in_network' });
+  check('the family\'s packet: no plan-based number for another carrier', packet[1], '- With Cigna: not known yet');
+  const appSource = readFileSync(path.join(repoRoot, 'App.tsx'), 'utf8');
+  ok('the match card and the packet pass the plan\'s carrier', /familyCostForProgram\(\{ insurance, plan, planCarrier: plan\?\.carrier \?\? '',/.test(appSource) && /planCarrier: benefitsByCase\[caseId\]\?\.carrier \?\? '',/.test(appSource));
+  const panelSource = readFileSync(path.join(repoRoot, 'src/lib/FamilyCostPanel.tsx'), 'utf8');
+  ok('the case file\'s panel passes it too', /planCarrier: plan \? plan\.carrier : undefined,/.test(panelSource));
+  ok('Find placement takes the carrier from the plan on file before any words in the title or summary',
+    /const planCarrier = \(benefitsByCase\[record\.id\]\?\.carrier \|\| ''\)\.trim\(\);\s*const insuranceHint = planCarrier \|\| nationalInsuranceProviders\.find/.test(appSource));
+
+  // The plan editor opens only on what the server holds now.
+  ok('the plan editor is blocked unless benefits loaded from the server', /function openBenefitsEditor\(record: CaseRecord\) \{\s*const blocked = benefitsEditorBlock\(record\.id\);\s*if \(blocked\) \{/.test(appSource)
+    && /if \(loaded === 'remote'\) return null;/.test(appSource));
+  ok('it says why, calmly', appSource.includes("title: 'Benefits are still loading'") && appSource.includes("title: 'Benefits need a connection'"));
+
+  // Only the amounts changed in the editor are sent.
+  const opened = plan;
+  const edited = { ...plan, inNetwork: { ...inNet, deductibleMet: 2000 } };
+  check('only the changed amount is sent', insurance.changedPlanCostsPatch(opened, edited), { in_deductible_met: 2000 });
+  check('nothing changed, nothing sent', insurance.changedPlanCostsPatch(opened, plan), {});
+  check('a cleared amount is sent as null', insurance.changedPlanCostsPatch(opened, { ...plan, inNetwork: { ...inNet, oopMet: null } }), { in_oop_met: null });
+  check('"No" out-of-network benefits clears every out-of-network amount', insurance.changedPlanCostsPatch({ ...plan, outOfNetwork: none, oonBenefits: null }, { ...plan, outOfNetwork: none, oonBenefits: false }),
+    { oon_benefits: false, oon_deductible: null, oon_deductible_met: null, oon_oop_max: null, oon_oop_met: null, oon_coinsurance_pct: null });
+  check('a new plan sends what was typed', insurance.changedPlanCostsPatch(null, { inNetwork: { ...none, deductible: 500 }, outOfNetwork: none, oonBenefits: null }), { in_deductible: 500 });
+  // A teammate raised the out-of-pocket met meanwhile; this editor changed the deductible met.
+  const teammate = { ...plan, inNetwork: { ...inNet, oopMet: 2500 } };
+  check('the teammate\'s change survives this save', insurance.mergePlanCostsChanges(teammate, opened, edited).inNetwork, { ...inNet, oopMet: 2500, deductibleMet: 2000 });
+  check('VOB rates: only the changed one is sent', insurance.changedVobCostsPatch({ allowedDailyRate: 600, billedDailyRate: 900, copayPerDay: 25, precertRequired: true }, { allowedDailyRate: 650, billedDailyRate: 900, copayPerDay: 25, precertRequired: true }), { allowed_daily_rate: 650 });
+  const casesSource = readFileSync(path.join(repoRoot, 'src/lib/cases.ts'), 'utf8');
+  ok('cases.ts sends the changed keys when it knows what the editor opened with', casesSource.includes("'costsOpened' in patch ? changedPlanCostsPatch(patch.costsOpened, patch.costs) : planCostsToPatch(patch.costs)")
+    && casesSource.includes("'costsOpened' in patch ? changedVobCostsPatch(patch.costsOpened, patch.costs) : vobCostsToPatch(patch.costs)"));
+  ok('both editors pass what they opened with', (appSource.match(/costsOpened: form\.openedCosts/g) || []).length === 2);
 }
 
 // ─── (h) The wire format (insurance.ts) matches the migration ───────────────

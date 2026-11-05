@@ -187,6 +187,39 @@ export function planCostsToPatch(plan: PlanCosts): Row {
   return { ...networkToPatch('in', plan.inNetwork), oon_benefits: plan.oonBenefits, ...networkToPatch('oon', outOfNetwork) };
 }
 
+export const EMPTY_PLAN_COSTS: PlanCosts = { inNetwork: EMPTY_NETWORK_BENEFITS, outOfNetwork: EMPTY_NETWORK_BENEFITS, oonBenefits: null };
+
+function changedKeys(before: Row, after: Row, always: string[] = []): Row {
+  const patch: Row = {};
+  for (const [key, value] of Object.entries(after)) {
+    if (always.includes(key) || before[key] !== value) patch[key] = value;
+  }
+  return patch;
+}
+
+const OON_AMOUNT_KEYS = ['oon_deductible', 'oon_deductible_met', 'oon_oop_max', 'oon_oop_met', 'oon_coinsurance_pct'];
+
+/**
+ * The save_case_benefits p_patch keys for only the amounts the editor
+ * changed from what it opened with (`opened`), so a teammate's update to
+ * another amount made meanwhile is never sent back over. "No" out-of-network
+ * benefits always clears those amounts.
+ */
+export function changedPlanCostsPatch(opened: PlanCosts | null | undefined, edited: PlanCosts): Row {
+  return changedKeys(planCostsToPatch(opened ?? EMPTY_PLAN_COSTS), planCostsToPatch(edited), edited.oonBenefits === false ? ['oon_benefits', ...OON_AMOUNT_KEYS] : []);
+}
+
+/** `current` (what the case holds now) with the editor's changes from `opened` laid over it: the optimistic copy of a changed-keys save. */
+export function mergePlanCostsChanges(current: PlanCosts | null | undefined, opened: PlanCosts | null | undefined, edited: PlanCosts): PlanCosts {
+  const patch = changedPlanCostsPatch(opened, edited);
+  return planCostsFromRow({ ...planCostsToPatch(current ?? EMPTY_PLAN_COSTS), ...patch });
+}
+
+/** The update_vob_status p_patch keys for only the rates the answer form changed from what it opened with. */
+export function changedVobCostsPatch(opened: VobCosts | null | undefined, edited: VobCosts): Row {
+  return changedKeys(vobCostsToPatch(opened ?? EMPTY_VOB_COSTS), vobCostsToPatch(edited));
+}
+
 export function vobCostsFromRow(row: Row): VobCosts {
   return {
     allowedDailyRate: wholeOrNull(row.allowed_daily_rate),

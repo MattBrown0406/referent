@@ -182,7 +182,9 @@ function compareCandidates(a: ProgramCredential, aStatus: Exclude<CredentialStat
 
 // ─── One program ────────────────────────────────────────────────────────────
 
-export type IntegrityChip = 'verified' | 'needs_review' | 'expired' | 'none';
+// 'concern': a license concern that is not simply "expired" (the license
+// could not be confirmed). Coral, like 'expired': it gives the same pause.
+export type IntegrityChip = 'verified' | 'needs_review' | 'expired' | 'concern' | 'none';
 
 export type IntegrityFlag =
   | 'all_verified'
@@ -202,8 +204,16 @@ export type IntegrityFlag =
   | 'npi_pending'
   | 'npi_rejected';
 
-// A state license that should give the practitioner pause before a referral.
-export type LicenseConcern = { status: 'expired' | 'rejected'; credential: ProgramCredential };
+// A state license that should give the practitioner pause before a referral:
+// no license is verified and current, and one on file shows expired or could
+// not be confirmed. `renewal` is a newer license row still waiting for its
+// check (the program sent a renewal): it does not lift the concern, it only
+// changes the words ("Renewal pending ReferralFit review").
+export type LicenseConcern = {
+  status: 'expired' | 'rejected';
+  credential: ProgramCredential;
+  renewal: ProgramCredential | null;
+};
 
 export type ProgramIntegrity = {
   onFile: number;
@@ -240,17 +250,69 @@ export function programIntegrity(credentials: ProgramCredential[], today: string
   if (!flags.length && credentials.length > 0) flags.push('all_verified');
 
   const anyExpired = [license, accreditation, legitscript].some((summary) => summary.status === 'expired');
-  const chip: IntegrityChip = credentials.length === 0 ? 'none' : anyExpired ? 'expired' : badge ? 'verified' : 'needs_review';
-  const licenseConcern = license.credential && (license.status === 'expired' || license.status === 'rejected')
-    ? { status: license.status, credential: license.credential }
-    : null;
+  const licenseConcern = licenseConcernFor(credentials, today);
+  const chip: IntegrityChip = credentials.length === 0
+    ? 'none'
+    : licenseConcern
+      ? licenseConcern.status === 'expired' ? 'expired' : 'concern'
+      : anyExpired ? 'expired' : badge ? 'verified' : 'needs_review';
   return { onFile: credentials.length, license, accreditation, legitscript, npi, badge, chip, licenseConcern, flags };
+}
+
+// The license concern, looking at EVERY license row rather than only the one
+// that speaks for the kind: a lapsed license next to a renewal still waiting
+// for its check is a concern (the renewal is not verified yet), and so is a
+// rejected one with nothing verified beside it. None while any license is
+// verified and current (expiring still counts as current).
+export function licenseConcernFor(credentials: ProgramCredential[], today: string): LicenseConcern | null {
+  const licenses = credentials.filter((item) => item.kind === 'state_license');
+  if (licenses.some((item) => isVerifiedCurrent(item, today))) return null;
+  const problems = licenses.filter((item) => {
+    const status = credentialStatus(item, today);
+    return status === 'expired' || status === 'rejected';
+  });
+  if (!problems.length) return null;
+  // The one that speaks for the concern: expired before rejected, then the
+  // usual order (a checked one, the later date, the most recently updated).
+  const worst = bestCredential(problems, ['state_license'], today);
+  if (!worst.credential || (worst.status !== 'expired' && worst.status !== 'rejected')) return null;
+  // A renewal: a license still waiting for its check that has not run out.
+  // ReferralFit's review of a listing's renewal is named before a practice's
+  // own unchecked one.
+  const waiting = licenses
+    .filter((item) => item.review === 'pending' && credentialStatus(item, today) !== 'expired')
+    .sort((a, b) => (a.scope === b.scope ? 0 : a.scope === 'listing' ? -1 : 1) || (a.updatedAt > b.updatedAt ? -1 : a.updatedAt < b.updatedAt ? 1 : 0));
+  return { status: worst.status, credential: worst.credential, renewal: waiting[0] ?? null };
+}
+
+// "Renewal pending ReferralFit review" (a listing's renewal) or "Renewal on
+// file, not checked yet" (the practice's own); '' without a renewal.
+export function renewalLine(concern: Pick<LicenseConcern, 'renewal'>): string {
+  if (!concern.renewal) return '';
+  return concern.renewal.scope === 'listing' ? 'Renewal pending ReferralFit review' : 'Renewal on file, not checked yet';
+}
+
+// The renewal line inside a sentence: "renewal pending ReferralFit review".
+function renewalPhrase(concern: Pick<LicenseConcern, 'renewal'>): string {
+  const line = renewalLine(concern);
+  return line ? line[0].toLowerCase() + line.slice(1) : '';
+}
+
+// "Its state license shows expired (Oct 1, 2026)." / "Its state license could
+// not be confirmed." plus the renewal, when there is one.
+function concernSentence(concern: LicenseConcern): string {
+  const what = concern.status === 'expired'
+    ? `Its state license shows expired${concern.credential.expiresOn ? ` (${formatStamp(concern.credential.expiresOn)})` : ''}.`
+    : 'Its state license could not be confirmed.';
+  const renewal = renewalLine(concern);
+  return renewal ? `${what} ${renewal}.` : what;
 }
 
 export const CHIP_LABELS: Record<IntegrityChip, string> = {
   verified: 'Verified',
   needs_review: 'Needs review',
   expired: 'Expired',
+  concern: 'Check license',
   none: 'None on file',
 };
 
@@ -278,12 +340,8 @@ export function integrityHeadline(integrity: ProgramIntegrity): string {
   if (integrity.onFile === 0) {
     return 'No credentials on file yet. Ask the program for its state license and accreditation, or look them up below.';
   }
-  if (integrity.licenseConcern?.status === 'expired') {
-    const expired = integrity.licenseConcern.credential.expiresOn;
-    return `Its state license shows expired${expired ? ` (${formatStamp(expired)})` : ''}. Check with the program before referring.`;
-  }
-  if (integrity.licenseConcern?.status === 'rejected') {
-    return 'Its state license could not be confirmed. Check with the program before referring.';
+  if (integrity.licenseConcern) {
+    return `${concernSentence(integrity.licenseConcern)} Check with the program before referring.`;
   }
   if (integrity.license.status === 'missing') {
     return "We couldn't find a current state license on file. Check with the program before referring.";
@@ -621,16 +679,14 @@ export function programLookupLinks(program: { state?: string; website?: string |
 
 // ─── Before a referral ──────────────────────────────────────────────────────
 
-// The Alert before Assign & refer or Send packet to a program whose state
-// license shows expired or could not be confirmed.
+// The Alert before Assign & refer or Send packet to a program with a license
+// concern: no license verified and current, and one on file shows expired or
+// could not be confirmed (a renewal still waiting for its check is named).
 export function licenseConcernAlert(programName: string, concern: LicenseConcern, action: 'refer' | 'packet'): { title: string; message: string; proceed: string } {
   const name = programName.trim() || 'This program';
-  const what = concern.status === 'expired'
-    ? `Its state license shows expired${concern.credential.expiresOn ? ` (${formatStamp(concern.credential.expiresOn)})` : ''}.`
-    : 'Its state license could not be confirmed.';
   return {
     title: 'Check the license first',
-    message: `${name}: ${what} Check with the program before referring. ${action === 'packet' ? 'Send the packet anyway?' : 'Refer anyway?'}`,
+    message: `${name}: ${concernSentence(concern)} Check with the program before referring. ${action === 'packet' ? 'Send the packet anyway?' : 'Refer anyway?'}`,
     proceed: action === 'packet' ? 'Send anyway' : 'Refer anyway',
   };
 }
@@ -642,7 +698,8 @@ export function licenseOverrideNote(programName: string, concern: LicenseConcern
   const what = concern.status === 'expired'
     ? `showed expired${concern.credential.expiresOn ? ` (${formatStamp(concern.credential.expiresOn)})` : ''}`
     : 'could not be confirmed';
-  return `${action === 'packet' ? 'Sent anyway' : 'Referred anyway'}: the state license for ${name} ${what}, and the practitioner confirmed going ahead.`;
+  const renewal = renewalPhrase(concern);
+  return `${action === 'packet' ? 'Sent anyway' : 'Referred anyway'}: the state license for ${name} ${what}${renewal ? ` (${renewal})` : ''}, and the practitioner confirmed going ahead.`;
 }
 
 // ─── Today: one card for the programs the practice refers to ────────────────
@@ -650,6 +707,8 @@ export function licenseOverrideNote(programName: string, concern: LicenseConcern
 export type CredentialWatchItem = {
   partnerId: string;
   name: string;
+  // 'expired' also covers a license concern (one that could not be
+  // confirmed): either needs a word with the program now.
   worst: 'expired' | 'expiring';
   // "state license expired Oct 1, 2026", "accreditation expires Nov 20, 2026"
   lines: string[];
@@ -665,7 +724,8 @@ export type CredentialWatchInput = {
 
 // Every partner the practice referred a client to in the last 12 months
 // whose state license or accreditation has expired or expires within 30
-// days. One card lists them all.
+// days, or whose license gives pause (licenseConcern). One card lists them
+// all.
 export function credentialWatchItems(input: CredentialWatchInput): CredentialWatchItem[] {
   const since = addDaysToStamp(input.today, -WATCH_REFERRAL_WINDOW_DAYS);
   const referred = new Set(
@@ -681,7 +741,18 @@ export function credentialWatchItems(input: CredentialWatchInput): CredentialWat
     const lines: string[] = [];
     let worst: 'expired' | 'expiring' | null = null;
     let soonest = '';
+    // The license concern speaks for the license (a lapsed license with a
+    // renewal still waiting for its check stays on the card).
+    const concern = integrity.licenseConcern;
+    if (concern) {
+      const date = concern.status === 'expired' ? concern.credential.expiresOn : null;
+      const renewal = renewalPhrase(concern);
+      lines.push(`${date ? `state license expired ${formatStamp(date)}` : 'state license could not be confirmed'}${renewal ? ` (${renewal})` : ''}`);
+      worst = 'expired';
+      if (date && (!soonest || date < soonest)) soonest = date;
+    }
     for (const [label, summary] of [['state license', integrity.license], ['accreditation', integrity.accreditation]] as const) {
+      if (label === 'state license' && concern) continue;
       if ((summary.status !== 'expired' && summary.status !== 'expiring') || !summary.credential?.expiresOn) continue;
       const date = summary.credential.expiresOn;
       lines.push(summary.status === 'expired' ? `${label} expired ${formatStamp(date)}` : `${label} expires ${formatStamp(date)}`);

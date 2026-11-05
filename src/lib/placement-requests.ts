@@ -1,5 +1,6 @@
 import { partnerTypes, stateOptions, therapyOptions } from '../data';
 import type { ReferralMatch } from '../data';
+import { identifyingTextProblem } from './identifying-text';
 import { addDaysToStamp, formatStamp, isDateStamp } from './integrity';
 
 // ─── Placement Request: the rules ───────────────────────────────────────────
@@ -92,41 +93,30 @@ function charLength(value: string): number {
 
 // ─── The note ───────────────────────────────────────────────────────────────
 
-const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}/;
-const NUMBER_RUN = /[0-9]([ ().-]*[0-9]){6,}/;
-const LINK = /(https?:|www[.])/i;
-
 export const NOTE_PROBLEMS = {
   tooLong: 'Keep the note to 300 characters',
-  email: 'Leave email addresses out of the note',
-  number: 'Leave phone numbers, ID numbers and dates out of the note',
-  link: 'Leave links out of the note',
-  money: 'Leave money out of the note. Programs never see the family\'s budget.',
-  label: 'The note mentions how this client is labeled in your workspace. Leave names and labels out.',
 } as const;
 
-// Shown under the note field, always.
-export const NOTE_WARNING = 'Programs read this note. Leave out names, initials, dates of birth, phone numbers and money.';
+// Shown under the note field, always: what identifyingTextProblem refuses.
+export const NOTE_WARNING = 'Programs read this note. Leave out names, contact details (phone, email, links), dates, ID numbers and money.';
+
+/** The names a note may not carry: the match's client label, the linked case's title and its contact names. */
+export function placementNoteNames(input: { clientLabel?: string | null; caseTitle?: string | null; contactNames?: (string | null | undefined)[] }): string[] {
+  return [input.clientLabel, input.caseTitle, ...(input.contactNames || [])]
+    .filter((value): value is string => typeof value === 'string' && value.trim() !== '');
+}
 
 /**
- * The first thing wrong with a request's note, or null. The same rules and
- * words as public.placement_note_problem: no email, no run of 7+ digits (a
- * phone, an ID, a date), no link, no money, and not the client's label or
- * the case title (`identifiers`, matched when 3+ characters).
+ * The first thing wrong with a request's note, or null: at most 300
+ * characters, then the one shared check for text programs read
+ * (identifying-text.ts, the same rules and words as the server's
+ * public.identifying_text_problem). `names` are the match's client label,
+ * the linked case's title and its contact names (placementNoteNames).
  */
-export function placementNoteProblem(note: string, identifiers: (string | null | undefined)[] = []): string | null {
+export function placementNoteProblem(note: string, names: (string | null | undefined)[] = []): string | null {
   const text = note.trim();
   if (charLength(text) > NOTE_MAX) return NOTE_PROBLEMS.tooLong;
-  if (EMAIL.test(text)) return NOTE_PROBLEMS.email;
-  if (NUMBER_RUN.test(text)) return NOTE_PROBLEMS.number;
-  if (LINK.test(text)) return NOTE_PROBLEMS.link;
-  if (text.includes('$')) return NOTE_PROBLEMS.money;
-  const lower = text.toLowerCase();
-  for (const identifier of identifiers) {
-    const value = btrim(identifier).toLowerCase();
-    if (charLength(value) >= 3 && lower.includes(value)) return NOTE_PROBLEMS.label;
-  }
-  return null;
+  return identifyingTextProblem(text, names.filter((value): value is string => typeof value === 'string' && value.trim() !== ''));
 }
 
 // ─── The payload (mirror of public.placement_request_payload) ───────────────
@@ -194,13 +184,74 @@ export function preparePlacementRequest(input: {
   criteria: PayloadCriteria;
   admitWindow: AdmitWindow | null | undefined;
   note: string;
-  identifiers: (string | null | undefined)[];
+  /** The client label, the case title and its contact names (placementNoteNames). */
+  names: (string | null | undefined)[];
 }): PreparedRequest | { problem: string } {
   const note = input.note.trim();
-  const problem = placementNoteProblem(note, input.identifiers);
+  const problem = placementNoteProblem(note, input.names);
   if (problem) return { problem };
   if (!input.admitWindow || !ADMIT_VALUES.includes(input.admitWindow)) return { problem: 'Choose when the client could be admitted' };
   return { payload: buildPlacementPayload(input.criteria, input.admitWindow, note), note };
+}
+
+// ─── One request, as reviewed ───────────────────────────────────────────────
+
+/** What the practitioner reviewed before sending: the programs in their order, the note, and both windows. */
+export type ReviewedRequest = {
+  partnerIds: string[];
+  note: string;
+  respondHours: ResponseWindowHours;
+  admitWindow: AdmitWindow;
+};
+
+/**
+ * One string for everything reviewed. The request id is reused only while
+ * this stays the same (a retry); any change (a program, the note, either
+ * window) is a new request with a new id.
+ */
+export function placementRequestSignature(reviewed: ReviewedRequest): string {
+  return JSON.stringify([reviewed.partnerIds.map((id) => id.toLowerCase()), reviewed.note.trim(), reviewed.respondHours, reviewed.admitWindow]);
+}
+
+/** The words for a replayed id the server keeps as first written (its 22023 refusal). */
+export const ALREADY_SENT_PROBLEM = 'This request already went out as first written. Cancel it and send a new one.';
+
+/** Hours the server gave programs to answer (respond_by minus created_at), or null. */
+export function responseHoursOf(request: Pick<PlacementRequest, 'createdAt' | 'respondBy'>): number | null {
+  const created = timeOf(request.createdAt);
+  const due = timeOf(request.respondBy);
+  if (Number.isNaN(created) || Number.isNaN(due)) return null;
+  return Math.round((due - created) / 3600000);
+}
+
+/**
+ * The request the server answered with is not the one reviewed: another
+ * note, admit window, response window or set of programs (an id replayed
+ * after an edit). The app then says so and offers Cancel.
+ */
+export function sentDiffersFromReview(view: PlacementRequestView, reviewed: ReviewedRequest): boolean {
+  const note = reviewed.note.trim();
+  if ((view.request.payload.note || '') !== note) return true;
+  if (view.request.payload.admit_window !== reviewed.admitWindow) return true;
+  const hours = responseHoursOf(view.request);
+  if (hours !== null && hours !== reviewed.respondHours) return true;
+  const sent = view.recipients.map((item) => item.partnerId || '').sort();
+  const asked = reviewed.partnerIds.map((id) => id.toLowerCase()).sort();
+  return sent.length !== asked.length || sent.some((id, index) => id !== asked[index]);
+}
+
+/**
+ * The practice name programs read on a request: the workspace's name, else
+ * its directory profile's (organization, then name), else "A ReferralFit
+ * practice". The same rule as public.placement_practice_name.
+ */
+export const UNNAMED_PRACTICE = 'A ReferralFit practice';
+
+export function placementPracticeName(workspaceName: string | null | undefined, profile?: { organization?: string | null; name?: string | null } | null): string {
+  const workspace = btrim(workspaceName);
+  if (workspace && workspace !== 'My Practice') return workspace;
+  const listing = btrim(btrim(profile?.organization) || profile?.name || '');
+  return listing || UNNAMED_PRACTICE;
 }
 
 // ─── Reading a stored payload ───────────────────────────────────────────────
@@ -286,10 +337,10 @@ export function deadlineLabel(iso: string): string {
   return new Date(time).toLocaleString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
-/** The practice name as a program should read it: never the unnamed default. */
+/** The practice name as a program should read it in a text: never the unnamed default ('' instead, and the text says "a ReferralFit practice"). */
 export function practiceNameForMessage(name: string | null | undefined): string {
   const value = (name || '').trim();
-  return value && value !== 'My Practice' ? value : '';
+  return value && value !== 'My Practice' && value !== UNNAMED_PRACTICE ? value : '';
 }
 
 /**

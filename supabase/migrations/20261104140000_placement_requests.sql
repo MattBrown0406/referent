@@ -5,18 +5,22 @@
 -- programs at once with ONE de-identified summary, and the answers come
 -- back side by side within hours.
 --
+--   0. identifying_text_problem: the one identifying-details check for free
+--      text a program reads (this note, and the level-of-care reason in
+--      20261104150000), the SQL twin of src/lib/identifying-text.ts.
 --   1. placement_requests: one row per request. Its payload is built HERE,
 --      on the server, from an allow-list (placement_request_payload): level
 --      of care, population, needs and must-haves, the insurance carrier's
 --      name (never a member id) or self-pay (never a budget), home state
 --      and location preference, the admit window, and a short note that is
---      refused if it carries contact details, money, or the client's label.
+--      refused if it carries contact details, money, dates, numbers, or a
+--      name from the match's label, the case's title or its contacts.
 --      A CHECK refuses any other key, whoever writes the row.
---   2. placement_request_recipients: one row per program asked, in the
---      practice's own ranked order (rank). channel 'portal' when the
---      program's listing is claimed by a center account that answers in
---      the center portal, otherwise 'manual' (the practitioner texts or
---      emails the summary and logs the answer by hand).
+--   2. placement_request_recipients: one row per program asked, at its
+--      place on the practice's own match screen (rank). channel 'portal'
+--      when the program's listing is claimed by a center account that
+--      answers in the center portal, otherwise 'manual' (the practitioner
+--      texts or emails the summary and logs the answer by hand).
 --   3. Reads: the practice reads its own rows (RLS). Centers read nothing
 --      directly: list_center_placement_requests returns only the rows
 --      addressed to a listing they claimed, with the practice's name and no
@@ -27,6 +31,8 @@
 --      respond_to_placement_request (the center).
 --   5. org_move_workspace_rows / org_merge_linked_partner_copies: a joiner's
 --      requests move with the rest of the workspace.
+--   6. merge_global_partners: open requests and a listing's credentials
+--      move to the listing that is kept.
 --
 -- ETHICS (non-negotiable):
 --   * Answers NEVER change ranking or scores. The matcher
@@ -46,15 +52,129 @@
 
 BEGIN;
 
+-- Paste order: this file moves program_credentials rows (section 9), so
+-- 20261104130000_program_integrity.sql must already be in. A skipped paste
+-- stops here, before anything changes.
+DO $$
+BEGIN
+  IF to_regclass('public.program_credentials') IS NULL THEN
+    RAISE EXCEPTION 'Paste 20261104130000_program_integrity.sql first: public.program_credentials is missing.';
+  END IF;
+END
+$$;
+
+-- ===========================================================================
+-- 0. The identifying-details check
+-- ===========================================================================
+
+-- The words of a case title, client label or contact name that could be a
+-- name: split on anything that is not a letter, three or more letters, and
+-- not on the never-a-name list: who someone is to the client (son, mom,
+-- family...) and the ordinary words case titles are made of (intervention,
+-- first call, detox...). The same list, in the same order, as NEVER_A_NAME
+-- in src/lib/identifying-text.ts (family's and client's are listed as
+-- written; the split already reads them as family and client).
+CREATE OR REPLACE FUNCTION public.identifying_name_words(p_names text[])
+RETURNS text[]
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT coalesce(array_agg(DISTINCT w.word ORDER BY w.word), ARRAY[]::text[])
+    FROM unnest(coalesce(p_names, ARRAY[]::text[])) AS n(v),
+         regexp_split_to_table(lower(normalize(coalesce(n.v, ''), NFKC)), '[^[:alpha:]]+') AS w(word)
+   WHERE length(w.word) >= 3
+     AND NOT (w.word = ANY (ARRAY['son', 'daughter', 'child', 'kid', 'boy', 'girl', 'wife', 'husband', 'spouse', 'partner',
+       'mom', 'mum', 'mother', 'dad', 'father', 'parent', 'brother', 'sister', 'sibling',
+       'grandson', 'granddaughter', 'grandmother', 'grandfather', 'aunt', 'uncle', 'niece',
+       'nephew', 'cousin', 'friend', 'family', 'client', 'self', 'the', 'and', 'for', 'about',
+       'stepson', 'stepdaughter', 'boyfriend', 'girlfriend', 'fiance', 'fiancee',
+       'intervention', 'interventions', 'placement', 'case', 'lead', 'call', 'calls', 'consult',
+       'inquiry', 'referral', 'program', 'treatment', 'rehab', 'detox', 'inpatient', 'outpatient',
+       'sober', 'living', 'aftercare', 'recovery', 'new', 'first', 'follow', 'check', 'update',
+       'plan', 'family''s', 'client''s']))
+$$;
+REVOKE ALL ON FUNCTION public.identifying_name_words(text[]) FROM PUBLIC, anon, authenticated;
+
+-- The one identifying-details check for free text a program reads (the
+-- placement-request note, the level-of-care reason): NULL when the text is
+-- fine, else a plain message saying what to take out. The SQL twin of
+-- identifyingTextProblem in src/lib/identifying-text.ts (rules version 1):
+-- same order, same words; both test suites run the same cases
+-- (scripts/fixtures/identifying-text-cases.json). p_names: the case's own
+-- title, client label and contact names (whole words, ignoring case).
+-- Special characters are written with chr(): this file is pasted by hand.
+CREATE OR REPLACE FUNCTION public.identifying_text_problem(p_text text, p_names text[])
+RETURNS text
+LANGUAGE plpgsql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_plain text := lower(normalize(coalesce(p_text, ''), NFKC));
+  v_months constant text := '(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|july?|aug(ust)?|sep(t)?(ember)?|oct(ober)?|nov(ember)?|dec(ember)?)';
+  v_endings constant text := '(com|net|org|edu|gov|io|co|me|ly|us|app|info|biz)(?![a-z0-9])';
+BEGIN
+  -- Control characters, line and paragraph separators, zero-width
+  -- characters and direction overrides (checked before normalizing).
+  IF coalesce(p_text, '') ~ ('[' || chr(1) || '-' || chr(31) || chr(127) || chr(8203) || '-' || chr(8207) || chr(8232) || chr(8233)
+                             || chr(8234) || '-' || chr(8238) || chr(8294) || '-' || chr(8297) || ']') THEN
+    RETURN 'Remove line breaks and hidden characters.';
+  END IF;
+  IF strpos(v_plain, '@') > 0
+     OR v_plain ~ ('[a-z0-9]+[[:space:]]+(at|[(]at[)]|[[]at[]])[[:space:]]+[a-z0-9]+[[:space:]]+(dot|[(]dot[)]|[[]dot[]])[[:space:]]+' || v_endings) THEN
+    RETURN 'Leave out email addresses. Programs read this.';
+  END IF;
+  IF v_plain ~ '(https?:|www[.])' OR v_plain ~ ('[a-z0-9-]+[.]' || v_endings) THEN
+    RETURN 'Leave out links and web addresses. Programs read this.';
+  END IF;
+  -- Which message shows: a currency sign is money, a date pattern is a
+  -- date, six or more digits are a phone or ID number, then the rest of
+  -- the money patterns. A month is a whole word or its standard
+  -- abbreviation (dec, sept, december) that starts a word ((?<![a-z])),
+  -- then an optional period, a space and a day: decent 12 is not a date.
+  IF v_plain ~ ('[' || chr(36) || chr(8364) || chr(163) || chr(165) || ']') THEN
+    RETURN 'Leave money out. Programs read this.';
+  END IF;
+  IF v_plain ~ '(?<![0-9])[0-9]{1,2}[/.-][0-9]{1,2}[/.-][0-9]{2,4}(?![0-9])'
+     OR v_plain ~ ('(?<![a-z])' || v_months || '[.]? +[0-9]{1,2}(?![0-9])')
+     OR v_plain ~ '(?<![a-z])(dob|d[.]o[.]b[.]?|born)(?![a-z])' THEN
+    RETURN 'Leave out dates such as a birth date. Programs read this.';
+  END IF;
+  IF v_plain ~ '[0-9]([^0-9a-z]{0,3}[0-9]){5,}' THEN
+    RETURN 'Leave out phone and ID numbers. Programs read this.';
+  END IF;
+  IF v_plain ~ '[0-9]{1,3}(,[0-9]{3})+' OR v_plain ~ '[0-9]+ ?k(?![a-z])'
+     OR v_plain ~ '(?<![a-z])(dollars?|usd|budget|afford[a-z0-9_]*|out[ -]of[ -]pocket|can pay|cash pay)(?![a-z])' THEN
+    RETURN 'Leave money out. Programs read this.';
+  END IF;
+  IF public.identifying_name_words(p_names) && regexp_split_to_array(v_plain, '[^[:alpha:]]+') THEN
+    RETURN 'Leave out names. Programs read this.';
+  END IF;
+  RETURN NULL;
+END
+$$;
+REVOKE ALL ON FUNCTION public.identifying_text_problem(text, text[]) FROM PUBLIC, anon, authenticated;
+
+-- What a program must never read about a case: its title and its contacts'
+-- names (the check above takes their name words). Empty for no case.
+CREATE OR REPLACE FUNCTION public.identifying_case_names(p_case_id uuid, p_org uuid)
+RETURNS text[]
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT ARRAY(SELECT c.title FROM public.cases c WHERE c.id = p_case_id AND c.org_id = p_org)
+      || ARRAY(SELECT cc.name FROM public.case_contacts cc WHERE cc.case_id = p_case_id AND cc.org_id = p_org)
+$$;
+REVOKE ALL ON FUNCTION public.identifying_case_names(uuid, uuid) FROM PUBLIC, anon, authenticated;
+
 -- ===========================================================================
 -- 1. Pure helpers
 -- ===========================================================================
 
--- The first thing wrong with a request's note, in plain words, or NULL. No
--- email addresses, no phone, ID or date numbers, no links, no money
--- (programs never see the family's budget), and not the client's label or
--- the case title (p_identifiers). Names cannot be detected reliably; the app
--- warns. Mirrored by placementNoteProblem in src/lib/placement-requests.ts.
+-- The first thing wrong with a request's note, in plain words, or NULL: at
+-- most 300 characters, then the identifying-details check (no email
+-- addresses, links, money, dates, phone or ID numbers, hidden characters,
+-- or a name word from p_identifiers: the match's client label, the case's
+-- title and its contact names). Mirrored in src/lib/placement-requests.ts.
 CREATE OR REPLACE FUNCTION public.placement_note_problem(p_note text, p_identifiers text[])
 RETURNS text
 LANGUAGE sql IMMUTABLE
@@ -62,13 +182,7 @@ SET search_path = pg_catalog
 AS $$
   SELECT CASE
     WHEN length(btrim(coalesce(p_note, ''))) > 300 THEN 'Keep the note to 300 characters'
-    WHEN p_note ~ '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}' THEN 'Leave email addresses out of the note'
-    WHEN p_note ~ '[0-9]([ ().-]*[0-9]){6,}' THEN 'Leave phone numbers, ID numbers and dates out of the note'
-    WHEN p_note ~* '(https?:|www[.])' THEN 'Leave links out of the note'
-    WHEN strpos(p_note, chr(36)) > 0 THEN 'Leave money out of the note. Programs never see the family''s budget.'
-    WHEN EXISTS (SELECT 1 FROM unnest(coalesce(p_identifiers, ARRAY[]::text[])) AS i(v)
-                  WHERE length(btrim(coalesce(i.v, ''))) >= 3 AND strpos(lower(p_note), lower(btrim(i.v))) > 0)
-      THEN 'The note mentions how this client is labeled in your workspace. Leave names and labels out.'
+    ELSE public.identifying_text_problem(p_note, p_identifiers)
   END
 $$;
 REVOKE ALL ON FUNCTION public.placement_note_problem(text, text[]) FROM PUBLIC, anon, authenticated;
@@ -235,8 +349,9 @@ CREATE INDEX IF NOT EXISTS placement_requests_case_idx ON public.placement_reque
 COMMENT ON TABLE public.placement_requests IS
   'A practice asks several of its own ranked programs about beds, fit and cost at once. payload is the de-identified summary built by placement_request_payload (no label, name, contact details or budget). Answers never change ranking. Written only through the placement request RPCs.';
 
--- One program asked. rank: its place in the practice's own ranked order
--- when the request went out (1 first); the answers never change it.
+-- One program asked. rank: its place on the practice's own match screen
+-- when the request went out (p_ranks, 1 to 999), or its position in the
+-- list sent (1 first); the answers never change it.
 -- channel: 'portal' (the program answers in the center portal) or 'manual'
 -- (the practitioner logs the answer; entered_by_practice). program_name:
 -- the partner's name then, kept if the partner is deleted later.
@@ -247,7 +362,7 @@ CREATE TABLE IF NOT EXISTS public.placement_request_recipients (
   partner_id          uuid,
   global_partner_id   uuid REFERENCES public.global_partners(id) ON DELETE SET NULL,
   channel             text NOT NULL CHECK (channel IN ('portal', 'manual')),
-  rank                integer NOT NULL CHECK (rank BETWEEN 1 AND 8),
+  rank                integer NOT NULL CHECK (rank BETWEEN 1 AND 999),
   program_name        text NOT NULL DEFAULT '' CHECK (length(program_name) <= 200),
   status              text NOT NULL DEFAULT 'sent' CHECK (status IN ('sent', 'viewed', 'responded', 'declined')),
   viewed_at           timestamptz,
@@ -367,6 +482,8 @@ REVOKE ALL ON FUNCTION public.placement_request_json(uuid) FROM PUBLIC, anon, au
 -- level_of_care, population, therapies, must_have_therapies, insurance,
 -- state and location_preference are read. Any other key (a label, a
 -- budget, a name) is ignored; a client_label there only screens the note.
+-- The note is screened against the label, the case's title and the names
+-- of the case's contacts.
 CREATE OR REPLACE FUNCTION public.placement_request_build(
   p_org uuid, p_match_profile_id uuid, p_criteria jsonb, p_case_id uuid, p_admit_window text, p_note text)
 RETURNS TABLE (o_payload jsonb, o_case_id uuid)
@@ -397,7 +514,7 @@ BEGIN
       RAISE EXCEPTION 'Case not found in your workspace' USING ERRCODE = 'P0002';
     END IF;
   END IF;
-  v_problem := public.placement_note_problem(btrim(coalesce(p_note, '')), ARRAY[v_label, v_title]);
+  v_problem := public.placement_note_problem(btrim(coalesce(p_note, '')), ARRAY[v_label] || public.identifying_case_names(v_case, p_org));
   IF v_problem IS NOT NULL THEN
     RAISE EXCEPTION '%', v_problem USING ERRCODE = '22023';
   END IF;
@@ -443,19 +560,73 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.placement_request_partner_ids(uuid, uuid[]) FROM PUBLIC, anon, authenticated;
 
+-- Each program's rank, in the order of p_ids (the partners asked, each
+-- once). Without p_ranks: 1, 2, 3 in the order sent. With p_ranks (one per
+-- entry of p_partner_ids, the program's place on the practice's match
+-- screen): 1 to 999, no two programs on the same rank; a program listed
+-- twice keeps the rank of its first entry.
+CREATE OR REPLACE FUNCTION public.placement_request_ranks(p_partner_ids uuid[], p_ids uuid[], p_ranks integer[])
+RETURNS integer[]
+LANGUAGE plpgsql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_ranks integer[];
+BEGIN
+  IF p_ranks IS NULL THEN
+    RETURN ARRAY(SELECT generate_series(1, cardinality(p_ids)));
+  END IF;
+  IF cardinality(p_ranks) <> coalesce(cardinality(p_partner_ids), 0) THEN
+    RAISE EXCEPTION 'Send one rank for each program asked' USING ERRCODE = '22023';
+  END IF;
+  IF EXISTS (SELECT 1 FROM unnest(p_ranks) AS x(r) WHERE x.r IS NULL OR x.r < 1 OR x.r > 999) THEN
+    RAISE EXCEPTION 'A rank is a whole number from 1 to 999' USING ERRCODE = '22023';
+  END IF;
+  v_ranks := ARRAY(SELECT p_ranks[array_position(p_partner_ids, u.pid)] FROM unnest(p_ids) WITH ORDINALITY AS u(pid, n) ORDER BY u.n);
+  IF (SELECT count(DISTINCT x.r) FROM unnest(v_ranks) AS x(r)) <> cardinality(v_ranks) THEN
+    RAISE EXCEPTION 'Two programs cannot share a rank' USING ERRCODE = '22023';
+  END IF;
+  RETURN v_ranks;
+END
+$$;
+REVOKE ALL ON FUNCTION public.placement_request_ranks(uuid[], uuid[], integer[]) FROM PUBLIC, anon, authenticated;
+
+-- A replayed id (the app retries after a timeout) must be the same request:
+-- true when this call's note, admit window, response window or programs
+-- differ from what went out. A program deleted since then still counts.
+CREATE OR REPLACE FUNCTION public.placement_request_replay_differs(
+  p_id uuid, p_partner_ids uuid[], p_respond_hours integer, p_admit_window text, p_note text)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT q.payload ->> 'note' IS DISTINCT FROM nullif(btrim(coalesce(p_note, '')), '')
+      OR q.payload ->> 'admit_window' IS DISTINCT FROM btrim(coalesce(p_admit_window, ''))
+      OR q.respond_by - q.created_at IS DISTINCT FROM make_interval(hours => p_respond_hours)
+      OR (SELECT count(*) FROM public.placement_request_recipients r WHERE r.request_id = q.id)
+         <> (SELECT count(DISTINCT u.pid) FROM unnest(coalesce(p_partner_ids, ARRAY[]::uuid[])) AS u(pid))
+      OR EXISTS (SELECT 1 FROM public.placement_request_recipients r
+                  WHERE r.request_id = q.id AND r.partner_id IS NOT NULL
+                    AND NOT (r.partner_id = ANY (array_remove(coalesce(p_partner_ids, ARRAY[]::uuid[]), NULL))))
+    FROM public.placement_requests q
+   WHERE q.id = p_id
+$$;
+REVOKE ALL ON FUNCTION public.placement_request_replay_differs(uuid, uuid[], integer, text, text) FROM PUBLIC, anon, authenticated;
+
 -- ===========================================================================
 -- 5. The practice's writers
 -- ===========================================================================
 
--- Ask up to 8 of the practice's own programs at once. p_partner_ids is the
--- practice's ranked order (rank 1 first); answers are compared in that
--- order and never change it. p_respond_hours: 4, 24 or 48. The app makes
--- p_id, so a retry after a timeout returns the request already made and
--- changes nothing. At most 20 requests per workspace in any 24 hours.
--- Returns {request, recipients}.
+-- Ask up to 8 of the practice's own programs at once, in its ranked order
+-- (p_ranks: each one's place on the match screen; else 1, 2, 3). Answers
+-- never change the order. p_respond_hours: 4, 24 or 48. The app makes
+-- p_id: a retry returns the request already made and changes nothing; a
+-- retry that differs is refused. At most 20 requests per workspace in any
+-- 24 hours. Returns {request, recipients}.
 CREATE OR REPLACE FUNCTION public.create_placement_request(
   p_id uuid, p_match_profile_id uuid, p_criteria jsonb, p_partner_ids uuid[],
-  p_respond_hours integer, p_admit_window text, p_note text, p_case_id uuid DEFAULT NULL)
+  p_respond_hours integer, p_admit_window text, p_note text, p_case_id uuid DEFAULT NULL,
+  p_ranks integer[] DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public
@@ -465,6 +636,7 @@ DECLARE
   v_org uuid := public.current_org_id();
   v_org_of uuid;
   v_ids uuid[];
+  v_ranks integer[];
   b record;
 BEGIN
   IF v_user IS NULL OR v_org IS NULL THEN
@@ -480,12 +652,16 @@ BEGIN
     IF v_org_of <> v_org THEN
       RAISE EXCEPTION 'Placement request not found' USING ERRCODE = 'P0002';
     END IF;
+    IF public.placement_request_replay_differs(p_id, p_partner_ids, p_respond_hours, p_admit_window, p_note) THEN
+      RAISE EXCEPTION 'This request already went out as first written. Cancel it and send a new one.' USING ERRCODE = '22023';
+    END IF;
     RETURN public.placement_request_json(p_id);
   END IF;
   IF p_respond_hours IS NULL OR p_respond_hours NOT IN (4, 24, 48) THEN
     RAISE EXCEPTION 'Choose 4, 24 or 48 hours for programs to answer' USING ERRCODE = '22023';
   END IF;
   v_ids := public.placement_request_partner_ids(v_org, p_partner_ids);
+  v_ranks := public.placement_request_ranks(p_partner_ids, v_ids, p_ranks);
   SELECT * INTO b FROM public.placement_request_build(v_org, p_match_profile_id, p_criteria, p_case_id, p_admit_window, p_note);
   IF (SELECT count(*) FROM public.placement_requests q
        WHERE q.org_id = v_org AND q.created_at > now() - interval '24 hours') >= 20 THEN
@@ -497,14 +673,14 @@ BEGIN
   INSERT INTO public.placement_request_recipients (request_id, org_id, partner_id, global_partner_id, channel, rank, program_name)
   SELECT p_id, v_org, p.id, p.global_partner_id,
          CASE WHEN public.placement_listing_answers_in_portal(p.global_partner_id) THEN 'portal' ELSE 'manual' END,
-         u.n, left(coalesce(nullif(btrim(p.organization), ''), nullif(btrim(p.name), ''), 'Program'), 200)
+         v_ranks[u.n], left(coalesce(nullif(btrim(p.organization), ''), nullif(btrim(p.name), ''), 'Program'), 200)
     FROM unnest(v_ids) WITH ORDINALITY AS u(pid, n)
     JOIN public.partners p ON p.id = u.pid AND p.org_id = v_org;
   RETURN public.placement_request_json(p_id);
 END
 $$;
-REVOKE ALL ON FUNCTION public.create_placement_request(uuid, uuid, jsonb, uuid[], integer, text, text, uuid) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION public.create_placement_request(uuid, uuid, jsonb, uuid[], integer, text, text, uuid) TO authenticated;
+REVOKE ALL ON FUNCTION public.create_placement_request(uuid, uuid, jsonb, uuid[], integer, text, text, uuid, integer[]) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.create_placement_request(uuid, uuid, jsonb, uuid[], integer, text, text, uuid, integer[]) TO authenticated;
 
 -- Internal. An open request of the caller's workspace becomes closed (a
 -- placement was found) or cancelled (no longer needed). Either way programs
@@ -844,5 +1020,69 @@ BEGIN
 END
 $$;
 REVOKE ALL ON FUNCTION public.org_merge_linked_partner_copies(uuid, uuid) FROM PUBLIC, anon, authenticated;
+
+-- ===========================================================================
+-- 9. Merging two listings keeps their requests and credentials
+-- ===========================================================================
+
+-- Same as 20260907120000 (its latest definition; one comment's dash made
+-- ASCII), plus two lines: the programs asked in open requests and the
+-- listing's credentials (with their private notes, which follow the
+-- credential id) move from the dropped listing to the kept one, so a
+-- center can still answer and ReferralFit's review survives the merge.
+CREATE OR REPLACE FUNCTION public.merge_global_partners(p_keep uuid, p_drop uuid)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_repointed integer := 0;
+  v_dupes integer := 0;
+  v_prev text := coalesce(current_setting('referralfit.syncing', true), '');
+BEGIN
+  IF NOT public.is_platform_admin() THEN
+    RAISE EXCEPTION 'Platform admin required' USING ERRCODE = '42501';
+  END IF;
+  IF p_keep = p_drop THEN
+    RAISE EXCEPTION 'Cannot merge a listing into itself' USING ERRCODE = '22023';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.global_partners WHERE id = p_keep)
+     OR NOT EXISTS (SELECT 1 FROM public.global_partners WHERE id = p_drop) THEN
+    RAISE EXCEPTION 'Directory listing not found' USING ERRCODE = 'P0002';
+  END IF;
+
+  PERFORM set_config('referralfit.syncing', 'on', true);
+
+  -- A workspace that imported both copies keeps the one linked to p_keep;
+  -- its p_drop copy is unlinked (not deleted - it may carry local history).
+  UPDATE public.partners d
+     SET global_partner_id = NULL
+   WHERE d.global_partner_id = p_drop
+     AND EXISTS (SELECT 1 FROM public.partners k WHERE k.org_id = d.org_id AND k.global_partner_id = p_keep);
+  GET DIAGNOSTICS v_dupes = ROW_COUNT;
+
+  UPDATE public.partners SET global_partner_id = p_keep WHERE global_partner_id = p_drop;
+  GET DIAGNOSTICS v_repointed = ROW_COUNT;
+
+  UPDATE public.user_favorites SET target_id = p_keep
+   WHERE target_type = 'global_partner' AND target_id = p_drop
+     AND NOT EXISTS (SELECT 1 FROM public.user_favorites f2
+                      WHERE f2.user_id = user_favorites.user_id AND f2.target_type = 'global_partner' AND f2.target_id = p_keep);
+  DELETE FROM public.user_favorites WHERE target_type = 'global_partner' AND target_id = p_drop;
+
+  UPDATE public.center_members SET global_partner_id = p_keep WHERE global_partner_id = p_drop;
+  UPDATE public.center_claim_codes SET global_partner_id = p_keep WHERE global_partner_id = p_drop;
+  UPDATE public.placement_request_recipients SET global_partner_id = p_keep WHERE global_partner_id = p_drop;
+  UPDATE public.program_credentials SET global_partner_id = p_keep WHERE global_partner_id = p_drop;
+
+  UPDATE public.global_partners SET status = 'archived', merged_into = p_keep WHERE id = p_drop;
+
+  PERFORM set_config('referralfit.syncing', v_prev, true);
+  RETURN v_repointed;
+END
+$$;
+REVOKE ALL ON FUNCTION public.merge_global_partners(uuid, uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.merge_global_partners(uuid, uuid) TO authenticated;
 
 COMMIT;

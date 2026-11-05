@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 import {
   ACCREDITORS,
+  KEPT_ON_RECORD_FALLBACK,
   KINDS,
   STATUS_LABELS,
   credentialStatus,
@@ -10,10 +11,14 @@ import {
   formFromRow,
   isMissingSchema,
   newId,
+  notesFromRows,
+  savedNotice,
   todayStamp,
   validateForm,
+  withListingNotes,
   type CredentialForm,
   type CredentialRow,
+  type ListingNotes,
 } from './credential-rules';
 import { supabase } from './supabase';
 
@@ -31,7 +36,7 @@ type Props = {
   onError: (message: string) => void;
 };
 
-type Editing = { id?: string; form: CredentialForm };
+type Editing = { id?: string; form: CredentialForm; rejected?: boolean };
 
 export default function Credentials({ listingId, listingState, onNotice, onError }: Props) {
   const [rows, setRows] = useState<CredentialRow[] | null>(null);
@@ -39,6 +44,9 @@ export default function Credentials({ listingId, listingState, onNotice, onError
   const [editing, setEditing] = useState<Editing | null>(null);
   const [problem, setProblem] = useState('');
   const [busy, setBusy] = useState(false);
+  // Information, said calmly in the card (not as an error): for example a
+  // credential ReferralFit could not confirm stays on record.
+  const [info, setInfo] = useState('');
 
   const load = useCallback(async () => {
     const { data, error } = await supabase.rpc('fetch_listing_credentials', { p_ids: [listingId] });
@@ -47,8 +55,15 @@ export default function Credentials({ listingId, listingState, onNotice, onError
       onError(error.message);
       return;
     }
+    // The notes (the program's note to ReferralFit, and ReferralFit's note
+    // on one it could not confirm) are the claimant's and ReferralFit's
+    // only: they come from their own call, never with the rows.
+    let notes: ListingNotes | null = null;
+    const noteRead = await supabase.rpc('fetch_listing_credential_notes', { p_global_partner_id: listingId });
+    if (!noteRead.error) notes = notesFromRows(noteRead.data);
+    else if (!isMissingSchema(noteRead.error.code)) { onError(noteRead.error.message); return; }
     setAvailable(true);
-    setRows((Array.isArray(data) ? data : []) as CredentialRow[]);
+    setRows(withListingNotes((Array.isArray(data) ? data : []) as CredentialRow[], notes));
   }, [listingId, onError]);
 
   useEffect(() => { void load(); }, [load]);
@@ -62,16 +77,18 @@ export default function Credentials({ listingId, listingState, onNotice, onError
     if ('problem' in checked) { setProblem(checked.problem); return; }
     setBusy(true);
     setProblem('');
+    setInfo('');
     try {
-      const { error } = await supabase.rpc('save_program_credential', {
+      const { data, error } = await supabase.rpc('save_program_credential', {
         p_id: editing.id || newId(),
         p_global_partner_id: listingId,
         p_partner_id: null,
         ...checked.payload,
       });
       if (error) throw error;
+      const saved = (Array.isArray(data) ? data[0] : data) as { status?: unknown } | null;
       setEditing(null);
-      onNotice('Credential saved. It shows as pending ReferralFit review until we check it with the issuer.');
+      onNotice(savedNotice(saved?.status));
       await load();
     } catch (saveError) {
       setProblem((saveError as Error).message);
@@ -83,9 +100,15 @@ export default function Credentials({ listingId, listingState, onNotice, onError
   async function remove(row: CredentialRow) {
     if (busy || !window.confirm(`Remove the ${credentialTitle(row).toLowerCase()}? Practitioners will no longer see it.`)) return;
     setBusy(true);
+    setInfo('');
     try {
       const { error } = await supabase.rpc('delete_program_credential', { p_id: row.id });
-      if (error) throw error;
+      if (error) {
+        // Kept on purpose (42501): the server's own calm words, shown as
+        // information beside the credential, not as an error.
+        if (error.code === '42501') { setInfo(error.message || KEPT_ON_RECORD_FALLBACK); return; }
+        throw error;
+      }
       onNotice('Credential removed.');
       await load();
     } catch (removeError) {
@@ -112,6 +135,7 @@ export default function Credentials({ listingId, listingState, onNotice, onError
         issuer's public record. ReferralFit checks each one by hand. Any change goes back for
         review. Credentials never change where you appear in match results.
       </p>
+      {info ? <p className="help" role="status">{info}</p> : null}
       {rows === null ? <p className="footnote">Loading credentials...</p> : rows.length === 0 ? (
         <p className="footnote">No credentials on file yet. Practitioners see "None on file" until you add them.</p>
       ) : (
@@ -130,7 +154,7 @@ export default function Credentials({ listingId, listingState, onNotice, onError
                 </div>
                 <span className={`badge credential-${status}`}>{STATUS_LABELS[status]}</span>
                 <div className="credential-actions">
-                  <button type="button" className="ghost small" disabled={busy || Boolean(editing)} onClick={() => { setProblem(''); setEditing({ id: row.id, form: formFromRow(row) }); }}>Edit</button>
+                  <button type="button" className="ghost small" disabled={busy || Boolean(editing)} onClick={() => { setProblem(''); setInfo(''); setEditing({ id: row.id, form: formFromRow(row), rejected: row.status === 'rejected' }); }}>Edit</button>
                   <button type="button" className="ghost small" disabled={busy} onClick={() => { void remove(row); }}>Remove</button>
                 </div>
               </li>
@@ -171,18 +195,20 @@ export default function Credentials({ listingId, listingState, onNotice, onError
           ) : null}
           <label>Link to the issuer's public record (https)</label>
           <input value={form.proofUrl} maxLength={500} inputMode="url" placeholder="https://" onChange={(e) => setForm({ proofUrl: e.target.value })} />
-          <label>Note for ReferralFit (optional)</label>
-          <textarea value={form.note} maxLength={1000} onChange={(e) => setForm({ note: e.target.value })} />
+          <label>Note for ReferralFit (only ReferralFit sees this)</label>
+          <textarea value={form.note} maxLength={1000} placeholder="Optional" onChange={(e) => setForm({ note: e.target.value })} />
           {problem ? <div className="error">{problem}</div> : null}
           <div className="actions">
             <button type="submit" disabled={busy}>{busy ? 'Saving' : 'Save credential'}</button>
             <button type="button" className="ghost" disabled={busy} onClick={() => { setEditing(null); setProblem(''); }}>Cancel</button>
           </div>
-          <p className="footnote">Saving sends it to ReferralFit for review. It shows as pending ReferralFit review until then.</p>
+          <p className="footnote">{editing.rejected
+            ? 'ReferralFit could not confirm this one, so it stays marked that way after a change. To have it reviewed again, add an updated credential.'
+            : 'Saving sends it to ReferralFit for review. It shows as pending ReferralFit review until then.'}</p>
         </form>
       ) : (
         <div className="actions">
-          <button type="button" disabled={busy || rows === null || rows.length >= 20} onClick={() => { setProblem(''); setEditing({ form: emptyForm(listingState) }); }}>Add a credential</button>
+          <button type="button" disabled={busy || rows === null || rows.length >= 20} onClick={() => { setProblem(''); setInfo(''); setEditing({ form: emptyForm(listingState) }); }}>Add a credential</button>
         </div>
       )}
     </div>

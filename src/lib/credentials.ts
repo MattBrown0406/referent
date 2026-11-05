@@ -65,6 +65,15 @@ function mapRows(rows: unknown): ProgramCredential[] {
   return rows.map((row) => credentialFromRow(row as CredentialRow)).filter((item): item is ProgramCredential => Boolean(item));
 }
 
+// A listing's notes (the program's note to ReferralFit, and ReferralFit's
+// note when it could not confirm a credential) are only for the listing's
+// claimant, in the portal, and for ReferralFit (fetchListingCredentialNotes).
+// The server no longer returns them on listing rows; anything an older
+// server still sends is dropped here, so no practitioner ever sees one.
+export function withoutListingNotes(credential: ProgramCredential): ProgramCredential {
+  return credential.scope === 'listing' ? { ...credential, note: '', verificationNote: '' } : credential;
+}
+
 function groupBy(credentials: ProgramCredential[], key: 'globalPartnerId' | 'partnerId'): Record<string, ProgramCredential[]> {
   const result: Record<string, ProgramCredential[]> = {};
   for (const credential of credentials) {
@@ -85,9 +94,32 @@ export async function fetchListingCredentials(listingIds: string[]): Promise<{ a
       if (isMissingCredentialSchema(error)) return { available: false, byListing: {} };
       throw credentialFailure(error, status, 'Could not load credentials.');
     }
-    all.push(...mapRows(data));
+    all.push(...mapRows(data).map(withoutListingNotes));
   }
   return { available: true, byListing: groupBy(all, 'globalPartnerId') };
+}
+
+export type ListingCredentialNotes = Record<string, { note: string; verificationNote: string }>;
+
+// A listing's notes by credential id: for the listing's claimant or a
+// platform admin only (anyone else gets no rows). null on a server without
+// the function (an older server still sends the notes on the rows, and
+// only an admin's own screens ask for them).
+export async function fetchListingCredentialNotes(globalPartnerId: string): Promise<ListingCredentialNotes | null> {
+  const { data, error, status } = await supabase.rpc('fetch_listing_credential_notes', { p_global_partner_id: globalPartnerId.toLowerCase() });
+  if (error) {
+    if (isMissingCredentialSchema(error)) return null;
+    throw credentialFailure(error, status, 'Could not load the notes.');
+  }
+  const notes: ListingCredentialNotes = {};
+  for (const row of (Array.isArray(data) ? data : []) as { id?: unknown; note?: unknown; verification_note?: unknown }[]) {
+    if (typeof row.id !== 'string') continue;
+    notes[row.id.toLowerCase()] = {
+      note: typeof row.note === 'string' ? row.note : '',
+      verificationNote: typeof row.verification_note === 'string' ? row.verification_note : '',
+    };
+  }
+  return notes;
 }
 
 // The practice's own checks (RLS: this workspace only) plus the listing
@@ -149,12 +181,33 @@ export async function verifyCredential(id: string, verdict: 'verified' | 'reject
   return saved;
 }
 
-export async function deleteCredential(id: string): Promise<void> {
-  const { error, status } = await supabase.rpc('delete_program_credential', { p_id: id });
-  if (error) throw credentialFailure(error, status, 'Could not remove the credential.');
+// The server kept the credential on purpose (42501): for example a listing
+// credential ReferralFit could not confirm stays on record. Not a failure to
+// apologise for: the screens show its message calmly, as information.
+export class CredentialKeptError extends StoreError {
+  constructor(message: string) {
+    super(message, false);
+    this.name = 'CredentialKeptError';
+  }
 }
 
-// The NPI Registry's name for an NPI credential, kept as a hint.
+export const CREDENTIAL_KEPT_TITLE = 'Kept on record';
+
+export async function deleteCredential(id: string): Promise<void> {
+  const { error, status } = await supabase.rpc('delete_program_credential', { p_id: id });
+  if (!error) return;
+  const message = (error as { message?: unknown }).message;
+  if (errorCode(error) === '42501' && typeof message === 'string' && message) throw new CredentialKeptError(message);
+  throw credentialFailure(error, status, 'Could not remove the credential.');
+}
+
+// The NPI Registry's name for an NPI credential, kept as a hint. On a
+// listing's credential only ReferralFit may keep it (the server refuses
+// anyone else with 42501): see mayKeepNpiHint.
+export function mayKeepNpiHint(scope: ProgramCredential['scope'], isPlatformAdmin: boolean): boolean {
+  return scope === 'local' || isPlatformAdmin;
+}
+
 export async function recordNpiLookup(id: string, name: string): Promise<ProgramCredential | null> {
   const { data, error, status } = await supabase.rpc('record_npi_lookup', { p_id: id, p_name: name });
   if (error) throw credentialFailure(error, status, 'Could not keep the NPI Registry result.');

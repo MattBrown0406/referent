@@ -117,12 +117,16 @@ import {
   EMPTY_NETWORK_BENEFITS,
   EMPTY_VOB_COSTS,
   type PartnerPlanStatus,
+  type PlanCosts,
   type SubscriberRelationship,
+  type VobCosts,
   type VobRequest,
   type VobStatus,
   VOB_STATUSES,
   SUBSCRIBER_RELATIONSHIPS,
+  changedVobCostsPatch,
   isVobAnswered,
+  mergePlanCostsChanges,
   memberIdLast4,
   nextBusinessDay,
   planLabel,
@@ -131,6 +135,8 @@ import {
   sortPlanStatuses,
   subscriberRelationshipLabel,
   vobChaseTitle,
+  vobCostsFromRow,
+  vobCostsToPatch,
   vobStatusLabel,
 } from './src/lib/insurance';
 import { DEFAULT_STAY_DAYS, familyCostCardLine, familyCostForProgram, familyCostPacketLines, perProgramNetwork, type FamilyCostEstimate } from './src/lib/family-cost';
@@ -156,7 +162,7 @@ import { latestRequestForMatch, placementTodayItems, requestProgress, type Place
 import LevelOfCareSheet from './src/lib/LevelOfCareSheet';
 import LevelOfCareCard, { AssessedLevelNote } from './src/lib/LevelOfCareCard';
 import { useCaseAssessments } from './src/lib/level-of-care-api';
-import { levelOfCarePacketLines, type PlacementLevel } from './src/lib/level-of-care';
+import { levelOfCarePacketLines, reasonNames, type PlacementLevel } from './src/lib/level-of-care';
 import {
   assignMatchReferral,
   completeFollowUpWithNext,
@@ -428,6 +434,9 @@ type CaseBenefitsFormState = {
   memberIdLast4: string;
   subscriberRelationship: SubscriberRelationship;
   costs: PlanCostsDraft; // deductible, out-of-pocket, coinsurance as typed (family-cost-form.ts)
+  // The cost sharing the editor opened with: only amounts changed from it
+  // are saved, so a teammate's update meanwhile is never sent back over.
+  openedCosts: PlanCosts | null;
 };
 
 type VobRequestFormState = {
@@ -444,6 +453,7 @@ type VobAnswerFormState = {
   note: string;
   quoted: string; // whole dollars as typed
   costs: VobCostsDraft; // daily rates, copay, pre-authorization as typed
+  openedCosts: VobCosts; // what the form opened with: only changed rates are saved
 };
 
 // "2:14 PM" in the device's local time.
@@ -2297,20 +2307,23 @@ export default function App() {
   // DISPLAY ONLY: rankPrograms below never reads them. Online only; on a
   // server without 20261104130000 the index is 'unavailable' and every
   // credential chip, card and prompt stays hidden.
-  const credentialIndex = useCredentialIndex(session?.user?.id, linkedListingIds, credentialsNonce + workspaceEpoch);
+  // Scoped to the account AND the workspace (workspaceEpoch): after a move to
+  // another workspace the last one's credentials never show, even when the
+  // first read for the new one fails. The same holds for the two hooks below.
+  const credentialIndex = useCredentialIndex(session?.user?.id, linkedListingIds, credentialsNonce, workspaceEpoch);
   // Placement Request (src/lib/placement-requests.ts): this practice's
   // requests and the programs' answers, read again on every full refresh.
   // DISPLAY ONLY: rankPrograms below never reads them and nothing writes
   // back to matching. Online only; on a server without 20261104140000 the
   // state is 'unavailable' and every placement button, card and screen hides.
-  const placement = usePlacementRequests(session?.user?.id, credentialsNonce + workspaceEpoch);
+  const placement = usePlacementRequests(session?.user?.id, credentialsNonce, workspaceEpoch);
   const placementAvailable = placement.state.status === 'ready';
   // Level-of-care assessment (src/lib/level-of-care.ts): the open case
   // file's assessments and the match's case's, read again on every full
   // refresh. Matching reads only the CHOSEN level, as the match's level of
   // care; scores and ranking never read anything else. Online only; on a
   // server without 20261104150000 every card, note and packet line hides.
-  const caseAssessments = useCaseAssessments(session?.user?.id, credentialsNonce + workspaceEpoch, [activeCaseId, tab === 'match' ? matchCaseId : null]);
+  const caseAssessments = useCaseAssessments(session?.user?.id, credentialsNonce, [activeCaseId, tab === 'match' ? matchCaseId : null], workspaceEpoch);
   const matchAssessment = tab === 'match' ? caseAssessments.currentFor(matchCaseId) : null;
   const integrityByPartner = useMemo(() => {
     const result = new Map<string, ProgramIntegrity>();
@@ -2577,6 +2590,8 @@ export default function App() {
     setPlacementSheet({
       match: saved,
       caseTitle: saved.caseId ? caseById.get(saved.caseId)?.title : undefined,
+      // The note may not name anyone on the case (identifying-text.ts).
+      contactNames: saved.caseId ? caseContactNames(saved.caseId) : [],
       options: matches.map((score, index) => ({
         partner: score.partner,
         rank: index + 1,
@@ -2584,6 +2599,12 @@ export default function App() {
         integrity: integrityByPartner.get(score.partner.id) ?? null,
       })),
     });
+  }
+
+  // The names on a case: what text programs read may never carry them.
+  function caseContactNames(caseId: string): string[] {
+    const id = caseId.toLowerCase();
+    return allCaseContacts.filter((item) => item.caseId.toLowerCase() === id).map((item) => item.name).filter((name) => name.trim() !== '');
   }
 
   // From Today or a saved match card (nothing else is up then), or after
@@ -2698,11 +2719,14 @@ export default function App() {
   // the linked case's plan and VOB answers. Display only: the ranking never
   // reads it. Null when there is nothing to estimate from: no linked case,
   // its benefits not loaded, or (insured) no plan on file.
+  // A match whose payment is not the plan on file (another carrier, or no
+  // carrier on the plan) gets no estimate from that plan's numbers: the
+  // card says "unknown — the match's payment isn't the plan on file".
   function familyCostFor(caseId: string | null | undefined, insurance: string, partner: Partner, networkStatus: PacketFitInput['networkStatus']): FamilyCostEstimate | null {
     if (!caseId || benefitsLoadedFor[caseId] !== 'remote' || !benefitCostsAvailable) return null;
     const plan = benefitsByCase[caseId] ?? null;
     if (insurance !== 'Cash pay' && !plan) return null;
-    return familyCostForProgram({ insurance, plan, requests: vobsByCase[caseId] || [], partner, perProgram: perProgramNetwork(networkStatus), days: costDaysByCase[caseId] });
+    return familyCostForProgram({ insurance, plan, planCarrier: plan?.carrier ?? '', requests: vobsByCase[caseId] || [], partner, perProgram: perProgramNetwork(networkStatus), days: costDaysByCase[caseId] });
   }
 
   // The family copy's side-by-side estimate. buildPacket leaves it out of
@@ -2713,6 +2737,7 @@ export default function App() {
     return familyCostPacketLines({
       insurance: matchProfile.insurance,
       plan: benefitsByCase[caseId] ?? null,
+      planCarrier: benefitsByCase[caseId]?.carrier ?? '',
       requests: vobsByCase[caseId] || [],
       partner,
       perProgram: perProgramNetwork(networkStatus),
@@ -3298,7 +3323,24 @@ export default function App() {
     };
   }
 
+  // The plan editor opens only on what the server holds for this case right
+  // now (benefitsLoadedFor 'remote'): an editor opened on nothing, or on a
+  // copy a failed refresh left behind, would save its blanks over the plan.
+  function benefitsEditorBlock(caseId: string): { title: string; message: string } | null {
+    const loaded = benefitsLoadedFor[caseId];
+    if (loaded === 'remote') return null;
+    return loaded === 'unavailable'
+      ? { title: 'Benefits need a connection', message: 'The plan could not be loaded, so it cannot be edited yet. Pull to refresh once you are back online.' }
+      : { title: 'Benefits are still loading', message: 'The plan is on its way from the server. Try again in a moment.' };
+  }
+
   function openBenefitsEditor(record: CaseRecord) {
+    const blocked = benefitsEditorBlock(record.id);
+    if (blocked) {
+      Alert.alert(blocked.title, blocked.message);
+      if (benefitsLoadedFor[record.id] === 'unavailable') void loadCaseBenefits(record.id);
+      return;
+    }
     const plan = benefitsByCase[record.id];
     setBenefitsForm({
       carrier: plan?.carrier || '',
@@ -3306,6 +3348,7 @@ export default function App() {
       memberIdLast4: plan?.memberIdLast4 || '',
       subscriberRelationship: plan?.subscriberRelationship || '',
       costs: planCostsDraft(plan),
+      openedCosts: plan ? { inNetwork: plan.inNetwork, outOfNetwork: plan.outOfNetwork, oonBenefits: plan.oonBenefits } : null,
     });
   }
 
@@ -3331,7 +3374,9 @@ export default function App() {
       return;
     }
     const previousPlan = benefitsByCase[record.id] ?? null;
-    const costs = parsedCosts?.ok ? parsedCosts.value : {
+    // Only the amounts changed in the editor move; the rest stay as the case
+    // holds them now (a teammate may have changed one meanwhile).
+    const costs = parsedCosts?.ok ? mergePlanCostsChanges(previousPlan, form.openedCosts, parsedCosts.value) : {
       inNetwork: previousPlan?.inNetwork ?? EMPTY_NETWORK_BENEFITS,
       outOfNetwork: previousPlan?.outOfNetwork ?? EMPTY_NETWORK_BENEFITS,
       oonBenefits: previousPlan?.oonBenefits ?? null,
@@ -3356,7 +3401,7 @@ export default function App() {
           planName: optimistic.planName,
           memberIdLast4: optimistic.memberIdLast4,
           subscriberRelationship: optimistic.subscriberRelationship,
-          ...(parsedCosts?.ok ? { costs: parsedCosts.value } : {}),
+          ...(parsedCosts?.ok ? { costs: parsedCosts.value, costsOpened: form.openedCosts } : {}),
         });
       },
       { partners, referrals, referralMatches, touches, followUps, scorecards },
@@ -3517,6 +3562,7 @@ export default function App() {
       note: request.note,
       quoted: request.quotedOutOfPocket == null ? '' : String(request.quotedOutOfPocket),
       costs: vobCostsDraft(request),
+      openedCosts: { allowedDailyRate: request.allowedDailyRate, billedDailyRate: request.billedDailyRate, copayPerDay: request.copayPerDay, precertRequired: request.precertRequired },
     });
   }
 
@@ -3548,7 +3594,8 @@ export default function App() {
       answeredBy: form.answeredBy.trim(),
       note: form.note.trim(),
       quotedOutOfPocket: quoted,
-      ...(parsedCosts?.ok ? parsedCosts.value : {}),
+      // Only the rates changed in the form move; the rest stay as they are now.
+      ...(parsedCosts?.ok ? vobCostsFromRow({ ...vobCostsToPatch(current), ...changedVobCostsPatch(form.openedCosts, parsedCosts.value) }) : {}),
       answeredAt: isVobAnswered(form.status) ? (statusChanged || !current.answeredAt ? nowIso : current.answeredAt) : undefined,
     };
     const previousVobs = vobsByCase[record.id] || [];
@@ -3569,7 +3616,7 @@ export default function App() {
           answeredBy: optimistic.answeredBy,
           note: optimistic.note,
           quotedOutOfPocket: quoted,
-          ...(parsedCosts?.ok ? { costs: parsedCosts.value } : {}),
+          ...(parsedCosts?.ok ? { costs: parsedCosts.value, costsOpened: form.openedCosts } : {}),
         });
       },
       { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
@@ -4580,7 +4627,11 @@ export default function App() {
     }
     const text = `${record.title} ${record.summary}`;
     const stateHint = stateOptions.find((state) => new RegExp(`\\b${state.code}\\b`).test(text) || text.toLowerCase().includes(state.name.toLowerCase()));
-    const insuranceHint = nationalInsuranceProviders.find((provider) => provider !== 'Cash pay' && text.toLowerCase().includes(provider.toLowerCase()));
+    // The plan on the case file is the family's payment; words in the
+    // title or summary are only a guess when no plan with a carrier is on
+    // file (so the match and the plan's cost estimate agree).
+    const planCarrier = (benefitsByCase[record.id]?.carrier || '').trim();
+    const insuranceHint = planCarrier || nationalInsuranceProviders.find((provider) => provider !== 'Cash pay' && text.toLowerCase().includes(provider.toLowerCase()));
     const budgetMatch = text.match(/\$\s?([\d,]{3,})/);
     const budgetHint = budgetMatch ? String(Number(budgetMatch[1].replace(/,/g, '')) || '') : '';
     applyMatchToForm(null); // nothing carried over from the previous family
@@ -7375,6 +7426,8 @@ export default function App() {
                     </View>
                     {loaded === 'unavailable' ? (
                       <Text style={styles.caseEmptyNote}>Benefits need a connection. Pull to refresh once you are back online.</Text>
+                    ) : !loaded ? (
+                      <Text style={styles.caseEmptyNote}>Benefits are still loading.</Text>
                     ) : null}
                     {plan && (plan.carrier || plan.planName || plan.memberIdLast4) ? (
                       <View style={styles.businessDetailRow}>
@@ -8980,6 +9033,7 @@ export default function App() {
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => assessmentBackRef.current()}>
         <LevelOfCareSheet
           caseId={record.id}
+          names={reasonNames({ caseTitle: record.title, contactNames: caseContactNames(record.id) })}
           previous={caseAssessments.currentFor(record.id)}
           backRef={assessmentBackRef}
           onClose={() => setAssessmentCaseId(null)}

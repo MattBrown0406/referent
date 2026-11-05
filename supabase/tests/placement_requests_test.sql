@@ -4,7 +4,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(95);
+SELECT plan(115);
 
 -- Actors
 --   c1  center account that claimed L1
@@ -14,14 +14,17 @@ SELECT plan(95);
 --   p2  member of practice P
 --   q1  owner of practice Q (QA imports L1)
 --   j1  solo owner of workspace J (JA imports L1, JB private), joins P
+--   s1  platform admin (ReferralFit), merges two listings
 INSERT INTO auth.users (id, email)
 VALUES
+  ('a1000000-0000-0000-0000-0000000000a7', 'placement-admin@example.test'),
   ('c1000000-0000-0000-0000-0000000000a7', 'placement-c1@example.test'),
   ('c2000000-0000-0000-0000-0000000000a7', 'placement-c2@example.test'),
   ('b1000000-0000-0000-0000-0000000000a7', 'placement-p1@example.test'),
   ('b2000000-0000-0000-0000-0000000000a7', 'placement-p2@example.test'),
   ('b3000000-0000-0000-0000-0000000000a7', 'placement-q1@example.test'),
   ('b4000000-0000-0000-0000-0000000000a7', 'placement-j1@example.test');
+INSERT INTO public.platform_admins (user_id) VALUES ('a1000000-0000-0000-0000-0000000000a7');
 
 SELECT set_config('test.org_p', org_id::text, true) FROM public.org_members WHERE user_id = 'b1000000-0000-0000-0000-0000000000a7';
 SELECT set_config('test.org_q', org_id::text, true) FROM public.org_members WHERE user_id = 'b3000000-0000-0000-0000-0000000000a7';
@@ -56,6 +59,7 @@ INSERT INTO public.partners (id, owner_id, name, organization, state) VALUES
   ('e8000000-0000-0000-0000-0000000000a7', 'b1000000-0000-0000-0000-0000000000a7', 'Intake', 'Program H', 'OR'),
   ('e9000000-0000-0000-0000-0000000000a7', 'b1000000-0000-0000-0000-0000000000a7', 'Intake', 'Program I', 'OR');
 INSERT INTO public.cases (id, title, status) VALUES ('f1000000-0000-0000-0000-0000000000a7', 'Rivera intervention', 'inquiry');
+INSERT INTO public.case_contacts (case_id, name, relationship, is_primary) VALUES ('f1000000-0000-0000-0000-0000000000a7', 'Dolores Huerta', 'mother', true);
 INSERT INTO public.match_profiles (id, client_label, level_of_care, state, insurance, max_budget, therapies, must_have_therapies,
                                    population, location_preference, case_id)
 VALUES ('f2000000-0000-0000-0000-0000000000a7', 'Rivera family', 'Inpatient', 'OR', 'Aetna', 48765,
@@ -103,7 +107,7 @@ SELECT ok(
 SELECT ok(
   (SELECT bool_and(p.prosecdef AND p.proconfig @> ARRAY['search_path=public'])
      FROM pg_proc p
-    WHERE p.oid IN ('public.create_placement_request(uuid, uuid, jsonb, uuid[], integer, text, text, uuid)'::regprocedure,
+    WHERE p.oid IN ('public.create_placement_request(uuid, uuid, jsonb, uuid[], integer, text, text, uuid, integer[])'::regprocedure,
                     'public.cancel_placement_request(uuid)'::regprocedure,
                     'public.close_placement_request(uuid)'::regprocedure,
                     'public.placement_request_finish(uuid, text)'::regprocedure,
@@ -114,6 +118,9 @@ SELECT ok(
                     'public.placement_request_channels(uuid[])'::regprocedure,
                     'public.placement_request_build(uuid, uuid, jsonb, uuid, text, text)'::regprocedure,
                     'public.placement_request_partner_ids(uuid, uuid[])'::regprocedure,
+                    'public.placement_request_replay_differs(uuid, uuid[], integer, text, text)'::regprocedure,
+                    'public.identifying_case_names(uuid, uuid)'::regprocedure,
+                    'public.merge_global_partners(uuid, uuid)'::regprocedure,
                     'public.placement_request_json(uuid)'::regprocedure,
                     'public.placement_listing_answers_in_portal(uuid)'::regprocedure,
                     'public.placement_practice_name(uuid)'::regprocedure,
@@ -125,14 +132,15 @@ SELECT ok(
   NOT EXISTS (
     SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
      WHERE n.nspname = 'public'
-       AND (p.proname LIKE 'placement%' OR p.proname IN ('create_placement_request', 'cancel_placement_request', 'close_placement_request',
-                                                       'log_manual_response', 'list_center_placement_requests',
-                                                       'mark_placement_request_viewed', 'respond_to_placement_request'))
+       AND (p.proname LIKE 'placement%' OR p.proname LIKE 'identifying%'
+            OR p.proname IN ('create_placement_request', 'cancel_placement_request', 'close_placement_request',
+                             'log_manual_response', 'list_center_placement_requests',
+                             'mark_placement_request_viewed', 'respond_to_placement_request', 'merge_global_partners'))
        AND has_function_privilege('anon', p.oid, 'EXECUTE')),
   'anon can run none of the new functions'
 );
 SELECT ok(
-  has_function_privilege('authenticated', 'public.create_placement_request(uuid, uuid, jsonb, uuid[], integer, text, text, uuid)', 'EXECUTE')
+  has_function_privilege('authenticated', 'public.create_placement_request(uuid, uuid, jsonb, uuid[], integer, text, text, uuid, integer[])', 'EXECUTE')
   AND has_function_privilege('authenticated', 'public.cancel_placement_request(uuid)', 'EXECUTE')
   AND has_function_privilege('authenticated', 'public.close_placement_request(uuid)', 'EXECUTE')
   AND has_function_privilege('authenticated', 'public.log_manual_response(uuid, text, text, date, integer, text, text)', 'EXECUTE')
@@ -147,6 +155,10 @@ SELECT ok(
   AND NOT has_function_privilege('authenticated', 'public.placement_note_problem(text, text[])', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_allowed_needs(text[])', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_request_partner_ids(uuid, uuid[])', 'EXECUTE')
+  AND NOT has_function_privilege('authenticated', 'public.placement_request_ranks(uuid[], uuid[], integer[])', 'EXECUTE')
+  AND NOT has_function_privilege('authenticated', 'public.placement_request_replay_differs(uuid, uuid[], integer, text, text)', 'EXECUTE')
+  AND NOT has_function_privilege('authenticated', 'public.identifying_text_problem(text, text[])', 'EXECUTE')
+  AND NOT has_function_privilege('authenticated', 'public.identifying_case_names(uuid, uuid)', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_request_build(uuid, uuid, jsonb, uuid, text, text)', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_request_json(uuid)', 'EXECUTE')
   AND NOT has_function_privilege('authenticated', 'public.placement_request_finish(uuid, text)', 'EXECUTE')
@@ -207,16 +219,24 @@ SELECT is(
     public.placement_note_problem('See www.example.org', ARRAY[]::text[]),
     public.placement_note_problem('Family can pay $30,000', ARRAY[]::text[]),
     public.placement_note_problem('The rivera FAMILY prefers women staff', ARRAY['Rivera family', NULL]),
-    public.placement_note_problem(repeat('a', 301), ARRAY[]::text[])],
+    public.placement_note_problem(repeat('a', 301), ARRAY[]::text[]),
+    public.placement_note_problem('Family can pay 40,000 cash', ARRAY[]::text[]),
+    public.placement_note_problem('Seen Nov 12, admit soon', ARRAY[]::text[]),
+    public.placement_note_problem('Line one' || chr(10) || 'line two', ARRAY[]::text[]),
+    coalesce(public.placement_note_problem('Son prefers a family program', ARRAY['Rivera family ' || chr(8212) || ' son Jake']), 'ok')],
   ARRAY['ok',
-        'Leave email addresses out of the note',
-        'Leave phone numbers, ID numbers and dates out of the note',
-        'Leave phone numbers, ID numbers and dates out of the note',
-        'Leave links out of the note',
-        'Leave money out of the note. Programs never see the family''s budget.',
-        'The note mentions how this client is labeled in your workspace. Leave names and labels out.',
-        'Keep the note to 300 characters'],
-  'the note: no contact details, numbers, links, money, or the client''s label'
+        'Leave out email addresses. Programs read this.',
+        'Leave out phone and ID numbers. Programs read this.',
+        'Leave out dates such as a birth date. Programs read this.',
+        'Leave out links and web addresses. Programs read this.',
+        'Leave money out. Programs read this.',
+        'Leave out names. Programs read this.',
+        'Keep the note to 300 characters',
+        'Leave money out. Programs read this.',
+        'Leave out dates such as a birth date. Programs read this.',
+        'Remove line breaks and hidden characters.',
+        'ok'],
+  'the note: 300 characters, then the shared identifying-details check (identifying_text_problem), its words'
 );
 SELECT is(
   ARRAY[public.placement_recipient_status('sent', now() - interval '1 minute', now()),
@@ -278,11 +298,52 @@ SELECT is(
 );
 SELECT is(
   (SELECT jsonb_array_length(public.create_placement_request('91000000-0000-0000-0000-0000000000a7', 'f2000000-0000-0000-0000-0000000000a7', NULL,
-            ARRAY['e5000000-0000-0000-0000-0000000000a7']::uuid[], 4, 'asap', 'Different') -> 'recipients')
+            ARRAY['e1000000-0000-0000-0000-0000000000a7', 'e2000000-0000-0000-0000-0000000000a7',
+                  'e4000000-0000-0000-0000-0000000000a7', 'e3000000-0000-0000-0000-0000000000a7']::uuid[],
+            24, 'this_week', '  Prefers a quiet setting ') -> 'recipients')
           || ':' || (SELECT count(*) FROM public.placement_request_recipients WHERE request_id = '91000000-0000-0000-0000-0000000000a7')
           || ':' || (SELECT payload ->> 'note' FROM public.placement_requests WHERE id = '91000000-0000-0000-0000-0000000000a7')),
   '4:4:Prefers a quiet setting',
-  'a replay with the same id is a no-op: the request already made comes back unchanged'
+  'a replay of the same request (same programs, any order) is a no-op: the request already made comes back unchanged'
+);
+SELECT throws_ok(
+  $$ SELECT public.create_placement_request('91000000-0000-0000-0000-0000000000a7', 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e2000000-0000-0000-0000-0000000000a7', 'e1000000-0000-0000-0000-0000000000a7',
+             'e3000000-0000-0000-0000-0000000000a7', 'e4000000-0000-0000-0000-0000000000a7']::uuid[],
+       24, 'this_week', 'A different note') $$,
+  '22023', 'This request already went out as first written. Cancel it and send a new one.',
+  'a replay with a different note is refused, never silently dropped'
+);
+SELECT throws_ok(
+  $$ SELECT public.create_placement_request('91000000-0000-0000-0000-0000000000a7', 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e2000000-0000-0000-0000-0000000000a7', 'e1000000-0000-0000-0000-0000000000a7',
+             'e3000000-0000-0000-0000-0000000000a7', 'e4000000-0000-0000-0000-0000000000a7']::uuid[],
+       24, 'asap', 'Prefers a quiet setting') $$,
+  '22023', 'This request already went out as first written. Cancel it and send a new one.',
+  'a replay with a different admit window is refused'
+);
+SELECT throws_ok(
+  $$ SELECT public.create_placement_request('91000000-0000-0000-0000-0000000000a7', 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e2000000-0000-0000-0000-0000000000a7', 'e1000000-0000-0000-0000-0000000000a7',
+             'e3000000-0000-0000-0000-0000000000a7', 'e4000000-0000-0000-0000-0000000000a7']::uuid[],
+       4, 'this_week', 'Prefers a quiet setting') $$,
+  '22023', 'This request already went out as first written. Cancel it and send a new one.',
+  'a replay with a different response window is refused'
+);
+SELECT throws_ok(
+  $$ SELECT public.create_placement_request('91000000-0000-0000-0000-0000000000a7', 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e2000000-0000-0000-0000-0000000000a7', 'e1000000-0000-0000-0000-0000000000a7', 'e3000000-0000-0000-0000-0000000000a7']::uuid[],
+       24, 'this_week', 'Prefers a quiet setting') $$,
+  '22023', 'This request already went out as first written. Cancel it and send a new one.',
+  'a replay that asks different programs is refused'
+);
+SELECT throws_ok(
+  $$ SELECT public.create_placement_request('91000000-0000-0000-0000-0000000000a7', 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e2000000-0000-0000-0000-0000000000a7', 'e1000000-0000-0000-0000-0000000000a7',
+             'e3000000-0000-0000-0000-0000000000a7', 'e5000000-0000-0000-0000-0000000000a7', NULL]::uuid[],
+       24, 'this_week', 'Prefers a quiet setting') $$,
+  '22023', 'This request already went out as first written. Cancel it and send a new one.',
+  'a replay that swaps one program, with an empty slot in the list, is refused too'
 );
 -- Without a saved match: only the allowed criteria are read.
 SELECT lives_ok(
@@ -301,19 +362,25 @@ SELECT is(
 SELECT throws_ok(
   $$ SELECT public.create_placement_request(gen_random_uuid(), NULL, '{"client_label":"Rivera family","level_of_care":"Detox"}'::jsonb,
        ARRAY['e1000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', 'Rivera family needs detox first') $$,
-  '22023', 'The note mentions how this client is labeled in your workspace. Leave names and labels out.',
+  '22023', 'Leave out names. Programs read this.',
   'a note naming the client''s label is refused'
 );
 SELECT throws_ok(
   $$ SELECT public.create_placement_request(gen_random_uuid(), 'f2000000-0000-0000-0000-0000000000a7', NULL,
        ARRAY['e1000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', 'See the Rivera intervention notes') $$,
-  '22023', 'The note mentions how this client is labeled in your workspace. Leave names and labels out.',
+  '22023', 'Leave out names. Programs read this.',
   'a note naming the case title is refused'
 );
 SELECT throws_ok(
   $$ SELECT public.create_placement_request(gen_random_uuid(), 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e1000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', 'Dolores asked for a women-only program') $$,
+  '22023', 'Leave out names. Programs read this.',
+  'a note naming one of the case''s contacts is refused'
+);
+SELECT throws_ok(
+  $$ SELECT public.create_placement_request(gen_random_uuid(), 'f2000000-0000-0000-0000-0000000000a7', NULL,
        ARRAY['e1000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', 'Mom: 541 555 0199') $$,
-  '22023', 'Leave phone numbers, ID numbers and dates out of the note',
+  '22023', 'Leave out phone and ID numbers. Programs read this.',
   'a note with a phone number is refused'
 );
 SELECT throws_ok(
@@ -354,6 +421,51 @@ SELECT is(
             4, 'flexible', NULL) -> 'recipients')),
   2,
   'a program listed twice is asked once'
+);
+-- The program's place on the practice's match screen (p_ranks).
+SELECT is(
+  (SELECT string_agg((r ->> 'partner_id') || ':' || (r ->> 'rank'), ',' ORDER BY (r ->> 'rank')::integer)
+     FROM jsonb_array_elements(public.create_placement_request('98000000-0000-0000-0000-0000000000a7', 'f2000000-0000-0000-0000-0000000000a7', NULL,
+            ARRAY['e5000000-0000-0000-0000-0000000000a7', 'e4000000-0000-0000-0000-0000000000a7', 'e6000000-0000-0000-0000-0000000000a7']::uuid[],
+            24, 'asap', NULL, NULL, ARRAY[5, 2, 9]) -> 'recipients') AS r),
+  'e4000000-0000-0000-0000-0000000000a7:2,e5000000-0000-0000-0000-0000000000a7:5,e6000000-0000-0000-0000-0000000000a7:9',
+  'with p_ranks, each program keeps its place on the match screen, and the answers list in that order'
+);
+SELECT lives_ok(
+  $$ SELECT public.create_placement_request('99000000-0000-0000-0000-0000000000a7', 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e7000000-0000-0000-0000-0000000000a7', 'e7000000-0000-0000-0000-0000000000a7', 'e8000000-0000-0000-0000-0000000000a7']::uuid[],
+       24, 'asap', NULL, NULL, ARRAY[3, 7, 4]) $$,
+  'a request with ranks, one program listed twice'
+);
+SELECT is(
+  (SELECT string_agg(r.partner_id::text || ':' || r.rank, ',' ORDER BY r.rank)
+     FROM public.placement_request_recipients r WHERE r.request_id = '99000000-0000-0000-0000-0000000000a7'),
+  'e7000000-0000-0000-0000-0000000000a7:3,e8000000-0000-0000-0000-0000000000a7:4',
+  'a program listed twice keeps the rank of its first entry'
+);
+SELECT throws_ok(
+  $$ SELECT public.create_placement_request(gen_random_uuid(), 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e5000000-0000-0000-0000-0000000000a7', 'e6000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', NULL, NULL, ARRAY[1]) $$,
+  '22023', 'Send one rank for each program asked',
+  'p_ranks lines up with the programs'
+);
+SELECT throws_ok(
+  $$ SELECT public.create_placement_request(gen_random_uuid(), 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e5000000-0000-0000-0000-0000000000a7', 'e6000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', NULL, NULL, ARRAY[1, 1000]) $$,
+  '22023', 'A rank is a whole number from 1 to 999',
+  'a rank is from 1 to 999'
+);
+SELECT throws_ok(
+  $$ SELECT public.create_placement_request(gen_random_uuid(), 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e5000000-0000-0000-0000-0000000000a7', 'e6000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', NULL, NULL, ARRAY[0, 2]) $$,
+  '22023', 'A rank is a whole number from 1 to 999',
+  'rank 0 is refused'
+);
+SELECT throws_ok(
+  $$ SELECT public.create_placement_request(gen_random_uuid(), 'f2000000-0000-0000-0000-0000000000a7', NULL,
+       ARRAY['e5000000-0000-0000-0000-0000000000a7', 'e6000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', NULL, NULL, ARRAY[4, 4]) $$,
+  '22023', 'Two programs cannot share a rank',
+  'two programs cannot share a rank'
 );
 RESET ROLE;
 
@@ -631,14 +743,14 @@ RESET ROLE;
 -- G. The daily limit
 -- ===========================================================================
 
--- P has sent 91 (moved back 25 hours), 92 and 94 in the last 24 hours.
+-- P has sent 91 (moved back 25 hours), 92, 94, 98 and 99 in the last 24 hours.
 SELECT set_config('request.jwt.claim.sub', 'b1000000-0000-0000-0000-0000000000a7', true);
 SET LOCAL ROLE authenticated;
 SELECT is(
-  (SELECT count(*)::integer FROM generate_series(1, 18) AS g,
+  (SELECT count(*)::integer FROM generate_series(1, 16) AS g,
           LATERAL public.create_placement_request(gen_random_uuid(), 'f2000000-0000-0000-0000-0000000000a7', NULL,
                   ARRAY['e4000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', 'Ask ' || g) AS made),
-  18,
+  16,
   'twenty requests fit in 24 hours'
 );
 SELECT throws_ok(
@@ -649,7 +761,7 @@ SELECT throws_ok(
 );
 SELECT lives_ok(
   $$ SELECT public.create_placement_request('92000000-0000-0000-0000-0000000000a7', NULL, NULL,
-       ARRAY['e4000000-0000-0000-0000-0000000000a7']::uuid[], 24, 'asap', NULL) $$,
+       ARRAY['e1000000-0000-0000-0000-0000000000a7']::uuid[], 48, 'asap', NULL) $$,
   'a replay still answers at the limit'
 );
 RESET ROLE;
@@ -787,6 +899,59 @@ SELECT is(
   (SELECT (responded_by IS NULL)::text || ':' || status FROM public.placement_request_recipients WHERE id = current_setting('test.r1_pa')::uuid),
   'true:declined',
   'a deleted center account leaves its answer, unattributed'
+);
+
+-- ===========================================================================
+-- K. ReferralFit merges two listings: requests and credentials follow
+-- ===========================================================================
+
+-- Unclaimed Oaks (L4, asked in request 91 by hand) turns out to be Cedar
+-- House (L2). Its credential, with its private note, must survive too.
+INSERT INTO public.program_credentials (id, global_partner_id, kind, identifier, issuing_state)
+VALUES ('fc000000-0000-0000-0000-0000000000a7', 'd4000000-0000-0000-0000-0000000000a7', 'state_license', 'LIC-OAKS', 'OR');
+INSERT INTO public.program_credential_listing_notes (credential_id, note) VALUES ('fc000000-0000-0000-0000-0000000000a7', 'License on the wall');
+SELECT set_config('request.jwt.claim.sub', 'a1000000-0000-0000-0000-0000000000a7', true);
+SET LOCAL ROLE authenticated;
+SELECT lives_ok($$ SELECT public.merge_global_partners('d2000000-0000-0000-0000-0000000000a7', 'd4000000-0000-0000-0000-0000000000a7') $$,
+  'ReferralFit merges the duplicate listing into the one it keeps');
+SELECT is(
+  (SELECT n.note FROM public.fetch_listing_credential_notes('d2000000-0000-0000-0000-0000000000a7') AS n
+    WHERE n.id = 'fc000000-0000-0000-0000-0000000000a7'),
+  'License on the wall',
+  'the dropped listing''s credential, and its private note, now belong to the kept listing'
+);
+RESET ROLE;
+SELECT is(
+  (SELECT r.global_partner_id::text || ':' || r.status FROM public.placement_request_recipients r WHERE r.id = current_setting('test.r1_pc')::uuid),
+  'd2000000-0000-0000-0000-0000000000a7:responded',
+  'a program asked in a request now points at the kept listing, its answer untouched'
+);
+SELECT is(
+  (SELECT count(*)::integer FROM public.placement_request_recipients WHERE global_partner_id = 'd4000000-0000-0000-0000-0000000000a7')
+    + (SELECT count(*)::integer FROM public.program_credentials WHERE global_partner_id = 'd4000000-0000-0000-0000-0000000000a7'),
+  0,
+  'nothing is left on the dropped listing'
+);
+SELECT is(
+  (SELECT pg_get_function_identity_arguments(p.oid) || ' -> ' || pg_get_function_result(p.oid) || ':' || p.prosecdef::text
+     FROM pg_proc p WHERE p.oid = 'public.merge_global_partners(uuid, uuid)'::regprocedure),
+  'p_keep uuid, p_drop uuid -> integer:true',
+  'the re-created merge keeps its signature and stays SECURITY DEFINER'
+);
+
+-- The paste-order guard, as pasted (the local reset records each
+-- statement): without 20261104130000's table the file stops at once.
+SELECT throws_ok(
+  format('DO $t$ BEGIN ALTER TABLE public.program_credentials RENAME TO program_credentials_gone; EXECUTE %L; END $t$',
+         (SELECT x FROM supabase_migrations.schema_migrations m, unnest(m.statements) AS x
+           WHERE m.version = '20261104140000' AND x LIKE '%DO $$%Paste 20261104130000_program_integrity.sql first%')),
+  'P0001', 'Paste 20261104130000_program_integrity.sql first: public.program_credentials is missing.',
+  'pasted without the program integrity migration, this file stops before changing anything'
+);
+SELECT lives_ok(
+  (SELECT x FROM supabase_migrations.schema_migrations m, unnest(m.statements) AS x
+    WHERE m.version = '20261104140000' AND x LIKE '%DO $$%Paste 20261104130000_program_integrity.sql first%'),
+  'with program_credentials in place, the guard passes'
 );
 
 SELECT * FROM finish();

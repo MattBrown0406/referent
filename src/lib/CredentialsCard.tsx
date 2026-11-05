@@ -11,14 +11,19 @@ import { ActivityIndicator, Alert, Linking, StyleSheet, Text, TextInput, Touchab
 
 import type { Partner } from '../data';
 import {
+  CREDENTIAL_KEPT_TITLE,
+  CredentialKeptError,
   EMPTY_CREDENTIAL_INDEX,
   deleteCredential,
   fetchCredentialIndex,
+  fetchListingCredentialNotes,
   lookupNpi,
+  mayKeepNpiHint,
   recordNpiLookup,
   saveCredential,
   verifyCredential,
   type CredentialIndex,
+  type ListingCredentialNotes,
 } from './credentials';
 import { fetchIsPlatformAdmin } from './directory';
 import { OfflineError, describeError, isServerUnreachable } from './errors';
@@ -80,42 +85,52 @@ export type CredentialIndexState = {
 
 const INITIAL_STATE: CredentialIndexState = { status: 'loading', index: EMPTY_CREDENTIAL_INDEX, error: '' };
 
+// The account and workspace a read belongs to: rows read for one never show
+// for the other, even when the next read fails.
+export function credentialScopeKey(userId: string | undefined, workspaceKey: string | number): string {
+  return `${userId || ''}|${workspaceKey}`;
+}
+
 // `listingIdsKey`: the linked listing ids, sorted and comma-joined (App's
 // linkedListingIds). `refreshKey` changes on every full refresh.
+// `workspaceKey` changes when the account moves to another workspace (App's
+// workspaceEpoch): what was read for the last one is dropped at once.
 // `isPlatformAdmin` only shows ReferralFit's own controls (adding a
 // listing's credentials); every write re-checks on the server.
-export function useCredentialIndex(userId: string | undefined, listingIdsKey: string, refreshKey: number): { state: CredentialIndexState; reload: () => void; isPlatformAdmin: boolean } {
-  const [state, setState] = useState<CredentialIndexState>(INITIAL_STATE);
+export function useCredentialIndex(userId: string | undefined, listingIdsKey: string, refreshKey: number, workspaceKey: string | number = 0): { state: CredentialIndexState; reload: () => void; isPlatformAdmin: boolean } {
+  const scope = credentialScopeKey(userId, workspaceKey);
+  // The state remembers whose it is; another account's or workspace's reads
+  // read as "loading" until this one's arrive.
+  const [held, setHeld] = useState<{ scope: string; state: CredentialIndexState }>({ scope, state: INITIAL_STATE });
   const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
   const generationRef = useRef(0);
-  const userRef = useRef(userId);
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
 
   const load = useCallback(async () => {
     const generation = ++generationRef.current;
+    const readScope = scope;
     if (!userId) {
-      setState(INITIAL_STATE);
+      setHeld({ scope: readScope, state: INITIAL_STATE });
       return;
     }
     try {
       const index = await fetchCredentialIndex(listingIdsKey ? listingIdsKey.split(',') : []);
-      if (generation !== generationRef.current) return;
-      setState({ status: index.available ? 'ready' : 'unavailable', index, error: '' });
+      if (generation !== generationRef.current || scopeRef.current !== readScope) return;
+      setHeld({ scope: readScope, state: { status: index.available ? 'ready' : 'unavailable', index, error: '' } });
     } catch (error) {
-      if (generation !== generationRef.current) return;
-      // Keep what is on screen after a failed refresh; with nothing loaded
-      // yet, say why.
-      setState((current) => (current.status === 'ready'
+      if (generation !== generationRef.current || scopeRef.current !== readScope) return;
+      // Keep what is on screen after a failed refresh of THIS workspace;
+      // with nothing of its own loaded yet, say why (never the last
+      // workspace's rows).
+      setHeld((current) => (current.scope === readScope && current.state.status === 'ready'
         ? current
-        : { status: isServerUnreachable(error) ? 'offline' : 'error', index: EMPTY_CREDENTIAL_INDEX, error: describeError(error) }));
+        : { scope: readScope, state: { status: isServerUnreachable(error) ? 'offline' : 'error', index: EMPTY_CREDENTIAL_INDEX, error: describeError(error) } }));
     }
-  }, [userId, listingIdsKey]);
+  }, [userId, listingIdsKey, scope]);
 
   // Another account's credentials never show for this one.
   useEffect(() => {
-    if (userRef.current !== userId) {
-      userRef.current = userId;
-      setState(INITIAL_STATE);
-    }
     setIsPlatformAdmin(false);
     if (!userId) return undefined;
     let active = true;
@@ -129,6 +144,7 @@ export function useCredentialIndex(userId: string | undefined, listingIdsKey: st
     void load();
   }, [load, refreshKey]);
 
+  const state = held.scope === scope ? held.state : INITIAL_STATE;
   return { state, reload: () => { void load(); }, isPlatformAdmin };
 }
 
@@ -141,10 +157,13 @@ export function credentialsForPartner(index: CredentialIndex, partner: Pick<Part
 
 // ─── The shield chip (display only) ─────────────────────────────────────────
 
-const CHIP_STYLE: Record<IntegrityChip, { icon: keyof typeof Ionicons.glyphMap; color: string; background: string }> = {
+// A license concern (integrity.ts licenseConcern) is always coral: 'expired'
+// or 'concern', never the amber "Needs review".
+export const CHIP_STYLE: Record<IntegrityChip, { icon: keyof typeof Ionicons.glyphMap; color: string; background: string }> = {
   verified: { icon: 'shield-checkmark', color: COLORS.forest, background: COLORS.mintPale },
   needs_review: { icon: 'shield-half-outline', color: COLORS.gold, background: COLORS.goldPale },
   expired: { icon: 'shield-outline', color: COLORS.coral, background: COLORS.coralPale },
+  concern: { icon: 'shield-outline', color: COLORS.coral, background: COLORS.coralPale },
   none: { icon: 'shield-outline', color: COLORS.gray, background: COLORS.grayPale },
 };
 
@@ -193,10 +212,14 @@ type Props = {
   // "you", a teammate's name, or '' when unknown.
   whoLabel: (userId: string | null) => string;
   onChanged: () => void;
-  // A platform admin may add and edit a listing's credentials (the server
-  // re-checks); everyone else reads them.
+  // Given only to a platform admin (ReferralFit): may add and edit a
+  // listing's credentials, sees the listing's notes, and keeps NPI Registry
+  // hints on them (the server re-checks every one); everyone else reads the
+  // listing's credentials without their notes.
   canEditListing?: boolean;
 };
+
+type NotesState = { status: 'idle' | 'loading' | 'ready' | 'error'; byId: ListingCredentialNotes };
 
 type Editing = { id?: string; scope: 'listing' | 'local'; draft: CredentialDraft; problem: string; busy: boolean };
 type NpiCheck = { busy: boolean; result?: NpiLookupResult };
@@ -215,15 +238,35 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
   const [busyId, setBusyId] = useState<string | null>(null);
   const [npiChecks, setNpiChecks] = useState<Record<string, NpiCheck>>({});
   const [draftNpi, setDraftNpi] = useState<NpiCheck | null>(null);
+  // The listing's notes, for ReferralFit only (fetch_listing_credential_notes).
+  const [notes, setNotes] = useState<NotesState>({ status: 'idle', byId: {} });
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
 
+  const listingId = program.globalPartnerId ? program.globalPartnerId.toLowerCase() : '';
+  const listingRowsKey = listingId ? (state.index.listing[listingId] || []).map((item) => `${item.id}:${item.updatedAt}`).join(',') : '';
+  const loadNotes = useCallback(async () => {
+    if (!canEditListing || !listingId) return;
+    setNotes((current) => ({ status: 'loading', byId: current.byId }));
+    try {
+      const byId = await fetchListingCredentialNotes(listingId);
+      if (!mountedRef.current) return;
+      // null: an older server, which still sends the notes on the rows.
+      setNotes({ status: 'ready', byId: byId ?? {} });
+    } catch {
+      if (mountedRef.current) setNotes((current) => ({ status: 'error', byId: current.byId }));
+    }
+  }, [canEditListing, listingId]);
+  useEffect(() => {
+    void loadNotes();
+  }, [loadNotes, listingRowsKey]);
+
   if (state.status === 'unavailable') return null;
 
-  const listing = program.globalPartnerId ? state.index.listing[program.globalPartnerId.toLowerCase()] || [] : [];
+  const listing = listingId ? state.index.listing[listingId] || [] : [];
   const local = program.partnerId ? state.index.local[program.partnerId.toLowerCase()] || [] : [];
   const loaded = state.status === 'ready';
   const integrity = loaded ? programIntegrity([...listing, ...local], today) : null;
@@ -233,9 +276,26 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
     setEditing({ scope, draft: emptyCredentialDraft('state_license', program.state), problem: '', busy: false });
   }
 
+  // A listing's note, for ReferralFit's eyes only; '' for everyone else.
+  function listingNote(credential: ProgramCredential): { note: string; verificationNote: string } {
+    if (credential.scope !== 'listing' || !canEditListing) return { note: '', verificationNote: '' };
+    return notes.byId[credential.id] ?? { note: '', verificationNote: '' };
+  }
+
   function startEdit(credential: ProgramCredential) {
+    // Saving sends the note too: a listing's is edited only once it has
+    // loaded, so the program's note to ReferralFit is never wiped.
+    if (credential.scope === 'listing' && notes.status !== 'ready') {
+      Alert.alert(
+        notes.status === 'error' ? 'Notes need a connection' : 'Notes are still loading',
+        notes.status === 'error' ? 'The listing\'s notes could not be loaded, so it cannot be edited yet. Try again when you are back online.' : 'Try again in a moment.',
+      );
+      if (notes.status === 'error') void loadNotes();
+      return;
+    }
     setDraftNpi(null);
-    setEditing({ id: credential.id, scope: credential.scope, draft: draftFromCredential(credential), problem: '', busy: false });
+    const draft = draftFromCredential(credential);
+    setEditing({ id: credential.id, scope: credential.scope, draft: credential.scope === 'listing' ? { ...draft, note: listingNote(credential).note } : draft, problem: '', busy: false });
   }
 
   function updateDraft(patch: Partial<CredentialDraft>) {
@@ -258,7 +318,7 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
       const saved = await saveCredential(owner, normalized.fields, editing.id);
       // A registry name looked up in the editor is kept with the NPI.
       const lookup = draftNpi?.result;
-      if (saved.kind === 'npi' && lookup?.ok && lookup.npi === saved.identifier) {
+      if (saved.kind === 'npi' && lookup?.ok && lookup.npi === saved.identifier && mayKeepNpiHint(editing.scope, canEditListing)) {
         await recordNpiLookup(saved.id, lookup.name).catch(() => null);
       }
       if (!mountedRef.current) return;
@@ -278,7 +338,10 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
       await action();
       if (mountedRef.current) onChanged();
     } catch (error) {
-      Alert.alert(failureTitle, writeFailure(error));
+      // The server keeping a credential on purpose is information, not a
+      // failure: its own calm words, under a calm title.
+      if (error instanceof CredentialKeptError) Alert.alert(CREDENTIAL_KEPT_TITLE, error.message);
+      else Alert.alert(failureTitle, writeFailure(error));
       if (mountedRef.current) onChanged();
     } finally {
       if (mountedRef.current) setBusyId(null);
@@ -322,10 +385,10 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
     const result = await lookupNpi(credential.identifier);
     if (!mountedRef.current) return;
     setNpiChecks((current) => ({ ...current, [credential.id]: { busy: false, result } }));
-    // The practice's own NPI keeps the registry name as a hint (a listing's
-    // is the program's or ReferralFit's to keep; the result shows here
-    // either way).
-    if (result.ok && (credential.scope === 'local' || canEditListing)) {
+    // The practice's own NPI keeps the registry name as a hint. A listing's
+    // is ReferralFit's alone to keep (the server refuses anyone else); the
+    // result shows here either way.
+    if (result.ok && mayKeepNpiHint(credential.scope, canEditListing)) {
       recordNpiLookup(credential.id, result.name).then(() => { if (mountedRef.current) onChanged(); }).catch(() => undefined);
     }
   }
@@ -371,12 +434,16 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
     const editable = credential.scope === 'local' || canEditListing;
     const checkable = credential.scope === 'local';
     const who = credential.verifiedBy ? whoLabel(credential.verifiedBy) : '';
+    // A listing's notes are never the row's own (the server leaves them
+    // off; credentials.ts drops any it still sends): ReferralFit reads them
+    // from fetch_listing_credential_notes, practitioners never see them.
+    const { note, verificationNote } = credential.scope === 'listing' ? listingNote(credential) : credential;
     const reviewLine = credential.review === 'verified' && credential.verifiedAt
       ? credential.scope === 'listing'
         ? `Verified by ReferralFit on ${formatStamp(credential.verifiedAt.slice(0, 10))}`
         : `Checked${who ? ` by ${who}` : ''} on ${formatStamp(credential.verifiedAt.slice(0, 10))}`
       : credential.review === 'rejected' && credential.verifiedAt
-        ? `${credential.scope === 'listing' ? "ReferralFit couldn't confirm it" : `Not confirmed${who ? ` by ${who}` : ''}`} on ${formatStamp(credential.verifiedAt.slice(0, 10))}${credential.verificationNote ? `: ${credential.verificationNote}` : ''}`
+        ? `${credential.scope === 'listing' ? "ReferralFit couldn't confirm it" : `Not confirmed${who ? ` by ${who}` : ''}`} on ${formatStamp(credential.verifiedAt.slice(0, 10))}${verificationNote ? `: ${verificationNote}` : ''}`
         : credential.scope === 'listing' ? 'Waiting for ReferralFit to check it' : 'Not checked yet. Look it up below, then mark it checked.';
     return (
       <View key={credential.id} style={styles.row}>
@@ -391,7 +458,7 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
         </View>
         <Text style={styles.meta}>{expiryLine(credential, today)}</Text>
         <Text style={styles.meta}>{reviewLine}</Text>
-        {credential.note ? <Text style={styles.meta}>Note: {credential.note}</Text> : null}
+        {note ? <Text style={styles.meta}>{credential.scope === 'listing' ? 'Program\'s note to ReferralFit' : 'Note'}: {note}</Text> : null}
         {credential.kind === 'npi' && credential.npiLookupName && !npiChecks[credential.id]?.result ? (
           <Text style={styles.meta}>
             NPI Registry name: {credential.npiLookupName}{credential.npiCheckedAt ? ` (looked up ${formatStamp(credential.npiCheckedAt.slice(0, 10))})` : ''}. A hint, not a verification.
@@ -510,7 +577,7 @@ export default function CredentialsCard({ program, state, today, whoLabel, onCha
         ) : null}
         <Text style={styles.fieldLabel}>Link to the public record (https)</Text>
         <TextInput style={styles.input} value={draft.proofUrl} onChangeText={(proofUrl) => updateDraft({ proofUrl })} placeholder="https://... the issuer's lookup page" placeholderTextColor={COLORS.gray} keyboardType="url" autoCapitalize="none" autoCorrect={false} maxLength={500} accessibilityLabel="Link to the public record" />
-        <Text style={styles.fieldLabel}>Note (optional)</Text>
+        <Text style={styles.fieldLabel}>{current.scope === 'listing' ? 'Note for ReferralFit (only ReferralFit and the program see it)' : 'Note (optional, your practice only)'}</Text>
         <TextInput style={[styles.input, styles.noteInput]} value={draft.note} onChangeText={(note) => updateDraft({ note })} placeholder="Who you spoke with, what you saw" placeholderTextColor={COLORS.gray} multiline maxLength={1000} accessibilityLabel="Note" />
         {current.id ? <Text style={styles.meta}>{current.scope === 'listing' ? 'Saving a change sends it back for ReferralFit review.' : 'Saving a change marks it not checked again, so check it once more afterwards.'}</Text> : null}
         {current.problem ? <Text accessibilityRole="alert" style={styles.problem}>{current.problem}</Text> : null}

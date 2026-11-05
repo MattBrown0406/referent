@@ -19,6 +19,7 @@ import {
   type PlacementRequestView,
   type PlacementSeen,
   type ResponseWindowHours,
+  placementPracticeName,
 } from './placement-requests';
 import { supabase } from './supabase';
 
@@ -138,6 +139,8 @@ export type NewPlacementRequest = {
   matchProfileId: string;
   /** The practice's ranked order, rank 1 first. */
   partnerIds: string[];
+  /** Each program's place on the match screen, aligned with partnerIds (p_ranks): the answers screen shows the same numbers. */
+  ranks: number[];
   respondHours: ResponseWindowHours;
   admitWindow: AdmitWindow;
   /** Already trimmed and checked (preparePlacementRequest). */
@@ -165,9 +168,34 @@ export async function createPlacementRequest(input: NewPlacementRequest): Promis
     p_admit_window: input.admitWindow,
     p_note: input.note,
     p_case_id: null,
+    p_ranks: input.ranks,
   });
   if (error) throw placementFailure(error, status, 'Could not send the placement request.');
   return viewOrThrow(data, 'Sent');
+}
+
+/**
+ * The practice name programs read on this workspace's requests, worked out
+ * as public.placement_practice_name does (placementPracticeName): the
+ * workspace's name, else its directory profile's, else "A ReferralFit
+ * practice". '' only when it could not be read (the screens then say so
+ * without guessing).
+ */
+export async function fetchPlacementPracticeName(): Promise<string> {
+  try {
+    const org = await supabase.rpc('current_org_id');
+    if (org.error || typeof org.data !== 'string' || !org.data) return '';
+    const orgId = org.data;
+    const [workspace, listing] = await Promise.all([
+      supabase.from('orgs').select('name').eq('id', orgId).maybeSingle(),
+      supabase.from('global_partners').select('organization, name').eq('owner_org_id', orgId).is('merged_into', null).order('id', { ascending: true }).limit(1),
+    ]);
+    if (workspace.error) return '';
+    const profile = !listing.error && Array.isArray(listing.data) ? (listing.data[0] as { organization?: string | null; name?: string | null } | undefined) : undefined;
+    return placementPracticeName((workspace.data as { name?: string | null } | null)?.name, profile);
+  } catch {
+    return '';
+  }
 }
 
 export async function cancelPlacementRequest(id: string): Promise<PlacementRequestView> {
@@ -257,13 +285,27 @@ export type PlacementRequestsHook = {
   markSeen: (view: PlacementRequestView) => void;
 };
 
+// The account and workspace a read belongs to: one workspace's requests
+// never show for another, even when the next read fails.
+export function placementScopeKey(userId: string | undefined, workspaceKey: string | number): string {
+  return `${userId || ''}|${workspaceKey}`;
+}
+
 // `refreshKey` changes on every full refresh of the app (pull to refresh,
-// foreground, workspace change), so answers that arrived meanwhile show.
-export function usePlacementRequests(userId: string | undefined, refreshKey: number): PlacementRequestsHook {
-  const [state, setState] = useState<PlacementRequestsState>(INITIAL);
+// foreground), so answers that arrived meanwhile show. `workspaceKey`
+// changes when the account moves to another workspace (App's
+// workspaceEpoch): the last workspace's requests are dropped at once.
+export function usePlacementRequests(userId: string | undefined, refreshKey: number, workspaceKey: string | number = 0): PlacementRequestsHook {
+  const scope = placementScopeKey(userId, workspaceKey);
+  // The state remembers whose it is: another account's or workspace's reads
+  // as "loading" until this one's arrive.
+  const [held, setHeld] = useState<{ scope: string; state: PlacementRequestsState }>({ scope, state: INITIAL });
+  const state = held.scope === scope ? held.state : INITIAL;
   const [seen, setSeen] = useState<PlacementSeen>({});
   const generationRef = useRef(0);
   const userRef = useRef(userId);
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
   const stateRef = useRef(state);
   stateRef.current = state;
   const seenRef = useRef(seen);
@@ -271,35 +313,36 @@ export function usePlacementRequests(userId: string | undefined, refreshKey: num
 
   const load = useCallback(async (): Promise<PlacementRequestsState['status'] | 'failed'> => {
     const generation = ++generationRef.current;
+    const readScope = scope;
     if (!userId) {
-      setState(INITIAL);
+      setHeld({ scope: readScope, state: INITIAL });
       return 'failed';
     }
     try {
       const read = await fetchPlacementRequests();
-      if (generation !== generationRef.current) return 'failed';
+      if (generation !== generationRef.current || scopeRef.current !== readScope) return 'failed';
       const next: PlacementRequestsState = read.available
         ? { status: 'ready', requests: read.requests, error: '' }
         : { status: 'unavailable', requests: [], error: '' };
-      setState(next);
+      setHeld({ scope: readScope, state: next });
       return next.status;
     } catch (error) {
-      if (generation !== generationRef.current) return 'failed';
+      if (generation !== generationRef.current || scopeRef.current !== readScope) return 'failed';
       const offline = isServerUnreachable(error);
-      // Keep what is on screen after a failed refresh; with nothing loaded
-      // yet, say why.
-      setState((current) => (current.status === 'ready'
+      // Keep what is on screen after a failed refresh of THIS workspace;
+      // with nothing of its own loaded yet, say why (never the last
+      // workspace's requests).
+      setHeld((current) => (current.scope === readScope && current.state.status === 'ready'
         ? current
-        : { status: offline ? 'offline' : 'error', requests: [], error: describeError(error) }));
+        : { scope: readScope, state: { status: offline ? 'offline' : 'error', requests: [], error: describeError(error) } }));
       return offline ? 'offline' : 'error';
     }
-  }, [userId]);
+  }, [userId, scope]);
 
   // Another account's requests never show for this one.
   useEffect(() => {
     if (userRef.current !== userId) {
       userRef.current = userId;
-      setState(INITIAL);
       setSeen({});
     }
     if (!userId) return undefined;
@@ -313,10 +356,11 @@ export function usePlacementRequests(userId: string | undefined, refreshKey: num
   }, [load, refreshKey]);
 
   const replace = useCallback((view: PlacementRequestView) => {
-    setState((current) => {
-      if (current.status !== 'ready') return { status: 'ready', requests: [view], error: '' };
-      const others = current.requests.filter((item) => item.request.id !== view.request.id);
-      return { ...current, requests: [view, ...others].sort((a, b) => b.request.createdAt.localeCompare(a.request.createdAt)) };
+    const into = scopeRef.current;
+    setHeld((current) => {
+      if (current.scope !== into || current.state.status !== 'ready') return { scope: into, state: { status: 'ready', requests: [view], error: '' } };
+      const others = current.state.requests.filter((item) => item.request.id !== view.request.id);
+      return { scope: into, state: { ...current.state, requests: [view, ...others].sort((a, b) => b.request.createdAt.localeCompare(a.request.createdAt)) } };
     });
   }, []);
 

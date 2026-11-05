@@ -70,9 +70,11 @@ COMMENT ON COLUMN public.case_benefits.oon_benefits IS
   'Whether the plan pays anything out-of-network: true, false (the family pays the full cost), or NULL (not known).';
 
 -- One program's answer: what the stay costs per day and what the plan needs.
+-- An allowed or billed rate is at least $1 (a 0 would read as a free stay;
+-- not known is NULL). A copay of 0 is a real "no copay".
 ALTER TABLE public.vob_requests
-  ADD COLUMN IF NOT EXISTS allowed_daily_rate integer DEFAULT NULL CHECK (allowed_daily_rate BETWEEN 0 AND 100000),
-  ADD COLUMN IF NOT EXISTS billed_daily_rate  integer DEFAULT NULL CHECK (billed_daily_rate BETWEEN 0 AND 100000),
+  ADD COLUMN IF NOT EXISTS allowed_daily_rate integer DEFAULT NULL CHECK (allowed_daily_rate BETWEEN 1 AND 100000),
+  ADD COLUMN IF NOT EXISTS billed_daily_rate  integer DEFAULT NULL CHECK (billed_daily_rate BETWEEN 1 AND 100000),
   ADD COLUMN IF NOT EXISTS copay_per_day      integer DEFAULT NULL CHECK (copay_per_day BETWEEN 0 AND 100000),
   ADD COLUMN IF NOT EXISTS precert_required   boolean DEFAULT NULL;
 
@@ -199,23 +201,30 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.case_benefits_apply_costs(uuid, uuid, jsonb) FROM PUBLIC, anon, authenticated;
 
--- Stores a VOB answer's cost keys (allowed_daily_rate, billed_daily_rate,
--- copay_per_day: whole dollars or null; precert_required: true, false or
--- null). Keys the patch does not carry keep their stored value.
+-- Stores a VOB answer's cost keys (allowed_daily_rate, billed_daily_rate:
+-- whole dollars from 1, or null; copay_per_day: whole dollars from 0, or
+-- null; precert_required: true, false or null). Keys the patch does not
+-- carry keep their stored value.
 CREATE OR REPLACE FUNCTION public.vob_requests_apply_costs(p_id uuid, p_org uuid, p_patch jsonb)
 RETURNS void
 LANGUAGE plpgsql
 SET search_path = public
 AS $$
+DECLARE
+  v_allowed integer;
+  v_billed integer;
 BEGIN
   IF NOT (p_patch ?| ARRAY['allowed_daily_rate', 'billed_daily_rate', 'copay_per_day', 'precert_required']) THEN
     RETURN;
   END IF;
+  v_allowed := public.patch_whole_number(p_patch, 'allowed_daily_rate', 'The allowed rate per day', 100000);
+  v_billed := public.patch_whole_number(p_patch, 'billed_daily_rate', 'The billed rate per day', 100000);
+  IF v_allowed = 0 OR v_billed = 0 THEN
+    RAISE EXCEPTION 'Enter the daily rate in dollars, or leave it blank if you do not know it.' USING ERRCODE = '22023';
+  END IF;
   UPDATE public.vob_requests r
-     SET allowed_daily_rate = CASE WHEN p_patch ? 'allowed_daily_rate'
-           THEN public.patch_whole_number(p_patch, 'allowed_daily_rate', 'The allowed rate per day', 100000) ELSE r.allowed_daily_rate END,
-         billed_daily_rate = CASE WHEN p_patch ? 'billed_daily_rate'
-           THEN public.patch_whole_number(p_patch, 'billed_daily_rate', 'The billed rate per day', 100000) ELSE r.billed_daily_rate END,
+     SET allowed_daily_rate = CASE WHEN p_patch ? 'allowed_daily_rate' THEN v_allowed ELSE r.allowed_daily_rate END,
+         billed_daily_rate = CASE WHEN p_patch ? 'billed_daily_rate' THEN v_billed ELSE r.billed_daily_rate END,
          copay_per_day = CASE WHEN p_patch ? 'copay_per_day'
            THEN public.patch_whole_number(p_patch, 'copay_per_day', 'The copay per day', 100000) ELSE r.copay_per_day END,
          precert_required = CASE WHEN p_patch ? 'precert_required'

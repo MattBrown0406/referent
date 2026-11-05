@@ -35,6 +35,10 @@ const COLORS = {
   amberSoft: '#FFFAEB',
 };
 
+// Who reads a rejection note: the program, in its portal (the listing's
+// claimant). Practitioners never do (fetch_listing_credential_notes).
+export const REJECTION_NOTE_LABEL = 'The program sees this note; practitioners do not';
+
 function openLink(url: string) {
   Linking.openURL(url).catch(() => Alert.alert('Could not open the page', url));
 }
@@ -143,7 +147,7 @@ export default function CredentialReviewQueue({ onBack, onCountChange }: Props) 
                   <Field label={item.kind === 'npi' ? 'NPI' : 'Number'} value={item.identifier} />
                   <Field label="Expires" value={expiryLine(item, today)} />
                   <Field label="Today" value={statusLabel((item.statusToday || 'pending') as CredentialStatus, 'listing')} />
-                  <Field label="Note" value={item.note} />
+                  <Field label="Program's note" value={item.note} />
                   <Field label="Changed" value={item.updatedAt.slice(0, 10)} />
                 </View>
                 <View style={styles.linkRow}>
@@ -176,13 +180,14 @@ export default function CredentialReviewQueue({ onBack, onCountChange }: Props) 
 
                 {rejectingId === item.id ? (
                   <View style={styles.rejectBox}>
+                    <Text style={styles.rejectLabel}>{REJECTION_NOTE_LABEL}</Text>
                     <TextInput
                       style={styles.noteInput}
                       value={note}
                       onChangeText={setNote}
-                      placeholder="What could not be confirmed? The program sees this note."
+                      placeholder="What could not be confirmed, and what would fix it?"
                       placeholderTextColor={COLORS.gray}
-                      accessibilityLabel="Note for the program"
+                      accessibilityLabel={`Note for the program. ${REJECTION_NOTE_LABEL}`}
                       multiline
                       maxLength={1000}
                     />
@@ -253,6 +258,7 @@ const styles = StyleSheet.create({
   fieldList: { gap: 6 },
   fieldRow: { flexDirection: 'row', gap: 10 },
   fieldLabel: { width: 80, fontSize: 13, fontWeight: '600', color: COLORS.gray },
+  rejectLabel: { fontSize: 12, fontWeight: '700', color: COLORS.gray, marginBottom: 4 },
   fieldValue: { flex: 1, fontSize: 14, color: COLORS.ink, lineHeight: 19 },
   linkRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   linkButton: { minHeight: 36, flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.blueSoft, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 7 },

@@ -9,13 +9,18 @@
 -- level, with a one-line reason.
 --
 --   1. level_of_care_recommendation: the rules, mirrored from
---      src/lib/level-of-care.ts (LEVEL_OF_CARE_RULES, version 1). Both test
---      suites check one digest of all 15,625 rating sets, so they agree.
+--      src/lib/level-of-care.ts (LEVEL_OF_CARE_RULES, version 2: Matt's
+--      clinical decisions of 2026-11-05). Both test suites check one digest
+--      of all 15,625 rating sets, so they agree.
 --   2. case_assessments: one row per assessment of a case. A case can be
 --      reassessed; the newest row is current. Six ratings (0-4) and six
 --      short notes (200 characters each), whether anyone was in immediate
 --      danger, the recommendation, the chosen level and the reason for a
---      different one, the rules version, who assessed and when.
+--      different one, the rules version, who assessed and when. A reason
+--      is needed whenever the chosen level is not where the recommendation
+--      starts (Detox when it is the first step), and it goes through the
+--      shared identifying-details check (identifying_text_problem, from
+--      20261104140000) because it goes into the program's packet.
 --   3. Reads: the case's workspace only (RLS). anon reads nothing. No client
 --      writes; save_case_assessment (SECURITY DEFINER) checks everything and
 --      writes the timeline entry, which names the levels and never a rating.
@@ -35,21 +40,38 @@
 
 BEGIN;
 
+-- Paste order: this file uses identifying_text_problem and
+-- identifying_case_names, and re-creates the workspace move with the
+-- placement request tables, so 20261104140000_placement_requests.sql must
+-- already be in. A skipped paste stops here, before anything changes.
+DO $$
+BEGIN
+  IF to_regclass('public.placement_requests') IS NULL OR to_regclass('public.placement_request_recipients') IS NULL
+     OR to_regprocedure('public.identifying_text_problem(text, text[])') IS NULL
+     OR to_regprocedure('public.identifying_case_names(uuid, uuid)') IS NULL THEN
+    RAISE EXCEPTION 'Paste 20261104140000_placement_requests.sql first: the placement request tables or the identifying-details check are missing.';
+  END IF;
+END
+$$;
+
 -- ===========================================================================
 -- 1. Pure helpers
 -- ===========================================================================
 
--- The rules, version 1. p_ratings: the six areas in order (withdrawal,
+-- The rules, version 2. p_ratings: the six areas in order (withdrawal,
 -- physical, emotional, readiness, relapse, environment), each 0-4.
 --   level       Inpatient when physical or emotional is 3+, relapse or
---               environment is 4, or two or more of readiness, relapse and
---               environment are 3+. Else IOP / PHP when physical, emotional
---               or relapse is 2+ or readiness is 3+. Else Therapist.
---               Withdrawal never sets it.
+--               environment is 4, two or more of readiness, relapse and
+--               environment are 3+, or four or more of physical, emotional,
+--               readiness, relapse and environment are 2+. Else IOP / PHP
+--               when physical, emotional or relapse is 2+, readiness is 3+,
+--               or withdrawal is 2+ (at 2 it needs medical oversight; at 3+
+--               detox comes first, and the step down after it is never
+--               lower than IOP / PHP). Else Therapist.
 --   first_step  Detox when withdrawal is 3+.
 --   support     Sober Living when environment is 3+.
--- NULL for a rules version this server does not know. Mirrors recommend()
--- in src/lib/level-of-care.ts; change both together.
+-- Only version 2 is accepted: NULL for any other. Mirrors recommend() in
+-- src/lib/level-of-care.ts; change both together.
 CREATE OR REPLACE FUNCTION public.level_of_care_recommendation(p_ratings integer[], p_rules_version integer)
 RETURNS jsonb
 LANGUAGE plpgsql IMMUTABLE
@@ -64,12 +86,14 @@ DECLARE
   e integer := p_ratings[6];
   v_level text := 'Therapist';
 BEGIN
-  IF p_rules_version IS DISTINCT FROM 1 THEN
+  IF p_rules_version IS DISTINCT FROM 2 THEN
     RETURN NULL;
   END IF;
-  IF p >= 3 OR m >= 3 OR u >= 4 OR e >= 4 OR ((r >= 3)::integer + (u >= 3)::integer + (e >= 3)::integer) >= 2 THEN
+  IF p >= 3 OR m >= 3 OR u >= 4 OR e >= 4
+     OR ((r >= 3)::integer + (u >= 3)::integer + (e >= 3)::integer) >= 2
+     OR ((p >= 2)::integer + (m >= 2)::integer + (r >= 2)::integer + (u >= 2)::integer + (e >= 2)::integer) >= 4 THEN
     v_level := 'Inpatient';
-  ELSIF p >= 2 OR m >= 2 OR u >= 2 OR r >= 3 THEN
+  ELSIF p >= 2 OR m >= 2 OR u >= 2 OR r >= 3 OR w >= 2 THEN
     v_level := 'IOP / PHP';
   END IF;
   RETURN jsonb_build_object(
@@ -80,8 +104,9 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.level_of_care_recommendation(integer[], integer) FROM PUBLIC, anon, authenticated;
 
--- The timeline wording: the levels only, never a rating. Mirrors
--- assessmentEventBody in src/lib/level-of-care.ts.
+-- The timeline wording: the levels only, never a rating. "; chosen X" when
+-- the chosen level is not where the recommendation starts (its first step,
+-- else its level). Mirrors assessmentEventBody in src/lib/level-of-care.ts.
 CREATE OR REPLACE FUNCTION public.case_assessment_event_body(p_level text, p_first_step text, p_support text, p_chosen text)
 RETURNS text
 LANGUAGE sql IMMUTABLE
@@ -91,14 +116,16 @@ AS $$
     || CASE WHEN p_first_step IS NOT NULL THEN p_first_step || ', then ' ELSE '' END
     || p_level
     || CASE WHEN p_support IS NOT NULL THEN ', with ' || p_support ELSE '' END
-    || CASE WHEN p_chosen IS DISTINCT FROM p_level THEN '; chosen ' || p_chosen ELSE '' END
+    || CASE WHEN p_chosen IS DISTINCT FROM coalesce(p_first_step, p_level) THEN '; chosen ' || p_chosen ELSE '' END
 $$;
 REVOKE ALL ON FUNCTION public.case_assessment_event_body(text, text, text, text) FROM PUBLIC, anon, authenticated;
 
 -- The first thing wrong with the reason for choosing a different level, or
--- NULL. It goes into the program's copy of the packet: one line, no email
--- addresses, phone or ID numbers, or links. Mirrors reasonProblem.
-CREATE OR REPLACE FUNCTION public.case_assessment_reason_problem(p_reason text)
+-- NULL. It goes into the program's copy of the packet: 3 to 200 characters,
+-- one line, then the identifying-details check (no email addresses, links,
+-- money, dates, phone or ID numbers, or a name word from p_names: the
+-- case's title and its contacts' names). Mirrors reasonProblem.
+CREATE OR REPLACE FUNCTION public.case_assessment_reason_problem(p_reason text, p_names text[])
 RETURNS text
 LANGUAGE sql IMMUTABLE
 SET search_path = pg_catalog
@@ -107,20 +134,19 @@ AS $$
     WHEN length(btrim(coalesce(p_reason, ''))) < 3 THEN 'Say why you chose a different level. The reason goes in the program''s packet.'
     WHEN length(btrim(p_reason)) > 200 THEN 'Keep the reason to 200 characters'
     WHEN p_reason ~ '[[:cntrl:]]' THEN 'Keep the reason to one line'
-    WHEN p_reason ~ '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}' THEN 'Leave email addresses out of the reason'
-    WHEN p_reason ~ '[0-9]([ ().-]*[0-9]){6,}' THEN 'Leave phone and ID numbers out of the reason'
-    WHEN p_reason ~* '(https?:|www[.])' THEN 'Leave links out of the reason'
+    ELSE public.identifying_text_problem(p_reason, p_names)
   END
 $$;
-REVOKE ALL ON FUNCTION public.case_assessment_reason_problem(text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.case_assessment_reason_problem(text, text[]) FROM PUBLIC, anon, authenticated;
 
 -- The first thing wrong with an assessment, in plain words, or NULL: six
 -- ratings 0-4, six notes (or none) of at most 200 characters, a level of
 -- care, the recommendation the app showed matching these rules, and a reason
--- when the chosen level is neither the recommended level nor its first step.
+-- whenever the chosen level is not where the recommendation starts (its
+-- first step when it has one, else its level). p_names: see the reason.
 CREATE OR REPLACE FUNCTION public.case_assessment_problem(
   p_ratings integer[], p_notes text[], p_rules_version integer, p_level text, p_first_step text,
-  p_support text, p_chosen text, p_reason text)
+  p_support text, p_chosen text, p_reason text, p_names text[])
 RETURNS text
 LANGUAGE plpgsql IMMUTABLE
 SET search_path = public, pg_catalog
@@ -149,13 +175,13 @@ BEGIN
      IS DISTINCT FROM (p_level, nullif(p_first_step, ''), nullif(p_support, '')) THEN
     RETURN 'The recommendation on this phone does not match the server''s rules. Update the app, then save again.';
   END IF;
-  IF p_chosen = v_rec ->> 'level' OR p_chosen IS NOT DISTINCT FROM v_rec ->> 'first_step' THEN
+  IF p_chosen = coalesce(v_rec ->> 'first_step', v_rec ->> 'level') THEN
     RETURN NULL;
   END IF;
-  RETURN public.case_assessment_reason_problem(p_reason);
+  RETURN public.case_assessment_reason_problem(p_reason, p_names);
 END
 $$;
-REVOKE ALL ON FUNCTION public.case_assessment_problem(integer[], text[], integer, text, text, text, text, text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.case_assessment_problem(integer[], text[], integer, text, text, text, text, text, text[]) FROM PUBLIC, anon, authenticated;
 
 -- ===========================================================================
 -- 2. The table
@@ -164,7 +190,8 @@ REVOKE ALL ON FUNCTION public.case_assessment_problem(integer[], text[], integer
 -- One assessment of one case; the newest (assessed_at, then id) is current.
 -- id is made by the app, so a retry after a timeout is a no-op. The timeline
 -- entry it wrote has the same id. override_reason is empty exactly when the
--- chosen level is the recommended level or its first step.
+-- chosen level is where the recommendation starts: its first step when it
+-- has one (Detox), else the recommended level.
 CREATE TABLE IF NOT EXISTS public.case_assessments (
   id                     uuid PRIMARY KEY,
   org_id                 uuid NOT NULL REFERENCES public.orgs(id) ON DELETE CASCADE,
@@ -192,7 +219,7 @@ CREATE TABLE IF NOT EXISTS public.case_assessments (
   assessed_at            timestamptz NOT NULL DEFAULT now(),
   created_at             timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT case_assessments_override_reason CHECK (
-    (chosen_level = recommended_level OR chosen_level IS NOT DISTINCT FROM recommended_first_step) = (override_reason = '')),
+    (chosen_level = coalesce(recommended_first_step, recommended_level)) = (override_reason = '')),
   CONSTRAINT case_assessments_case_org_fk FOREIGN KEY (case_id, org_id)
     REFERENCES public.cases (id, org_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE
 );
@@ -238,7 +265,8 @@ REVOKE ALL ON FUNCTION public.case_assessment_json(public.case_assessments) FROM
 
 -- Save an assessment of a case in the caller's workspace, and its timeline
 -- entry (same id). The app makes p_id: a retry returns the saved row and
--- changes nothing. case_assessment_problem checks everything.
+-- changes nothing. case_assessment_problem checks everything; the reason
+-- is screened against the case's title and its contacts' names.
 CREATE OR REPLACE FUNCTION public.save_case_assessment(
   p_id uuid, p_case_id uuid, p_ratings integer[], p_notes text[], p_imminent_danger boolean,
   p_rules_version integer, p_recommended_level text, p_recommended_first_step text,
@@ -271,11 +299,11 @@ BEGIN
     RAISE EXCEPTION 'Case not found' USING ERRCODE = 'P0002';
   END IF;
   v_problem := public.case_assessment_problem(p_ratings, p_notes, p_rules_version, p_recommended_level,
-    p_recommended_first_step, p_recommended_support, p_chosen_level, p_override_reason);
+    p_recommended_first_step, p_recommended_support, p_chosen_level, p_override_reason, public.identifying_case_names(p_case_id, v_org));
   IF v_problem IS NOT NULL THEN
     RAISE EXCEPTION '%', v_problem USING ERRCODE = '22023';
   END IF;
-  v_follows := p_chosen_level = p_recommended_level OR p_chosen_level IS NOT DISTINCT FROM nullif(p_recommended_first_step, '');
+  v_follows := p_chosen_level = coalesce(nullif(p_recommended_first_step, ''), p_recommended_level);
   INSERT INTO public.case_assessments (id, org_id, case_id, withdrawal_rating, physical_rating, emotional_rating,
     readiness_rating, relapse_rating, environment_rating, withdrawal_note, physical_note, emotional_note,
     readiness_note, relapse_note, environment_note, imminent_danger, recommended_level, recommended_first_step,

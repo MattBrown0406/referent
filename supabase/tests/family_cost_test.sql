@@ -9,7 +9,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(73);
+SELECT plan(79);
 
 -- Actors
 --   u1  owner of practice P
@@ -97,6 +97,18 @@ SELECT throws_ok(
      VALUES ('a1000000-0000-0000-0000-0000000fc001', current_setting('test.org_p')::uuid, 'a9000000-0000-0000-0000-0000000fc002', 'x', 100001) $$,
   '23514', NULL,
   'a daily rate above $100,000 cannot be stored'
+);
+SELECT throws_ok(
+  $$ INSERT INTO public.vob_requests (owner_id, org_id, case_id, program_name, allowed_daily_rate)
+     VALUES ('a1000000-0000-0000-0000-0000000fc001', current_setting('test.org_p')::uuid, 'a9000000-0000-0000-0000-0000000fc002', 'x', 0) $$,
+  '23514', NULL,
+  'an allowed rate of $0 cannot be stored (not known is NULL)'
+);
+SELECT throws_ok(
+  $$ INSERT INTO public.vob_requests (owner_id, org_id, case_id, program_name, billed_daily_rate)
+     VALUES ('a1000000-0000-0000-0000-0000000fc001', current_setting('test.org_p')::uuid, 'a9000000-0000-0000-0000-0000000fc002', 'x', 0) $$,
+  '23514', NULL,
+  'nor a billed rate of $0'
 );
 
 -- ===========================================================================
@@ -457,6 +469,26 @@ SELECT throws_ok(
   $$ SELECT * FROM public.update_vob_status('c3000000-0000-0000-0000-0000000fc002', jsonb_build_object('allowed_daily_rate', 100001), NULL) $$,
   '22023', 'The allowed rate per day must be a whole number from 0 to 100000',
   'a daily rate over $100,000 is refused'
+);
+SELECT throws_ok(
+  $$ SELECT * FROM public.update_vob_status('c3000000-0000-0000-0000-0000000fc002', jsonb_build_object('allowed_daily_rate', 0), NULL) $$,
+  '22023', 'Enter the daily rate in dollars, or leave it blank if you do not know it.',
+  'an allowed rate of $0 is refused in plain words'
+);
+SELECT throws_ok(
+  $$ SELECT * FROM public.update_vob_status('c3000000-0000-0000-0000-0000000fc002', jsonb_build_object('status', 'not_accepted', 'billed_daily_rate', '0'), NULL) $$,
+  '22023', 'Enter the daily rate in dollars, or leave it blank if you do not know it.',
+  'a billed rate of $0 is refused too, and the status change with it'
+);
+SELECT is(
+  (SELECT (status, allowed_daily_rate, billed_daily_rate)::text FROM public.vob_requests WHERE id = 'c3000000-0000-0000-0000-0000000fc002'),
+  '(in_network,600,1300)',
+  'a refused $0 rate changes nothing'
+);
+SELECT is(
+  (SELECT event_body FROM public.update_vob_status('c3000000-0000-0000-0000-0000000fc002', jsonb_build_object('copay_per_day', 0, 'billed_daily_rate', 1), NULL)),
+  '',
+  'a $0 copay (no copay) and a $1 rate are fine'
 );
 SELECT throws_ok(
   $$ SELECT * FROM public.update_vob_status('c3000000-0000-0000-0000-0000000fc002', jsonb_build_object('copay_per_day', 12.5), NULL) $$,

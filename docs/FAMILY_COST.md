@@ -41,10 +41,15 @@ in-network (`in_`) and out-of-network (`oon_`) separately:
 | `precert_required` | Does the plan need pre-authorization? `true`, `false`, or `null` |
 
 Every column is nullable with no default: **null means "not entered"**,
-never 0. A real 0 (a $0 deductible, 0% coinsurance) is stored as 0 and is
-different from blank. Whole dollars only, parsed in the app with
+never 0. A real 0 (a $0 deductible, 0% coinsurance, a $0 copay) is stored as
+0 and is different from blank. Whole dollars only, parsed in the app with
 `parseWholeDollars` like every other money field. Limits: plan amounts $0 to
-$1,000,000, daily amounts $0 to $100,000, coinsurance 0 to 100.
+$1,000,000, the copay $0 to $100,000, coinsurance 0 to 100, and the
+**allowed and billed daily rates $1 to $100,000**: a $0 rate would read as a
+free stay, so it is refused (CHECK `BETWEEN 1 AND 100000`, and in
+`vob_requests_apply_costs` with the 22023 message "Enter the daily rate in
+dollars, or leave it blank if you do not know it."). Not known is blank
+(null).
 
 Rules, enforced in the app, in `case_benefits_merge_costs` (plain-words
 errors), and by CHECK constraints as a backstop:

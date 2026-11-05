@@ -42,7 +42,7 @@ function transpileTo(relSrc, outName, rewrite = (js) => js) {
 
 mkdirSync(path.join(tmpDir, 'lib'), { recursive: true });
 transpileTo('src/data.ts', 'data.js');
-for (const name of ['beds', 'matching', 'integrity', 'errors', 'placement-requests']) transpileTo(`src/lib/${name}.ts`, `lib/${name}.js`);
+for (const name of ['beds', 'matching', 'integrity', 'errors', 'identifying-text', 'placement-requests']) transpileTo(`src/lib/${name}.ts`, `lib/${name}.js`);
 transpileTo('portal/src/placement-rules.ts', 'portal/placement-rules.js');
 
 // placement-api.ts with its device and network edges stubbed: a fake
@@ -108,7 +108,7 @@ const riveraMatch = {
   caseId: 'f1000000-0000-0000-0000-0000000000a7',
 };
 {
-  const prepared = rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: 'this_week', note: '  Prefers a quiet setting  ', identifiers: [riveraMatch.clientLabel, 'Rivera intervention'] });
+  const prepared = rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: 'this_week', note: '  Prefers a quiet setting  ', names: [riveraMatch.clientLabel, 'Rivera intervention'] });
   check('the fixture builds the server\'s payload exactly', prepared.payload, JSON.parse(FIXTURE_JSON));
   check('the note is sent trimmed', prepared.note, 'Prefers a quiet setting');
   check('exactly the ten allowed keys', Object.keys(prepared.payload).sort(), [...rules.PAYLOAD_KEYS].sort());
@@ -172,9 +172,14 @@ check(
   ok('the response windows are 4, 24 and 48 hours on both sides', /p_respond_hours NOT IN \(4, 24, 48\)/.test(migration) && rules.RESPONSE_WINDOW_HOURS.join(',') === '4,24,48');
   ok('at most 8 programs and 20 requests a day on both sides',
     migration.includes('cardinality(v_ids) > 8') && migration.includes(">= 20 THEN") && rules.MAX_RECIPIENTS === 8 && rules.MAX_REQUESTS_PER_DAY === 20);
-  ok('the note patterns are the server\'s', migration.includes("p_note ~ '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}'")
-    && migration.includes("p_note ~ '[0-9]([ ().-]*[0-9]){6,}'") && migration.includes("p_note ~* '(https?:|www[.])'"));
+  // The note: 300 characters, then the one shared check (identifying-text.ts
+  // and its SQL twin public.identifying_text_problem, tested on both sides
+  // with scripts/fixtures/identifying-text-cases.json).
+  ok('the server checks the note with the shared identifying-details check', /public\.identifying_text_problem\(p_note, p_identifiers\)/.test(migration));
   for (const message of Object.values(rules.NOTE_PROBLEMS)) ok(`the note message is the server's: ${message}`, migration.includes(message.replace(/'/g, "''")));
+  const appRules = readFileSync(path.join(repoRoot, 'src/lib/placement-requests.ts'), 'utf8');
+  ok('the app\'s note check is the shared one, with no ad hoc patterns left', appRules.includes("import { identifyingTextProblem } from './identifying-text';")
+    && /return identifyingTextProblem\(text, /.test(appRules) && !/const (EMAIL|NUMBER_RUN|LINK) =/.test(appRules));
   for (const message of Object.values(rules.ANSWER_PROBLEMS)) ok(`the answer message is the server's: ${message}`, migration.includes(message));
   for (const column of [...rules.REQUEST_COLUMNS, ...rules.RECIPIENT_COLUMNS]) {
     ok(`the app reads a column the migration makes: ${column}`, new RegExp(`\\n  ${column} +[a-z]`).test(migration));
@@ -183,6 +188,7 @@ check(
 
 // ─── (c) The note ───────────────────────────────────────────────────────────
 
+const identifying = require(path.join(tmpDir, 'lib', 'identifying-text.js'));
 check('the note rules (the same table as the pgTAP test)', [
   rules.placementNoteProblem('Prefers a quiet setting, 30 days sober before', ['Rivera family']),
   rules.placementNoteProblem('Call mom at jane.rivera@example.com'),
@@ -192,11 +198,50 @@ check('the note rules (the same table as the pgTAP test)', [
   rules.placementNoteProblem('Family can pay $30,000'),
   rules.placementNoteProblem('The rivera FAMILY prefers women staff', ['Rivera family', null]),
   rules.placementNoteProblem('a'.repeat(301)),
-], [null, rules.NOTE_PROBLEMS.email, rules.NOTE_PROBLEMS.number, rules.NOTE_PROBLEMS.number, rules.NOTE_PROBLEMS.link, rules.NOTE_PROBLEMS.money, rules.NOTE_PROBLEMS.label, rules.NOTE_PROBLEMS.tooLong]);
+  rules.placementNoteProblem('Family can pay 40,000 cash'),
+  rules.placementNoteProblem('Seen Nov 12, admit soon'),
+  rules.placementNoteProblem('Line one\nline two'),
+  rules.placementNoteProblem('Son prefers a family program', ['Rivera family \u2014 son Jake']),
+], [null,
+  'Leave out email addresses. Programs read this.',
+  'Leave out phone and ID numbers. Programs read this.',
+  'Leave out dates such as a birth date. Programs read this.',
+  'Leave out links and web addresses. Programs read this.',
+  'Leave money out. Programs read this.',
+  'Leave out names. Programs read this.',
+  rules.NOTE_PROBLEMS.tooLong,
+  'Leave money out. Programs read this.',
+  'Leave out dates such as a birth date. Programs read this.',
+  'Remove line breaks and hidden characters.',
+  null]);
+ok('the pgTAP test asserts the same note table', pgtap.includes("placement_note_problem('Seen Nov 12, admit soon'") && pgtap.includes("'Remove line breaks and hidden characters.'"));
+{
+  // Every case of the shared fixture reads the same through the note check
+  // (under 300 characters, the note check IS identifyingTextProblem).
+  const fixture = JSON.parse(readFileSync(path.join(repoRoot, 'scripts/fixtures/identifying-text-cases.json'), 'utf8'));
+  const cases = Array.isArray(fixture) ? fixture : fixture.cases || [];
+  let compared = 0;
+  for (const item of cases) {
+    const text = item.text;
+    const names = item.names ?? fixture.names ?? [];
+    if (typeof text !== 'string' || text.trim() !== text || Array.from(text).length > 300) continue;
+    assert.deepEqual(rules.placementNoteProblem(text, names), identifying.identifyingTextProblem(text, names), `note check = shared check: ${text.slice(0, 40)}`);
+    compared += 1;
+  }
+  ok(`the note check agrees with the shared check on the fixture (${compared} cases)`, compared > 10);
+}
+check('names: the client label, the case title and its contacts, blanks left out', rules.placementNoteNames({ clientLabel: 'Rivera family', caseTitle: 'Rivera intervention', contactNames: ['Maria Lopez', '  ', null] }), ['Rivera family', 'Rivera intervention', 'Maria Lopez']);
+check('a contact\'s name is refused', rules.placementNoteProblem('Maria prefers mornings', rules.placementNoteNames({ clientLabel: 'J.R.', contactNames: ['Maria Lopez'] })), 'Leave out names. Programs read this.');
 check('a two-letter label never blocks a note', rules.placementNoteProblem('JD prefers mornings', ['JD']), null);
-check('a note naming the case title is refused', 'problem' in rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: 'asap', note: 'See the Rivera intervention notes', identifiers: [riveraMatch.clientLabel, 'Rivera intervention'] }), true);
-check('the admit window is required', rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: null, note: '', identifiers: [] }), { problem: 'Choose when the client could be admitted' });
-ok('the note warning says what to leave out', /names/.test(rules.NOTE_WARNING) && /phone/.test(rules.NOTE_WARNING) && /money/.test(rules.NOTE_WARNING));
+check('a note naming the case title is refused', 'problem' in rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: 'asap', note: 'See the Rivera intervention notes', names: [riveraMatch.clientLabel, 'Rivera intervention'] }), true);
+check('the admit window is required', rules.preparePlacementRequest({ criteria: riveraMatch, admitWindow: null, note: '', names: [] }), { problem: 'Choose when the client could be admitted' });
+ok('the note warning says what to leave out', /names/.test(rules.NOTE_WARNING) && /phone/.test(rules.NOTE_WARNING) && /dates/.test(rules.NOTE_WARNING) && /money/.test(rules.NOTE_WARNING));
+{
+  const sheet = readFileSync(path.join(repoRoot, 'src/lib/PlacementRequestSheet.tsx'), 'utf8');
+  ok('the sheet checks the note against the label, the case title and its contacts', /placementNoteNames\(\{ clientLabel: request\.match\.clientLabel, caseTitle: request\.caseTitle, contactNames: request\.contactNames \}\)/.test(sheet));
+  const app = readFileSync(path.join(repoRoot, 'App.tsx'), 'utf8');
+  ok('the app hands the sheet the case\'s contact names', /contactNames: saved\.caseId \? caseContactNames\(saved\.caseId\) : \[\],/.test(app));
+}
 
 // ─── (d) The summary programs read, by text or email ───────────────────────
 
@@ -367,25 +412,29 @@ function query(result) {
   check('requests come back with their programs in rank order', [read.available, read.requests[0].recipients.map((item) => item.rank)], [true, [1, 2]]);
 
   fake.rpc = (name, args) => {
-    check('create sends the saved match, the ranked ids, and no criteria of its own', [name, args.p_match_profile_id, args.p_partner_ids, args.p_criteria, args.p_respond_hours, args.p_note],
-      ['create_placement_request', 'm1', ['p1', 'p2'], null, 24, 'Prefers a quiet setting']);
+    check('create sends the saved match, the ranked ids, their places on the match screen, and no criteria of its own', [name, args.p_match_profile_id, args.p_partner_ids, args.p_ranks, args.p_criteria, args.p_respond_hours, args.p_note],
+      ['create_placement_request', 'm1', ['p1', 'p2'], [1, 3], null, 24, 'Prefers a quiet setting']);
     ok('nothing identifying rides along', !JSON.stringify(args).toLowerCase().includes('rivera') && !('p_client_label' in args) && !('p_budget' in args));
-    return Promise.resolve({ data: { request: requestRow, recipients: [recipientRow({ rank: 1 }), recipientRow({ rank: 2 })] }, error: null, status: 200 });
+    return Promise.resolve({ data: { request: requestRow, recipients: [recipientRow({ rank: 1 }), recipientRow({ rank: 3 })] }, error: null, status: 200 });
   };
   const id = api.newPlacementRequestId();
-  const created = await api.createPlacementRequest({ id, matchProfileId: 'm1', partnerIds: ['p1', 'p2'], respondHours: 24, admitWindow: 'this_week', note: 'Prefers a quiet setting' });
-  check('the created request reads back', [created.request.id, created.recipients.length], ['q1', 2]);
+  const created = await api.createPlacementRequest({ id, matchProfileId: 'm1', partnerIds: ['p1', 'p2'], ranks: [1, 3], respondHours: 24, admitWindow: 'this_week', note: 'Prefers a quiet setting' });
+  check('the created request reads back, numbered as on the match screen', [created.request.id, created.recipients.map((item) => item.rank)], ['q1', [1, 3]]);
 
   fake.rpc = () => Promise.resolve({ data: null, error: { message: 'TypeError: Network request failed' }, status: 0 });
-  await assert.rejects(api.createPlacementRequest({ id, matchProfileId: 'm1', partnerIds: ['p1'], respondHours: 4, admitWindow: 'asap', note: '' }), (error) => error instanceof errors.OfflineError);
+  await assert.rejects(api.createPlacementRequest({ id, matchProfileId: 'm1', partnerIds: ['p1'], ranks: [1], respondHours: 4, admitWindow: 'asap', note: '' }), (error) => error instanceof errors.OfflineError);
   checks += 1;
   await assert.rejects(api.logManualAnswer('r1', { bedAvailable: 'yes', likelyAccept: 'yes', earliestAdmitOn: null, dailyRate: null, costNote: '', note: '' }), (error) => error instanceof errors.OfflineError);
   checks += 1;
   await assert.rejects(api.cancelPlacementRequest('q1'), (error) => error instanceof errors.OfflineError);
   checks += 1;
   fake.rpc = () => Promise.resolve({ data: null, error: { code: '22023', message: 'A request can go to at most 8 programs' }, status: 400 });
-  await assert.rejects(api.createPlacementRequest({ id, matchProfileId: 'm1', partnerIds: ['p1'], respondHours: 4, admitWindow: 'asap', note: '' }),
+  await assert.rejects(api.createPlacementRequest({ id, matchProfileId: 'm1', partnerIds: ['p1'], ranks: [1], respondHours: 4, admitWindow: 'asap', note: '' }),
     (error) => error instanceof errors.StoreError && !(error instanceof errors.OfflineError) && error.message === 'A request can go to at most 8 programs');
+  checks += 1;
+  fake.rpc = () => Promise.resolve({ data: null, error: { code: '22023', message: rules.ALREADY_SENT_PROBLEM }, status: 400 });
+  await assert.rejects(api.createPlacementRequest({ id, matchProfileId: 'm1', partnerIds: ['p1'], ranks: [1], respondHours: 4, admitWindow: 'asap', note: '' }),
+    (error) => error.message === 'This request already went out as first written. Cancel it and send a new one.');
   checks += 1;
   fake.rpc = () => Promise.resolve({ data: null, error: { code: '22023', message: 'The program already answered in ReferralFit' }, status: 400 });
   await assert.rejects(api.logManualAnswer('r1', { bedAvailable: 'yes', likelyAccept: 'yes', earliestAdmitOn: null, dailyRate: null, costNote: '', note: '' }),
@@ -393,8 +442,58 @@ function query(result) {
   checks += 1;
 
   const sheet = readFileSync(path.join(repoRoot, 'src/lib/PlacementRequestSheet.tsx'), 'utf8');
-  ok('one id per request, reused on retry (a retry is a no-op on the server)', /const id = requestIdRef\.current \|\| newPlacementRequestId\(\);\s*requestIdRef\.current = id;/.test(sheet));
-  ok('a changed choice of programs is a new request', /requestIdRef\.current = null; \/\/ a different request now/.test(sheet));
+  ok('one id per request as reviewed, reused only for that exact request (a retry is a no-op on the server)',
+    /const signature = placementRequestSignature\(reviewed\);\s*const id = requestKeyRef\.current\?\.signature === signature \? requestKeyRef\.current\.id : newPlacementRequestId\(\);\s*requestKeyRef\.current = \{ id, signature \};/.test(sheet));
+  ok('the sheet sends what it reviewed, with each program\'s place on the match screen', /partnerIds: reviewed\.partnerIds,/.test(sheet) && /ranks: chosen\.map\(\(option\) => option\.rank\),/.test(sheet)
+    && /respondHours: reviewed\.respondHours,/.test(sheet) && /admitWindow: reviewed\.admitWindow,/.test(sheet) && /note: reviewed\.note,/.test(sheet));
+  ok('a request the server kept as first written is said, with Cancel offered', /if \(sentDiffersFromReview\(view, reviewed\)\) \{/.test(sheet) && /error\.message === ALREADY_SENT_PROBLEM/.test(sheet)
+    && sheet.includes('cancelPlacementRequest(conflict.requestId)') && sheet.includes('Cancel the earlier request'));
+  ok('the review lists each program by its number on the match screen', /\{option\.rank\}\. \{option\.partner\.organization \|\| option\.partner\.name\}/.test(sheet));
+
+  // Any change to what was reviewed is a new request with a new id.
+  const reviewed = { partnerIds: ['P1', 'p2'], note: 'Prefers a quiet setting', respondHours: 24, admitWindow: 'this_week' };
+  const same = rules.placementRequestSignature(reviewed);
+  check('the same request reads the same (a retry keeps its id)', rules.placementRequestSignature({ ...reviewed, partnerIds: ['p1', 'P2'], note: ' Prefers a quiet setting ' }), same);
+  check('every reviewed input changes the request', [
+    rules.placementRequestSignature({ ...reviewed, partnerIds: ['p1'] }),
+    rules.placementRequestSignature({ ...reviewed, partnerIds: ['p2', 'p1'] }),
+    rules.placementRequestSignature({ ...reviewed, note: 'Prefers a small program' }),
+    rules.placementRequestSignature({ ...reviewed, respondHours: 48 }),
+    rules.placementRequestSignature({ ...reviewed, admitWindow: 'asap' }),
+  ].map((value) => value !== same), [true, true, true, true, true]);
+
+  // What came back is checked against what was reviewed.
+  const back = rules.viewFromJson({
+    request: { ...requestRow, created_at: '2026-11-04T12:00:00Z', respond_by: '2026-11-05T12:00:00Z', payload: { ...JSON.parse(FIXTURE_JSON), admit_window: 'this_week', note: 'Prefers a quiet setting' } },
+    recipients: [recipientRow({ rank: 1, partner_id: 'p1' }), recipientRow({ rank: 3, partner_id: 'p2' })],
+  });
+  check('the response window the server gave', rules.responseHoursOf(back.request), 24);
+  check('what was reviewed came back', rules.sentDiffersFromReview(back, reviewed), false);
+  check('another note, admit window, response window or set of programs did not', [
+    rules.sentDiffersFromReview(back, { ...reviewed, note: 'Something else' }),
+    rules.sentDiffersFromReview(back, { ...reviewed, admitWindow: 'asap' }),
+    rules.sentDiffersFromReview(back, { ...reviewed, respondHours: 4 }),
+    rules.sentDiffersFromReview(back, { ...reviewed, partnerIds: ['p1', 'p3'] }),
+    rules.sentDiffersFromReview(back, { ...reviewed, partnerIds: ['p1'] }),
+  ], [true, true, true, true, true]);
+  check('the words for it are the server\'s', rules.ALREADY_SENT_PROBLEM, 'This request already went out as first written. Cancel it and send a new one.');
+
+  // The sender's name programs read: placement_practice_name's rule.
+  check('the practice name programs read', [
+    rules.placementPracticeName('Cascade Interventions', { organization: 'Cascade LLC', name: 'Dana' }),
+    rules.placementPracticeName('My Practice', { organization: ' Cascade LLC ', name: 'Dana' }),
+    rules.placementPracticeName('', { organization: '', name: 'Dana Lee' }),
+    rules.placementPracticeName('  ', null),
+    rules.placementPracticeName('My Practice', { organization: '  ', name: '  ' }),
+  ], ['Cascade Interventions', 'Cascade LLC', 'Dana Lee', 'A ReferralFit practice', 'A ReferralFit practice']);
+  ok('the same rule as the server', /btrim\(o\.name\) NOT IN \('', 'My Practice'\)/.test(migration) && /coalesce\(nullif\(btrim\(g\.organization\), ''\), g\.name, ''\)/.test(migration) && migration.includes("'A ReferralFit practice')"));
+  check('a text never says "with A ReferralFit practice"', rules.practiceNameForMessage('A ReferralFit practice'), '');
+  ok('the sheet previews that name', sheet.includes('fetchPlacementPracticeName()') && /From \{practiceShown\}/.test(sheet) && !/practiceShown \|\| 'A ReferralFit practice'/.test(sheet));
+  const apiSource = readFileSync(path.join(repoRoot, 'src/lib/placement-api.ts'), 'utf8');
+  ok('the name is read the server\'s way: the workspace, then its own directory profile', apiSource.includes(".eq('owner_org_id', orgId).is('merged_into', null).order('id', { ascending: true }).limit(1)")
+    && apiSource.includes('return placementPracticeName('));
+  const compare = readFileSync(path.join(repoRoot, 'src/lib/PlacementCompare.tsx'), 'utf8');
+  ok('the answers screen texts with the same name, and its numbers are the match screen\'s', compare.includes('fetchPlacementPracticeName()') && compare.includes("Numbers are each program's place in your match results when you asked."));
 }
 
 // ─── (i) The center portal's mirror agrees ──────────────────────────────────
@@ -528,11 +627,15 @@ function topLevelStatements(sql) {
   for (const name of ['referral_handoffs', 'referral_handoff_events', 'referral_sources', 'referral_intake_submissions', 'referral_intake_rate_limits', 'center_availability']) {
     ok(`no object named ${name}`, !migration.includes(name));
   }
-  // Purely additive: only new objects, plus the two internal workspace
-  // helpers re-created from their latest definitions (same signatures).
-  const recreated = created.filter((name) => !name.startsWith('placement_') && !['create_placement_request', 'cancel_placement_request', 'close_placement_request',
+  // Purely additive: only new objects (the placement functions and the
+  // shared identifying-details check, identifying_*), plus existing helpers
+  // re-created from their latest definitions (same signatures): the two
+  // workspace-move helpers, and merge_global_partners (open requests and a
+  // listing's credentials follow a merged listing).
+  const recreated = created.filter((name) => !name.startsWith('placement_') && !name.startsWith('identifying_') && !['create_placement_request', 'cancel_placement_request', 'close_placement_request',
     'log_manual_response', 'list_center_placement_requests', 'mark_placement_request_viewed', 'respond_to_placement_request'].includes(name));
-  check('the only existing functions re-created are the two workspace-move helpers', recreated.sort(), ['org_merge_linked_partner_copies', 'org_move_workspace_rows']);
+  ok('the workspace-move helpers are re-created', recreated.includes('org_merge_linked_partner_copies') && recreated.includes('org_move_workspace_rows'));
+  check('and no other existing function but merge_global_partners', recreated.filter((name) => !['org_merge_linked_partner_copies', 'org_move_workspace_rows', 'merge_global_partners'].includes(name)), []);
   ok('no existing table is altered and nothing is dropped', !/ALTER TABLE (?!public\.placement_request)/.test(migration) && !/DROP (TABLE|FUNCTION|COLUMN|TRIGGER)/.test(migration));
   const previous = readFileSync(path.join(repoRoot, 'supabase/migrations/20261104130000_program_integrity.sql'), 'utf8');
   const merge = (sql) => sql.slice(sql.indexOf('CREATE OR REPLACE FUNCTION public.org_merge_linked_partner_copies'), sql.indexOf('REVOKE ALL ON FUNCTION public.org_merge_linked_partner_copies'));

@@ -14,7 +14,9 @@ side by side within hours.
 - Center portal: `portal/src/PlacementRequests.tsx` with
   `portal/src/placement-rules.ts`
 - Tests: `scripts/placement-request-test.mjs`,
-  `supabase/tests/placement_requests_test.sql`
+  `supabase/tests/placement_requests_test.sql`; the shared
+  identifying-details check: `scripts/identifying-text-test.mjs`,
+  `supabase/tests/identifying_text_test.sql`
 
 ## The ethics (non-negotiable)
 
@@ -66,10 +68,30 @@ The rules hold whatever the client sends:
 - Without a saved match, `create_placement_request` reads only seven named
   criteria from `p_criteria`; anything else (a label, a budget, an email, a
   phone, a name, an address) is ignored. Tested.
-- The note is refused, in plain words, if it has an email address, a run of
-  seven or more digits (a phone, an ID, a date), a link, a dollar sign, or
-  the saved match's label or its case's title. Names cannot be detected
-  reliably, so the app warns under the field: "Programs read this note.
+- The note (at most 300 characters) goes through the one identifying-details
+  check every free-text field a program reads shares:
+  `public.identifying_text_problem(p_text, p_names)`, the SQL twin of
+  `identifyingTextProblem` in `src/lib/identifying-text.ts` (both test
+  suites run every case in `scripts/fixtures/identifying-text-cases.json`;
+  `supabase/tests/identifying_text_test.sql` on the server). In order, it
+  refuses hidden or reordering characters and line breaks, email addresses
+  (including "at ... dot com" and a fullwidth @), links and bare domains,
+  money (currency signs, comma thousands, "40k", budget words), dates and a
+  date of birth (numeric dates, and a month as a whole word or its standard
+  abbreviation followed by a day: "Dec 12", "december 3" and "Sept. 14" are
+  refused, "decent 12" and "marvel 3" are not), phone and ID numbers (six
+  or more digits with any separators; fullwidth digits fold to ASCII under
+  NFKC), and the **name words** of the saved match's client label, the
+  case's title and the names of the case's contacts (words of three or more
+  letters, ignoring case, relationship words such as son, mom or family,
+  and the ordinary words case titles are made of, such as intervention,
+  placement, case, lead, call, consult, inquiry, referral, program,
+  treatment, rehab, detox, inpatient, outpatient, sober, living, aftercare,
+  recovery, new, first, follow, check, update and plan: with the title
+  "Rivera intervention", "rivera" is refused and "intervention planned for
+  next week" is fine). The refusal is
+  the RPC's 22023 error message, e.g. "Leave out names. Programs read
+  this." The app still warns under the field: "Programs read this note.
   Leave out names, initials, dates of birth, phone numbers and money."
 - Programs see the practice's **name** (the workspace name; its directory
   profile's name if the workspace was never named; otherwise "A ReferralFit
@@ -77,15 +99,18 @@ The rules hold whatever the client sends:
 
 ## What is stored
 
-`placement_requests`: `id` (made by the app, so a retry is a no-op),
-`org_id`, `created_by`, `match_profile_id`, `case_id`, `payload`,
+`placement_requests`: `id` (made by the app, so a retry is a no-op; a retry
+that differs is refused, see below), `org_id`, `created_by`,
+`match_profile_id`, `case_id`, `payload`,
 `respond_by` (4, 24 or 48 hours; 24 by default), `status` (open, closed,
 cancelled), `closed_at`, `created_at`.
 
 `placement_request_recipients`: one row per program asked: `request_id`,
 `org_id`, `partner_id` (the practice's partner), `global_partner_id` (its
-directory listing, if any), `channel`, `rank`, `program_name` (kept if the
-partner is deleted), `status` (sent, viewed, responded, declined), and the
+directory listing, if any), `channel`, `rank` (1 to 999: the program's place
+on the practice's match screen when the app sends `p_ranks`, else its
+position in the list sent), `program_name` (kept if the partner is
+deleted), `status` (sent, viewed, responded, declined), and the
 answer: `bed_available` (yes / no / waitlist), `likely_accept` (yes / maybe
 / no; "no" is a decline), `earliest_admit_on`, `daily_rate` (whole dollars),
 `cost_note` (200 characters), `note` (300), `responded_at`, `responded_by`,
@@ -117,7 +142,7 @@ RPCs (all SECURITY DEFINER, `search_path` pinned):
 
 | RPC | Who | What |
 | --- | --- | --- |
-| `create_placement_request(p_id, p_match_profile_id, p_criteria, p_partner_ids, p_respond_hours, p_admit_window, p_note, p_case_id)` | practice | 1 to 8 of its own partners, in ranked order; at most 20 requests per workspace in any 24 hours; a replayed id returns the request already made. Returns `{request, recipients}`. |
+| `create_placement_request(p_id, p_match_profile_id, p_criteria, p_partner_ids, p_respond_hours, p_admit_window, p_note, p_case_id default null, p_ranks default null)` | practice | 1 to 8 of its own partners, in ranked order; `p_ranks` (integer[], one per entry of `p_partner_ids`, 1 to 999, no two the same) is each program's place on the match screen, stored as `rank`; without it, 1, 2, 3 in the order sent. At most 20 requests per workspace in any 24 hours. A replayed id with the same note, admit window, response window and set of programs returns the request already made and changes nothing; if any of those differ it is refused (22023, "This request already went out as first written. Cancel it and send a new one."). Returns `{request, recipients}`. |
 | `cancel_placement_request(p_id)` / `close_placement_request(p_id)` | practice | No longer needed / placement found. Programs can no longer answer. Idempotent. |
 | `log_manual_response(p_recipient_id, ...)` | practice | A phone or text answer; allowed after the deadline, never over the program's own portal answer, never on a cancelled request. |
 | `placement_request_channels(p_partner_ids)` | practice | Before sending: which programs answer in the portal. |
@@ -129,6 +154,14 @@ A joiner's requests move with their workspace when they join a practice
 (`org_move_workspace_rows`, plus `org_merge_linked_partner_copies` repointing
 a program the team already tracks). Both are the latest definitions plus
 those lines, same signatures; tested through `accept_org_invite`.
+
+When ReferralFit merges two directory listings, `merge_global_partners`
+(re-created from `20260907120000` plus two lines, same signature; one
+comment's dash made ASCII) also moves the programs asked in requests
+(`placement_request_recipients.global_partner_id`) and the listing's
+credentials (`program_credentials`, with their private notes) from the
+dropped listing to the kept one, so an open request can still be answered
+by the center and the credentials survive the merge.
 
 ## Where it shows
 
@@ -177,11 +210,12 @@ section. Tested with Supabase stubbed.
 
 ## Compatibility with the 1.0.4 app
 
-Purely additive. Two new tables and new functions; the only existing
-functions re-created are the internal `org_move_workspace_rows` and
-`org_merge_linked_partner_copies` (called only by `accept_org_invite`),
-from their latest definitions with the same signatures. No existing table,
-column, policy, trigger or callable function changes. The 1.0.4 app's own
+Two new tables and new functions. The existing functions re-created are
+the internal `org_move_workspace_rows` and `org_merge_linked_partner_copies`
+(called only by `accept_org_invite`), and the admin-only
+`merge_global_partners` (two added lines), each from its latest definition
+with the same signature. No existing table, column, policy or trigger
+changes, and nothing the 1.0.4 app calls changes. The 1.0.4 app's own
 partner and match deletes still work with requests on them (the answer
 stays under the program's name; the request stays without its match), and
 account deletion takes a solo workspace's requests with it (tested).
@@ -191,7 +225,9 @@ account deletion takes a solo workspace's requests with it (tested).
 Production has every migration through 20261024130000. Apply, in order,
 `20261104120000_family_cost.sql`, `20261104130000_program_integrity.sql`,
 then this one, **before** shipping an app build with the feature (the app
-copes without it, but the feature stays hidden).
+copes without it, but the feature stays hidden). The file checks the order
+itself: without `public.program_credentials` it stops at once with "Paste
+20261104130000_program_integrity.sql first: ..." and changes nothing.
 
 1. Paste `supabase/migrations/20261104140000_placement_requests.sql` into the
    SQL editor and run it. It is ASCII only, has no backslashes, every
@@ -223,29 +259,39 @@ copes without it, but the feature stays hidden).
           has_function_privilege('anon', p.oid, 'EXECUTE') AS anon_ok
      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
     WHERE n.nspname = 'public'
-      AND (p.proname LIKE 'placement%' OR p.proname IN ('create_placement_request', 'cancel_placement_request',
+      AND (p.proname LIKE 'placement%' OR p.proname LIKE 'identifying%'
+           OR p.proname IN ('create_placement_request', 'cancel_placement_request',
            'close_placement_request', 'log_manual_response', 'list_center_placement_requests',
-           'mark_placement_request_viewed', 'respond_to_placement_request',
+           'mark_placement_request_viewed', 'respond_to_placement_request', 'merge_global_partners',
            'org_move_workspace_rows', 'org_merge_linked_partner_copies'))
     ORDER BY p.proname;
 
    -- The allow-list, spot-checked: no budget, no member id.
    SELECT public.placement_request_payload('Inpatient', 'Women', ARRAY['Trauma', 'MAT'], NULL,
           'Aetna ID W123456789', 'OR', 'Close to family', 'asap', '') AS payload;
+
+   -- The identifying-details check, spot-checked.
+   SELECT public.identifying_text_problem('Jake prefers a quiet program', ARRAY['Rivera family - son Jake']) AS name_check,
+          public.identifying_text_problem('Needs a 30 day stay', ARRAY['Rivera family']) AS fine;
    ```
 
    Expected: both tables `rls = true`, `authenticated_select = true`,
    `authenticated_writes = false`, `anon_select = false`. Every function
    `anon_ok = false`; `authenticated_ok = true` for the seven RPCs plus
-   `placement_request_channels` and `placement_recipient_status`, false for
-   the internal helpers (`placement_note_problem`, `placement_allowed_needs`,
+   `placement_request_channels`, `placement_recipient_status` and
+   `merge_global_partners` (it checks for a platform admin itself), false
+   for the internal helpers (`identifying_text_problem`,
+   `identifying_name_words`, `identifying_case_names`,
+   `placement_note_problem`, `placement_allowed_needs`,
    `placement_request_payload`, `placement_answer_problem`,
-   `placement_request_partner_ids`,
+   `placement_request_partner_ids`, `placement_request_ranks`,
+   `placement_request_replay_differs`,
    `placement_listing_answers_in_portal`, `placement_practice_name`,
    `placement_request_json`, `placement_request_build`,
    `placement_request_finish`, `org_move_workspace_rows`,
    `org_merge_linked_partner_copies`). The payload has
-   `"insurance_carrier": null` and `"payment": "insurance"`.
+   `"insurance_carrier": null` and `"payment": "insurance"`;
+   `name_check = 'Leave out names. Programs read this.'`, `fine` is NULL.
 
 4. Rebuild and deploy the center portal (`cd portal && npm run build`, as
    in `portal/README.md`).
@@ -261,8 +307,8 @@ copes without it, but the feature stays hidden).
   instead. A `placement_response` kind is the natural next step.
 - No email or text is sent by the server: programs without a claimed
   listing get the summary from the practitioner's own Messages or Mail.
-- Rank is the position among the programs asked (1 to 8), in the order of
-  the ranked results; the original result number is not kept.
+- An app that does not send `p_ranks` stores the position among the
+  programs asked (1 to 8), not the original result number.
 - The "new answers" marker is per phone (AsyncStorage), not synced across
   devices.
 - Answers are not cached for offline use.

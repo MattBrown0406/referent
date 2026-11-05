@@ -10,17 +10,27 @@
 
 export const IDENTIFYING_TEXT_RULES_VERSION = 1;
 
-// Words in a case's own title or contact names that say who someone is to the
-// client, not who they are. They are never treated as a name.
-const RELATIONSHIP_WORDS = new Set([
+// Words in a case's own title or contact names that are never treated as a
+// name: who someone is to the client (son, mom, family...), and the ordinary
+// words case titles are made of ("Rivera intervention", "Lopez family's
+// first call", "New inquiry - detox"). Possessives need no entry of their
+// own: a name is split on anything that is not a letter, so "family's" is
+// "family" and "s"; family's and client's are listed anyway, as written.
+const NEVER_A_NAME = new Set([
   'son', 'daughter', 'child', 'kid', 'boy', 'girl', 'wife', 'husband', 'spouse', 'partner',
   'mom', 'mum', 'mother', 'dad', 'father', 'parent', 'brother', 'sister', 'sibling',
   'grandson', 'granddaughter', 'grandmother', 'grandfather', 'aunt', 'uncle', 'niece',
   'nephew', 'cousin', 'friend', 'family', 'client', 'self', 'the', 'and', 'for', 'about',
   'stepson', 'stepdaughter', 'boyfriend', 'girlfriend', 'fiance', 'fiancee',
+  'intervention', 'interventions', 'placement', 'case', 'lead', 'call', 'calls', 'consult',
+  'inquiry', 'referral', 'program', 'treatment', 'rehab', 'detox', 'inpatient', 'outpatient',
+  'sober', 'living', 'aftercare', 'recovery', 'new', 'first', 'follow', 'check', 'update',
+  'plan', "family's", "client's",
 ]);
 
-const MONTHS = '(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*';
+// A month as a whole word or its standard abbreviation (dec, sept, december),
+// never the start of a longer word: "decent 12" and "marvel 3" are not dates.
+const MONTHS = '(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|july?|aug(ust)?|sep(t)?(ember)?|oct(ober)?|nov(ember)?|dec(ember)?)';
 const DOMAIN_ENDINGS = '(com|net|org|edu|gov|io|co|me|ly|us|app|info|biz)';
 
 // Characters that hide or reorder text: control characters, line and
@@ -38,12 +48,12 @@ function hasHiddenCharacters(text: string): boolean {
 }
 
 // The words of a case title, client label, or contact name that could be a
-// name: three or more letters, not a relationship word.
+// name: three or more letters, not a word on the never-a-name list.
 export function nameWords(values: string[]): string[] {
   const words = new Set<string>();
   for (const value of values) {
     for (const word of value.normalize('NFKC').toLowerCase().split(/[^\p{L}]+/u)) {
-      if (word.length >= 3 && !RELATIONSHIP_WORDS.has(word)) words.add(word);
+      if (word.length >= 3 && !NEVER_A_NAME.has(word)) words.add(word);
     }
   }
   return [...words];

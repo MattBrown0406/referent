@@ -1,6 +1,6 @@
 {
   "about": "Cases for identifyingTextProblem (src/lib/identifying-text.ts) and public.identifying_text_problem (SQL). expect is null (allowed) or a word the refusal message must contain. Both test suites run every case.",
-  "names": ["Jane Rivera", "Rivera family — son Jake", "Maria Lopez"],
+  "names": ["Jane Rivera", "Rivera family — son Jake", "Maria Lopez", "Rivera intervention"],
   "cases": [
     { "text": "Prefers a small program with a quiet setting", "expect": null },
     { "text": "Needs medication management and a trauma focus", "expect": null },
@@ -9,6 +9,9 @@
     { "text": "Son has tried outpatient twice", "expect": null },
     { "text": "Needs a 30 day stay, 2 prior admissions", "expect": null },
     { "text": "Call me at the office if you have a bed", "expect": null },
+    { "text": "intervention planned for next week", "expect": null },
+    { "text": "decent 12", "expect": null },
+    { "text": "marvel 3", "expect": null },
     { "text": "jane@gmail.com", "expect": "email" },
     { "text": "jane@gmail", "expect": "email" },
     { "text": "jane＠gmail.com", "expect": "email" },
@@ -27,6 +30,9 @@
     { "text": "born 03/14/85", "expect": "date" },
     { "text": "admit 11.12.2026", "expect": "date" },
     { "text": "seen Nov 12", "expect": "date" },
+    { "text": "Dec 12", "expect": "date" },
+    { "text": "december 3", "expect": "date" },
+    { "text": "Sept. 14", "expect": "date" },
     { "text": "555/123/4567", "expect": "number" },
     { "text": "555,123,4567", "expect": "number" },
     { "text": "555_123_4567", "expect": "number" },

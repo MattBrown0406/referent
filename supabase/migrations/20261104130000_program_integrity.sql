@@ -15,15 +15,28 @@
 --      while the listing is active (its claimant and ReferralFit also see
 --      them while it is pending or archived); a partner's are readable by its
 --      workspace only. anon reads nothing. No client writes the table.
+--      A listing credential's notes (the program's note and ReferralFit's
+--      review note) are private: they live in program_credential_listing_
+--      notes (no client grants), its row keeps both columns NULL, and only
+--      the claimant and ReferralFit read them (fetch_listing_credential_
+--      notes). A partner's notes stay on its row, inside the workspace.
 --   3. Writes go through SECURITY DEFINER functions:
 --        save_program_credential     add or edit (any change resets the
---                                    verification to pending)
+--                                    verification to pending, except that a
+--                                    claimant's edit of a rejected listing
+--                                    credential stays rejected until
+--                                    ReferralFit reviews it again)
 --        verify_program_credential   a listing's: platform admin only; a
 --                                    partner's: the practitioner's own check
---        delete_program_credential
+--        delete_program_credential   a claimant cannot remove a rejected
+--                                    listing credential
 --        record_npi_lookup           the name the public NPI Registry gave,
---                                    a hint only, never a verification
---   4. list_pending_listing_credentials: ReferralFit's review queue.
+--                                    a hint only, never a verification; on
+--                                    a listing's NPI, ReferralFit only
+--      A platform admin may change any listing's credentials, a merged or
+--      archived one included.
+--   4. list_pending_listing_credentials: ReferralFit's review queue (new
+--      and edited credentials, and rejected ones edited since the review).
 --   5. program_credential_status and listing_credentials_verified: the
 --      status rules and the directory badge, mirrored in src/lib/integrity.ts.
 --   6. org_merge_linked_partner_copies keeps a joiner's checks on the
@@ -38,6 +51,19 @@
 -- under 3,700 characters.
 
 BEGIN;
+
+-- Paste order: 20261104120000_family_cost.sql comes first. A skipped paste
+-- stops here, before anything changes.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = 'case_benefits' AND column_name = 'in_deductible')
+     OR NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = 'public' AND table_name = 'vob_requests' AND column_name = 'allowed_daily_rate') THEN
+    RAISE EXCEPTION 'Paste 20261104120000_family_cost.sql first: the case_benefits and vob_requests cost columns are missing.';
+  END IF;
+END
+$$;
 
 -- ===========================================================================
 -- 1. Pure helpers (also used by the table's CHECK constraints)
@@ -147,11 +173,11 @@ CREATE TABLE IF NOT EXISTS public.program_credentials (
   issuing_state     text NOT NULL DEFAULT '' CHECK (issuing_state = '' OR issuing_state ~ '^[A-Z]{2}$'),
   expires_on        date,
   proof_url         text CHECK (proof_url IS NULL OR public.is_valid_proof_url(proof_url)),
-  note              text NOT NULL DEFAULT '' CHECK (length(note) <= 1000),
+  note              text CHECK (length(note) <= 1000),
   status            text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'verified', 'rejected')),
   verified_by       uuid REFERENCES auth.users(id) ON DELETE SET NULL,
   verified_at       timestamptz,
-  verification_note text NOT NULL DEFAULT '' CHECK (length(verification_note) <= 1000),
+  verification_note text CHECK (length(verification_note) <= 1000),
   npi_lookup_name   text CHECK (npi_lookup_name IS NULL OR length(npi_lookup_name) <= 200),
   npi_checked_at    timestamptz,
   created_by        uuid REFERENCES auth.users(id) ON DELETE SET NULL,
@@ -174,6 +200,15 @@ CREATE TABLE IF NOT EXISTS public.program_credentials (
     AND (kind NOT IN ('accreditation', 'legitscript') OR btrim(identifier) <> '' OR proof_url IS NOT NULL)),
   CONSTRAINT program_credentials_review_consistent CHECK ((status = 'pending') = (verified_at IS NULL))
 );
+
+-- note, verification_note: a partner's are on its row ('' when empty). A
+-- listing's are always NULL here: they are private to the program and
+-- ReferralFit and live in program_credential_listing_notes (section 3).
+ALTER TABLE public.program_credentials
+  DROP CONSTRAINT IF EXISTS program_credentials_listing_notes_private,
+  ADD CONSTRAINT program_credentials_listing_notes_private CHECK (
+    CASE WHEN global_partner_id IS NOT NULL THEN note IS NULL AND verification_note IS NULL
+         ELSE note IS NOT NULL AND verification_note IS NOT NULL END);
 
 CREATE INDEX IF NOT EXISTS program_credentials_listing_idx ON public.program_credentials (global_partner_id, kind)
   WHERE global_partner_id IS NOT NULL;
@@ -228,6 +263,22 @@ CREATE POLICY "program_credentials: workspace read" ON public.program_credential
   FOR SELECT TO authenticated
   USING (org_id IS NOT NULL AND org_id = (SELECT public.current_org_id()));
 
+-- A listing credential's notes: the program's own note and ReferralFit's
+-- review note (why it could not be confirmed). Private to the listing's
+-- claimant and ReferralFit, so they are kept off the readable table: no
+-- client reads or writes this one (RLS on, no policy, no grant). The
+-- writers keep it; fetch_listing_credential_notes reads it.
+CREATE TABLE IF NOT EXISTS public.program_credential_listing_notes (
+  credential_id     uuid PRIMARY KEY REFERENCES public.program_credentials(id) ON DELETE CASCADE,
+  note              text NOT NULL DEFAULT '' CHECK (length(note) <= 1000),
+  verification_note text NOT NULL DEFAULT '' CHECK (length(verification_note) <= 1000)
+);
+ALTER TABLE public.program_credential_listing_notes ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE public.program_credential_listing_notes FROM PUBLIC, anon, authenticated;
+GRANT ALL ON TABLE public.program_credential_listing_notes TO service_role;
+COMMENT ON TABLE public.program_credential_listing_notes IS
+  'The private notes of a directory listing''s credential (the program''s note, ReferralFit''s review note). Read only through fetch_listing_credential_notes (the claimant and ReferralFit); no client grants.';
+
 -- ===========================================================================
 -- 4. Internal helpers for the writers
 -- ===========================================================================
@@ -268,9 +319,10 @@ $$;
 REVOKE ALL ON FUNCTION public.program_credential_problem(text, text, text, text, text, date, text, text) FROM PUBLIC, anon, authenticated;
 
 -- Who may change a credential. A listing's: its claimant (the center, or
--- the workspace that owns it as its profile) or a platform admin. A
--- partner's: any member of that partner's workspace. Returns the workspace
--- for a partner's credential and NULL for a listing's; raises otherwise.
+-- the workspace that owns it as its profile) or a platform admin; only an
+-- admin once the listing was merged into another. A partner's: any member
+-- of that partner's workspace. Returns the workspace for a partner's
+-- credential and NULL for a listing's; raises otherwise.
 CREATE OR REPLACE FUNCTION public.program_credential_writer_scope(p_global_partner_id uuid, p_partner_id uuid)
 RETURNS uuid
 LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -291,7 +343,7 @@ BEGIN
     IF NOT public.is_platform_admin() AND NOT public.global_listing_claimed_by_caller(p_global_partner_id) THEN
       RAISE EXCEPTION 'Only the program that claimed this listing, or ReferralFit, can change its credentials' USING ERRCODE = '42501';
     END IF;
-    IF v_merged IS NOT NULL THEN
+    IF v_merged IS NOT NULL AND NOT public.is_platform_admin() THEN
       RAISE EXCEPTION 'This listing was merged into another. Update the credentials there.' USING ERRCODE = '22023';
     END IF;
     RETURN NULL;
@@ -343,10 +395,61 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.program_credential_fields(text, text, text, text, text, date, text, text) FROM PUBLIC, anon, authenticated;
 
+-- Internal. Stores a listing credential's private notes. A NULL argument
+-- keeps what is stored (a new row starts with '').
+CREATE OR REPLACE FUNCTION public.program_credential_store_notes(p_id uuid, p_note text, p_verification_note text)
+RETURNS void
+LANGUAGE sql
+SET search_path = public
+AS $$
+  INSERT INTO public.program_credential_listing_notes AS l (credential_id, note, verification_note)
+  VALUES (p_id, coalesce(p_note, ''), coalesce(p_verification_note, ''))
+  ON CONFLICT (credential_id) DO UPDATE
+    SET note = coalesce(p_note, l.note), verification_note = coalesce(p_verification_note, l.verification_note)
+$$;
+REVOKE ALL ON FUNCTION public.program_credential_store_notes(uuid, text, text) FROM PUBLIC, anon, authenticated;
+
+-- Internal (save_program_credential). Writes an edit: p_old is the stored
+-- row, n the new fields. Any change resets the review to pending, except a
+-- claimant's edit of a rejected listing credential: it stays rejected,
+-- with ReferralFit's note, until ReferralFit reviews it again. The NPI
+-- Registry hint stays only while the NPI is unchanged. A listing's note
+-- goes to its private notes, never on the row.
+CREATE OR REPLACE FUNCTION public.program_credential_write_edit(p_old public.program_credentials, n public.program_credentials, p_user uuid)
+RETURNS public.program_credentials
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+DECLARE
+  v_row public.program_credentials%ROWTYPE;
+  v_listing boolean := p_old.global_partner_id IS NOT NULL;
+  v_keep_hint boolean := n.kind = 'npi' AND p_old.kind = 'npi' AND p_old.identifier = n.identifier;
+  v_sticks boolean := p_old.global_partner_id IS NOT NULL AND p_old.status = 'rejected' AND NOT public.is_platform_admin();
+BEGIN
+  UPDATE public.program_credentials c
+     SET kind = n.kind, accreditor = n.accreditor, accreditor_name = n.accreditor_name, identifier = n.identifier,
+         issuing_state = n.issuing_state, expires_on = n.expires_on, proof_url = n.proof_url,
+         note = CASE WHEN NOT v_listing THEN n.note END,
+         status = CASE WHEN v_sticks THEN 'rejected' ELSE 'pending' END,
+         verified_by = CASE WHEN v_sticks THEN c.verified_by END, verified_at = CASE WHEN v_sticks THEN c.verified_at END,
+         verification_note = CASE WHEN NOT v_listing THEN '' END,
+         npi_lookup_name = CASE WHEN v_keep_hint THEN p_old.npi_lookup_name END,
+         npi_checked_at = CASE WHEN v_keep_hint THEN p_old.npi_checked_at END,
+         updated_by = p_user, updated_at = now()
+   WHERE c.id = p_old.id
+  RETURNING * INTO v_row;
+  IF v_listing THEN
+    PERFORM public.program_credential_store_notes(p_old.id, n.note, CASE WHEN NOT v_sticks THEN '' END);
+  END IF;
+  RETURN v_row;
+END
+$$;
+REVOKE ALL ON FUNCTION public.program_credential_write_edit(public.program_credentials, public.program_credentials, uuid) FROM PUBLIC, anon, authenticated;
+
 -- Add (a new p_id) or edit a credential. The app makes the id, so a retry
--- is safe: the same values again change nothing. Any change resets the
--- review to pending; the NPI Registry hint stays only while the NPI is
--- unchanged. At most 20 credentials per listing or partner.
+-- is safe: the same values again change nothing. An edit resets the review
+-- (program_credential_write_edit has the one exception). A listing's note
+-- goes to its private notes. At most 20 credentials per listing or partner.
 CREATE OR REPLACE FUNCTION public.save_program_credential(
   p_id uuid, p_global_partner_id uuid, p_partner_id uuid,
   p_kind text, p_accreditor text, p_accreditor_name text, p_identifier text,
@@ -361,7 +464,8 @@ DECLARE
   v_old public.program_credentials%ROWTYPE;
   v_row public.program_credentials%ROWTYPE;
   n public.program_credentials;
-  v_keep_hint boolean;
+  v_listing boolean := p_global_partner_id IS NOT NULL;
+  v_old_note text;
 BEGIN
   IF v_user IS NULL THEN
     RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
@@ -378,21 +482,13 @@ BEGIN
     IF v_old.global_partner_id IS DISTINCT FROM p_global_partner_id OR v_old.partner_id IS DISTINCT FROM p_partner_id THEN
       RAISE EXCEPTION 'This credential belongs to another program' USING ERRCODE = '22023';
     END IF;
-    IF (v_old.kind, v_old.accreditor, v_old.accreditor_name, v_old.identifier, v_old.issuing_state, v_old.expires_on, v_old.proof_url, v_old.note)
+    v_old_note := CASE WHEN v_listing THEN coalesce((SELECT l.note FROM public.program_credential_listing_notes l WHERE l.credential_id = p_id), '')
+                       ELSE v_old.note END;
+    IF (v_old.kind, v_old.accreditor, v_old.accreditor_name, v_old.identifier, v_old.issuing_state, v_old.expires_on, v_old.proof_url, v_old_note)
        IS NOT DISTINCT FROM (n.kind, n.accreditor, n.accreditor_name, n.identifier, n.issuing_state, n.expires_on, n.proof_url, n.note) THEN
       RETURN v_old;
     END IF;
-    v_keep_hint := n.kind = 'npi' AND v_old.kind = 'npi' AND v_old.identifier = n.identifier;
-    UPDATE public.program_credentials c
-       SET kind = n.kind, accreditor = n.accreditor, accreditor_name = n.accreditor_name, identifier = n.identifier,
-           issuing_state = n.issuing_state, expires_on = n.expires_on, proof_url = n.proof_url, note = n.note,
-           status = 'pending', verified_by = NULL, verified_at = NULL, verification_note = '',
-           npi_lookup_name = CASE WHEN v_keep_hint THEN v_old.npi_lookup_name END,
-           npi_checked_at = CASE WHEN v_keep_hint THEN v_old.npi_checked_at END,
-           updated_by = v_user, updated_at = now()
-     WHERE c.id = p_id
-    RETURNING * INTO v_row;
-    RETURN v_row;
+    RETURN public.program_credential_write_edit(v_old, n, v_user);
   END IF;
 
   IF (SELECT count(*) FROM public.program_credentials c
@@ -400,10 +496,13 @@ BEGIN
     RAISE EXCEPTION 'A program can have at most 20 credentials. Remove an old one first.' USING ERRCODE = '22023';
   END IF;
   INSERT INTO public.program_credentials (id, global_partner_id, org_id, partner_id, kind, accreditor, accreditor_name,
-                                          identifier, issuing_state, expires_on, proof_url, note, created_by, updated_by)
-  VALUES (p_id, p_global_partner_id, v_org, p_partner_id, n.kind, n.accreditor, n.accreditor_name,
-          n.identifier, n.issuing_state, n.expires_on, n.proof_url, n.note, v_user, v_user)
+                                          identifier, issuing_state, expires_on, proof_url, note, verification_note, created_by, updated_by)
+  VALUES (p_id, p_global_partner_id, v_org, p_partner_id, n.kind, n.accreditor, n.accreditor_name, n.identifier, n.issuing_state,
+          n.expires_on, n.proof_url, CASE WHEN NOT v_listing THEN n.note END, CASE WHEN NOT v_listing THEN '' END, v_user, v_user)
   RETURNING * INTO v_row;
+  IF v_listing THEN
+    PERFORM public.program_credential_store_notes(p_id, n.note, '');
+  END IF;
   RETURN v_row;
 END
 $$;
@@ -414,7 +513,8 @@ GRANT EXECUTE ON FUNCTION public.save_program_credential(uuid, uuid, uuid, text,
 -- admin, or the SQL editor), and declining one needs a note the program
 -- can act on. A partner's: any member of its workspace, recording that they
 -- checked it themselves. p_seen_updated_at, when given, must match the row:
--- a credential edited after the reviewer opened it is reviewed again.
+-- a credential edited after the reviewer opened it is reviewed again. A
+-- listing's review note goes to its private notes, never on the row.
 CREATE OR REPLACE FUNCTION public.verify_program_credential(p_id uuid, p_verdict text, p_note text, p_seen_updated_at timestamptz DEFAULT NULL)
 RETURNS public.program_credentials
 LANGUAGE plpgsql SECURITY DEFINER
@@ -445,17 +545,23 @@ BEGIN
     RAISE EXCEPTION 'This credential changed after you opened it. Review it again.' USING ERRCODE = '22023';
   END IF;
   UPDATE public.program_credentials c
-     SET status = p_verdict, verified_by = auth.uid(), verified_at = now(), verification_note = v_note
+     SET status = p_verdict, verified_by = auth.uid(), verified_at = now(),
+         verification_note = CASE WHEN c.global_partner_id IS NULL THEN v_note END
    WHERE c.id = p_id
   RETURNING * INTO v_row;
+  IF v_row.global_partner_id IS NOT NULL THEN
+    PERFORM public.program_credential_store_notes(p_id, NULL, v_note);
+  END IF;
   RETURN v_row;
 END
 $$;
 REVOKE ALL ON FUNCTION public.verify_program_credential(uuid, text, text, timestamptz) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.verify_program_credential(uuid, text, text, timestamptz) TO authenticated;
 
--- Remove a credential (the same people who may edit it). Returns false when
--- it is already gone, so a retry is safe.
+-- Remove a credential (the same people who may edit it), with its private
+-- notes. A listing credential ReferralFit rejected stays on record: only
+-- ReferralFit removes it. Returns false when it is already gone, so a
+-- retry is safe.
 CREATE OR REPLACE FUNCTION public.delete_program_credential(p_id uuid)
 RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER
@@ -472,6 +578,10 @@ BEGIN
     RETURN false;
   END IF;
   PERFORM public.program_credential_writer_scope(v_row.global_partner_id, v_row.partner_id);
+  IF v_row.global_partner_id IS NOT NULL AND v_row.status = 'rejected' AND NOT public.is_platform_admin() THEN
+    RAISE EXCEPTION 'ReferralFit could not confirm this credential, so it stays on record. Add an updated one and we will review it.'
+      USING ERRCODE = '42501';
+  END IF;
   DELETE FROM public.program_credentials c WHERE c.id = p_id;
   RETURN true;
 END
@@ -480,8 +590,10 @@ REVOKE ALL ON FUNCTION public.delete_program_credential(uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.delete_program_credential(uuid) TO authenticated;
 
 -- Keep the name the public NPI Registry returned for an NPI credential, and
--- when. A hint for the reader only: it never changes the review. The same
--- people who may edit the credential may record it.
+-- when. A hint for the reader only: it never changes the review. On a
+-- listing's NPI, ReferralFit only (a platform admin, or the SQL editor):
+-- the program cannot vouch for itself. On a partner's NPI, any member of
+-- the partner's workspace.
 CREATE OR REPLACE FUNCTION public.record_npi_lookup(p_id uuid, p_name text)
 RETURNS public.program_credentials
 LANGUAGE plpgsql SECURITY DEFINER
@@ -490,14 +602,19 @@ AS $$
 DECLARE
   v_row public.program_credentials%ROWTYPE;
 BEGIN
-  IF auth.uid() IS NULL THEN
-    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
-  END IF;
   SELECT * INTO v_row FROM public.program_credentials WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'Credential not found' USING ERRCODE = 'P0002';
   END IF;
-  PERFORM public.program_credential_writer_scope(v_row.global_partner_id, v_row.partner_id);
+  IF v_row.global_partner_id IS NOT NULL THEN
+    IF auth.uid() IS NOT NULL AND NOT public.is_platform_admin() THEN
+      RAISE EXCEPTION 'Only ReferralFit can record the NPI Registry name on a directory listing' USING ERRCODE = '42501';
+    END IF;
+  ELSIF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
+  ELSE
+    PERFORM public.program_credential_writer_scope(NULL, v_row.partner_id);
+  END IF;
   IF v_row.kind <> 'npi' THEN
     RAISE EXCEPTION 'Only an NPI can be checked against the NPI Registry' USING ERRCODE = '22023';
   END IF;
@@ -531,6 +648,25 @@ $$;
 REVOKE ALL ON FUNCTION public.fetch_listing_credentials(uuid[]) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.fetch_listing_credentials(uuid[]) TO authenticated;
 
+-- A listing's credential notes (the program's note and ReferralFit's review
+-- note, '' when empty), one row per credential: for the listing's claimant
+-- (its center, or the workspace that owns it) and platform admins only.
+-- Anyone else gets no rows.
+CREATE OR REPLACE FUNCTION public.fetch_listing_credential_notes(p_global_partner_id uuid)
+RETURNS TABLE (id uuid, note text, verification_note text)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT c.id, coalesce(l.note, ''), coalesce(l.verification_note, '')
+    FROM public.program_credentials c
+    LEFT JOIN public.program_credential_listing_notes l ON l.credential_id = c.id
+   WHERE c.global_partner_id = p_global_partner_id
+     AND (public.global_listing_claimed_by_caller(p_global_partner_id) OR public.is_platform_admin())
+   ORDER BY c.kind, c.id
+$$;
+REVOKE ALL ON FUNCTION public.fetch_listing_credential_notes(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.fetch_listing_credential_notes(uuid) TO authenticated;
+
 -- The directory badge "Credentials verified": a state license that is
 -- verified and current, AND an accreditation or a LegitScript certification
 -- that is verified and current (current: not past its expiration date).
@@ -552,10 +688,12 @@ $$;
 REVOKE ALL ON FUNCTION public.listing_credentials_verified(uuid, date) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.listing_credentials_verified(uuid, date) TO authenticated;
 
--- ReferralFit's queue: every listing credential waiting for review, the
--- longest-waiting first, with the listing it belongs to. Platform admins
--- only (or the SQL editor). status_today is the status on the server's
--- date, so an expired one stands out.
+-- ReferralFit's queue: every listing credential waiting for review (pending,
+-- or rejected and edited by the program since; status_today reads rejected
+-- for those), the longest-waiting first, with the listing it belongs to and
+-- the program's private note. Platform admins only (or the SQL editor).
+-- status_today is the status on the server's date, so an expired one
+-- stands out.
 CREATE OR REPLACE FUNCTION public.list_pending_listing_credentials()
 RETURNS TABLE (id uuid, global_partner_id uuid, listing text, listing_state text, listing_website text, listing_status text,
                kind text, accreditor text, accreditor_name text, identifier text, issuing_state text, expires_on date,
@@ -572,12 +710,13 @@ BEGIN
   RETURN QUERY
   SELECT c.id, c.global_partner_id, coalesce(nullif(g.organization, ''), g.name), g.state, coalesce(g.website, ''), g.status,
          c.kind, c.accreditor, c.accreditor_name, c.identifier, c.issuing_state, c.expires_on,
-         c.proof_url, c.note, c.npi_lookup_name, c.npi_checked_at,
+         c.proof_url, coalesce(l.note, ''), c.npi_lookup_name, c.npi_checked_at,
          public.program_credential_status(c.status, c.expires_on, current_date),
          c.created_at, c.updated_at
     FROM public.program_credentials c
     JOIN public.global_partners g ON g.id = c.global_partner_id
-   WHERE c.status = 'pending'
+    LEFT JOIN public.program_credential_listing_notes l ON l.credential_id = c.id
+   WHERE c.status = 'pending' OR (c.status = 'rejected' AND c.updated_at > c.verified_at)
    ORDER BY c.updated_at, c.id;
 END
 $$;

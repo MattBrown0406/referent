@@ -45,16 +45,30 @@ on file and what to check, never that a program is bad.
 | `issuing_state` | State licenses only, two letters |
 | `expires_on` | The last day it is good. NULL when there is none (an NPI never has one) |
 | `proof_url` | The issuer's public lookup page or record. `https://` on a public host only (`is_valid_proof_url`) |
-| `note` | Free text, up to 1,000 characters |
+| `note` | Free text, up to 1,000 characters. A partner's: on the row (`''` when empty). A listing's: **always NULL here** (see below) |
 | `status` | `pending`, `verified` or `rejected` (the stored review) |
-| `verified_by`, `verified_at`, `verification_note` | Who reviewed it, when, and the note (a rejection of a listing's credential needs one) |
+| `verified_by`, `verified_at`, `verification_note` | Who reviewed it, when, and the note (a rejection of a listing's credential needs one). A listing's `verification_note` is **always NULL here** too |
 | `npi_lookup_name`, `npi_checked_at` | The name the NPI Registry returned, and when. **A hint, never a verification** |
 | `created_by`, `updated_by`, `updated_at` | Who added and last changed it |
 
 CHECK constraints back the rules up: one owner per row, an NPI that passes
 its check digit and has no date, an accreditor only on an accreditation, a
 state only (and always) on a license, `verified_at` set exactly when the
-review is not pending. At most 20 credentials per listing or partner.
+review is not pending, and a listing's notes never on the row
+(`program_credentials_listing_notes_private`). At most 20 credentials per
+listing or partner.
+
+**A listing's notes are private.** The program's own note and ReferralFit's
+review note (why a credential could not be confirmed) are for the program
+and ReferralFit, not for every practitioner who can read the listing. They
+live in `program_credential_listing_notes` (`credential_id` primary key,
+`ON DELETE CASCADE`; `note`, `verification_note`), which has RLS on, no
+policy and no client grant at all. `fetch_listing_credential_notes(p_global_partner_id)`
+(SECURITY DEFINER) returns `(id, note, verification_note)` for each of the
+listing's credentials (`''` when empty) to the listing's claimant (its
+center, or the workspace that owns it) and to platform admins; anyone else
+gets no rows. A practice's own credentials keep both notes on the row,
+inside the workspace, as before.
 
 ## Who reads what
 
@@ -68,7 +82,9 @@ is gone too):
   (`program_credentials_listing_visible`, SECURITY DEFINER because
   `global_partners` is entitlement-gated and `center_members` is self-read);
 - a partner's credentials: **its workspace only**;
-- `anon`: nothing. No client writes the table, ever (no write policy).
+- a listing's notes: its claimant and ReferralFit only, through
+  `fetch_listing_credential_notes`;
+- `anon`: nothing. No client writes either table, ever (no write policy).
 
 ## How it is written
 
@@ -80,23 +96,41 @@ All SECURITY DEFINER with a pinned `search_path`, revoked from `PUBLIC` and
   p_expires_on, p_proof_url, p_note)`: add (new id) or edit. The app makes
   the id, so a retry after a timeout is safe; the same values again change
   nothing. **Any change resets the review to pending**: a center's edit goes
-  back to ReferralFit, a practice's edit waits for a new check. The NPI
-  Registry hint survives only while the NPI is unchanged. Plain-words errors
-  (`program_credential_problem`), e.g. "An NPI is 10 digits and its last
-  digit must check out. Check the number."
+  back to ReferralFit, a practice's edit waits for a new check. **Except: a
+  rejection sticks.** When a claimant (not an admin) edits a listing
+  credential ReferralFit rejected, the new values are saved but it stays
+  `rejected`, with ReferralFit's note, until ReferralFit reviews it again (it
+  goes back into the review queue). The NPI Registry hint survives only
+  while the NPI is unchanged. A listing's note goes to its private notes.
+  Plain-words errors (`program_credential_problem`), e.g. "An NPI is 10
+  digits and its last digit must check out. Check the number."
 - `verify_program_credential(p_id, p_verdict, p_note, p_seen_updated_at)`:
   `verified` or `rejected`. A listing's: platform admin only (or the SQL
-  editor), and a rejection needs a note the program can act on. A partner's:
-  a member of its workspace. `p_seen_updated_at` refuses a check on a
-  credential that changed after the reviewer opened it.
+  editor), and a rejection needs a note the program can act on (stored in
+  the private notes). A partner's: a member of its workspace (the note on
+  the row). `p_seen_updated_at` refuses a check on a credential that changed
+  after the reviewer opened it.
 - `delete_program_credential(p_id)`: the same people who may edit it;
-  `false` when it is already gone.
+  `false` when it is already gone. A claimant cannot remove a listing
+  credential ReferralFit rejected (42501, "ReferralFit could not confirm
+  this credential, so it stays on record. Add an updated one and we will
+  review it.").
 - `record_npi_lookup(p_id, p_name)`: keeps the registry name on an NPI
-  credential (editors only). Never changes the review.
+  credential. On a **listing's** NPI, ReferralFit only (a platform admin, or
+  the SQL editor): a claimant gets 42501, because a program cannot vouch for
+  itself. On a partner's NPI, any member of its workspace. Never changes
+  the review.
+
+A platform admin may add, edit and remove any listing's credentials, a
+merged or archived listing included (a claimant cannot touch a merged one).
 
 Readers: `fetch_listing_credentials(p_ids uuid[])` (SECURITY INVOKER, up to
-500 listings per call, so the policies decide), `list_pending_listing_credentials()`
-(platform admins), `listing_credentials_verified(p_global_id, p_today)`.
+500 listings per call, so the policies decide; listing rows carry NULL
+notes), `fetch_listing_credential_notes(p_global_partner_id)` (the private
+notes, above), `list_pending_listing_credentials()` (platform admins: every
+pending listing credential, plus a rejected one the program edited since its
+review, whose `status_today` reads `rejected`; `note` is the program's
+private note), `listing_credentials_verified(p_global_id, p_today)`.
 
 When a solo practitioner joins a practice, their checks follow the partner:
 the composite foreign key to `partners (id, org_id)` is `ON UPDATE CASCADE`,
@@ -179,11 +213,14 @@ place), `Verified` (the badge), otherwise `Needs review`.
   open its profile.
 - **Center portal:** a "Credentials" section on the program's own listing:
   add, edit, remove. After a change it says "pending ReferralFit review";
-  a rejection shows ReferralFit's note.
+  a rejection shows ReferralFit's note (read with
+  `fetch_listing_credential_notes`), stays rejected after an edit until
+  ReferralFit looks again, and cannot be removed.
 - **ReferralFit's review:** Workspace, "Program credentials" (platform admins
   only, next to "Directory submissions"): every pending listing credential,
-  oldest first, with the record link, the lookup links and the NPI check,
-  then Verify, or Reject with a note.
+  and every rejected one the program has edited since, oldest first, with
+  the record link, the lookup links and the NPI check, then Verify, or
+  Reject with a note.
 
 ## Checking by hand, never scraping
 
@@ -217,7 +254,8 @@ did not answer in time. Try again later, or open it in your browser." A
 registry that is down, a non-JSON body, an unknown number: each has its own
 plain message, and `lookupNpi` never throws. The name is stored as
 `npi_lookup_name` / `npi_checked_at` (the practice's own NPI, or a listing's
-when its editor checks it). It never verifies anything.
+when ReferralFit checks it; a program cannot record it on its own listing).
+It never verifies anything.
 
 ## Offline and older servers
 
@@ -234,8 +272,8 @@ prompt, no Today card, no admin queue, no portal section.
 
 ## Compatibility with the 1.0.4 app
 
-The 1.0.4 app in TestFlight never touches the table. The migration adds a
-table and new functions, and re-creates one internal function
+The 1.0.4 app in TestFlight never touches the table. The migration adds two
+tables and new functions, and re-creates one internal function
 (`org_merge_linked_partner_copies`, called only by `accept_org_invite`) with
 the same signature and one added line. No existing table, column, policy or
 callable function changes. Its partner deletes cascade to the practice's
@@ -246,7 +284,10 @@ checks (tested), and its workspace joins carry them (tested).
 Production has every migration through 20261024130000. Apply
 `20261104120000_family_cost.sql` first (it is independent of this one), then
 this one, **before** shipping an app build that includes the feature (the
-app copes without it, but the feature stays hidden).
+app copes without it, but the feature stays hidden). The file checks the
+order itself: if `20261104120000`'s columns (`case_benefits.in_deductible`,
+`vob_requests.allowed_daily_rate`) are missing it stops at once with "Paste
+20261104120000_family_cost.sql first: ..." and changes nothing.
 
 1. Paste `supabase/migrations/20261104130000_program_integrity.sql` into the
    SQL editor and run it. It is ASCII only, has no backslashes, every
@@ -271,6 +312,11 @@ app copes without it, but the feature stays hidden).
           has_table_privilege('anon', c.oid, 'SELECT') AS anon_select
      FROM pg_class c WHERE c.oid = 'public.program_credentials'::regclass;
 
+   -- The private notes: RLS on, no client privilege at all.
+   SELECT c.relrowsecurity AS notes_rls,
+          has_table_privilege('authenticated', c.oid, 'SELECT') OR has_table_privilege('anon', c.oid, 'SELECT') AS notes_client_select
+     FROM pg_class c WHERE c.oid = 'public.program_credential_listing_notes'::regclass;
+
    -- Who may call what.
    SELECT p.proname,
           has_function_privilege('authenticated', p.oid, 'EXECUTE') AS authenticated_ok,
@@ -278,9 +324,10 @@ app copes without it, but the feature stays hidden).
      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
     WHERE n.nspname = 'public'
       AND p.proname IN ('save_program_credential', 'verify_program_credential', 'delete_program_credential', 'record_npi_lookup',
-                        'fetch_listing_credentials', 'list_pending_listing_credentials', 'listing_credentials_verified',
-                        'program_credential_status', 'is_valid_npi', 'is_valid_proof_url', 'program_credentials_listing_visible',
-                        'program_credential_problem', 'program_credential_fields', 'program_credential_writer_scope',
+                        'fetch_listing_credentials', 'fetch_listing_credential_notes', 'list_pending_listing_credentials',
+                        'listing_credentials_verified', 'program_credential_status', 'is_valid_npi', 'is_valid_proof_url',
+                        'program_credentials_listing_visible', 'program_credential_problem', 'program_credential_fields',
+                        'program_credential_writer_scope', 'program_credential_store_notes', 'program_credential_write_edit',
                         'org_merge_linked_partner_copies')
     ORDER BY p.proname;
 
@@ -291,11 +338,12 @@ app copes without it, but the feature stays hidden).
    ```
 
    Expected: `rls = true`, `authenticated_select = true`,
-   `authenticated_writes = false`, `anon_select = false`. Every function with
-   `anon_ok = false`; `authenticated_ok = true` for all except
-   `program_credential_problem`, `program_credential_fields`,
-   `program_credential_writer_scope` and `org_merge_linked_partner_copies`
-   (internal). Then `npi_ok = true`, `npi_bad = false`,
+   `authenticated_writes = false`, `anon_select = false`; `notes_rls = true`,
+   `notes_client_select = false`. Every function with `anon_ok = false`;
+   `authenticated_ok = true` for all except `program_credential_problem`,
+   `program_credential_fields`, `program_credential_writer_scope`,
+   `program_credential_store_notes`, `program_credential_write_edit` and
+   `org_merge_linked_partner_copies` (internal). Then `npi_ok = true`, `npi_bad = false`,
    `expiring = 'expiring'`, `http_link = false`.
 
 4. Rebuild and deploy the center portal (`cd portal && npm run build`, as
@@ -307,7 +355,9 @@ app copes without it, but the feature stays hidden).
 
 - Credentials are not cached for offline use.
 - When ReferralFit merges two listings, the dropped listing's credentials
-  stay on it (archived, hidden); re-enter them on the kept listing.
+  move to the kept listing with their notes and reviews
+  (`merge_global_partners`, re-created in `20261104140000`). Duplicates (two
+  state licenses, say) are not folded together; remove the extra one.
 - The state license lookup is a web search; a per-state map of licensing
   agency lookups would be better, but each address would need checking by
   hand first.
