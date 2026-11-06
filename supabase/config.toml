@@ -245,10 +245,17 @@ otp_expiry = 3600
 # admin_email = "admin@email.com"
 # sender_name = "Admin"
 
-# Uncomment to customize email template
-# [auth.email.template.invite]
-# subject = "You have been invited"
-# content_path = "./supabase/templates/invite.html"
+# The two emails the app sends. Production does not read this file: paste the
+# same subject and HTML into Supabase -> Authentication -> Emails -> Templates
+# (docs/SELF_SERVE_ACCOUNTS.md). Never `supabase config push` from here: it
+# would overwrite production's auth settings with these local ones.
+[auth.email.template.confirmation]
+subject = "Confirm your email for ReferralFit"
+content_path = "./supabase/templates/confirmation.html"
+
+[auth.email.template.recovery]
+subject = "Reset your ReferralFit password"
+content_path = "./supabase/templates/recovery.html"
 
 # Uncomment to customize notification email template
 # [auth.email.notification.password_changed]

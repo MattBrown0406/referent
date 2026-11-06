@@ -56,10 +56,31 @@ add all four:
 If these are missing, the email link lands on the Site URL in a browser tab
 instead of opening the app, and the user cannot set a new password.
 
-### Email templates (optional)
+### Authentication -> Emails -> Templates
 
-The default **Reset Password** and **Confirm signup** templates work. If you
-edit them, keep `{{ .ConfirmationURL }}` in the link.
+The app sends two emails, branded in `supabase/templates/` (the local stack
+uses the same files, so they can be checked in Mailpit). Production does not
+read the repo: paste each one by hand. Never run `supabase config push` to do
+it; that overwrites every production auth setting with the local ones.
+
+| Template | Subject | Message body |
+| --- | --- | --- |
+| **Confirm signup** | `Confirm your email for ReferralFit` | all of `supabase/templates/confirmation.html` |
+| **Reset password** | `Reset your ReferralFit password` | all of `supabase/templates/recovery.html` |
+
+Keep `{{ .ConfirmationURL }}` as the link: it is Supabase's own verify URL,
+and it carries `redirect_to` back to the app or to the web page that asked.
+The other templates (Invite user, Magic link, Change email address,
+Reauthentication) are not used by the app; leave them as they are.
+
+The emails go out through the referralfit.com SMTP sender (Resend). Keep
+Resend's click tracking off for that domain: it would send these sign-in
+links through a tracking redirect.
+
+If people on company email (Microsoft 365 / Outlook) report that a fresh link
+says it has expired, their mail scanner is opening the link before they do.
+The fix is a confirm page that verifies only on a button press
+(`{{ .TokenHash }}` + `verifyOtp`); not built, since nobody has hit it yet.
 
 ## 2. Apply the migration
 

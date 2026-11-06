@@ -47,7 +47,9 @@ type Props = {
 // A "notice" replaces the form after an email has been sent, so the user
 // knows exactly what to do next instead of staring at the same fields.
 type Notice =
-  | { kind: 'confirmEmail'; email: string }
+  // notConfirmed: reached from Sign in with the right password for an address
+  // that was never confirmed (its link may have expired).
+  | { kind: 'confirmEmail'; email: string; notConfirmed?: boolean }
   | { kind: 'resetSent'; email: string };
 
 const TAGLINES: Record<AuthMode, string> = {
@@ -91,6 +93,14 @@ export default function LoginScreen({ onSignedIn }: Props) {
     });
     setBusy(false);
     if (authError) {
+      // Supabase says this only once the password matched. Without a resend
+      // here, an expired confirmation link leaves no way into the account:
+      // signing up again only reports that it already exists.
+      if (authError.code === 'email_not_confirmed' || authError.message.toLowerCase().includes('email not confirmed')) {
+        setPassword('');
+        setNotice({ kind: 'confirmEmail', email: normalizeEmail(email), notConfirmed: true });
+        return;
+      }
       setError(friendlyAuthError(authError.message, 'signIn'));
       return;
     }
@@ -203,9 +213,11 @@ export default function LoginScreen({ onSignedIn }: Props) {
     const isConfirm = current.kind === 'confirmEmail';
     return (
       <>
-        <Text style={styles.noticeTitle}>{isConfirm ? 'Check your email' : 'Reset link sent'}</Text>
+        <Text style={styles.noticeTitle}>{isConfirm ? (current.notConfirmed ? 'Confirm your email first' : 'Check your email') : 'Reset link sent'}</Text>
         <Text style={styles.noticeBody}>
-          {isConfirm
+          {isConfirm && current.notConfirmed
+            ? `${current.email} has not been confirmed yet. Resend the confirmation email and open its link on this device, then sign in.`
+            : isConfirm
             ? `We sent a confirmation link to ${current.email}. Open it on this device to finish creating your account, then sign in.`
             : `If an account exists for ${current.email}, a link to set a new password is on its way. Open it on this device to continue.`}
         </Text>

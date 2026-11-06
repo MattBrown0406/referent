@@ -131,6 +131,24 @@ for (const text of [
 ]) assert.ok(loginSource.includes(text), `LoginScreen missing: ${text}`);
 assert.ok(!/console\.(log|warn|error)/.test(loginSource), 'LoginScreen must not log (passwords in scope)');
 assert.ok(!/Accounts are set up for your practice by ReferralFit/.test(loginSource), 'stale invite-only footnote');
+// Signing in to a never-confirmed address offers a new confirmation link: an
+// expired one otherwise leaves no way in (signing up again says it exists).
+assert.ok(loginSource.includes("authError.code === 'email_not_confirmed'"), 'sign-in must catch an unconfirmed address');
+assert.ok(loginSource.includes("setNotice({ kind: 'confirmEmail', email: normalizeEmail(email), notConfirmed: true })"), 'sign-in must offer Resend for an unconfirmed address');
+
+// ─── Email templates (pasted into production by hand) ───────────────────────
+const configToml = readFileSync(path.join(repoRoot, 'supabase/config.toml'), 'utf8');
+for (const name of ['confirmation', 'recovery']) {
+  const template = readFileSync(path.join(repoRoot, `supabase/templates/${name}.html`), 'utf8');
+  assert.ok(configToml.includes(`[auth.email.template.${name}]`) && configToml.includes(`content_path = "./supabase/templates/${name}.html"`), `config.toml must use templates/${name}.html`);
+  // The link must stay Supabase's own verify URL, which carries redirect_to
+  // back to the app or the web page that asked (auth-flows.ts).
+  assert.ok(template.includes('href="{{ .ConfirmationURL }}"'), `${name}.html must link to {{ .ConfirmationURL }}`);
+  assert.ok(!/<img|<script|<link|url\(|src=/i.test(template), `${name}.html must load nothing from outside the email`);
+  assert.ok(/same device|where you (signed up|asked)/.test(template), `${name}.html must say to open the link where the flow started`);
+  // eslint-disable-next-line no-control-regex
+  assert.ok(!/[^\x00-\x7F]/.test(template), `${name}.html must be ASCII (entities for anything else) so a paste cannot mangle it`);
+}
 
 const resetSource = readFileSync(path.join(repoRoot, 'src/lib/ResetPasswordScreen.tsx'), 'utf8');
 assert.ok(resetSource.includes('supabase.auth.updateUser({ password })'), 'ResetPasswordScreen must set the new password');
