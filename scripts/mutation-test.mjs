@@ -227,7 +227,7 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   }
   assert.doesNotMatch(workspace, /ReferralFit staff do not have access/, 'no claim the operator cannot back up');
   assert.match(workspace, /is private to your workspace/);
-  assert.match(intake, /export const INTAKE_LINK_ENABLED = false;/, 'the intake link is hidden this release by one flag');
+  assert.match(intake, /export const INTAKE_LINK_ENABLED = true;/, 'the intake link is on now that the website form is live (one flag hides it again)');
   assert.match(workspace, /workspace && INTAKE_LINK_ENABLED \? intakeLinkUrl\(/, 'no intake URL to copy or share while hidden');
   assert.match(workspace, /\{INTAKE_LINK_ENABLED \? \(/, 'the intake card copy is behind the flag');
   assert.match(dashboard, /INTAKE_LINK_ENABLED \? 'Add leads with New lead on Today, or share your intake link/, 'the dashboard stops telling people to share it');
@@ -262,6 +262,17 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   }).outputText;
   writeFileSync(path.join(tmpDir, 'auth-flows.js'), flowsJs);
   const flows = require(path.join(tmpDir, 'auth-flows.js'));
+  const intakeJs = ts.transpileModule(await readFile(new URL('../src/lib/intake-link.ts', import.meta.url), 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true },
+  }).outputText;
+  writeFileSync(path.join(tmpDir, 'intake-link.js'), intakeJs);
+  const intakeLink = require(path.join(tmpDir, 'intake-link.js'));
+  const intakeToken = 'ab12'.repeat(10);
+  assert.equal(intakeLink.intakeLinkUrl('https://ovfafffvcpaahktvlsdm.supabase.co', intakeToken), `https://referralfit.com/intake/${intakeToken}`, 'production shares the website form');
+  assert.equal(intakeLink.intakeLinkUrl('https://ovfafffvcpaahktvlsdm.supabase.co/', intakeToken), `https://referralfit.com/intake/${intakeToken}`);
+  assert.equal(intakeLink.intakeLinkUrl('http://127.0.0.1:55421', intakeToken), `http://127.0.0.1:55421/functions/v1/intake/${intakeToken}`, 'a local stack shares its own function form');
+  assert.equal(intakeLink.intakeLinkUrl('https://ovfafffvcpaahktvlsdm.supabase.co.evil.example', intakeToken), `https://ovfafffvcpaahktvlsdm.supabase.co.evil.example/functions/v1/intake/${intakeToken}`, 'only a real hosted project maps to the website');
+  assert.equal(intakeLink.intakeLinkUrl('https://ovfafffvcpaahktvlsdm.supabase.co', ''), '', 'no token, no link');
   const now = Date.UTC(2026, 9, 24, 12);
   const hour = 3600 * 1000;
   const recovery = 'referralfit://auth/recovery#access_token=AT&refresh_token=RT&type=recovery';

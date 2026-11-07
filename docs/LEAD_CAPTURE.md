@@ -21,12 +21,23 @@ Two doors into the same place:
    follow-up due today at now + the workspace's first-call target, and a
    system timeline entry, in one transaction (`create_lead`).
 2. **The intake link** (hosted form). Each workspace has an opaque token on
-   `orgs.intake_token`. The `intake` edge function serves a mobile-first form
-   branded with the practice name at
+   `orgs.intake_token`. The link the app shares is the form on the website,
+
+   ```
+   https://referralfit.com/intake/<token>
+   ```
+
+   which calls the `intake` edge function from the family's browser in JSON
+   (CORS for referralfit.com and www only; the website repo's
+   `src/lib/intake.ts` holds the contract). The function also still serves
+   its own mobile-first HTML form, branded with the practice name, at
 
    ```
    https://ovfafffvcpaahktvlsdm.supabase.co/functions/v1/intake/<token>
    ```
+
+   for links shared before the website form, and for a development build on
+   a local stack (`intakeLinkUrl` in `src/lib/intake-link.ts`).
 
    and a submission creates the same lead in that workspace
    (`create_lead_from_intake`, service role only). The form says who will
@@ -147,7 +158,7 @@ until the function exists. Nothing else depends on it.
    `supabase login`, and the project linked with `supabase link --project-ref ovfafffvcpaahktvlsdm`):
 
    ```sh
-   supabase functions deploy intake --no-verify-jwt
+   supabase functions deploy intake --project-ref ovfafffvcpaahktvlsdm --use-api --no-verify-jwt
    ```
 
    `--no-verify-jwt` is required: families open the link with no account.
@@ -170,7 +181,10 @@ until the function exists. Nothing else depends on it.
 | --- | --- |
 | `GET /intake/<token>` | 200, the branded form. 404 "This link is not active" for an unknown, malformed, or rotated token. |
 | `POST /intake/<token>` (form-encoded) | 200 thank-you page ("Thank you. We will call you shortly."); 400 with the form and a generic message on a bad submission (nothing typed is echoed back); 404 for an unknown token; 429 "Please try again in a little while" past the limits. |
-| Honeypot (`company`) filled | 200 thank-you page, nothing created. |
+| `GET /intake/<token>?format=json` (the website) | 200 `{ "practice_name" }`; 404 `{ "error": { "code": "not_found", "message" } }`. |
+| `POST /intake/<token>`, `Content-Type: application/json` (the website) | The same pipeline and limits as the form post. 200 `{ "ok": true }`; 400 `invalid`, 404 `not_found`, 429 `rate_limited`, 500 `server_error`, each as `{ "error": { "code", "message" } }`. Only the seven known string fields are read; a body over 8 KB or not a JSON object is a 400. |
+| `OPTIONS /intake/<token>` (CORS preflight) | 204. `Access-Control-Allow-Origin` names `https://referralfit.com` or `https://www.referralfit.com` when the request comes from one of them (with `Vary: Origin`, methods `GET, POST, OPTIONS`, headers `Content-Type, Accept`); any other origin gets no CORS headers, so its browser never sends the JSON post. Never `*`, never credentials. `INTAKE_EXTRA_ORIGINS` (comma separated) adds origins for local testing only. |
+| Honeypot (`company`) filled | 200 thank-you page (JSON: `{ "ok": true }`), nothing created. |
 | Other methods | 405. |
 
 Rate limits (in `supabase/functions/intake/intake.ts`), enforced by

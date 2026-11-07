@@ -2,6 +2,13 @@
 // lead in that practice's workspace through create_lead_from_intake (service
 // role). See docs/LEAD_CAPTURE.md for deployment.
 //
+// Two front ends share one pipeline:
+//   * the website form at https://referralfit.com/intake/<token>, which calls
+//     this function from the family's browser and speaks JSON (GET
+//     ?format=json, POST application/json) under CORS for referralfit.com
+//     only (intake.ts: corsHeaders, wantsJson, formFromJson);
+//   * the function's own HTML form, for links shared before the website form.
+//
 // Safety properties:
 //   * the token is validated by shape before any lookup and resolved on
 //     every request, so a rotated link stops working at once;
@@ -12,24 +19,31 @@
 //     junk posts cannot lock a practice's link (admitPost in intake.ts). A
 //     lead past the link's hourly budget is still kept, marked possible spam
 //     and without a push; only a much higher hard cap refuses it;
-//   * a filled honeypot field is answered with the thank-you page and
-//     creates nothing;
+//   * a filled honeypot field is answered like a success and creates nothing;
 //   * no submitted value is ever rendered back, logged, or returned;
-//   * the pages carry no scripts and a strict CSP.
+//   * the pages carry no scripts and a strict CSP; JSON answers name only an
+//     allowed origin, never '*', and never allow credentials.
 
 import { createClient } from 'npm:@supabase/supabase-js@2.110.8';
 
 import { bytesToHex, hmacSha256, requiredEnv } from '../_shared/webhooks.ts';
 import {
   admitPost,
+  allowedOrigins,
   clientAddress,
+  corsHeaders,
+  formFromJson,
   formPage,
   intakeRpcLead,
+  JSON_MESSAGES,
+  jsonError,
+  MAX_JSON_BYTES,
   type RateLimit,
   thankYouPage,
   tokenFromPath,
   tooManyPage,
   unavailablePage,
+  wantsJson,
 } from './intake.ts';
 
 const HTML_HEADERS = {
@@ -41,8 +55,22 @@ const HTML_HEADERS = {
   'x-frame-options': 'DENY',
 };
 
+const JSON_HEADERS = {
+  'content-type': 'application/json; charset=utf-8',
+  'cache-control': 'no-store',
+  'referrer-policy': 'no-referrer',
+  'x-content-type-options': 'nosniff',
+};
+
+// referralfit.com and www, plus INTAKE_EXTRA_ORIGINS for local testing only.
+const ORIGINS = allowedOrigins(Deno.env.get('INTAKE_EXTRA_ORIGINS'));
+
 function html(body: string, status = 200): Response {
   return new Response(body, { status, headers: HTML_HEADERS });
+}
+
+function json(body: unknown, status: number, cors: Record<string, string>): Response {
+  return new Response(JSON.stringify(body), { status, headers: { ...JSON_HEADERS, ...cors } });
 }
 
 function serviceClient() {
@@ -93,41 +121,110 @@ async function readForm(request: Request): Promise<URLSearchParams | null> {
   return form;
 }
 
+// The body, read only up to `max` bytes. null: larger than that.
+async function readCappedText(request: Request, max: number): Promise<string | null> {
+  if (Number(request.headers.get('content-length') || '0') > max) return null;
+  if (!request.body) return '';
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+async function readJsonForm(request: Request): Promise<URLSearchParams | null> {
+  const text = await readCappedText(request, MAX_JSON_BYTES);
+  return text === null ? null : formFromJson(text);
+}
+
+// A failure's code and message for the log. supabase-js RPC errors are plain
+// objects, which String() turns into "[object Object]". Never `details`, which
+// can quote a row; nothing a family typed is logged.
+function describeError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === 'object') {
+    const { code, message } = error as { code?: unknown; message?: unknown };
+    const text = [code, message].filter((part) => typeof part === 'string' && part).join(' ');
+    if (text) return text;
+  }
+  return 'unknown error';
+}
+
 Deno.serve(async (request) => {
   const url = new URL(request.url);
+  const cors = corsHeaders(request.headers.get('origin'), ORIGINS);
+
+  // Preflight for the website form: answered before any lookup or body read.
+  // A disallowed origin gets no Access-Control headers, so its JSON POST is
+  // never sent.
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+
+  const asJson = wantsJson(request.method, url, request.headers.get('content-type'));
+  const notFound = () =>
+    asJson ? json(jsonError('not_found', JSON_MESSAGES.not_found), 404, cors) : html(unavailablePage(), 404);
+
   const token = tokenFromPath(url.pathname);
-  if (!token) return html(unavailablePage(), 404);
+  if (!token) return notFound();
   if (request.method !== 'GET' && request.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405, headers: { allow: 'GET, POST' } });
+    return new Response('Method not allowed', { status: 405, headers: { allow: 'GET, POST, OPTIONS', ...cors } });
   }
 
   try {
     const supabase = serviceClient();
     const name = await practiceName(supabase, token);
-    if (!name) return html(unavailablePage(), 404);
+    if (!name) return notFound();
 
-    if (request.method === 'GET') return html(formPage(name));
+    if (request.method === 'GET') return asJson ? json({ practice_name: name }, 200, cors) : html(formPage(name));
 
     const parsed = await admitPost(
       token,
       await addressHashOf(request.headers),
-      () => readForm(request),
+      () => (asJson ? readJsonForm(request) : readForm(request)),
       (bucket, limit) => rateLimitHit(supabase, bucket, limit),
     );
-    if (parsed.kind === 'limited') return html(tooManyPage(), 429);
-    if (parsed.kind === 'bad_content_type') return html(formPage(name, 'Please use the form on this page.'), 400);
-    if (parsed.kind === 'honeypot') return html(thankYouPage(name));
-    if (parsed.kind === 'invalid') return html(formPage(name, parsed.reason), 400);
+    if (parsed.kind === 'limited') {
+      return asJson ? json(jsonError('rate_limited', JSON_MESSAGES.rate_limited), 429, cors) : html(tooManyPage(), 429);
+    }
+    if (parsed.kind === 'bad_content_type') {
+      return asJson
+        ? json(jsonError('invalid', JSON_MESSAGES.bad_request), 400, cors)
+        : html(formPage(name, JSON_MESSAGES.bad_request), 400);
+    }
+    if (parsed.kind === 'honeypot') return asJson ? json({ ok: true }, 200, cors) : html(thankYouPage(name));
+    if (parsed.kind === 'invalid') {
+      return asJson ? json(jsonError('invalid', parsed.reason), 400, cors) : html(formPage(name, parsed.reason), 400);
+    }
 
     const { error } = await supabase.rpc('create_lead_from_intake', { p_token: token, p_lead: intakeRpcLead(parsed) });
     if (error) {
-      if (error.code === 'P0002') return html(unavailablePage(), 404);
-      if (error.code === '22023') return html(formPage(name, 'Please check your name and phone number and try again.'), 400);
+      if (error.code === 'P0002') return notFound();
+      if (error.code === '22023') {
+        return asJson
+          ? json(jsonError('invalid', JSON_MESSAGES.check_fields), 400, cors)
+          : html(formPage(name, JSON_MESSAGES.check_fields), 400);
+      }
       throw error;
     }
-    return html(thankYouPage(name));
+    return asJson ? json({ ok: true }, 200, cors) : html(thankYouPage(name));
   } catch (error) {
-    console.error('intake failed', error instanceof Error ? error.message : String(error));
-    return html(formPage('the practice', 'Something went wrong on our side. Please try again in a moment, or call the practice directly.'), 500);
+    console.error('intake failed', describeError(error));
+    return asJson
+      ? json(jsonError('server_error', JSON_MESSAGES.server_error), 500, cors)
+      : html(formPage('the practice', JSON_MESSAGES.server_error), 500);
   }
 });

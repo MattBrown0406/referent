@@ -2,11 +2,18 @@ import { assert, assertEquals, assertStringIncludes } from 'jsr:@std/assert@1';
 
 import {
   admitPost,
+  ALLOWED_ORIGINS,
+  allowedOrigins,
   bucketNames,
   clientAddress,
+  corsHeaders,
   escapeHtml,
+  formFromJson,
   formPage,
   intakeRpcLead,
+  JSON_MESSAGES,
+  jsonError,
+  MAX_JSON_BYTES,
   IP_LIMIT,
   IP_POST_LIMIT,
   parseSubmission,
@@ -16,6 +23,7 @@ import {
   TOKEN_HARD_LIMIT,
   TOKEN_LIMIT,
   tokenFromPath,
+  wantsJson,
 } from './intake.ts';
 
 const TOKEN = 'a'.repeat(40);
@@ -244,4 +252,91 @@ Deno.test('the per-address all-posts limit is looser than the per-address lead l
   assert(IP_POST_LIMIT.perWindow > IP_LIMIT.perWindow);
   assertEquals(TOKEN_LIMIT, { perWindow: 30, windowSeconds: 3600 });
   assertEquals(TOKEN_HARD_LIMIT, { perWindow: 300, windowSeconds: 3600 }, 'the hard cap is ten times the budget');
+});
+
+// ─── The referralfit.com form (JSON + CORS) ─────────────────────────────────
+
+Deno.test('allowedOrigins: referralfit.com and www only, plus well-formed local extras', () => {
+  assertEquals(ALLOWED_ORIGINS, ['https://referralfit.com', 'https://www.referralfit.com']);
+  assertEquals(allowedOrigins(undefined), [...ALLOWED_ORIGINS]);
+  assertEquals(allowedOrigins(''), [...ALLOWED_ORIGINS]);
+  assertEquals(allowedOrigins(' http://localhost:3219 , http://127.0.0.1:3000'), [...ALLOWED_ORIGINS, 'http://localhost:3219', 'http://127.0.0.1:3000']);
+  assertEquals(allowedOrigins('*,https://evil.example/path,null,ftp://x.test'), [...ALLOWED_ORIGINS], 'a wildcard, a path, null and other schemes are ignored');
+});
+
+Deno.test('corsHeaders names an allowed origin and never a wildcard or credentials', () => {
+  const allowed = allowedOrigins(undefined);
+  const ok = corsHeaders('https://referralfit.com', allowed);
+  assertEquals(ok['access-control-allow-origin'], 'https://referralfit.com');
+  assertEquals(ok['access-control-allow-methods'], 'GET, POST, OPTIONS');
+  assertEquals(ok['access-control-allow-headers'], 'Content-Type, Accept');
+  assertEquals(ok.vary, 'Origin');
+  assertEquals(corsHeaders('https://www.referralfit.com', allowed)['access-control-allow-origin'], 'https://www.referralfit.com');
+  for (const origin of [null, '', 'https://evil.example', 'https://referralfit.com.evil.example', 'http://referralfit.com', 'https://referralfit-web.vercel.app', 'null']) {
+    const refused = corsHeaders(origin, allowed);
+    assertEquals(refused, { vary: 'Origin' }, `no CORS for ${origin}`);
+  }
+  for (const headers of [ok, corsHeaders('https://evil.example', allowed)]) {
+    assert(!Object.values(headers).includes('*'));
+    assert(!('access-control-allow-credentials' in headers));
+  }
+});
+
+Deno.test('wantsJson: GET with format=json and POST with a JSON body; the HTML form otherwise', () => {
+  const page = new URL(`https://x.supabase.co/functions/v1/intake/${TOKEN}`);
+  const asJson = new URL(`https://x.supabase.co/functions/v1/intake/${TOKEN}?format=json`);
+  assertEquals(wantsJson('GET', asJson, null), true);
+  assertEquals(wantsJson('GET', page, null), false);
+  assertEquals(wantsJson('POST', page, 'application/json'), true);
+  assertEquals(wantsJson('POST', page, 'Application/JSON; charset=utf-8'), true);
+  assertEquals(wantsJson('POST', page, 'application/x-www-form-urlencoded'), false);
+  assertEquals(wantsJson('POST', page, null), false);
+  assertEquals(wantsJson('PUT', asJson, 'application/json'), false);
+});
+
+Deno.test('formFromJson keeps only the known string fields, so parseSubmission applies unchanged', () => {
+  const form = formFromJson(JSON.stringify({
+    caller_name: '  Pat   Lee ', phone: '(555) 123-4567', email: '', about_relationship: 'son', about_first_name: 'Sam',
+    urgency: 'immediate_danger', company: '', extra: 'dropped', admin: true,
+  }));
+  assert(form);
+  assertEquals([...form.keys()].sort(), ['about_first_name', 'about_relationship', 'caller_name', 'company', 'email', 'phone', 'urgency']);
+  const parsed = parseSubmission(form);
+  assertEquals(parsed.kind, 'lead');
+  if (parsed.kind === 'lead') {
+    assertEquals(parsed.lead.caller_name, 'Pat Lee');
+    assertEquals(parsed.lead.urgency, 'immediate_danger');
+    assertEquals(parsed.lead.lead_source, 'Website');
+  }
+});
+
+Deno.test('formFromJson: the honeypot and the validation rules still decide', () => {
+  assertEquals(parseSubmission(formFromJson(JSON.stringify({ caller_name: 'Pat', phone: '5551234567', company: 'Acme' }))!).kind, 'honeypot');
+  const invalid = parseSubmission(formFromJson(JSON.stringify({ caller_name: 'Pat', phone: '123' }))!);
+  assertEquals(invalid, { kind: 'invalid', reason: 'Please add a phone number with area code so we can call you back.' });
+  // Non-string values are dropped, not coerced: a numeric phone is missing.
+  assertEquals(parseSubmission(formFromJson(JSON.stringify({ caller_name: 'Pat', phone: 5551234567 }))!).kind, 'invalid');
+});
+
+Deno.test('formFromJson refuses anything that is not a JSON object', () => {
+  for (const text of ['', 'not json', '[]', '[{"caller_name":"Pat"}]', 'null', '"text"', '42', 'caller_name=Pat&phone=5551234567']) {
+    assertEquals(formFromJson(text), null, text);
+  }
+});
+
+Deno.test('admitPost with a JSON body that is not an object: charged to the address only, then refused', async () => {
+  const hits: string[] = [];
+  const decision = await admitPost(TOKEN, 'addr', async () => formFromJson('[]'), async (bucket) => {
+    hits.push(bucket);
+    return true;
+  });
+  assertEquals(decision, { kind: 'bad_content_type' });
+  assertEquals(hits, ['ip-post:addr']);
+});
+
+Deno.test('JSON errors match the website contract and never echo input', () => {
+  assertEquals(jsonError('not_found', JSON_MESSAGES.not_found), { error: { code: 'not_found', message: 'This link is not active.' } });
+  assertEquals(jsonError('rate_limited', JSON_MESSAGES.rate_limited).error.code, 'rate_limited');
+  assertEquals(jsonError('invalid', 'Please add your name.').error, { code: 'invalid', message: 'Please add your name.' });
+  assert(MAX_JSON_BYTES >= 2048 && MAX_JSON_BYTES <= 16384, 'room for a real submission, nothing like an upload');
 });
