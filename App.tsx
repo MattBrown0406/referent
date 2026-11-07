@@ -1849,11 +1849,18 @@ export default function App() {
     // Once the saved copy is on screen, sheets can be open: an alert or a
     // prompt waits for them to close (iOS wedges a sheet presented over one).
     let showingSaved = false;
-    const whenScreenClear = (open: () => void) => {
-      // Up to about 10 minutes: "Could not load account" is the only sign a
-      // launch failed while the saved copy shows.
-      if (showingSaved) afterSheetCloses(open, { ifScreenBusy: 'wait', maxWaits: 1000 });
-      else open();
+    const launchStartedAt = Date.now();
+    const whenScreenClear = (open: () => void, untilRefreshed = false) => {
+      // Up to about 2 minutes, and not once a refresh since has worked:
+      // "Could not load account" is the only sign a launch failed while the
+      // saved copy shows.
+      if (showingSaved) {
+        afterSheetCloses(open, {
+          ifScreenBusy: 'wait',
+          maxWaits: 200,
+          stillWanted: () => !untilRefreshed || lastServerRefreshAtRef.current < launchStartedAt,
+        });
+      } else open();
     };
     (async () => {
       try {
@@ -1889,8 +1896,12 @@ export default function App() {
         const launchCopy = await readLaunchCopy(userId).catch(() => null);
         if (!active || generation !== authGenerationRef.current) return;
         showingSaved = Boolean(launchCopy);
+        // The Match form as this launch loaded it from the saved copy: a
+        // profile picked or a new match started meanwhile changes it.
+        let launchMatchForm: string | null = null;
         if (launchCopy) {
           applySnapshot(launchCopy.snapshot);
+          launchMatchForm = appliedMatchFormRef.current;
           if (launchCopy.caseList) {
             setCases(launchCopy.caseList.list.cases);
             setAllCaseContacts(launchCopy.caseList.list.contacts);
@@ -1919,9 +1930,13 @@ export default function App() {
           lastServerRefreshAtRef.current = 0;
           skippedServerCopy = true;
         } else {
-          // The Match form keeps anything typed while the saved copy showed;
-          // untouched, it loads the server's profile (edited elsewhere since).
-          applySnapshot(result.snapshot, !showingSaved || currentMatchFormRef.current === appliedMatchFormRef.current);
+          // The Match form keeps anything done to it while the saved copy
+          // showed (typed, a profile picked, a new match started); exactly as
+          // launch loaded it, it loads the server's profile (edited elsewhere
+          // since).
+          const formAsLaunched = launchMatchForm !== null
+            && appliedMatchFormRef.current === launchMatchForm && currentMatchFormRef.current === launchMatchForm;
+          applySnapshot(result.snapshot, !showingSaved || formAsLaunched);
         }
         const hydratedStatus = await syncStatus(userId).catch(() => null);
         if (!active || generation !== authGenerationRef.current) return;
@@ -1948,9 +1963,12 @@ export default function App() {
           }
         }
         if (!active || generation !== authGenerationRef.current) return;
-        if (changedMeanwhile()) {
+        if (changedMeanwhile() || (!caseListLoad && showingSaved)) {
+          // Not shown (newer screen) or not read (a failed read keeps the
+          // saved list): read again soon.
           skippedServerCopy = true;
-        } else if (caseListLoad || !showingSaved) {
+        }
+        if (!changedMeanwhile() && (caseListLoad || !showingSaved)) {
           // A failed read leaves the saved case list on screen.
           setCases(activeCaseList);
           setAllCaseContacts(activeContacts);
@@ -2043,7 +2061,7 @@ export default function App() {
       } catch (error) {
         if (active && generation === authGenerationRef.current) {
           const detail = describeError(error);
-          whenScreenClear(() => Alert.alert('Could not load account', detail));
+          whenScreenClear(() => Alert.alert('Could not load account', detail), true);
         }
       } finally {
         if (active && generation === authGenerationRef.current) setLoaded(true);

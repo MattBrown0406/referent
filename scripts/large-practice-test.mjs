@@ -27,15 +27,18 @@ assert.match(credentials, /fetchAllPages<unknown>\(\(from, to\) => supabase\.rpc
 
 // Launch: a returning user sees the saved copy first; the server copy
 // replaces it only if nothing was saved meanwhile.
-assert.match(app, /await readLaunchCopy\(userId\)[\s\S]{0,900}setLoaded\(true\);[\s\S]{0,1400}await hydrate\(userId\);[\s\S]{0,200}if \(changedMeanwhile\(\)\) \{\s*lastServerRefreshAtRef\.current = 0;\s*skippedServerCopy = true;\s*\} else \{[\s\S]{0,260}applySnapshot\(result\.snapshot, !showingSaved \|\| currentMatchFormRef\.current === appliedMatchFormRef\.current\);/,
+assert.match(app, /await readLaunchCopy\(userId\)[\s\S]{0,900}setLoaded\(true\);[\s\S]{0,1400}await hydrate\(userId\);[\s\S]{0,200}if \(changedMeanwhile\(\)\) \{\s*lastServerRefreshAtRef\.current = 0;\s*skippedServerCopy = true;\s*\} else \{[\s\S]{0,700}applySnapshot\(result\.snapshot, !showingSaved \|\| formAsLaunched\);/,
   'the saved copy shows before hydrate, a newer screen is not overwritten, and the Match form keeps only what was typed');
 assert.match(app, /const applyMatchToForm = useCallback\(\(match: ReferralMatch \| null\) => \{\s*appliedMatchFormRef\.current = matchFormSignature\(matchFormValuesFor\(match\)\);/,
   'loading a profile into the form records what was loaded');
 assert.match(app, /currentMatchFormRef\.current = matchFormSignature\(\[\s*selectedMatchId, matchClientLabel, matchType, matchState, matchInsurance, matchNetworkPreferences,\s*matchBudget, matchTherapies, matchMustHave, matchPopulation, matchLocationPreference,\s*\]\);/,
   'and the form on screen is compared field for field, in the same order');
-assert.match(app, /if \(changedMeanwhile\(\)\) \{\s*skippedServerCopy = true;\s*\} else if \(caseListLoad \|\| !showingSaved\) \{/,
-  'a failed case-list read leaves the saved list on screen');
-assert.match(app, /afterSheetCloses\(open, \{ ifScreenBusy: 'wait', maxWaits: 1000 \}\)/, 'launch prompts wait for a long-open sheet instead of being dropped');
+assert.match(app, /const formAsLaunched = launchMatchForm !== null\s*&& appliedMatchFormRef\.current === launchMatchForm && currentMatchFormRef\.current === launchMatchForm;/,
+  'only a form exactly as launch loaded it (no profile picked, nothing typed, no new match) takes the server\'s version');
+assert.match(app, /if \(changedMeanwhile\(\) \|\| \(!caseListLoad && showingSaved\)\) \{[\s\S]{0,200}skippedServerCopy = true;\s*\}\s*if \(!changedMeanwhile\(\) && \(caseListLoad \|\| !showingSaved\)\) \{/,
+  'a failed case-list read leaves the saved list on screen and is read again soon');
+assert.match(app, /afterSheetCloses\(open, \{\s*ifScreenBusy: 'wait',\s*maxWaits: 200,\s*stillWanted: \(\) => !untilRefreshed \|\| lastServerRefreshAtRef\.current < launchStartedAt,/,
+  'launch prompts wait for a long-open sheet, and a failed-launch alert is dropped once a refresh has worked');
 assert.match(app, /setLoaded\(true\);\s*\/\/ The saved copy shows its waiting changes[\s\S]{0,300}const savedStatus = await syncStatus\(userId\)[\s\S]{0,200}setQueuedWrites\(savedStatus\.pending\);\s*setRejectedWrites\(savedStatus\.waiting \+ savedStatus\.rejected\);/,
   'the badge and banner count the saved copy\'s waiting changes at once');
 assert.match(app, /if \(skippedServerCopy \|\| changedMeanwhile\(\)\) \{\s*lastServerRefreshAtRef\.current = 0;\s*scheduleCatchUpRefresh\(\);\s*\} else if \(result\.source === 'remote'\) \{/,
