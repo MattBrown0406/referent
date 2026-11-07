@@ -17,7 +17,16 @@ every screen.
    - Password: long and random; keep it in App Store Connect only.
    - Tick **Auto Confirm User**.
 2. **Supabase → SQL Editor** → paste `supabase/preflight/app_review_demo_account.sql`
-   → Run. It seeds six partners, four cases, referrals, touches, and a Today list.
+   → Run. It seeds nine partners, four cases, referrals, touches, and a Today list,
+   and the 1.1.0 features: on the Nguyen case, a level-of-care assessment, the
+   family's plan benefits with three programs' benefits answers (so "True cost
+   to the family" shows estimates), and a placement request from the saved
+   match to four programs (three answered, one waiting; Today → Placement
+   requests, or Match → Program answers); verified credentials on four
+   programs (Basalt Canyon has no LegitScript on file, Juniper Crest has none);
+   and a referral handoff the program has moved to "family reached"
+   (Referrals → Handoffs). The placement request is open for 48 hours from the
+   run, so run it close to submission.
    Re-run it any time to reset the reviewer workspace; it refuses to touch a
    workspace that has any other member.
 3. **Sign in once yourself** on a device with those credentials and tap
