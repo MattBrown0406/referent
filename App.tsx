@@ -2076,10 +2076,10 @@ export default function App() {
   // share sheet, or a picker is up, the tap waits (up to 10 minutes) until the
   // user closes it, then opens its target. Nothing is dismissed for them, so
   // no sheet can be left frozen half-closed.
-  const [pendingNav, setPendingNav] = useState<{ target: Parameters<Parameters<typeof subscribeToNotificationResponses>[0]>[0]; partnerId?: string; caseId?: string; at: number } | null>(null);
+  const [pendingNav, setPendingNav] = useState<{ target: Parameters<Parameters<typeof subscribeToNotificationResponses>[0]>[0]; partnerId?: string; caseId?: string; placementRequestId?: string; at: number } | null>(null);
   const notificationTapRef = useRef<(...args: Parameters<Parameters<typeof subscribeToNotificationResponses>[0]>) => void>(() => undefined);
-  notificationTapRef.current = (target, partnerId, caseId) => {
-    setPendingNav({ target, partnerId, caseId, at: Date.now() });
+  notificationTapRef.current = (target, partnerId, caseId, placementRequestId) => {
+    setPendingNav({ target, partnerId, caseId, placementRequestId, at: Date.now() });
     // A lead that arrived since the last refresh is not on this phone yet.
     if (target === 'case' && caseId && !latestCasesRef.current.some((item) => item.id === caseId)) {
       void refreshFromServer('pull').catch(() => undefined);
@@ -2100,8 +2100,14 @@ export default function App() {
         // The screen just cleared; let any closing sheet finish animating.
         clearSince = Date.now();
       } else if (Date.now() - clearSince >= SHEET_SWAP_MS) {
-        const { target, partnerId, caseId } = pendingNav;
+        const { target, partnerId, caseId, placementRequestId } = pendingNav;
         setPendingNav(null);
+        if (target === 'placement') {
+          // A program answered: its request's answers, read fresh on open.
+          setTab('home');
+          if (placementRequestId) openPlacementCompare(placementRequestId);
+          return;
+        }
         if (target === 'case') {
           setTab('home');
           if (caseId) {
@@ -2133,7 +2139,7 @@ export default function App() {
     if (!session?.user?.id) return undefined;
     // Through a ref, so the handler always sees this render's state (the
     // subscription itself lives for the whole sign-in).
-    return subscribeToNotificationResponses((target, partnerId, caseId) => notificationTapRef.current(target, partnerId, caseId));
+    return subscribeToNotificationResponses((target, partnerId, caseId, placementRequestId) => notificationTapRef.current(target, partnerId, caseId, placementRequestId));
   }, [session?.user?.id]);
 
   useEffect(() => {

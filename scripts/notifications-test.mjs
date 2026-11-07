@@ -130,6 +130,49 @@ assert.deepEqual(remote, [['case', undefined, 'c1'], ['workspace', undefined, un
 assert.deepEqual(notifications.remotePushTarget({ kind: 'new_lead' }), { target: 'home' }, 'a lead push without a case id lands on Today');
 unsubscribeRemote();
 
+// A program answered a placement request: the tap opens that request's answers.
+const PLACEMENT_ID = '91000000-0000-4000-8000-0000000000B8';
+const answered = [];
+const unsubscribeAnswered = notifications.subscribeToNotificationResponses((target, partnerId, caseId, placementRequestId) => answered.push([target, placementRequestId]));
+nativeState.responseListener({ notification: { request: { identifier: 'push-5', content: { data: { kind: 'placement_response', user_id: 'user-b', placement_request_id: PLACEMENT_ID } } } } });
+nativeState.responseListener({ notification: { request: { identifier: 'push-6', content: { data: { kind: 'placement_response', user_id: 'user-a', placement_request_id: PLACEMENT_ID } } } } });
+assert.deepEqual(answered, [['placement', PLACEMENT_ID.toLowerCase()]], 'a placement answer push opens its request, only for the addressed account');
+assert.deepEqual(notifications.remotePushTarget({ kind: 'placement_response', placement_request_id: 'not-an-id' }), { target: 'home' }, 'a placement push without a valid id lands on Today');
+unsubscribeAnswered();
+assert.ok(/if \(target === 'placement'\) \{[\s\S]{0,200}openPlacementCompare\(placementRequestId\)/.test(appSource), 'App routes a placement tap to the answers screen');
+
+// The push preference and its migration.
+const pushSource = readFileSync(path.join(repoRoot, 'src/lib/push.ts'), 'utf8');
+assert.ok(pushSource.includes("{ key: 'placement_response', label: 'A program answers my placement request'"), 'the Notify me card lists the new kind');
+assert.ok(pushSource.includes("placement_response: 'placementResponse'") && pushSource.includes('placementResponse: true,'), 'placement_response maps to its preference, on by default like the database');
+assert.ok(pushSource.includes("const OPTIONAL_PREFERENCE_COLUMNS = ['placement_response', 'bed_opened'] as const;"), 'an older server without the column still loads and saves the other switches');
+const pushMigration = readFileSync(path.join(repoRoot, 'supabase/migrations/20261106120000_placement_response_push.sql'), 'utf8');
+assert.ok(/^[\x00-\x7F]*$/.test(pushMigration) && !pushMigration.includes('\\'), 'push migration: ASCII only, no backslashes');
+{
+  const statements = [];
+  let start = 0;
+  let dollar = null;
+  for (let index = 0; index < pushMigration.length; index += 1) {
+    if (dollar) { if (pushMigration.startsWith(dollar, index)) { index += dollar.length - 1; dollar = null; } continue; }
+    const tag = /^\$[A-Za-z_]*\$/.exec(pushMigration.slice(index, index + 20));
+    if (tag) { dollar = tag[0]; index += tag[0].length - 1; continue; }
+    if (pushMigration[index] === '-' && pushMigration[index + 1] === '-') { const end = pushMigration.indexOf('\n', index); index = end < 0 ? pushMigration.length : end; continue; }
+    if (pushMigration[index] === ';') { statements.push(pushMigration.slice(start, index + 1)); start = index + 1; }
+  }
+  assert.equal(dollar, null, 'push migration: every dollar quote is closed');
+  assert.equal(pushMigration.slice(start).trim(), '', 'push migration: nothing after the last statement');
+  assert.ok(Math.max(...statements.map((statement) => statement.length)) < 3700, 'push migration: every statement is under 3,700 characters');
+  assert.ok(statements[0].trim().endsWith('BEGIN;') && statements[statements.length - 1].trim().endsWith('COMMIT;'), 'push migration: one BEGIN/COMMIT');
+}
+for (const text of [
+  "WHEN 'placement_response' THEN v_pref.placement_response",
+  "WHEN 'placement_response' THEN 'A program answered'",
+  'AFTER UPDATE ON public.placement_request_recipients',
+  'IF NEW.entered_by_practice OR',
+  "public.push_dispatch_setting('referralfit_push_dispatch_secret')",
+  'REVOKE ALL ON FUNCTION public.push_dispatch_setting(text) FROM PUBLIC, anon, authenticated, service_role;',
+]) assert.ok(pushMigration.includes(text), `push migration missing: ${text}`);
+
 // ─── Reminders follow Today's Mine rule ─────────────────────────────────────
 // Assigned to me, or to nobody (and its case assigned to me or to nobody).
 const ME = 'aaaaaaaa-1111-4111-8111-111111111111';
