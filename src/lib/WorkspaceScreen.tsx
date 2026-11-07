@@ -38,6 +38,16 @@ import { fetchPendingListingCredentials } from './credentials';
 import { prepareForWorkspaceChange } from './store';
 import { deleteOwnAccount } from './account';
 import { AiDraftsCard } from './AiDraftKey';
+import {
+  APP_LOCK_GRACE_OPTIONS,
+  appLockEnableMessage,
+  appLockName,
+  appLockStatus,
+  disableAppLock,
+  enableAppLock,
+  setAppLockGrace,
+  type AppLockStatus,
+} from './app-lock';
 import { removeAnthropicKey } from './outreach-api';
 import {
   enablePush,
@@ -134,6 +144,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   const [notify, setNotify] = useState<PreferencesState | null>(null);
   const [notifyError, setNotifyError] = useState('');
   const [notifyNote, setNotifyNote] = useState('');
+  // "Lock with Face ID" on this phone (null: no lock here, e.g. the web).
+  const [lock, setLock] = useState<AppLockStatus | null>(() => appLockStatus());
+  const [lockBusy, setLockBusy] = useState(false);
+  const [lockNote, setLockNote] = useState<string | null>(null);
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
 
@@ -296,6 +310,32 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       await load();
       onLeadSettingsChanged?.();
     }, 'Could not save the target');
+  }
+
+  // Turning the lock on asks for Face ID (or the passcode) first, natively.
+  async function toggleLock(on: boolean) {
+    if (lockBusy) return;
+    setLockNote(null);
+    if (!on) {
+      disableAppLock();
+      setLock(appLockStatus());
+      return;
+    }
+    setLockBusy(true);
+    try {
+      const result = await enableAppLock(lock?.graceSeconds ?? 60);
+      setLockNote(result.ok ? null : appLockEnableMessage(result.error));
+    } catch {
+      setLockNote(appLockEnableMessage('failed'));
+    } finally {
+      setLock(appLockStatus());
+      setLockBusy(false);
+    }
+  }
+
+  function chooseLockGrace(seconds: number) {
+    setAppLockGrace(seconds);
+    setLock(appLockStatus());
   }
 
   // Turning push on is the only place the OS permission prompt is raised.
@@ -592,6 +632,58 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
               )}
             </View>
 
+            {lock ? (
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>Privacy on this phone</Text>
+                {!lock.available ? (
+                  <Text style={styles.helpText}>To lock ReferralFit, first set a passcode for this iPhone in Settings &gt; Face ID &amp; Passcode.</Text>
+                ) : (
+                  <>
+                    <View style={styles.memberRow}>
+                      <View style={styles.memberInfo}>
+                        <Text style={styles.memberName}>Lock with {appLockName(lock.biometry)}</Text>
+                        <Text style={styles.memberRole}>
+                          {lock.biometry === 'none'
+                            ? 'Asks for this iPhone\u2019s passcode to open ReferralFit.'
+                            : `Asks for ${appLockName(lock.biometry)} to open ReferralFit. Your passcode works too.`}
+                        </Text>
+                      </View>
+                      <Switch
+                        accessibilityLabel={`Lock with ${appLockName(lock.biometry)}`}
+                        value={lock.enabled}
+                        disabled={lockBusy}
+                        onValueChange={toggleLock}
+                        trackColor={{ true: COLORS.blue }}
+                      />
+                    </View>
+                    {lock.enabled ? (
+                      <>
+                        <Text style={styles.memberRole}>Lock again when you come back to the app:</Text>
+                        <View style={styles.choiceRow} accessibilityRole="radiogroup">
+                          {APP_LOCK_GRACE_OPTIONS.map((option) => {
+                            const selected = lock.graceSeconds === option.seconds;
+                            return (
+                              <TouchableOpacity
+                                key={option.seconds}
+                                accessibilityRole="radio"
+                                accessibilityState={{ selected }}
+                                onPress={() => chooseLockGrace(option.seconds)}
+                                style={[styles.choice, selected && styles.choiceSelected]}
+                              >
+                                <Text style={[styles.choiceText, selected && styles.choiceTextSelected]}>{option.label}</Text>
+                              </TouchableOpacity>
+                            );
+                          })}
+                        </View>
+                      </>
+                    ) : null}
+                    {lockNote ? <Text style={styles.helpText}>{lockNote}</Text> : null}
+                  </>
+                )}
+                <Text style={styles.helpText}>The app switcher always shows a blank ReferralFit screen, never a case.</Text>
+              </View>
+            ) : null}
+
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Your directory profile</Text>
               {directoryProfile?.profile ? (
@@ -869,6 +961,11 @@ const styles = StyleSheet.create({
   targetRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   targetInput: { width: 72, borderWidth: 1, borderColor: COLORS.line, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, fontSize: 16, color: COLORS.ink, backgroundColor: COLORS.bg, textAlign: 'center' },
   helpTextSpaced: { marginTop: 10 },
+  choiceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  choice: { minHeight: 36, justifyContent: 'center', borderWidth: 1, borderColor: COLORS.line, borderRadius: 999, paddingVertical: 7, paddingHorizontal: 12 },
+  choiceSelected: { backgroundColor: COLORS.blueSoft, borderColor: COLORS.blue },
+  choiceText: { fontSize: 14, fontWeight: '600', color: COLORS.gray },
+  choiceTextSelected: { color: COLORS.blue },
   inviteRow: {
     flexDirection: 'row',
     alignItems: 'center',

@@ -42,7 +42,7 @@
       [
         "expo-secure-store",
         {
-          "faceIDPermission": false
+          "faceIDPermission": "ReferralFit uses Face ID to unlock the app, so your cases stay private if someone else picks up your phone."
         }
       ],
       [

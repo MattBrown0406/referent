@@ -238,7 +238,11 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   assert.equal(picker.microphonePermission, false, 'no microphone usage string');
   assert.match(picker.photosPermission || '', /photo/i);
   const secureStore = appJson.expo.plugins.find((plugin) => Array.isArray(plugin) && plugin[0] === 'expo-secure-store')?.[1] || {};
-  assert.equal(secureStore.faceIDPermission, false, 'no Face ID usage string');
+  // Face ID is used now (Lock with Face ID, modules/app-lock): the usage
+  // string is required, and only alongside the code that asks for it.
+  const appLockSwift = await readFile(new URL('../modules/app-lock/ios/AppLockModule.swift', import.meta.url), 'utf8');
+  assert.match(secureStore.faceIDPermission || '', /Face ID/, 'the Face ID usage string says why');
+  assert.match(appLockSwift, /evaluatePolicy\(\.deviceOwnerAuthentication/, 'and the app does ask for Face ID');
   assert.ok(!(appJson.expo.android?.permissions || []).includes('android.permission.RECORD_AUDIO'), 'no RECORD_AUDIO');
 }
 
