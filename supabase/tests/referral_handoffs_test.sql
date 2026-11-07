@@ -7,7 +7,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(35);
+SELECT plan(47);
 
 -- Actors
 --   t1  owner of team T (TA imports listing L1)
@@ -173,6 +173,92 @@ SELECT is(
 );
 
 -- ===========================================================================
+-- D2. Who moves a step: a teammate, a program signed in to the portal, a
+--     creator who left. The reminder stays with the right person.
+-- ===========================================================================
+
+INSERT INTO auth.users (id, email)
+VALUES ('c1000000-0000-0000-0000-0000000000e9', 'handoff-center@example.test'),
+       ('a9000000-0000-0000-0000-0000000000e9', 'handoff-gone@example.test');
+
+-- m1 (a teammate) marks j1's handoff in the app.
+SELECT set_config('request.jwt.claim.sub', 'b2000000-0000-0000-0000-0000000000e9', true);
+SET LOCAL ROLE authenticated;
+SELECT is(
+  (SELECT status || ':' || version FROM public.transition_referral_handoff(current_setting('test.j_handoff')::uuid, 3, 'family_reached')),
+  'family_reached:4', 'a teammate marks a step on someone else''s handoff'
+);
+RESET ROLE;
+SELECT is(
+  (SELECT owner_id FROM public.follow_ups WHERE referral_handoff_id = current_setting('test.j_handoff')::uuid AND status = 'open'),
+  'b3000000-0000-0000-0000-0000000000e9'::uuid, 'and the next reminder is still the creator''s'
+);
+
+-- The program's page in a browser signed in to the center portal: the
+-- request carries the center account, which is in no part of the practice.
+SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000e9', true);
+SET LOCAL ROLE authenticated;
+SELECT is(
+  (SELECT status || ':' || version FROM public.public_referral_handoff_transition(current_setting('test.j_token'), 4, 'consult_scheduled')),
+  'consult_scheduled:5', 'the program''s page works while its browser is signed in to the portal'
+);
+SELECT is(auth.uid(), 'c1000000-0000-0000-0000-0000000000e9'::uuid, 'and the request''s own identity is back after the step');
+RESET ROLE;
+SELECT ok(
+  (SELECT owner_id = 'b3000000-0000-0000-0000-0000000000e9' FROM public.follow_ups
+    WHERE referral_handoff_id = current_setting('test.j_handoff')::uuid AND status = 'open')
+  AND NOT EXISTS (SELECT 1 FROM public.follow_ups WHERE referral_handoff_id = current_setting('test.j_handoff')::uuid
+                   AND completed_by = 'c1000000-0000-0000-0000-0000000000e9'),
+  'the reminder stays the creator''s, and the center account is written into no practice row'
+);
+
+-- A creator no longer in the workspace (a9 has a workspace of its own):
+-- the next reminder goes to the workspace owner.
+SELECT set_config('request.jwt.claim.sub', 'b1000000-0000-0000-0000-0000000000e9', true);
+SET LOCAL ROLE authenticated;
+SELECT set_config('test.t_token', token, true)
+  FROM public.create_referral_handoff('f1000000-0000-0000-0000-0000000000e9', NULL, 'e1000000-0000-0000-0000-0000000000e9', 'Family D', 'Juniper Ridge', '');
+SELECT throws_ok(
+  $$ SELECT * FROM public.create_referral_handoff('f1000000-0000-0000-0000-0000000000e9', NULL, 'e1000000-0000-0000-0000-0000000000e9', 'Family E', 'Juniper Ridge', '') $$,
+  '23505', NULL, 'a referral has one open handoff at a time'
+);
+INSERT INTO public.referrals (id, owner_id, partner_id, direction, referred_on, client_label)
+VALUES ('f5000000-0000-0000-0000-0000000000e9', 'b1000000-0000-0000-0000-0000000000e9', 'e1000000-0000-0000-0000-0000000000e9', 'inbound', '2026-11-04', 'Inbound client');
+SELECT throws_ok(
+  $$ SELECT * FROM public.create_referral_handoff('f5000000-0000-0000-0000-0000000000e9', NULL, 'e1000000-0000-0000-0000-0000000000e9', 'Family F', 'Juniper Ridge', '') $$,
+  '22023', NULL, 'and only one this practice sent out'
+);
+RESET ROLE;
+UPDATE public.referral_handoffs SET owner_id = 'a9000000-0000-0000-0000-0000000000e9' WHERE referral_id = 'f1000000-0000-0000-0000-0000000000e9';
+SELECT set_config('request.jwt.claim.sub', '', true);
+SELECT is(
+  (SELECT f.owner_id FROM public.follow_ups f
+    WHERE f.referral_handoff_id = (SELECT id FROM public.public_referral_handoff_transition(current_setting('test.t_token'), 1, 'received') AS t
+                                    CROSS JOIN public.referral_handoffs h WHERE h.referral_id = 'f1000000-0000-0000-0000-0000000000e9')
+      AND f.status = 'open'),
+  'b1000000-0000-0000-0000-0000000000e9'::uuid,
+  'a creator who left the team: the next reminder goes to the workspace owner'
+);
+
+-- The history goes only with its handoff.
+SELECT throws_ok(
+  $$ DELETE FROM public.referral_handoff_events WHERE handoff_id = current_setting('test.j_handoff')::uuid $$,
+  '42501', NULL, 'the history is never deleted on its own'
+);
+SELECT set_config('request.jwt.claim.sub', 'b1000000-0000-0000-0000-0000000000e9', true);
+SET LOCAL ROLE authenticated;
+SELECT lives_ok($$ DELETE FROM public.referrals WHERE id = 'f1000000-0000-0000-0000-0000000000e9' $$, 'deleting a referral with a handoff works');
+RESET ROLE;
+SELECT is(
+  (SELECT count(*)::integer FROM public.referral_handoffs WHERE referral_id = 'f1000000-0000-0000-0000-0000000000e9'),
+  0, 'and takes its handoff, history and link with it'
+);
+SELECT ok(
+  pg_get_functiondef('public.org_move_workspace_rows(uuid, uuid)'::regprocedure) LIKE '%case_assessments%',
+  'moving a workspace still moves its level-of-care assessments'
+);
+
+-- ===========================================================================
 -- E. Deleting an account
 -- ===========================================================================
 
@@ -238,7 +324,7 @@ SELECT ok(
 );
 SET LOCAL ROLE anon;
 SELECT is((SELECT count(*)::integer FROM public.public_referral_handoff_resolve('0000')), 0, 'signed out, a wrong token shows nothing');
-SELECT is((SELECT status FROM public.public_referral_handoff_resolve(current_setting('test.j_token'))), 'contact_attempted', 'and the right one shows the status');
+SELECT is((SELECT status FROM public.public_referral_handoff_resolve(current_setting('test.j_token'))), 'consult_scheduled', 'and the right one shows the status');
 RESET ROLE;
 SELECT ok(
   has_table_privilege('authenticated', 'public.referral_handoffs', 'SELECT')

@@ -1,5 +1,5 @@
 import * as Clipboard from 'expo-clipboard';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -80,6 +80,9 @@ export default function HandoffsSheet({ visible, referrals, partnersById, caseNa
   const [handoffs, setHandoffs] = useState<ReferralHandoff[] | null>(null);
   const [loadError, setLoadError] = useState('');
   const [busyId, setBusyId] = useState<string | null>(null);
+  // Set before the first await: two taps in one frame both read busyId as
+  // null, and a second handoff would replace the first one's only link.
+  const creatingRef = useRef(false);
   const [link, setLink] = useState<{ url: string; alias: string; handoffId: string } | null>(null);
   const [composing, setComposing] = useState(false);
   const [referralId, setReferralId] = useState<string | null>(null);
@@ -130,12 +133,13 @@ export default function HandoffsSheet({ visible, referrals, partnersById, caseNa
   }
 
   async function create() {
-    if (!chosen || busyId) return;
+    if (!chosen || busyId || creatingRef.current) return;
     const problem = handoffAliasProblem(alias, caseNamesFor(chosen.caseId), chosen.clientLabel || null) || recipientProblem(recipient, email);
     if (problem) {
       setFormError(problem);
       return;
     }
+    creatingRef.current = true;
     setBusyId('new');
     setFormError('');
     try {
@@ -154,6 +158,7 @@ export default function HandoffsSheet({ visible, referrals, partnersById, caseNa
     } catch (error) {
       setFormError(failureText(error));
     } finally {
+      creatingRef.current = false;
       setBusyId(null);
     }
   }

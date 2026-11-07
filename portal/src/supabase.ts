@@ -12,4 +12,15 @@ const LOCAL_URL = import.meta.env.DEV ? import.meta.env.VITE_SUPABASE_URL as str
 const LOCAL_KEY = import.meta.env.DEV ? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined : undefined;
 const useLocal = Boolean(LOCAL_URL && LOCAL_KEY);
 
-export const supabase = createClient(useLocal ? LOCAL_URL as string : SUPABASE_URL, useLocal ? LOCAL_KEY as string : SUPABASE_PUBLISHABLE_KEY);
+const url = useLocal ? LOCAL_URL as string : SUPABASE_URL;
+const key = useLocal ? LOCAL_KEY as string : SUPABASE_PUBLISHABLE_KEY;
+
+export const supabase = createClient(url, key);
+
+// The handoff page (/h) is signed out by design: its calls carry the token
+// only. This client never reads or sends a center portal session stored in
+// the same browser (the server then sees nobody signed in), and never
+// stores one.
+export const signedOutSupabase = createClient(url, key, {
+  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false, storageKey: 'referralfit-handoff-signed-out' },
+});

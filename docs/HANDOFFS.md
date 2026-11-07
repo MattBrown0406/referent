@@ -8,13 +8,20 @@ reminder moves with every step.
 - **App:** Referrals → **Handoffs** (`src/lib/HandoffsSheet.tsx`,
   `src/lib/handoffs.ts`). New handoff: pick an outbound referral, an alias the
   program sees, and who receives it. The link is shown once. A handoff can be
-  marked forward here (when the program called instead) or revoked.
+  marked forward here by anyone on the team (when the program called
+  instead) or revoked. A referral has one open handoff at a time, and only a
+  referral the practice sent out can have one (the server checks both).
 - **Program's page:** `https://portal.referralfit.com/h#<token>`
-  (`portal/src/Handoff.tsx`). Signed out. It shows the alias, the two names
-  and the status, and records the next step.
+  (`portal/src/Handoff.tsx`). Signed out, even in a browser signed in to the
+  center portal: it uses its own client, which sends no stored session. It
+  shows the alias, the two names and the status, and records the next step.
+  When the server cannot be reached it says so and offers to try again
+  (the link is not called revoked).
 - **Today:** each handoff has one open reminder (follow-up kind
-  `referral_handshake`), written by the server. Done on it opens Handoffs; it
-  is never treated as the referral's admit question.
+  `referral_handshake`), written by the server for the handoff's creator
+  while they are on the team, else for the workspace owner, whoever moved
+  the step. Done on it opens Handoffs; it is never treated as the referral's
+  admit question.
 
 ## Privacy
 
@@ -28,8 +35,9 @@ reminder moves with every step.
 - The page calls two functions, `public_referral_handoff_resolve` and
   `public_referral_handoff_transition`, with the token alone (granted to
   `anon`). Nothing else about handoffs is reachable signed out.
-- History (`referral_handoff_events`) is append-only: never edited, never
-  deleted by a client.
+- History (`referral_handoff_events`) is append-only: never edited, and
+  deleted only with its handoff. Deleting the referral or the partner, or
+  the workspace, deletes the handoff, its history and its link.
 
 ## Where it came from
 

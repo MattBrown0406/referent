@@ -104,15 +104,19 @@ ALTER TABLE public.follow_ups
 
 -- The history is never edited. It may move with its workspace (org_id),
 -- lose a deleted account's id (actor_id set to NULL by its key), and goes
--- when the workspace or the referral does. No client can update or delete
--- it either way: authenticated holds SELECT only.
+-- only with its handoff (which goes with its workspace, referral or
+-- partner). No client can update or delete it either way: authenticated
+-- holds SELECT only.
 CREATE OR REPLACE FUNCTION public.reject_handoff_event_mutation()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER
 SET search_path = pg_catalog
 AS $$
 BEGIN
-  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  IF TG_OP = 'DELETE' THEN
+    IF NOT EXISTS (SELECT 1 FROM public.referral_handoffs h WHERE h.id = OLD.handoff_id) THEN RETURN OLD; END IF;
+    RAISE EXCEPTION 'Referral handoff history is append-only' USING ERRCODE = '42501';
+  END IF;
   IF (to_jsonb(NEW) - 'org_id' - 'actor_id') = (to_jsonb(OLD) - 'org_id' - 'actor_id')
      AND (NEW.actor_id IS NULL OR NEW.actor_id = OLD.actor_id) THEN
     RETURN NEW;
@@ -122,9 +126,8 @@ END
 $$;
 REVOKE ALL ON FUNCTION public.reject_handoff_event_mutation() FROM PUBLIC, anon, authenticated;
 
--- Same as 20260830201717, plus: the alias is what the program reads, so it
--- passes the identifying-details check (no names from the case, its
--- contacts or the referral's client label; no dates, numbers, emails).
+-- Same as 20260830201717, plus: the alias (what the program reads) passes
+-- the identifying-details check; one open handoff per outbound referral.
 CREATE OR REPLACE FUNCTION public.create_referral_handoff(
   p_referral_id uuid, p_case_id uuid, p_partner_id uuid,
   p_client_alias text, p_recipient_display text, p_recipient_email text DEFAULT '')
@@ -149,10 +152,17 @@ BEGIN
          AND pg_catalog.lower(pg_catalog.btrim(p_recipient_email)) !~ '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$') THEN
     RAISE EXCEPTION 'Invalid handoff details' USING ERRCODE = '22023';
   END IF;
-  SELECT * INTO v_referral FROM public.referrals WHERE id = p_referral_id AND org_id = v_org;
+  SELECT * INTO v_referral FROM public.referrals WHERE id = p_referral_id AND org_id = v_org FOR UPDATE;
   IF NOT FOUND OR v_referral.partner_id IS DISTINCT FROM p_partner_id
      OR (p_case_id IS NOT NULL AND v_referral.case_id IS DISTINCT FROM p_case_id) THEN
     RAISE EXCEPTION 'Referral links do not match this workspace' USING ERRCODE = 'P0002';
+  END IF;
+  IF v_referral.direction IS DISTINCT FROM 'outbound' THEN
+    RAISE EXCEPTION 'A handoff is for a referral you sent to a program' USING ERRCODE = '22023';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.referral_handoffs h
+              WHERE h.referral_id = p_referral_id AND h.revoked_at IS NULL AND h.status <> 'closed') THEN
+    RAISE EXCEPTION 'This referral already has an open handoff. Revoke it to send a new link.' USING ERRCODE = '23505';
   END IF;
   v_problem := public.identifying_text_problem(p_client_alias,
     public.identifying_case_names(coalesce(p_case_id, v_referral.case_id), v_org), v_referral.client_label);
@@ -174,8 +184,23 @@ $$;
 REVOKE ALL ON FUNCTION public.create_referral_handoff(uuid, uuid, uuid, text, text, text) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.create_referral_handoff(uuid, uuid, uuid, text, text, text) TO authenticated;
 
--- Same as 20260830201717, plus: when the creator's account is gone, the
--- next reminder goes to the workspace owner (none when nobody is left).
+-- Sets (or puts back) the request's identity: follow_ups pins a new row to
+-- the signed-in author, and a handoff's reminder is written for its owner
+-- whoever moved the step.
+CREATE OR REPLACE FUNCTION public.handoff_request_identity(p_sub text, p_claims text)
+RETURNS void
+LANGUAGE sql
+SET search_path = pg_catalog
+AS $$
+  SELECT pg_catalog.set_config('request.jwt.claim.sub', coalesce(p_sub, ''), true),
+         pg_catalog.set_config('request.jwt.claims', coalesce(p_claims, ''), true);
+$$;
+REVOKE ALL ON FUNCTION public.handoff_request_identity(text, text) FROM PUBLIC, anon, authenticated, service_role;
+
+-- Same as 20260830201717, plus: the next reminder goes to the creator while
+-- still on the team, else the workspace owner; a teammate or the program's
+-- page (signed in to the portal or not) can move the step, and the page's
+-- account is never written into the practice's rows.
 CREATE OR REPLACE FUNCTION public.apply_referral_handoff_transition(
   p_handoff_id uuid, p_expected_version integer, p_next_status text, p_actor_type text, p_actor_id uuid DEFAULT NULL)
 RETURNS TABLE (handoff_status text, handoff_version integer)
@@ -188,6 +213,8 @@ DECLARE
   v_new_version integer;
   v_title text;
   v_owner uuid;
+  v_sub text := current_setting('request.jwt.claim.sub', true);
+  v_claims text := current_setting('request.jwt.claims', true);
 BEGIN
   SELECT * INTO v_h FROM public.referral_handoffs WHERE id = p_handoff_id FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'Handoff not found' USING ERRCODE = 'P0002'; END IF;
@@ -204,10 +231,15 @@ BEGIN
   UPDATE public.referral_handoffs SET status = p_next_status, version = v_new_version WHERE id = v_h.id;
   INSERT INTO public.referral_handoff_events (handoff_id, org_id, from_status, to_status, version, actor_type, actor_id)
   VALUES (v_h.id, v_h.org_id, v_h.status, p_next_status, v_new_version, p_actor_type, p_actor_id);
+  IF p_actor_type = 'recipient' THEN PERFORM public.handoff_request_identity('', ''); END IF;
   UPDATE public.follow_ups AS f SET status = 'done', completed_at = pg_catalog.clock_timestamp()
    WHERE f.referral_handoff_id = v_h.id AND f.kind = 'referral_handshake' AND f.status = 'open';
-  v_owner := coalesce(v_h.owner_id, (SELECT m.user_id FROM public.org_members m
-                                      WHERE m.org_id = v_h.org_id ORDER BY (m.role = 'owner') DESC, m.user_id LIMIT 1));
+  SELECT m.user_id INTO v_owner FROM public.org_members m WHERE m.org_id = v_h.org_id AND m.user_id = v_h.owner_id;
+  IF v_owner IS NULL THEN
+    SELECT m.user_id INTO v_owner FROM public.org_members m
+     WHERE m.org_id = v_h.org_id ORDER BY (m.role = 'owner') DESC, m.user_id LIMIT 1;
+  END IF;
+  PERFORM public.handoff_request_identity('', '');
   IF p_next_status <> 'closed' AND v_owner IS NOT NULL THEN
     v_title := CASE p_next_status
       WHEN 'received' THEN 'Referral handoff: contact the family'
@@ -217,12 +249,13 @@ BEGIN
     INSERT INTO public.follow_ups (owner_id, org_id, partner_id, referral_id, case_id, referral_handoff_id, title, due_on, status, note, kind)
     VALUES (v_owner, v_h.org_id, v_h.partner_id, v_h.referral_id, v_h.case_id, v_h.id, v_title, CURRENT_DATE + 1, 'open', '', 'referral_handshake');
   END IF;
+  PERFORM public.handoff_request_identity(v_sub, v_claims);
   RETURN QUERY SELECT p_next_status, v_new_version;
 END
 $$;
 REVOKE ALL ON FUNCTION public.apply_referral_handoff_transition(uuid, integer, text, text, uuid) FROM PUBLIC, anon, authenticated;
 
--- Same as 20261104140000 (its latest definition), plus the two handoff
+-- Same as 20261104150000 (its latest definition), plus the two handoff
 -- tables (their keys cascade too; this catches any row they did not reach).
 CREATE OR REPLACE FUNCTION public.org_move_workspace_rows(p_from uuid, p_to uuid)
 RETURNS void
@@ -246,6 +279,7 @@ BEGIN
   UPDATE public.placement_decisions   SET org_id = p_to WHERE org_id = p_from;
   UPDATE public.placement_requests    SET org_id = p_to WHERE org_id = p_from;
   UPDATE public.placement_request_recipients SET org_id = p_to WHERE org_id = p_from;
+  UPDATE public.case_assessments      SET org_id = p_to WHERE org_id = p_from;
   UPDATE public.referral_handoffs     SET org_id = p_to WHERE org_id = p_from;
   UPDATE public.referral_handoff_events SET org_id = p_to WHERE org_id = p_from;
   -- These cascade from orgs, so without a move they would vanish with the

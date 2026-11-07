@@ -85,6 +85,14 @@ assert.ok(portal.includes("export function handoffTokenFrom(hash: string): strin
 assert.ok(portal.includes("window.history.replaceState(null, '', window.location.pathname)"), 'and clears it from the address bar'); checks += 1;
 assert.ok(portal.includes("supabase.rpc('public_referral_handoff_resolve', { p_token: token })") && portal.includes("supabase.rpc('public_referral_handoff_transition', {"), 'it calls the two token-checked functions, nothing else'); checks += 1;
 assert.ok(!/from\('referral_handoffs'\)/.test(portal), 'it never reads the handoff table'); checks += 1;
+const portalClient = read('portal/src/supabase.ts');
+assert.ok(portal.includes("import { signedOutSupabase as supabase } from './supabase';")
+  && /signedOutSupabase = createClient\(url, key, \{\s*auth: \{ persistSession: false, autoRefreshToken: false, detectSessionInUrl: false/.test(portalClient),
+  'the page sends no center portal session stored in the same browser'); checks += 1;
+assert.ok(portal.includes("result = error ? 'unreachable' : next ? 'ok' : 'gone';") && portal.includes('ReferralFit could not be reached') && portal.includes('>Try again</button>'),
+  'a server that did not answer is not called a revoked link, and the page can try again'); checks += 1;
+assert.ok(portal.includes("setView((current) => (current ? { ...current, status: recorded, version, next: stepAfter(recorded) } : current));"),
+  'a saved step shows from the answer, whether or not the next read works'); checks += 1;
 assert.ok(portalMain.includes('const isHandoff = /^\\/h\\/?$/.test(window.location.pathname);'), 'the portal serves /h signed out'); checks += 1;
 check('the portal and the app list the same steps', [...portal.matchAll(/\{ status: '([a-z_]+)', label: '([^']+)'/g)].map((match) => [match[1], match[2]]),
   handoffs.HANDOFF_STEPS.map((step) => [step.status, step.label]));
@@ -99,6 +107,8 @@ assert.ok(app.includes("item.kind !== 'check_in' && item.kind !== 'referral_hand
 assert.ok(app.includes("followUp.kind !== 'referral_handshake'),"), 'and Done on it does not ask whether the family was admitted'); checks += 1;
 assert.ok(/if \(card\.kind === 'referral_handshake'\) \{\s*setShowHandoffs\(true\);/.test(app), 'Done on a handoff reminder opens Handoffs'); checks += 1;
 assert.ok(sheet.includes("handoffAliasProblem(alias, caseNamesFor(chosen.caseId), chosen.clientLabel || null)"), 'the alias is checked against the case and the client label before sending'); checks += 1;
+assert.ok(sheet.includes('if (!chosen || busyId || creatingRef.current) return;') && sheet.includes('creatingRef.current = true;\n    setBusyId(\'new\');'),
+  'two fast taps create one handoff (the guard is set before the first await)'); checks += 1;
 assert.ok(read('src/lib/store.ts').includes("| 'check_in' | 'referral_handshake';"), 'the follow-up kinds include the handoff\'s'); checks += 1;
 
 console.log(`handoff-test: ${checks} checks passed`);
