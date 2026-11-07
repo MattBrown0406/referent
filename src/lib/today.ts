@@ -340,10 +340,11 @@ const TODAY_KIND_ORDER: Record<string, number> = {
   first_call: 0,
   promised_call: 1,
   waiting_on: 2,
-  consult: 3,
-  touch: 4,
-  follow_up: 5,
-  check_in: 6, // a scheduled outcome check-in; never more urgent than a call
+  referral_handshake: 3, // a program is waiting on, or reporting, the family
+  consult: 4,
+  touch: 5,
+  follow_up: 6,
+  check_in: 7, // a scheduled outcome check-in; never more urgent than a call
 };
 
 // ─── Closed and lost cases ──────────────────────────────────────────────────

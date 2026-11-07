@@ -59,7 +59,9 @@ export type FollowUpStatus = 'open' | 'done' | 'skipped';
 // partner-relationship touch (Done → Log touch); the rest are self-evident.
 // 'check_in' (migration 20261001160000) is a post-placement outcome check-in
 // created by the server 7, 30 and 90 days after admission.
-export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch' | 'check_in';
+// 'referral_handshake' (migration 20261106130000): a referral handoff's
+// reminder, written by the server as the program steps it forward.
+export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch' | 'check_in' | 'referral_handshake';
 
 export type FollowUp = {
   id: string;

@@ -149,3 +149,17 @@ button.request {
 .placement dl.summary dd { margin: 0; font-size: 15px; }
 .placement .choices { display: flex; flex-wrap: wrap; gap: 8px 18px; }
 .placement > button.ghost.small { margin-bottom: 12px; }
+
+/* Referral handoff page (/h, src/Handoff.tsx) */
+.handoff-muted { color: var(--gray); }
+.handoff-eyebrow { color: var(--gray); font-size: 12px; font-weight: 700; letter-spacing: 0.5px; margin: 0 0 4px; }
+.handoff-title { font-size: 24px; margin: 0 0 8px; }
+.handoff-steps { list-style: none; padding: 0; margin: 20px 0; }
+.handoff-steps li { display: grid; grid-template-columns: 34px 1fr; gap: 12px; align-items: start; padding: 8px 0; color: var(--gray); }
+.handoff-steps strong { display: block; font-size: 15px; }
+.handoff-steps small { display: block; font-size: 13px; margin-top: 2px; }
+.handoff-marker { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; border: 2px solid var(--line); background: var(--card); font-size: 13px; font-weight: 700; }
+.handoff-steps li.done, .handoff-steps li.current { color: var(--ink); }
+.handoff-steps li.done .handoff-marker { background: var(--green); border-color: var(--green); color: #fff; }
+.handoff-steps li.current .handoff-marker { border-color: var(--blue); color: var(--blue); box-shadow: 0 0 0 4px var(--blue-soft); }
+.handoff-action { width: 100%; min-height: 48px; font-size: 16px; }

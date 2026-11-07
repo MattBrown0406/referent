@@ -161,6 +161,7 @@ import PlacementRequestSheet, { clearUnansweredSendKeys, type PlacementSheetRequ
 import { openCallOrText } from './src/lib/phone-actions';
 import { IS_WEB, useWideWeb, WEB_PAGE, WEB_SHEET, WEB_SHEET_OVERLAY } from './src/lib/web-layout';
 import PlacementCompare, { type CompareChoice } from './src/lib/PlacementCompare';
+import HandoffsSheet from './src/lib/HandoffsSheet';
 import { usePlacementRequests } from './src/lib/placement-api';
 import { latestRequestForMatch, placementTodayItems, requestProgress, type PlacementRequest, type PlacementRequestView } from './src/lib/placement-requests';
 import LevelOfCareSheet from './src/lib/LevelOfCareSheet';
@@ -524,6 +525,7 @@ function todayKindIcon(card: TodayCard): IconName {
     case 'waiting_on': return 'hourglass-outline';
     case 'touch': return 'hand-left-outline';
     case 'check_in': return 'clipboard-outline';
+    case 'referral_handshake': return 'paper-plane-outline';
     case 'cadence': return 'repeat';
     default: return 'return-up-back';
   }
@@ -1109,6 +1111,8 @@ export default function App() {
   const [benefitsLoadedFor, setBenefitsLoadedFor] = useState<Record<string, 'remote' | 'unavailable'>>({});
   const [benefitsForm, setBenefitsForm] = useState<CaseBenefitsFormState | null>(null);
   const [vobForm, setVobForm] = useState<VobRequestFormState | null>(null);
+  // Referrals > Handoffs (src/lib/HandoffsSheet.tsx).
+  const [showHandoffs, setShowHandoffs] = useState(false);
   const [vobRowLimit, setVobRowLimit] = useState(LIST_ROWS_SHOWN);
   const vobFormOpen = Boolean(vobForm);
   useEffect(() => { if (!vobFormOpen) setVobRowLimit(LIST_ROWS_SHOWN); }, [vobFormOpen]);
@@ -2441,6 +2445,13 @@ export default function App() {
   const caseById = useMemo(() => new Map(cases.map((item) => [item.id, item])), [cases]);
   // The contact each case card shows (CaseRow), found once per change rather
   // than by scanning every contact for every row.
+  // What a handoff's alias must not contain: the case's title and its
+  // contacts' names (HandoffsSheet checks; the server checks again).
+  const handoffCaseNames = useCallback((caseId: string | undefined): string[] => {
+    if (!caseId) return [];
+    const title = caseById.get(caseId)?.title;
+    return [...(title ? [title] : []), ...allCaseContacts.filter((contact) => contact.caseId === caseId).map((contact) => contact.name)];
+  }, [caseById, allCaseContacts]);
   const primaryContactByCase = useMemo(() => {
     const index = new Map<string, CaseContact>();
     for (const contact of allCaseContacts) if (contact.isPrimary && !index.has(contact.caseId)) index.set(contact.caseId, contact);
@@ -3119,7 +3130,7 @@ export default function App() {
     };
     // One admit check per referral: a packet sent again for a referral that
     // already has an open check, or already has its answer, adds none.
-    const admitCheckOpen = followUps.some((item) => item.referralId === referralId && item.status === 'open' && item.kind !== 'check_in');
+    const admitCheckOpen = followUps.some((item) => item.referralId === referralId && item.status === 'open' && item.kind !== 'check_in' && item.kind !== 'referral_handshake');
     const needsAdmitCheck = assignOnSend || (!admitCheckOpen && referral.admitted == null);
     const followUp: FollowUp | null = needsAdmitCheck ? {
       id: makeId('f'),
@@ -4310,7 +4321,7 @@ export default function App() {
     || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory
     || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
     || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible
-    || placementSheet || placementCompareId,
+    || placementSheet || placementCompareId || showHandoffs,
   );
   if (sheetOpenNow && !anySheetOpenRef.current) sheetOpenedCountRef.current += 1;
   anySheetOpenRef.current = sheetOpenNow;
@@ -4756,7 +4767,8 @@ export default function App() {
       // Every outbound referral is waiting on the admit answer until one is
       // recorded, whether it went out by packet or by Assign & refer (which
       // never stamps packetSentAt).
-      referralAwaitingAnswer: Boolean(referral && referral.direction === 'Outbound' && referral.admitted == null),
+      // A handoff's reminder is about the handoff, not the admit answer.
+      referralAwaitingAnswer: Boolean(referral && referral.direction === 'Outbound' && referral.admitted == null && followUp.kind !== 'referral_handshake'),
     };
   }
 
@@ -5089,6 +5101,12 @@ export default function App() {
   }
 
   function openDoneSheet(card: TodayCard) {
+    // A handoff's reminder moves on when its step is marked, from the
+    // program's link or here: Done opens Handoffs.
+    if (card.kind === 'referral_handshake') {
+      setShowHandoffs(true);
+      return;
+    }
     if (card.virtual || (!card.caseId && !card.referralId)) {
       if (card.virtual) openTouchLogger(partners.find((item) => item.id === card.partnerId) as Partner);
       else if (card.followUp) completePlainFollowUp(card.followUp);
@@ -7244,6 +7262,20 @@ export default function App() {
           <TouchableOpacity style={styles.quickLogButton} onPress={() => openReferral('Inbound')}><AppIcon name="arrow-down-circle" size={20} color={COLORS.forest} /><Text style={styles.quickLogText}>Log inbound</Text></TouchableOpacity>
           <TouchableOpacity style={styles.quickLogButton} onPress={() => openReferral('Outbound')}><AppIcon name="arrow-up-circle" size={20} color={COLORS.blue} /><Text style={styles.quickLogText}>Log outbound</Text></TouchableOpacity>
         </View>
+
+        <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="Handoffs: send a program a private link to report each step"
+          style={styles.globalDirectoryBanner}
+          onPress={() => setShowHandoffs(true)}
+        >
+          <AppIcon name="paper-plane-outline" size={20} color={COLORS.blue} />
+          <View style={styles.globalDirectoryCopy}>
+            <Text style={styles.globalDirectoryTitle}>Handoffs</Text>
+            <Text style={styles.globalDirectorySubtitle}>Send the program a private link; they mark each step and your reminder follows</Text>
+          </View>
+          <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
+        </TouchableOpacity>
 
         <SectionTitle title="Referral history" />
         <View style={styles.searchBox}>
@@ -9874,6 +9906,14 @@ export default function App() {
           setPlacementSheet(null);
           afterSheetCloses(() => setPlacementCompareId(requestId));
         }}
+      />
+      <HandoffsSheet
+        visible={showHandoffs}
+        referrals={referrals}
+        partnersById={partnerById}
+        caseNamesFor={handoffCaseNames}
+        onClose={() => setShowHandoffs(false)}
+        onChanged={() => { void refreshFromServer('pull').catch(() => undefined); }}
       />
       <PlacementCompare
         requestId={placementCompareId}

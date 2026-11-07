@@ -172,7 +172,7 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   const composerBody = source.slice(source.indexOf('async function openPacketComposer('), source.indexOf('function openPacketForAssigned('));
   assert.match(composerBody, /const alreadyReferred = matchProfile\.status === 'Referred' && matchProfile\.assignedPartnerId === partner\.id && Boolean\(matchProfile\.referralId\);[\s\S]*assignOnSend: !alreadyReferred/, 'a second packet to the same program does not assign again');
   const finalizeBody = source.slice(source.indexOf('function finalizePacketSend('), source.indexOf('// ─── Case files ───', source.indexOf('function finalizePacketSend(')));
-  assert.match(finalizeBody, /const admitCheckOpen = followUps\.some\(\(item\) => item\.referralId === referralId && item\.status === 'open' && item\.kind !== 'check_in'\);\s*const needsAdmitCheck = assignOnSend \|\| \(!admitCheckOpen && referral\.admitted == null\);/, 'no second admit check while one is open or the answer is in');
+  assert.match(finalizeBody, /const admitCheckOpen = followUps\.some\(\(item\) => item\.referralId === referralId && item\.status === 'open' && item\.kind !== 'check_in' && item\.kind !== 'referral_handshake'\);\s*const needsAdmitCheck = assignOnSend \|\| \(!admitCheckOpen && referral\.admitted == null\);/, 'no second admit check while one is open or the answer is in (a check-in or a handoff reminder is not one)');
   assert.match(finalizeBody, /: async \(\) => \{\s*await updateReferralPacketStamp\(/, 'without a new admit check the packet only stamps the referral');
 }
 

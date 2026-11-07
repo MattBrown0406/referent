@@ -327,8 +327,9 @@ console.log('\n── Closed and lost cases ──');
 // ─── The admit question follows the referral, not the packet ────────────────
 // An outbound referral with no admit answer yet asks "did they admit?" when
 // its check is done, whether it went out by packet or by Assign & refer.
-check('admit question gated on direction Outbound and admitted == null',
-  /referralAwaitingAnswer: Boolean\(referral && referral\.direction === 'Outbound' && referral\.admitted == null\)/.test(appSource)
+// A handoff's reminder carries the referral too, but asks about the handoff.
+check('admit question gated on direction Outbound and admitted == null (not for a handoff reminder)',
+  /referralAwaitingAnswer: Boolean\(referral && referral\.direction === 'Outbound' && referral\.admitted == null && followUp\.kind !== 'referral_handshake'\)/.test(appSource)
   && !/referralAwaitingAnswer: Boolean\(referral\?\.packetSentAt/.test(appSource));
 check('Today context lookups use Maps, not a find per card',
   /function followUpContext\(followUp: FollowUp\) \{\s*const partner = followUp\.partnerId \? partnerById\.get\(followUp\.partnerId\)/.test(appSource));

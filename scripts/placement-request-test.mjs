@@ -639,7 +639,7 @@ function query(result) {
   ok('the API never sends criteria of its own (the server reads the saved match)', /p_criteria: null/.test(apiSource));
   const app = readFileSync(path.join(repoRoot, 'App.tsx'), 'utf8');
   ok('the match memo still ranks through matching.ts alone', /const matches = useMemo\(\s*\(\) => rankPrograms\(draftMatchProfile, partners, scorecards, bedOptions\),\s*\[draftMatchProfile, partners, scorecards, bedOptions\],/.test(app));
-  ok('both placement sheets count as open sheets', /\|\| placementSheet \|\| placementCompareId,\s*\);/.test(app));
+  ok('both placement sheets count as open sheets', /\|\| placementSheet \|\| placementCompareId(?: \|\| [A-Za-z]+)*,\s*\);/.test(app));
   ok('the answers screen opens after the send sheet has closed', /setPlacementSheet\(null\);\s*afterSheetCloses\(\(\) => setPlacementCompareId\(requestId\)\);/.test(app));
   ok('Choose this program hands off to the existing flows', /void openMatchedReferral\(partner\.id\);/.test(app) && /void openPacketComposer\(partner, shown \?\? scoreProgram\(/.test(app));
   ok('the hand-off waits for the answers screen to close', /setPendingPlacementChoice\(null\);\s*afterSheetCloses\(\(\) => \{/.test(app));
