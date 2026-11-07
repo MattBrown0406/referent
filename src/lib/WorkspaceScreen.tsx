@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   Modal,
   Platform,
   SafeAreaView,
@@ -196,6 +197,18 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
     if (visible) void load();
     else { setReviewOpen(false); setCredentialReviewOpen(false); }
   }, [visible, load]);
+
+  // The screen stays mounted while hidden, and the lock can change outside
+  // it: a passcode set in Settings makes it available; one removed turns it
+  // off at the next unlock. Read again on opening and on every return.
+  useEffect(() => {
+    if (!visible) return undefined;
+    setLock(appLockStatus());
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') setLock(appLockStatus());
+    });
+    return () => subscription.remove();
+  }, [visible]);
 
   const isOwner = workspace?.myRole === 'owner';
   const soloOwner = isOwner && (workspace?.members.length ?? 0) <= 1;

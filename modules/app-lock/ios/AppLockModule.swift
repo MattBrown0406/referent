@@ -57,8 +57,19 @@ final class AppLockController: NSObject {
   // One automatic Face ID prompt per return to the app; after a cancel the
   // Unlock button stays until tapped.
   private var promptedThisVisit = false
-  // Uptime, not the clock: changing the phone's time cannot skip the lock.
+  // A monotonic clock that keeps counting while the phone sleeps
+  // (systemUptime stops, so an hour asleep read as seconds away). Not the
+  // wall clock: changing the phone's time cannot skip the lock.
   private var leftAt: TimeInterval?
+  // Windows behind the lock that VoiceOver must not read (a modal view only
+  // hides its own window's views).
+  private var hiddenFromVoiceOver: [Weak] = []
+
+  private struct Weak { weak var window: UIWindow? }
+
+  static func now() -> TimeInterval {
+    TimeInterval(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1_000_000_000
+  }
 
   static var enabled: Bool { UserDefaults.standard.bool(forKey: enabledKey) }
 
@@ -102,9 +113,9 @@ final class AppLockController: NSObject {
     center.addObserver(self, selector: #selector(didEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
     center.addObserver(self, selector: #selector(willEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
     center.addObserver(self, selector: #selector(didBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
+    center.addObserver(self, selector: #selector(keyboardWillShow), name: UIResponder.keyboardWillShowNotification, object: nil)
     if Self.enabled {
-      locked = true
-      show()
+      lock()
       if UIApplication.shared.applicationState == .active { promptIfNeeded() }
     }
   }
@@ -115,16 +126,36 @@ final class AppLockController: NSObject {
   }
 
   @objc private func didEnterBackground() {
-    leftAt = ProcessInfo.processInfo.systemUptime
+    leftAt = Self.now()
     promptedThisVisit = false
     show()
   }
 
   @objc private func willEnterForeground() {
-    if Self.enabled, !locked, let leftAt, ProcessInfo.processInfo.systemUptime - leftAt >= Self.graceSeconds {
-      locked = true
+    if Self.enabled, !locked, let leftAt, Self.now() - leftAt >= Self.graceSeconds {
+      lock()
     }
     leftAt = nil
+  }
+
+  // Locked: the cover is up and nothing behind it takes typing. iOS brings
+  // the keyboard back for the field that had it, and the keyboard's window
+  // sits above every app window, so the hidden field would show its
+  // suggestions and take keys (a hardware keyboard too).
+  private func lock() {
+    locked = true
+    endEditing()
+    show()
+  }
+
+  private func endEditing() {
+    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+  }
+
+  // A field that takes focus while locked (a sheet opened by a notification
+  // tap) gives it up again. Not during Face ID: the passcode is not ours.
+  @objc private func keyboardWillShow() {
+    if locked, !authenticating { endEditing() }
   }
 
   @objc private func didBecomeActive() {
@@ -153,7 +184,9 @@ final class AppLockController: NSObject {
         // than shut the person out of their own app.
         if !ok { Self.save(enabled: false, graceSeconds: nil) }
         self.locked = false
-        self.hide()
+        // An answer that lands after the person left keeps the cover up for
+        // the app switcher; didBecomeActive takes it down on return.
+        if UIApplication.shared.applicationState == .active { self.hide() }
       } else {
         self.show()
       }
@@ -198,8 +231,11 @@ final class AppLockController: NSObject {
       guard let scene = scenes.first(where: { $0.activationState == .foregroundActive })
         ?? scenes.first(where: { $0.activationState == .foregroundInactive })
         ?? scenes.first else { return }
-      let cover = UIWindow(windowScene: scene)
-      cover.windowLevel = .alert + 1
+      let cover = AppLockWindow(windowScene: scene)
+      // React Native puts each Alert.alert in a window at .alert + 1 and
+      // makes it key: the cover stays above them, so an alert raised while
+      // locked waits behind it.
+      cover.windowLevel = .alert + 2
       let controller = AppLockViewController()
       controller.onUnlock = { [weak self] in self?.unlock() }
       cover.rootViewController = controller
@@ -208,12 +244,31 @@ final class AppLockController: NSObject {
     guard let window, let controller = window.rootViewController as? AppLockViewController else { return }
     controller.update(locked: locked, biometry: Self.status()["biometry"] as? String ?? "none")
     window.isHidden = false
-    if locked { UIAccessibility.post(notification: .screenChanged, argument: controller.focusTarget) }
+    if locked {
+      hideOthersFromVoiceOver(except: window)
+      UIAccessibility.post(notification: .screenChanged, argument: controller.focusTarget)
+    }
   }
 
   private func hide() {
     window?.isHidden = true
+    for entry in hiddenFromVoiceOver { entry.window?.accessibilityElementsHidden = false }
+    hiddenFromVoiceOver = []
   }
+
+  private func hideOthersFromVoiceOver(except cover: UIWindow) {
+    guard let scene = cover.windowScene else { return }
+    for other in scene.windows where other !== cover && !other.accessibilityElementsHidden {
+      other.accessibilityElementsHidden = true
+      hiddenFromVoiceOver.append(Weak(window: other))
+    }
+  }
+}
+
+// Never the key window: React Native presents its sheets and alerts from the
+// key window, and the hardware keyboard types into it.
+final class AppLockWindow: UIWindow {
+  override var canBecomeKey: Bool { false }
 }
 
 final class AppLockViewController: UIViewController {

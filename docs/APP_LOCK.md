@@ -15,15 +15,29 @@ Workspace → **Privacy on this phone**. Per phone, off by default.
 ## How it works
 
 `modules/app-lock` is a local Expo module (Swift, no third-party code). The
-cover is a `UIWindow` of its own at alert level + 1: a React view cannot
+cover is a `UIWindow` of its own at alert level + 2: a React view cannot
 cover a sheet that is already open (React Native presents each sheet from the
-view controller below it), and an alert raised while locked would otherwise
-land on top. The setting is in `UserDefaults`, read when the module starts
+view controller below it), and React Native puts each `Alert.alert` in a
+window at alert level + 1, so an alert raised while locked (an expired
+sign-in link, a sync issue) waits behind the cover. The cover never becomes
+the key window, so nothing is presented onto it and a hardware keyboard never
+types into it. The setting is in `UserDefaults`, read when the module starts
 (`index.ts` → `startAppLock()`), so the lock is up before the first screen
-draws. Time away is measured by uptime, so changing the clock does not skip
-it. Face ID's own sheet makes the app inactive and active again; that never
-re-triggers the lock, and after a cancel the lock waits for the Unlock
-button instead of prompting in a loop.
+draws.
+
+- **Time away** is measured by `CLOCK_MONOTONIC_RAW`, which keeps counting
+  while the phone sleeps (uptime does not, so an hour asleep would have read
+  as seconds) and ignores changes to the phone's clock.
+- **Typing:** locking ends editing, and a field that takes focus while locked
+  gives it up again, so the keyboard and its suggestions never show over the
+  cover.
+- **VoiceOver** cannot reach the app's windows while it is locked.
+- **Face ID's own sheet** makes the app inactive and active again; that never
+  re-triggers the lock, and after a cancel the lock waits for the Unlock
+  button instead of prompting in a loop. An unlock answered after the person
+  left keeps the cover up for the app switcher.
+- **The Workspace card** reads the lock again on opening and on every return,
+  so a passcode set or removed in Settings shows at once.
 
 The web app has no lock; the card is hidden there. `NSFaceIDUsageDescription`
 comes from the `expo-secure-store` plugin in `app.json` (`faceIDPermission`).
