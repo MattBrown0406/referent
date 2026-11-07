@@ -258,5 +258,31 @@ equal('whole-dollar fields read what people type, and refuse what they would mis
   business.parseWholeDollars('abc'),
 ], [null, 1500, 1500, 1500, 0, undefined, undefined, undefined]);
 
+// A large practice: 2,000 cases, five stage rows and two linked records each.
+// "All time" looked every case's rows up by scanning the whole history four
+// or five times per case (about 100 million comparisons, seconds frozen).
+{
+  const bigCases = [];
+  const bigStages = [];
+  const bigIntegrations = [];
+  const statuses = ['inquiry', 'consult', 'engaged', 'placed', 'aftercare'];
+  for (let n = 0; n < 2000; n += 1) {
+    const id = `big-${n}`;
+    const createdAt = new Date(Date.UTC(2024, 0, 1) + n * 3_600_000).toISOString();
+    bigCases.push(makeCase({ id, status: statuses[n % statuses.length], leadSource: n % 2 ? 'Website' : 'Professional referral', quotedAmount: 5000, paidAmount: 1000, createdAt }));
+    statuses.forEach((status, index) => bigStages.push({ id: `${id}-s${index}`, caseId: id, status, enteredAt: new Date(Date.parse(createdAt) + index * 86_400_000).toISOString() }));
+    bigIntegrations.push(
+      { id: `${id}-i1`, caseId: id, provider: 'square', recordType: 'invoice', externalId: `${id}-inv`, status: 'paid', amountCents: 500000, currency: 'USD', externalUrl: '', metadata: {}, lastSyncedAt: SYNCED, updatedAt: SYNCED },
+      { id: `${id}-i2`, caseId: id, provider: 'pandadoc', recordType: 'document', externalId: `${id}-doc`, status: 'document.sent', amountCents: 100000, currency: 'USD', externalUrl: '', metadata: {}, updatedAt: SYNCED },
+    );
+  }
+  const started = performance.now();
+  const big = business.computeBusinessDashboard(bigCases, [], { stages: bigStages, integrations: bigIntegrations }, 'all', new Date(2026, 7, 6, 12));
+  const elapsed = performance.now() - started;
+  equal('a large practice: every case counted', big.casesCreated, 2000);
+  equal('a large practice: collected from the linked invoices', big.collectedRevenue, 2000 * 5000);
+  equal('a large practice: "All time" computes in well under a second', elapsed < 500, true);
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

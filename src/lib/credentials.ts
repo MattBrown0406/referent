@@ -38,7 +38,9 @@ export const EMPTY_CREDENTIAL_INDEX: CredentialIndex = { available: true, listin
 // Typed as '*' for supabase-js (the client has no generated schema types):
 // the columns are the explicit list the mapper reads.
 const SELECT = CREDENTIAL_COLUMNS.join(', ') as '*';
-// fetch_listing_credentials reads at most this many listings per call.
+// fetch_listing_credentials reads at most this many listings per call, and
+// each call is paged: a listing can hold many credentials, and PostgREST cuts
+// any response (a set-returning function's included) at 1000 rows.
 const LISTING_CHUNK = 200;
 
 export function isMissingCredentialSchema(error: unknown): boolean {
@@ -93,12 +95,15 @@ export async function fetchListingCredentials(listingIds: string[]): Promise<{ a
   const ids = Array.from(new Set(listingIds.filter(Boolean).map((id) => id.toLowerCase())));
   const all: ProgramCredential[] = [];
   for (let start = 0; start < ids.length; start += LISTING_CHUNK) {
-    const { data, error, status } = await supabase.rpc('fetch_listing_credentials', { p_ids: ids.slice(start, start + LISTING_CHUNK) });
-    if (error) {
+    const chunk = ids.slice(start, start + LISTING_CHUNK);
+    let rows: unknown[];
+    try {
+      rows = await fetchAllPages<unknown>((from, to) => supabase.rpc('fetch_listing_credentials', { p_ids: chunk }).order('id').range(from, to));
+    } catch (error) {
       if (isMissingCredentialSchema(error)) return { available: false, byListing: {} };
-      throw credentialFailure(error, status, 'Could not load credentials.');
+      throw credentialFailure(error, (error as { httpStatus?: number } | null)?.httpStatus, 'Could not load credentials.');
     }
-    all.push(...mapRows(data).map(withoutListingNotes));
+    all.push(...mapRows(rows).map(withoutListingNotes));
   }
   return { available: true, byListing: groupBy(all, 'globalPartnerId') };
 }

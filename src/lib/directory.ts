@@ -157,13 +157,19 @@ export type ListingBedsStatus = ListingBeds & {
 
 type ListingBedsStatusRow = ListingBedsRow & { global_partner_id: string; program: boolean | null };
 
+// At most one row per listing; asked in chunks well under PostgREST's
+// 1000-row cap, which applies to set-returning functions too.
+const LISTING_BEDS_CHUNK = 500;
+
 export async function fetchListingBeds(ids: string[]): Promise<Map<string, ListingBedsStatus>> {
   const result = new Map<string, ListingBedsStatus>();
-  if (ids.length === 0) return result;
-  const { data, error } = await supabase.rpc('fetch_listing_beds', { p_ids: ids });
-  if (error) throw new StoreError(error.message || 'Could not load bed availability.', false);
-  for (const row of (data || []) as ListingBedsStatusRow[]) {
-    result.set(row.global_partner_id, { ...mapListingBeds(row), globalPartnerId: row.global_partner_id, program: Boolean(row.program) });
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  for (let start = 0; start < unique.length; start += LISTING_BEDS_CHUNK) {
+    const { data, error } = await supabase.rpc('fetch_listing_beds', { p_ids: unique.slice(start, start + LISTING_BEDS_CHUNK) });
+    if (error) throw new StoreError(error.message || 'Could not load bed availability.', false);
+    for (const row of (data || []) as ListingBedsStatusRow[]) {
+      result.set(row.global_partner_id, { ...mapListingBeds(row), globalPartnerId: row.global_partner_id, program: Boolean(row.program) });
+    }
   }
   return result;
 }

@@ -131,6 +131,7 @@ function query(table) {
     select() { if (b.op !== 'select') b.returning = true; return api; },
     order(col) { b.order.push([col]); return api; },
     eq(col, value) { b.filters.push((row) => row[col] === value); return api; },
+    gte(col, value) { b.filters.push((row) => row[col] == null || String(row[col]) >= String(value)); return api; },
     in(col, values) { b.filters.push((row) => values.includes(row[col])); return api; },
     range(from, to) { b.range = [from, to]; return api; },
     limit() { return api; },
@@ -520,6 +521,28 @@ await check('a server outage (5xx) queues the change AND saves its copy, so a re
   state.failOn = null;
   await store.hydrate(U);
   assert.equal(state.db.touches.filter((row) => row.id === T).length, 1, 'the touch lands once when the server recovers');
+});
+
+await check('touches load for the last year only, and an older saved one leaves the copy without a lookup', async () => {
+  await freshAccount();
+  const P = '77777777-7777-4777-8777-77777777778a';
+  const OLD = '77777777-7777-4777-8777-77777777778b';
+  const NEW = '77777777-7777-4777-8777-77777777778c';
+  const daysAgo = (days) => new Date(Date.now() - days * 86_400_000).toISOString();
+  state.db.partners.push({ id: P, name: 'Hope House', organization: 'Org', types: ['Inpatient'], created_at: daysAgo(500), org_id: ORG });
+  state.db.touches.push(
+    { id: OLD, partner_id: P, kind: 'call', note: '', occurred_at: daysAgo(400), org_id: ORG },
+    { id: NEW, partner_id: P, kind: 'call', note: '', occurred_at: daysAgo(10), org_id: ORG },
+  );
+  const first = await store.hydrate(U);
+  assert.deepEqual(first.snapshot.touches.map((row) => row.id), [NEW], 'a touch older than a year is not loaded');
+  assert.equal(store.TOUCH_WINDOW_DAYS, 365);
+  // A copy saved by an earlier build still holds the old touch.
+  await store.persistCache({ ...first.snapshot, touches: [...first.snapshot.touches, { id: OLD, partnerId: P, kind: 'call', note: '', occurredAt: daysAgo(400) }] }, U);
+  state.log = [];
+  const second = await store.hydrate(U);
+  assert.deepEqual(second.snapshot.touches.map((row) => row.id), [NEW], 'it leaves the saved copy');
+  assert.equal(state.log.filter((line) => line === 'select touches').length, 1, 'with no per-id lookup of old touches');
 });
 
 await check('scorecards carry how many referrals the family-experience average covers', async () => {

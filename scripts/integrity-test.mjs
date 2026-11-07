@@ -50,7 +50,19 @@ transpileTo('portal/src/credential-rules.ts', 'portal/credential-rules.js');
 writeFileSync(path.join(tmpDir, 'lib', 'supabase.js'), 'exports.supabase = globalThis.__credentialSupabase;');
 writeFileSync(path.join(tmpDir, 'lib', 'cases.js'), "let n = 0; exports.newUuid = () => `00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`;");
 const fakeSupabase = { rpc: null, from: null };
-globalThis.__credentialSupabase = { rpc: (name, args) => fakeSupabase.rpc(name, args), from: (table) => fakeSupabase.from(table) };
+// rpc() returns a builder, as supabase-js does: paged reads chain
+// .order().range() before awaiting it.
+globalThis.__credentialSupabase = {
+  rpc: (name, args) => {
+    const builder = {
+      order: () => builder,
+      range: () => builder,
+      then: (resolve, reject) => Promise.resolve(fakeSupabase.rpc(name, args)).then(resolve, reject),
+    };
+    return builder;
+  },
+  from: (table) => fakeSupabase.from(table),
+};
 
 // The tests never reach the network: any real fetch fails loudly.
 globalThis.fetch = () => { throw new Error('integrity-test: the real network must never be called'); };

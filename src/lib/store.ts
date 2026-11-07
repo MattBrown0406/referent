@@ -2070,11 +2070,19 @@ function mapScorecardRow(row: ScorecardRow): PartnerScorecard {
 async function fetchNetworkTrackRecords(globalPartnerIds: string[]): Promise<Map<string, NetworkTrackRecord>> {
   const result = new Map<string, NetworkTrackRecord>();
   const ids = Array.from(new Set(globalPartnerIds.filter(Boolean)));
-  for (let index = 0; index < ids.length; index += 200) {
-    const chunk = ids.slice(index, index + 200);
-    const { data, error } = await supabase.rpc('fetch_global_partner_stats', { p_ids: chunk });
-    if (error) return result;
-    for (const row of (data || []) as NetworkStatsRow[]) {
+  const chunks: string[][] = [];
+  for (let index = 0; index < ids.length; index += 200) chunks.push(ids.slice(index, index + 200));
+  // Four chunks at a time: a large network's 10+ calls no longer queue one
+  // behind another on every launch. A failed chunk ranks on local history.
+  const answers: NetworkStatsRow[][] = [];
+  for (let start = 0; start < chunks.length; start += 4) {
+    answers.push(...await Promise.all(chunks.slice(start, start + 4).map(async (chunk) => {
+      const { data, error } = await supabase.rpc('fetch_global_partner_stats', { p_ids: chunk });
+      return error ? [] : (data || []) as NetworkStatsRow[];
+    })));
+  }
+  for (const rows of answers) {
+    for (const row of rows) {
       if (!row.disclosed) continue;
       result.set(row.global_partner_id, {
         admitRate: toNullableNumber(row.admit_rate),
@@ -2293,6 +2301,11 @@ async function writeCacheUnlocked(fence: SessionFence, snapshot: Snapshot): Prom
 }
 
 async function readCacheUnlocked(fence: SessionFence): Promise<Snapshot | null> {
+  // What this process last wrote is what the key holds (every write goes
+  // through writeCacheUnlocked, every removal forgets it, and snapshots are
+  // never changed in place), so it is not read back and parsed again: in a
+  // large practice that was megabytes of JSON for every saved edit (savedRow).
+  if (lastCacheWrite && lastCacheWrite.userId === fence.userId) return lastCacheWrite.snapshot;
   let raw: string | null;
   try {
     raw = await AsyncStorage.getItem(accountStorageKey(CACHE_KEY_PREFIX, fence.userId));
@@ -2694,8 +2707,13 @@ function isPendingRow(set: Set<string>, id: string): boolean {
 //     A row the server has wins (kept if still open, dropped if completed)
 //     unless a pending change writes it. An id the server does not know
 //     survives only while a pending op creates it.
-async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null, pending: PendingRows): Promise<{ snapshot: Snapshot }> {
+async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null, pending: PendingRows, windowStart = touchWindowStart()): Promise<{ snapshot: Snapshot }> {
   if (!local) return { snapshot: remote };
+  // A saved touch older than the window is not missing from the server, just
+  // outside the load: drop it (no per-id lookup) unless a pending change
+  // still writes it.
+  const localTouches = local.touches.filter((touch) => inTouchWindow(touch.occurredAt, windowStart)
+    || isPendingRow(pending.touches, touch.id) || isPendingRow(pending.written.touches, touch.id));
   const keepUnsynced = async <T extends { id: string }>(
     table: ProbedTable, r: T[], l: T[], created: Set<string>, written: Set<string>, deleted?: Set<string>,
   ): Promise<T[]> => {
@@ -2722,7 +2740,7 @@ async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null, pend
       partners: await keepUnsynced('partners', remote.partners, local.partners, pending.partners, pending.written.partners),
       referrals: await keepUnsynced('referrals', remote.referrals, local.referrals, pending.referrals, pending.written.referrals),
       referralMatches: await keepUnsynced('match_profiles', remote.referralMatches, local.referralMatches, pending.matches, pending.written.matches, pending.deletedMatches),
-      touches: await keepUnsynced('touches', remote.touches, local.touches, pending.touches, pending.written.touches),
+      touches: await keepUnsynced('touches', remote.touches, localTouches, pending.touches, pending.written.touches),
       followUps: [
         ...remote.followUps.map((row) => devicesCopy(row.id) ?? row),
         ...serverCopies.filter((row) => row.status === 'open' || devicesCopy(row.id)).map((row) => devicesCopy(row.id) ?? mapFollowUpRow(row)),
@@ -2741,9 +2759,24 @@ async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null, pend
 // 50,000). Raising it further is not free: every row is held in memory and
 // written to the saved copy (one AsyncStorage value) on every save — about
 // 25-40 MB of JSON at this ceiling. Past it the launch shows the saved copy
-// with a notice (hydrate) instead of failing. The real fix is a time window
-// for touches (see the round-11 report), not a higher ceiling.
+// with a notice (hydrate) instead of failing.
 export const TOUCH_MAX_PAGES = 100;
+
+// ...and they load for the last year only. The partner sheet's recent
+// activity and outreach history are their only readers; each partner's last
+// contact comes from the server (partners.last_contact_at, kept by a trigger
+// on every touch), never from this list. The saved copy keeps the same window
+// (mergeUnsyncedLocal), apart from touches a pending change still writes.
+export const TOUCH_WINDOW_DAYS = 365;
+
+export function touchWindowStart(now = Date.now()): string {
+  return new Date(now - TOUCH_WINDOW_DAYS * 86_400_000).toISOString();
+}
+
+function inTouchWindow(occurredAt: string, windowStart: string): boolean {
+  const at = Date.parse(occurredAt);
+  return !Number.isFinite(at) || at >= Date.parse(windowStart);
+}
 
 // Every list is paged (see paging.ts) and ordered on an immutable key plus the
 // primary key, so a teammate's edit landing mid-fetch cannot move a row across
@@ -2754,12 +2787,12 @@ export const TOUCH_MAX_PAGES = 100;
 // follow-ups, so those load in full and are never count-limited. Completed
 // rows (done/skipped) are not loaded at all — nothing renders them, and the old
 // due_on-ordered read was what dropped the newest open items past 1,000 rows.
-async function fetchSnapshot(): Promise<Snapshot> {
+async function fetchSnapshot(windowStart = touchWindowStart()): Promise<Snapshot> {
   const [partnerRows, referralRows, matchRows, touchRows, balanceRows, followUpRows, scorecardRows] = await Promise.all([
     fetchAllPages<PartnerRow>((from, to) => supabase.from('partners').select('*').order('created_at', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<ReferralRow>((from, to) => supabase.from('referrals').select('*').order('referred_on', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<MatchRow>((from, to) => supabase.from('match_profiles').select('*').order('created_at', { ascending: false }).order('id').range(from, to)),
-    fetchAllPages<TouchRow>((from, to) => supabase.from('touches').select('*').order('occurred_at', { ascending: false }).order('id').range(from, to), { maxPages: TOUCH_MAX_PAGES }),
+    fetchAllPages<TouchRow>((from, to) => supabase.from('touches').select('*').gte('occurred_at', windowStart).order('occurred_at', { ascending: false }).order('id').range(from, to), { maxPages: TOUCH_MAX_PAGES }),
     fetchAllPages<BalanceRow>((from, to) => supabase.from('partner_balances').select('partner_id, inbound, outbound').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
     fetchAllPages<FollowUpRow>((from, to) => supabase.from('follow_ups').select('*').eq('status', 'open').order('created_at', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<ScorecardRow>((from, to) => supabase.from('partner_scorecard').select('partner_id, referrals_sent, admits, non_admits, avg_family_experience, last_referral_on, completed, decided_placements, completion_rate, median_days_to_admit, still_enrolled').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
@@ -2888,6 +2921,25 @@ export async function hydrate(expectedUserId: string): Promise<HydrateResult> {
     if (isServerUnreachable(error)) return { snapshot: emptySnapshot(), source: 'cache' };
     throw asStoreError(error);
   }
+}
+
+// What a returning user sees at launch while hydrate() reads the server
+// (App.tsx): this account's saved copy with every change still pending on
+// this device applied, and its saved case list. null when this device has no
+// saved copy for the account (a first sign-in waits for the server as before).
+export type LaunchCopy = { snapshot: Snapshot; caseList: { list: CaseList; savedAt: string } | null };
+
+export async function readLaunchCopy(expectedUserId: string): Promise<LaunchCopy | null> {
+  const fence = await sessionFence(expectedUserId);
+  const snapshot = await readCacheWithPending(fence);
+  if (!snapshot) return null;
+  const caseList = await withCacheLock(async () => {
+    await assertSessionFence(fence);
+    const copy = await readCaseListCacheUnlocked(fence);
+    await assertSessionFence(fence);
+    return copy;
+  });
+  return { snapshot, caseList: caseList ? { list: caseList.list, savedAt: caseList.savedAt } : null };
 }
 
 // Refresh the account-scoped offline cache from the latest in-memory state.

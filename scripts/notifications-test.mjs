@@ -65,7 +65,7 @@ for (const status of [ios.AUTHORIZED, ios.PROVISIONAL, ios.EPHEMERAL]) {
 assert.equal(notifications.permissionAllowsNotifications({ granted: false, canAskAgain: true, ios: { status: 0 } }), false);
 assert.match(appSource, /notificationPromptKey/);
 assert.match(appSource, /notificationScheduleKey/);
-assert.match(appSource, /await activateReferralFitNotificationOwner\(userId\);[\s\S]{0,180}await hydrate\(userId\)/, 'account transition must invalidate and cancel old schedules before hydration');
+assert.match(appSource, /await activateReferralFitNotificationOwner\(userId\);[\s\S]{0,1500}?await readLaunchCopy\(userId\)[\s\S]{0,1500}?await hydrate\(userId\)/, 'account transition must invalidate and cancel old schedules before the saved copy shows and before hydration');
 assert.match(appSource, /notificationPermissionState === 'blocked'/, 'blocked users need an in-app Settings route');
 
 nativeState.permission = { granted: false, canAskAgain: false, ios: { status: 0 } };
@@ -102,6 +102,20 @@ const scheduledPartners = nativeState.scheduled.map((item) => item.content.data.
 assert.equal(scheduledPartners.includes('a'), false, 'superseded schedule must not survive replacement');
 assert.equal(scheduledPartners.includes('b'), true, 'latest schedule must be installed');
 assert.equal(nativeState.scheduled.some((item) => /Account [AB]/.test(`${item.content.title} ${item.content.body}`)), false, 'a partner name never reaches the lock screen');
+
+// A save that leaves the reminders as they were does not cancel and re-add
+// them; one that changes them does.
+{
+  const input = { partners: [partner('b', 'Account B')], referrals: [], referralMatches: [], followUps: [] };
+  const cancelsBefore = nativeState.cancelCount;
+  const scheduledBefore = nativeState.scheduled.length;
+  await notifications.rescheduleNotifications(input, 'user-b');
+  assert.equal(nativeState.cancelCount, cancelsBefore, 'an unchanged plan is not re-applied');
+  assert.equal(nativeState.scheduled.length, scheduledBefore, 'and its reminders stay as scheduled');
+  await notifications.rescheduleNotifications({ ...input, partners: [...input.partners, partner('c', 'Account C')] }, 'user-b');
+  assert.equal(nativeState.cancelCount, cancelsBefore + 1, 'a changed plan replaces the schedule');
+  assert.ok(nativeState.scheduled.some((item) => item.content.data.partnerId === 'c'), 'with the new reminder in it');
+}
 
 await notifications.cancelReferralFitNotifications();
 assert.equal(nativeState.scheduled.length, 0, 'sign-out cancellation removes app schedules');

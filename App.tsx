@@ -6,6 +6,7 @@ import {
   ActivityIndicator,
   Alert,
   AppState,
+  FlatList,
   Image,
   KeyboardAvoidingView,
   Linking,
@@ -184,6 +185,7 @@ import {
   FollowUp,
   FollowUpKind,
   hydrate,
+  readLaunchCopy,
   discardAllRejectedWrites,
   discardRejectedWrite,
   discardWaitingWrite,
@@ -346,6 +348,12 @@ function makeId(_prefix?: string) {
 const FOREGROUND_REFRESH_MIN_INTERVAL_MS = 30_000;
 // Long enough for an iOS sheet's dismissal to finish before the next presents.
 const SHEET_SWAP_MS = 600;
+// Rows a long list shows before "Show more" (closed cases, referral history).
+const LIST_ROWS_SHOWN = 100;
+// Cards each Today section shows before "Show more": every card carries its
+// own call / text / done actions, and Today is the screen every launch opens.
+const TODAY_ROWS_SHOWN = 25;
+type TodayListSection = 'overdue' | 'today' | 'partnersDue';
 
 // Where the case list / open case file on screen came from. 'cache' is the
 // saved offline copy (read-only until the server is reached again);
@@ -1101,6 +1109,9 @@ export default function App() {
   const [benefitsLoadedFor, setBenefitsLoadedFor] = useState<Record<string, 'remote' | 'unavailable'>>({});
   const [benefitsForm, setBenefitsForm] = useState<CaseBenefitsFormState | null>(null);
   const [vobForm, setVobForm] = useState<VobRequestFormState | null>(null);
+  const [vobRowLimit, setVobRowLimit] = useState(LIST_ROWS_SHOWN);
+  const vobFormOpen = Boolean(vobForm);
+  useEffect(() => { if (!vobFormOpen) setVobRowLimit(LIST_ROWS_SHOWN); }, [vobFormOpen]);
   const [vobAnswerForm, setVobAnswerForm] = useState<VobAnswerFormState | null>(null);
   const [vobSaving, setVobSaving] = useState(false);
   // True cost to the family (src/lib/family-cost.ts): the length of stay each
@@ -1126,6 +1137,11 @@ export default function App() {
   const refreshInFlightRef = useRef<Promise<'ok' | 'offline'> | null>(null);
   const [showNewCase, setShowNewCase] = useState(false);
   const [showClosedCases, setShowClosedCases] = useState(false);
+  // Long lists show this many rows, then "Show more" (search reaches them all):
+  // a large practice's closed cases and referral history ran to thousands of
+  // rows rendered at once, again on every keystroke anywhere in the app.
+  const [closedCaseLimit, setClosedCaseLimit] = useState(LIST_ROWS_SHOWN);
+  const [todayRowLimits, setTodayRowLimits] = useState<Record<TodayListSection, number>>({ overdue: TODAY_ROWS_SHOWN, today: TODAY_ROWS_SHOWN, partnersDue: TODAY_ROWS_SHOWN });
   const [caseSearch, setCaseSearch] = useState('');
   const [caseSearchResults, setCaseSearchResults] = useState<CaseSearchResult[] | null>(null);
   const [pendingCaseMatchId, setPendingCaseMatchId] = useState<string | null>(null);
@@ -1198,6 +1214,8 @@ export default function App() {
   const [referralForm, setReferralForm] = useState(emptyReferral);
   const [referralSearch, setReferralSearch] = useState('');
   const [referralDirectionFilter, setReferralDirectionFilter] = useState<'All' | ReferralDirection>('All');
+  const [referralRowLimit, setReferralRowLimit] = useState(LIST_ROWS_SHOWN);
+  useEffect(() => { setReferralRowLimit(LIST_ROWS_SHOWN); }, [referralSearch, referralDirectionFilter]);
   const [showBusinessDashboard, setShowBusinessDashboard] = useState(false);
   const [showWorkspace, setShowWorkspace] = useState(false);
   // Lead capture: the "New lead" quick-add sheet, the workspace's first-call
@@ -1743,9 +1761,31 @@ export default function App() {
         activeOrgIdRef.current = orgId;
         await activateReferralFitNotificationOwner(userId);
         if (!active || generation !== authGenerationRef.current) return;
+
+        // A returning user sees the saved copy at once; the server copy read
+        // below replaces it, unless something was saved meanwhile (then the
+        // screen is newer than that read, and the next refresh brings the
+        // rest). A first sign-in has no copy and waits for the server.
+        const serialBeforeRead = localChangeSerialRef.current;
+        const launchCopy = await readLaunchCopy(userId).catch(() => null);
+        if (!active || generation !== authGenerationRef.current) return;
+        const showingSaved = Boolean(launchCopy);
+        if (launchCopy) {
+          applySnapshot(launchCopy.snapshot);
+          if (launchCopy.caseList) {
+            setCases(launchCopy.caseList.list.cases);
+            setAllCaseContacts(launchCopy.caseList.list.contacts);
+            setCaseListSource({ userId, source: 'cache', savedAt: launchCopy.caseList.savedAt, truncated: false });
+          }
+          setLoaded(true);
+        }
+        const changedMeanwhile = () => showingSaved
+          && (localChangeSerialRef.current !== serialBeforeRead || Boolean(mutationActiveRef.current));
+
         const result = await hydrate(userId);
         if (!active || generation !== authGenerationRef.current) return;
-        applySnapshot(result.snapshot);
+        if (changedMeanwhile()) lastServerRefreshAtRef.current = 0;
+        else applySnapshot(result.snapshot);
         const hydratedStatus = await syncStatus(userId).catch(() => null);
         if (!active || generation !== authGenerationRef.current) return;
         const setAside = hydratedStatus ? hydratedStatus.waiting + hydratedStatus.rejected : 0;
@@ -1770,9 +1810,11 @@ export default function App() {
           }
         }
         if (!active || generation !== authGenerationRef.current) return;
-        setCases(activeCaseList);
-        setAllCaseContacts(activeContacts);
-        setCaseListSource(caseListLoad);
+        if (!changedMeanwhile()) {
+          setCases(activeCaseList);
+          setAllCaseContacts(activeContacts);
+          setCaseListSource(caseListLoad);
+        }
 
         try {
           const nextBusinessData = await fetchBusinessData();
@@ -2223,14 +2265,24 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [directoryPlan, directoryPlanStatuses]);
 
+  // Server answers by plan and state, then by partner: planStatusFor and the
+  // Directory filter look a partner up instead of scanning the whole list for
+  // every partner (millions of comparisons in a large network).
+  const planStatusIndex = useMemo(() => {
+    const index = new Map<string, Map<string, PartnerPlanStatus>>();
+    for (const [key, list] of Object.entries(planStatuses)) index.set(key, new Map(list.map((item) => [item.partnerId, item])));
+    return index;
+  }, [planStatuses]);
+
   const directoryPartners = useMemo(() => {
     const needle = search.trim().toLowerCase();
+    const fromServer = directoryPlan ? planStatusIndex.get(`${directoryPlan}|ANY`) : undefined;
     return partners
       .filter((partner) => directoryType === 'All' || typesForPartner(partner).includes(directoryType as Partner['type']))
       .filter((partner) => !needle || `${partner.name} ${partner.organization} ${partner.city} ${partner.state} ${partnerTypeLabel(partner)} ${partner.therapies.join(' ')}`.toLowerCase().includes(needle))
-      .filter((partner) => !directoryPlan || (directoryPlanStatuses?.find((item) => item.partnerId === partner.id)?.networkStatus || planNetworkStatusForPartner(partner, directoryPlan)) === 'in_network')
+      .filter((partner) => !directoryPlan || (fromServer?.get(partner.id)?.networkStatus || planNetworkStatusForPartner(partner, directoryPlan)) === 'in_network')
       .sort((a, b) => Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)) || a.organization.localeCompare(b.organization));
-  }, [partners, directoryType, search, directoryPlan, directoryPlanStatuses]);
+  }, [partners, directoryType, search, directoryPlan, planStatusIndex]);
 
   // The match's own payment stays listed even when this state's list lacks
   // it (paymentOptionsForState), so the form never shows Cash pay for a
@@ -2387,7 +2439,18 @@ export default function App() {
   // of a linear find per row per render.
   const partnerById = useMemo(() => new Map(partners.map((item) => [item.id, item])), [partners]);
   const caseById = useMemo(() => new Map(cases.map((item) => [item.id, item])), [cases]);
+  // The contact each case card shows (CaseRow), found once per change rather
+  // than by scanning every contact for every row.
+  const primaryContactByCase = useMemo(() => {
+    const index = new Map<string, CaseContact>();
+    for (const contact of allCaseContacts) if (contact.isPrimary && !index.has(contact.caseId)) index.set(contact.caseId, contact);
+    return index;
+  }, [allCaseContacts]);
   const referralById = useMemo(() => new Map(referrals.map((item) => [item.id, item])), [referrals]);
+  // Referrals' "Partner activity": the five most recently referred-with.
+  const recentPartnerActivity = useMemo(() => partners.slice()
+    .sort((a, b) => (lastReferralByPartner[b.id] || '').localeCompare(lastReferralByPartner[a.id] || '') || a.organization.localeCompare(b.organization))
+    .slice(0, 5), [partners, lastReferralByPartner]);
 
   // "Choose this program" on the answers screen: the request's saved match
   // is on the form by now (choosePlacementProgram loaded it), so the usual
@@ -3335,7 +3398,7 @@ export default function App() {
   // the linked listing, which the server reads.
   function planStatusFor(partner: Partner, plan: string, state: string): PartnerPlanStatus {
     const key = `${plan}|${state || 'ANY'}`;
-    const fromServer = planStatuses[key]?.find((item) => item.partnerId === partner.id);
+    const fromServer = planStatusIndex.get(key)?.get(partner.id);
     if (fromServer) return fromServer;
     return {
       partnerId: partner.id,
@@ -6476,21 +6539,24 @@ export default function App() {
           {todaySections.overdue.length ? (
             <View style={styles.todaySection}>
               <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderOverdue]}>🔴 OVERDUE</Text>
-              {todaySections.overdue.map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card, overdue: true })}</React.Fragment>)}
+              {todaySections.overdue.slice(0, todayRowLimits.overdue).map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card, overdue: true })}</React.Fragment>)}
+              {TodayShowMore('overdue', todaySections.overdue.length)}
             </View>
           ) : null}
 
           {todaySections.today.length ? (
             <View style={styles.todaySection}>
               <Text style={styles.todaySectionHeader}>📞 TODAY</Text>
-              {todaySections.today.map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
+              {todaySections.today.slice(0, todayRowLimits.today).map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
+              {TodayShowMore('today', todaySections.today.length)}
             </View>
           ) : null}
 
           {todaySections.partnersDue.length ? (
             <View style={styles.todaySection}>
               <Text style={styles.todaySectionHeader}>🤝 PARTNERS DUE</Text>
-              {todaySections.partnersDue.map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
+              {todaySections.partnersDue.slice(0, todayRowLimits.partnersDue).map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
+              {TodayShowMore('partnersDue', todaySections.partnersDue.length)}
             </View>
           ) : null}
 
@@ -6925,7 +6991,7 @@ export default function App() {
   // loaded with the cases, so it shows without opening the file.
   function CaseRow({ record, lastInGroup }: { record: CaseRecord; lastInGroup?: boolean }) {
     const colors = CASE_STATUS_COLORS[record.status];
-    const primary = allCaseContacts.find((item) => item.caseId === record.id && item.isPrimary);
+    const primary = primaryContactByCase.get(record.id);
     return (
       <TouchableOpacity onPress={() => openCase(record.id)} style={[styles.caseRow, lastInGroup && { borderBottomWidth: 0 }]}>
         <View style={[styles.caseRowIcon, { backgroundColor: colors.bg }]}><AppIcon name="folder" size={17} color={colors.fg} /></View>
@@ -7042,9 +7108,12 @@ export default function App() {
                   <Text style={styles.closedToggleText}>Closed ({closedCases.length})</Text>
                 </TouchableOpacity>
                 {showClosedCases ? (
-                  <View style={styles.followUpCard}>
-                    {closedCases.map((record, index) => <React.Fragment key={record.id}>{CaseRow({ record, lastInGroup: index === closedCases.length - 1 })}</React.Fragment>)}
-                  </View>
+                  <>
+                    <View style={styles.followUpCard}>
+                      {closedCases.slice(0, closedCaseLimit).map((record, index, shown) => <React.Fragment key={record.id}>{CaseRow({ record, lastInGroup: index === shown.length - 1 })}</React.Fragment>)}
+                    </View>
+                    {closedCases.length > closedCaseLimit ? ShowMoreButton(closedCases.length - closedCaseLimit, 'closed cases', () => setClosedCaseLimit((limit) => limit + LIST_ROWS_SHOWN)) : null}
+                  </>
                 ) : null}
               </View>
             ) : null}
@@ -7054,9 +7123,12 @@ export default function App() {
     );
   }
 
+  // A FlatList, not a ScrollView of cards: a large network renders only the
+  // cards on screen (a few thousand partners was tens of thousands of views
+  // re-rendered on every keystroke). Everything above the cards is its header.
   function DirectoryScreen() {
-    return (
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled" refreshControl={renderRefreshControl()}>
+    const header = (
+      <>
         {renderHeader('Directory')}
         {renderRefreshNotice()}
         <View style={styles.directoryTitleRow}>
@@ -7106,9 +7178,38 @@ export default function App() {
           </View>
         ) : null}
         <View style={styles.directoryCountRow}><Text style={styles.directoryCount}>{directoryPartners.length} RESULTS</Text><AppIcon name="options-outline" size={18} color={COLORS.gray} /></View>
-        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} lastReferralOn={lastReferralByPartner[partner.id]} integrity={directoryChipFor(partner)} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
-        {!directoryPartners.length ? <EmptyState icon="people-outline" title={directoryPlan ? `Nobody lists ${directoryPlan} in-network` : 'No partners found'} body={directoryPlan ? 'Programs report their own networks and lists are often incomplete. Clear the plan filter, or request a VOB from the case to find out for sure.' : 'Try another search or add a new relationship.'} /> : null}
-      </ScrollView>
+      </>
+    );
+    return (
+      <FlatList
+        data={directoryPartners}
+        keyExtractor={(partner) => partner.id}
+        renderItem={({ item: partner }) => <PartnerCard partner={partner} lastReferralOn={lastReferralByPartner[partner.id]} integrity={directoryChipFor(partner)} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />}
+        ListHeaderComponent={header}
+        ListEmptyComponent={<EmptyState icon="people-outline" title={directoryPlan ? `Nobody lists ${directoryPlan} in-network` : 'No partners found'} body={directoryPlan ? 'Programs report their own networks and lists are often incomplete. Clear the plan filter, or request a VOB from the case to find out for sure.' : 'Try another search or add a new relationship.'} />}
+        initialNumToRender={12}
+        maxToRenderPerBatch={12}
+        windowSize={7}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.scrollContent}
+        keyboardShouldPersistTaps="handled"
+        refreshControl={renderRefreshControl()}
+      />
+    );
+  }
+
+  function TodayShowMore(section: TodayListSection, total: number) {
+    const remaining = total - todayRowLimits[section];
+    if (remaining <= 0) return null;
+    return ShowMoreButton(remaining, 'cards', () => setTodayRowLimits((limits) => ({ ...limits, [section]: limits[section] + TODAY_ROWS_SHOWN })), TODAY_ROWS_SHOWN);
+  }
+
+  function ShowMoreButton(remaining: number, what: string, onPress: () => void, step = LIST_ROWS_SHOWN) {
+    const next = Math.min(remaining, step);
+    return (
+      <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Show ${next} more ${what}, ${remaining} not shown`} style={styles.showMoreButton} onPress={onPress}>
+        <Text style={styles.showMoreText}>Show {next} more · {remaining} not shown</Text>
+      </TouchableOpacity>
     );
   }
 
@@ -7171,11 +7272,11 @@ export default function App() {
           <Text style={styles.referralFilterCount}>{filteredReferrals.length} records</Text>
         </View>
         {filteredReferrals.length ? <View style={styles.referralList}>
-          {filteredReferrals.map((referral, index) => {
+          {filteredReferrals.slice(0, referralRowLimit).map((referral, index, shown) => {
             const partner = partnerById.get(referral.partnerId);
             if (!partner) return null;
             return (
-              <TouchableOpacity key={referral.id} onPress={() => setSelectedPartner(partner)} style={[styles.referralRow, index === filteredReferrals.length - 1 && { borderBottomWidth: 0 }]}>
+              <TouchableOpacity key={referral.id} onPress={() => setSelectedPartner(partner)} style={[styles.referralRow, index === shown.length - 1 && { borderBottomWidth: 0 }]}>
                 <View style={[styles.referralDirectionLine, { backgroundColor: referral.direction === 'Inbound' ? COLORS.forest : COLORS.blue }]} />
                 <View style={{ flex: 1 }}>
                   <View style={styles.referralTop}><Text style={styles.referralClient}>{referral.clientLabel}</Text><Text style={styles.referralDate}>{shortDate(referral.date)}</Text></View>
@@ -7186,9 +7287,10 @@ export default function App() {
             );
           })}
         </View> : <EmptyState icon="swap-horizontal-outline" title="No matching referrals" body={referrals.length ? 'Try another search or direction filter.' : 'Add a partner, then log your first inbound or outbound referral.'} />}
+        {filteredReferrals.length > referralRowLimit ? ShowMoreButton(filteredReferrals.length - referralRowLimit, 'referrals', () => setReferralRowLimit((limit) => limit + LIST_ROWS_SHOWN)) : null}
 
         <SectionTitle title="Partner activity" />
-        {partners.length ? partners.slice().sort((a, b) => (lastReferralByPartner[b.id] || '').localeCompare(lastReferralByPartner[a.id] || '') || a.organization.localeCompare(b.organization)).slice(0, 5).map((partner) => (
+        {partners.length ? recentPartnerActivity.map((partner) => (
           <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={styles.balanceRow}>
             <View style={styles.balanceNameRow}><Text style={styles.balanceName} numberOfLines={1}>{partner.organization}</Text></View>
             <Text style={styles.balanceNumbers}>{partnerActivityLine(partner, lastReferralByPartner[partner.id])}</Text>
@@ -8649,9 +8751,19 @@ export default function App() {
                 </>
               )}
               <Text style={styles.fieldLabel}>{matchedReferral ? 'ASSIGN REFERENT' : 'PARTNER'}</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.partnerPicker}>
-                {partners.slice().sort((a, b) => Number(b.id === referralForm.partnerId) - Number(a.id === referralForm.partnerId)).map((partner) => <TouchableOpacity key={partner.id} onPress={() => setReferralForm({ ...referralForm, partnerId: partner.id })} style={[styles.partnerPick, referralForm.partnerId === partner.id && styles.partnerPickActive]}><Initials name={partner.organization} size={34} /><Text numberOfLines={2} style={[styles.partnerPickText, referralForm.partnerId === partner.id && styles.partnerPickTextActive]}>{partner.organization}</Text></TouchableOpacity>)}
-              </ScrollView>
+              {/* Virtualized: a large network is thousands of picks. */}
+              <FlatList
+                horizontal
+                data={partners.slice().sort((a, b) => Number(b.id === referralForm.partnerId) - Number(a.id === referralForm.partnerId))}
+                keyExtractor={(partner) => partner.id}
+                renderItem={({ item: partner }) => <TouchableOpacity onPress={() => setReferralForm({ ...referralForm, partnerId: partner.id })} style={[styles.partnerPick, referralForm.partnerId === partner.id && styles.partnerPickActive]}><Initials name={partner.organization} size={34} /><Text numberOfLines={2} style={[styles.partnerPickText, referralForm.partnerId === partner.id && styles.partnerPickTextActive]}>{partner.organization}</Text></TouchableOpacity>}
+                initialNumToRender={8}
+                maxToRenderPerBatch={8}
+                windowSize={5}
+                showsHorizontalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+                contentContainerStyle={styles.partnerPicker}
+              />
               {matchedReferral && referralForm.partnerId ? (() => {
                 const chosen = partners.find((item) => item.id === referralForm.partnerId);
                 const rank = placementRankFor(matchedReferral.id, referralForm.partnerId);
@@ -9213,6 +9325,8 @@ export default function App() {
       ? sortPlanStatuses(partners.map((partner) => planStatusFor(partner, plan.carrier, state)))
       : partners.slice().sort((a, b) => a.organization.localeCompare(b.organization)).map((partner): PartnerPlanStatus => ({ partnerId: partner.id, organization: partner.organization, networkStatus: 'unknown', source: 'none', sameState: null }));
     const serverAnswered = Boolean(plan?.carrier && planStatuses[`${plan.carrier}|${state}`]);
+    // The first rows (in-network first), plus the chosen one wherever it is.
+    const shownSuggestions = suggestions.filter((item, index) => index < vobRowLimit || item.partnerId === vobForm.partnerId);
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
         <SafeAreaView style={styles.modalPage}>
@@ -9231,9 +9345,9 @@ export default function App() {
               </Text>
               <Text style={styles.fieldLabel}>WHICH PROGRAM</Text>
               <View style={styles.followUpCard}>
-                {suggestions.map((item, index) => {
+                {shownSuggestions.map((item, index) => {
                   const selected = vobForm.partnerId === item.partnerId;
-                  const partner = partners.find((candidate) => candidate.id === item.partnerId);
+                  const partner = partnerById.get(item.partnerId);
                   const line = plan?.carrier ? planStatusLine(item.networkStatus, requests, item.partnerId) : null;
                   const open = requests.find((request) => request.partnerId === item.partnerId && !isVobAnswered(request.status));
                   return (
@@ -9242,7 +9356,7 @@ export default function App() {
                       accessibilityRole="button"
                       accessibilityState={{ selected }}
                       onPress={() => setVobForm((current) => (current ? { ...current, partnerId: selected ? null : item.partnerId, programName: '' } : current))}
-                      style={[styles.caseNextStepRow, index === suggestions.length - 1 && { borderBottomWidth: 0 }]}
+                      style={[styles.caseNextStepRow, index === shownSuggestions.length - 1 && { borderBottomWidth: 0 }]}
                     >
                       <View style={[styles.followUpIcon, { width: 30, height: 30 }]}><AppIcon name={selected ? 'radio-button-on' : 'radio-button-off'} size={17} color={selected ? COLORS.forest : COLORS.gray} /></View>
                       <View style={{ flex: 1 }}>
@@ -9256,6 +9370,7 @@ export default function App() {
                 })}
                 {!suggestions.length ? <Text style={styles.caseEmptyNote}>No partners in your network yet. Type the program below.</Text> : null}
               </View>
+              {suggestions.length > vobRowLimit ? ShowMoreButton(suggestions.length - vobRowLimit, 'programs', () => setVobRowLimit((limit) => limit + LIST_ROWS_SHOWN)) : null}
               <FormField label="OR A PROGRAM BY NAME" value={vobForm.programName} onChangeText={(programName) => setVobForm((current) => (current ? { ...current, programName, partnerId: programName.trim() ? null : current.partnerId } : current))} placeholder="A program outside your network" />
               <FormField label="NOTE (OPTIONAL)" value={vobForm.note} onChangeText={(note) => setVobForm((current) => (current ? { ...current, note } : current))} placeholder="Who you spoke with, fax or portal used, what they need from you" multiline />
               <TouchableOpacity accessibilityRole="button" style={styles.primaryButton} onPress={() => submitVobRequest(vobForm)}>
@@ -10196,6 +10311,8 @@ const styles = StyleSheet.create({
   caseSearchHint: { color: COLORS.gray, fontSize: 12, lineHeight: 18, padding: 14 },
   closedToggle: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, paddingHorizontal: 2, marginBottom: 8 },
   closedToggleText: { color: COLORS.gray, fontSize: 12, fontWeight: '800' },
+  showMoreButton: { minHeight: 44, alignItems: 'center', justifyContent: 'center', paddingVertical: 8, marginBottom: 14 },
+  showMoreText: { color: COLORS.forest, fontSize: 14, fontWeight: '700' },
   caseSectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   caseSectionAction: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 3, paddingVertical: 6 },
   caseSectionActions: { flexDirection: 'row', alignItems: 'center', gap: 12 },

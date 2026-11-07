@@ -1143,11 +1143,22 @@ export async function updateVobStatus(id: string, eventId: string, patch: VobSta
 // "Which of my partners take this plan?" Server-side, for the whole
 // workspace, from each partner's own data or its linked listing. The
 // answer is what programs report about themselves ("per program").
+// One row per partner: paged (PostgREST cuts any response at 1000 rows,
+// set-returning functions included), in the function's own order.
+type PlanRow = { partner_id?: unknown; organization?: unknown; network_status?: unknown; source?: unknown; same_state?: unknown };
+
 export async function fetchPartnersForPlan(plan: string, state: string): Promise<PartnerPlanStatus[]> {
   return withStableCaseAccount(async () => {
-    const { data, error, status } = await supabase.rpc('partners_for_plan', { p_insurance: plan, p_state: state || null });
-    if (error) throw caseFailure(error, status);
-    const rows = (Array.isArray(data) ? data : []) as { partner_id?: unknown; organization?: unknown; network_status?: unknown; source?: unknown; same_state?: unknown }[];
+    let rows: PlanRow[];
+    try {
+      rows = await fetchAllPages<PlanRow>(
+        (from, to) => supabase.rpc('partners_for_plan', { p_insurance: plan, p_state: state || null })
+          .order('organization').order('partner_id').range(from, to),
+        { keyOf: (row) => (typeof row.partner_id === 'string' ? row.partner_id : undefined) },
+      );
+    } catch (error) {
+      throw caseFailure(error, (error as { httpStatus?: number } | null)?.httpStatus);
+    }
     return rows.flatMap((row): PartnerPlanStatus[] => {
       if (typeof row.partner_id !== 'string' || typeof row.network_status !== 'string') return [];
       const status = row.network_status === 'in_network' || row.network_status === 'out_of_network' ? row.network_status : 'unknown';

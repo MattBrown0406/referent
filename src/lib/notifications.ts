@@ -248,16 +248,28 @@ function isScheduleCurrent(generation: number, ownerId: string): boolean {
   return generation === scheduleGeneration && ownerId === scheduleOwnerId;
 }
 
+// What replaceSchedule last put on the system, per account: identical plans
+// are not re-applied. Forgotten whenever the system's copy is cleared.
+let lastAppliedSchedule: { ownerId: string; signature: string } | null = null;
+
 async function replaceSchedule(input: NotificationInput, generation: number, ownerId: string): Promise<void> {
   const permission = await getNotificationPermissionState();
   if (!isScheduleCurrent(generation, ownerId)) return;
   if (permission !== 'authorized') {
+    lastAppliedSchedule = null;
     if (permission !== 'unsupported') await Notifications.cancelAllScheduledNotificationsAsync();
     return;
   }
 
-  await Notifications.cancelAllScheduledNotificationsAsync();
-  if (!isScheduleCurrent(generation, ownerId)) return;
+  // Planned first, then applied only when it differs from what this device
+  // last scheduled: most saves leave the reminders exactly as they were, and
+  // cancelling and re-adding up to MAX_SCHEDULED of them on every save held
+  // the save lock for no change.
+  const requests: Notifications.NotificationRequestInput[] = [];
+  const plan = (request: Notifications.NotificationRequestInput): boolean => {
+    requests.push(request);
+    return true;
+  };
 
   const { partners } = input;
   // The user's own follow-ups and consult alerts come before partner cadence
@@ -269,7 +281,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
 
   // Static copy is intentional: a repeating notification cannot carry a live
   // count. The current count is shown after the user opens the app.
-  if (remaining > 0 && await scheduleIfCurrent(generation, ownerId, {
+  if (remaining > 0 && plan({
     content: {
       title: 'ReferralFit briefing',
       body: "Open ReferralFit to review today's actions.",
@@ -293,7 +305,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
     const [hour, minute] = followUp.dueTime.split(':').map(Number);
     const when = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), hour || 0, (minute || 0) - 30, 0);
     if (when.getTime() <= now.getTime()) continue;
-    if (await scheduleIfCurrent(generation, ownerId, {
+    if (plan({
       content: {
         title: 'Consult in 30 minutes',
         body: `Consult at ${clockLabel(followUp.dueTime)}`,
@@ -330,7 +342,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
     const body = pastDue.length === 1
       ? GENERIC_FOLLOW_UP_BODY
       : allOverdue ? `${pastDue.length} overdue follow-ups` : `${pastDue.length} follow-ups due or overdue`;
-    if (await scheduleIfCurrent(generation, ownerId, {
+    if (plan({
       content: {
         title: pastDue.length === 1 ? 'Follow-up due' : 'Follow-ups due',
         body,
@@ -346,7 +358,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   }
   for (const { when } of upcoming) {
     if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;
-    if (await scheduleIfCurrent(generation, ownerId, {
+    if (plan({
       content: {
         title: 'Follow-up due',
         body: GENERIC_FOLLOW_UP_BODY,
@@ -391,7 +403,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
     for (const when of dates) {
       if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;
       const ageAtDelivery = daysSince + Math.max(0, daysBetween(now, when));
-      if (await scheduleIfCurrent(generation, ownerId, {
+      if (plan({
         content: {
           title: 'ReferralFit',
           body: `Time to reach out to a referral partner — it's been ${ageAtDelivery} ${ageAtDelivery === 1 ? 'day' : 'days'}`,
@@ -406,12 +418,22 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
       })) remaining -= 1;
     }
   }
-}
 
+  if (!isScheduleCurrent(generation, ownerId)) return;
+  const signature = JSON.stringify(requests);
+  if (lastAppliedSchedule && lastAppliedSchedule.ownerId === ownerId && lastAppliedSchedule.signature === signature) return;
+  lastAppliedSchedule = null;
+  await Notifications.cancelAllScheduledNotificationsAsync();
+  for (const request of requests) {
+    if (!(await scheduleIfCurrent(generation, ownerId, request))) return;
+  }
+  lastAppliedSchedule = { ownerId, signature };
+}
 // Scheduled reminders, delivered ones, and the last tap, as the system holds
 // them. A browser has none of these (the web app shows what is due on Today).
 async function clearSystemNotifications(): Promise<void> {
   if (Platform.OS === 'web') return;
+  lastAppliedSchedule = null;
   await Notifications.cancelAllScheduledNotificationsAsync();
   await Notifications.dismissAllNotificationsAsync();
   await Notifications.clearLastNotificationResponseAsync();
