@@ -286,15 +286,16 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   assert.match(login, /await recordAuthFlowStart\('signup', target\);\s*const \{ error: resendError \} = await supabase\.auth\.resend\(/, 'a resend is recorded');
   assert.match(login, /await recordAuthFlowStart\('recovery', normalizedEmail\);\s*const \{ error: resetError \} = await supabase\.auth\.resetPasswordForEmail\(/, 'a reset is recorded');
   const handler = source.slice(source.indexOf('async function handleAuthUrl('), source.indexOf('Linking.getInitialURL()'));
-  assert.match(handler, /if \(redirect\.kind === 'tokens' && !linkEmailAllowed\(jwtEmail\(redirect\.accessToken\), startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;/,
-    'a link for an account this device did not ask for is refused before it replaces any session');
-  assert.ok(handler.indexOf('linkEmailAllowed(jwtEmail(') < handler.indexOf("'Switch accounts?'"), 'and before the switch-accounts question');
-  assert.match(handler, /if \(!linkEmailAllowed\(result\.data\.session\?\.user\?\.email, startedFor\)\) \{\s*const \{ error: outError \} = await supabase\.auth\.signOut\(\{ scope: 'local' \}\);/,
-    'the server-checked account is compared again after the session is set');
+  assert.match(handler, /const checked = await supabase\.auth\.getUser\(redirect\.accessToken\)/, 'the link\'s token is checked by the server, not read from its own claims');
+  assert.ok(handler.indexOf('supabase.auth.getUser(redirect.accessToken)') < handler.indexOf("'Switch accounts?'") && handler.indexOf("'Switch accounts?'") < handler.indexOf('supabase.auth.setSession('), 'checked before the switch question, and both before the session changes');
+  assert.match(handler, /if \(!linkEmailAllowed\(linkUser\.email, startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;/, 'a link for an account this device did not ask for is refused before it replaces any session');
+  assert.match(handler, /if \(!linkEmailAllowed\(signedIn\?\.email, startedFor\) \|\| \(linkUserId && signedIn\?\.id\?\.toLowerCase\(\) !== linkUserId\)\) \{\s*let signedOut = !\(await supabase\.auth\.signOut\(\{ scope: 'local' \}\)\)\.error;/,
+    'the account signed in is compared again, email and id, and signed out locally if it differs');
+  assert.match(handler, /await flushWriteQueue\(current\.userId\)[\s\S]{0,900}will be removed from this browser\./, 'on the web, switching sends what it can and says what will be lost');
   assert.match(handler, /const decision = decideAuthLink\(url, await readAuthFlowStarts\(\), Date\.now\(\), webOrigin\);/);
   assert.ok(handler.indexOf('clearAuthLinkFromAddressBar();') < handler.indexOf('const decision = decideAuthLink('), 'in a browser the tokens leave the address bar first');
   assert.ok(handler.indexOf("decision.action === 'not_started'") < handler.indexOf('supabase.auth.setSession('), 'nothing is exchanged for a flow this device did not start');
-  assert.match(handler, /if \(current && \(!linkUser \|\| linkUser !== current\.userId\.toLowerCase\(\)\)\) \{[\s\S]{0,200}'Switch accounts\?'/, 'a link for another account asks before switching');
+  assert.match(handler, /if \(current && linkUserId !== current\.userId\.toLowerCase\(\)\) \{[\s\S]{0,1200}'Switch accounts\?'/, 'a link for another account asks before switching');
   assert.ok(handler.indexOf("'Switch accounts?'") < handler.indexOf('supabase.auth.setSession('), 'the question comes before the switch');
   assert.match(handler, /await clearAuthFlowStart\(decision\.flow\);/, 'a used link needs a fresh start for the next one');
   assert.doesNotMatch(source, /flowType: 'pkce'/);

@@ -1124,8 +1124,12 @@ await check('the web wipe needs no session and takes every account\'s data, coun
   assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${U}`), true, 'and the signed-in account\'s stays');
   assert.equal(await store.pendingWriteCount(U), 1, 'its queue too');
   state.asyncStorage.set(`referralfit-cache-v2:${other}`, '{}');
+  // A queue written by a newer build (an envelope this one cannot read) is
+  // counted and removed whole: nothing is set aside under a key the wipe
+  // would then miss.
+  state.asyncStorage.set(`referralfit-write-queue-v2:${other}`, JSON.stringify({ version: 3, userId: other, ops: [{ kind: 'futureOp', note: 'client text' }, { kind: 'futureOp' }] }));
   const unsent = await store.wipeAccountDataWithoutSession();
-  assert.equal(unsent, 1, 'the unsent change is counted, so the person can be told');
+  assert.equal(unsent, 3, 'every unsent change is counted (1 here, 2 in the unreadable queue), so the person can be told');
   const left = [...state.asyncStorage.keys()].filter((key) => /referralfit-(cache|write-queue|rejected-writes|unreadable-writes|case-list|case-file|workspace)/.test(key));
   assert.deepEqual(left, [], 'no saved copy, queue, case file or binding is left for any account');
   assert.equal(state.asyncStorage.get('referralfit.welcome.v1'), 'seen', 'flags that hold no client data stay');

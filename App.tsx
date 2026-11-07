@@ -97,8 +97,8 @@ import {
 } from './src/lib/outreach';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
-import { decideAuthLink, jwtEmail, jwtSubject, linkEmailAllowed, parseAuthRedirect } from './src/lib/auth-flows';
-import { clearAuthFlowStart, clearAuthLinkFromAddressBar, currentWebOrigin, readAuthFlowEmails, readAuthFlowStarts } from './src/lib/auth-link-guard';
+import { decideAuthLink, linkEmailAllowed, parseAuthRedirect } from './src/lib/auth-flows';
+import { clearAuthFlowStart, clearAuthLinkFromAddressBar, currentWebOrigin, pruneAuthFlowEmails, readAuthFlowEmails, readAuthFlowStarts } from './src/lib/auth-link-guard';
 import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, fetchWorkspaceMembers, memberDisplayName, type LeadSettings, type OrgMember } from './src/lib/org';
 import { refreshPushRegistration, unregisterThisDevice } from './src/lib/push';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
@@ -1701,6 +1701,7 @@ export default function App() {
     let active = true;
     const webOrigin = currentWebOrigin();
     const here = webOrigin ? 'this browser' : 'this device';
+    void pruneAuthFlowEmails();
     async function handleAuthUrl(url: string | null) {
       if (!url || !active) return;
       // Only parsed so non-auth URLs stay cheap; decideAuthLink re-checks.
@@ -1731,19 +1732,46 @@ export default function App() {
         'That link is for another account',
         `It was not sent to the email ${webOrigin ? 'this browser' : 'this phone'} asked for, so nothing was changed. Request a new link from the sign-in screen, and open it from your own email.`,
       );
-      if (redirect.kind === 'tokens' && !linkEmailAllowed(jwtEmail(redirect.accessToken), startedFor)) {
-        refuseOtherAccount();
-        return;
-      }
+      // The link's account as the server reads its token (a token's own
+      // claims are not signed until checked), before anything about this
+      // device's session changes.
+      let linkUserId: string | null = null;
       if (redirect.kind === 'tokens') {
-        const linkUser = jwtSubject(redirect.accessToken);
+        const checked = await supabase.auth.getUser(redirect.accessToken)
+          .catch((error: unknown) => ({ data: { user: null }, error }));
+        if (!active) return;
+        const linkUser = checked.data.user;
+        if (checked.error || !linkUser) {
+          Alert.alert(
+            isAuthNetworkError(checked.error) ? 'No connection' : 'That link has expired',
+            isAuthNetworkError(checked.error)
+              ? 'The link could not be checked. Connect, then open it again.'
+              : `Request a new one from the sign-in screen and open it in ${here}.`,
+          );
+          return;
+        }
+        if (!linkEmailAllowed(linkUser.email, startedFor)) {
+          refuseOtherAccount();
+          return;
+        }
+        linkUserId = linkUser.id.toLowerCase();
         const current = await currentAuthSessionIdentity({ allowOffline: true }).catch(() => null);
         if (!active) return;
-        if (current && (!linkUser || linkUser !== current.userId.toLowerCase())) {
+        if (current && linkUserId !== current.userId.toLowerCase()) {
+          // A browser keeps one account's data: the one signed in now loses
+          // what has not reached its workspace. Send what can be sent first.
+          let unsentNote = '';
+          if (webOrigin) {
+            await flushWriteQueue(current.userId).catch(() => undefined);
+            const status = await syncStatus(current.userId).catch(() => null);
+            if (!active) return;
+            const unsent = status ? status.pending + status.waiting + status.rejected : 0;
+            if (unsent) unsentNote = ` ${unsent} ${unsent === 1 ? 'change' : 'changes'} made here for the account signed in now ${unsent === 1 ? 'has' : 'have'} not reached its workspace and will be removed from this browser.`;
+          }
           const switchAccounts = await new Promise<boolean>((resolve) => {
             Alert.alert(
               'Switch accounts?',
-              `This link is for a different ReferralFit account than the one signed in on ${webOrigin ? 'this browser' : 'this phone'}. Switching signs ${webOrigin ? 'this browser' : 'this phone'} into that account.`,
+              `This link is for a different ReferralFit account than the one signed in on ${webOrigin ? 'this browser' : 'this phone'}. Switching signs ${webOrigin ? 'this browser' : 'this phone'} into that account.${unsentNote}`,
               [
                 { text: 'Stay signed in', style: 'cancel', onPress: () => resolve(false) },
                 { text: 'Switch', style: 'destructive', onPress: () => resolve(true) },
@@ -1762,12 +1790,15 @@ export default function App() {
         Alert.alert('That link has expired', `Request a new one from the sign-in screen and open it in ${here}.`);
         return;
       }
-      // The account the server signed in, checked again (a code link has no
-      // token to read first).
-      if (!linkEmailAllowed(result.data.session?.user?.email, startedFor)) {
-        const { error: outError } = await supabase.auth.signOut({ scope: 'local' });
-        if (outError) await forceLocalSignOut().catch(() => undefined);
-        if (active) refuseOtherAccount();
+      // The account the server signed in, checked again: the same one the
+      // token was checked for (a code link has no token to check first).
+      const signedIn = result.data.session?.user;
+      if (!linkEmailAllowed(signedIn?.email, startedFor) || (linkUserId && signedIn?.id?.toLowerCase() !== linkUserId)) {
+        let signedOut = !(await supabase.auth.signOut({ scope: 'local' })).error;
+        if (!signedOut) signedOut = await forceLocalSignOut().then(() => true, () => false);
+        if (!active) return;
+        if (signedOut) refuseOtherAccount();
+        else Alert.alert('Sign out now', `That link signed ${webOrigin ? 'this browser' : 'this phone'} into an account it did not ask for. Sign out from Settings.`);
         return;
       }
       // One link per start: a second link needs the flow started again.
@@ -1797,9 +1828,10 @@ export default function App() {
     if (IS_WEB) {
       void wipeAccountDataWithoutSession(userId)
         .then((unsent) => {
-          if (!userId && unsent > 0 && generation === authGenerationRef.current) {
-            Alert.alert('Signed out', `You were signed out, and this browser’s copy of your practice’s data was removed. ${unsent} ${unsent === 1 ? 'change' : 'changes'} made here had not reached your workspace and could not be saved.`);
-          }
+          if (unsent <= 0 || generation !== authGenerationRef.current) return;
+          const lost = `${unsent} ${unsent === 1 ? 'change' : 'changes'} made here had not reached ${userId ? 'that account’s' : 'your'} workspace and could not be saved.`;
+          if (!userId) Alert.alert('Signed out', `You were signed out, and this browser’s copy of your practice’s data was removed. ${lost}`);
+          else Alert.alert('Another account’s data was removed', `This browser held data for the account signed in here before. ${lost}`);
         })
         .catch((error) => {
           if (!userId) Alert.alert('Practice data still in this browser', `It could not be removed: ${describeError(error)}. Clear this site’s data in the browser’s settings.`);
@@ -6343,7 +6375,7 @@ export default function App() {
             // queue and every saved case copy (store.ts). Needs no session,
             // so it works when the session has already gone too.
             await flushWriteQueue(userId).catch(() => undefined);
-            await wipeAccountDataWithoutSession(userId);
+            await wipeAccountDataWithoutSession();
           }
           // Offline, supabase-js cannot sign out (it tries to refresh first and
           // gives up after ~25 s without clearing anything): clear it here.

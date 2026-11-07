@@ -30,7 +30,7 @@ import {
 } from './org';
 import { INTAKE_LINK_ENABLED, intakeLinkUrl, intakeShareMessage } from './intake-link';
 import { openPrivacyPolicy } from './privacy';
-import { SUPABASE_URL } from './supabase';
+import { SUPABASE_URL, supabase } from './supabase';
 import { type Entitlement, type EntitlementState } from './entitlements';
 import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySubmissions, type OrgDirectoryProfileState } from './directory';
 import DirectoryReviewQueue from './DirectoryReviewQueue';
@@ -223,6 +223,28 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
     } finally {
       setBusy(false);
     }
+  }
+
+  // Signing out here ends this device's session only; this ends every other
+  // one (a browser left signed in on a shared computer, a lost phone). A
+  // browser signed out this way removes its practice data when it next opens.
+  function signOutOtherDevices() {
+    Alert.alert(
+      'Sign out other devices?',
+      `Signs your account out on every other phone and browser. ${Platform.OS === 'web' ? 'This browser' : 'This phone'} stays signed in. A browser signed out this way removes its copy of your practice’s data the next time it opens ReferralFit.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Sign out others',
+          style: 'destructive',
+          onPress: () => void run(async () => {
+            const { error } = await supabase.auth.signOut({ scope: 'others' });
+            if (error) throw error;
+            Alert.alert('Other devices signed out', 'They need your password to sign back in.');
+          }, 'Could not sign out other devices'),
+        },
+      ],
+    );
   }
 
   // App Store guideline 5.1.1(v): in-app account deletion. Two confirmations,
@@ -877,6 +899,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
               <Text style={styles.helpText}>{Platform.OS === 'web' ? 'Signs this browser out of ReferralFit and removes your practice’s data from it. Your workspace stays as it is, and you can sign back in any time.' : 'Signs this phone out of ReferralFit. Your workspace stays as it is, and you can sign back in any time.'}</Text>
               <TouchableOpacity accessibilityRole="button" accessibilityLabel="Sign out" disabled={busy} onPress={onSignOut} style={[styles.smallButton, styles.helpTextSpaced, { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center' }]}>
                 <Text style={styles.smallButtonText}>Sign out</Text>
+              </TouchableOpacity>
+              <Text style={[styles.helpText, styles.helpTextSpaced]}>Left signed in somewhere else, such as a shared computer or a lost phone?</Text>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Sign out other devices" disabled={busy} onPress={signOutOtherDevices} style={[styles.smallButton, styles.helpTextSpaced, { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center' }]}>
+                <Text style={styles.smallButtonText}>Sign out other devices</Text>
               </TouchableOpacity>
             </View>
 

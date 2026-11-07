@@ -10,8 +10,10 @@ import type { AlertButton, AlertOptions, AlertType, KeyboardType } from 'react-n
 // Same rules as iOS: a dialog closes only through one of its buttons. Escape
 // (RN Web routes it to the topmost Modal only) presses the cancel button, or
 // dismisses when the alert is cancelable, or presses OK when it is the only
-// button. Enter on a focused button presses that button; anywhere else it
-// presses the main button, never a destructive one.
+// button. A dialog opens with its main button focused (never a destructive
+// one), so the focus ring and Enter agree; a list of three or more choices
+// has no default and opens with none of them pressable by Enter or Space
+// until the person tabs to one. A button reached with Tab presses itself.
 
 type Dialog = {
   id: number;
@@ -100,6 +102,8 @@ export function WebAlertHost() {
   // they reached. The dialog's own first focus (React Native Web focuses the
   // first button when it opens) never decides what Enter does.
   const tabbedRef = useRef(false);
+  // The main button of a two-button dialog, focused when it opens.
+  const mainButtonRef = useRef<View | null>(null);
 
   useEffect(() => {
     listeners.add(setDialogs);
@@ -109,6 +113,24 @@ export function WebAlertHost() {
   useEffect(() => {
     setText(dialog?.prompt?.defaultValue ?? '');
     tabbedRef.current = false;
+    if (!dialog || dialog.prompt) return undefined; // a prompt's text field keeps its focus
+    // The Modal mounts its content a moment later (a portal), so this tries
+    // for up to a second; React Native Web's own focus trap leaves a focus
+    // already inside the dialog alone. Never after the person pressed Tab.
+    let tries = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    const focusMain = () => {
+      if (tabbedRef.current) return;
+      const node = mainButtonRef.current as unknown as { focus?: () => void } | null;
+      if (node?.focus) {
+        node.focus();
+        return;
+      }
+      tries += 1;
+      if (tries < 20) timer = setTimeout(focusMain, 50);
+    };
+    timer = setTimeout(focusMain, 0);
+    return () => clearTimeout(timer);
   }, [dialog?.id]);
 
   function press(button: AlertButton) {
@@ -148,16 +170,28 @@ export function WebAlertHost() {
     if (!dialog || typeof window === 'undefined') return undefined;
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Tab') { tabbedRef.current = true; return; }
-      if (event.key !== 'Enter' || event.shiftKey) return;
       const target = event.target as { getAttribute?: (name: string) => string | null; tagName?: string } | null;
       const onButton = target?.getAttribute?.('role') === 'button' || target?.tagName === 'BUTTON';
       if (onButton && tabbedRef.current) return; // the button they tabbed to presses itself
-      event.preventDefault();
-      event.stopPropagation();
-      enter();
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.type === 'keydown') enter();
+        return;
+      }
+      // Space or Shift+Enter on a button the dialog focused by itself
+      // presses nothing.
+      if (onButton && (event.key === ' ' || event.key === 'Spacebar' || event.key === 'Enter')) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
     };
     window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
+    window.addEventListener('keyup', onKey, true);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('keyup', onKey, true);
+    };
   }, [dialog?.id]);
 
   if (!dialog) return null;
@@ -186,6 +220,7 @@ export function WebAlertHost() {
               return (
                 <Pressable
                   key={`${button.text ?? 'OK'}-${index}`}
+                  ref={main ? mainButtonRef : undefined}
                   onPress={() => press(button)}
                   accessibilityRole="button"
                   style={({ hovered, pressed }: { hovered?: boolean; pressed: boolean }) => [

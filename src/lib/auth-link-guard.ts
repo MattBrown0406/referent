@@ -62,6 +62,26 @@ export async function readAuthFlowEmails(kind: AuthFlowKind, now = Date.now()): 
   return list.filter((entry) => now - entry.at >= 0 && now - entry.at <= AUTH_FLOW_WINDOW_MS).map((entry) => entry.email);
 }
 
+// Addresses older than the window leave this device (a shared computer
+// keeps no typed address past the day it was asked for). Run at launch.
+export async function pruneAuthFlowEmails(now = Date.now()): Promise<void> {
+  try {
+    const all = await readFlowEmails();
+    let changed = false;
+    for (const kind of ['signup', 'recovery'] as AuthFlowKind[]) {
+      const kept = (all[kind] || []).filter((entry) => now - entry.at >= 0 && now - entry.at <= AUTH_FLOW_WINDOW_MS);
+      if (kept.length !== (all[kind] || []).length) changed = true;
+      if (kept.length) all[kind] = kept;
+      else delete all[kind];
+    }
+    if (!changed) return;
+    if (Object.keys(all).length) await AsyncStorage.setItem(AUTH_FLOW_EMAILS_KEY, JSON.stringify(all));
+    else await AsyncStorage.removeItem(AUTH_FLOW_EMAILS_KEY);
+  } catch {
+    // ignored: read again, the entries are filtered anyway
+  }
+}
+
 // Best effort: a storage failure must never block sign-up or a reset. The
 // link then asks the user to sign in instead of signing them in by itself.
 export async function recordAuthFlowStart(kind: AuthFlowKind, email: string, now = Date.now()): Promise<void> {

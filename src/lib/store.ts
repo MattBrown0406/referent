@@ -1677,6 +1677,18 @@ const ACCOUNT_DATA_PREFIXES = [
   CASE_LIST_KEY_PREFIX, CASE_FILE_INDEX_KEY_PREFIX, CASE_FILE_KEY_PREFIX, WORKSPACE_KEY_PREFIX,
 ];
 
+function storedChangeCount(raw: string | null): number {
+  if (!raw) return 0;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) return parsed.length;
+    if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { ops?: unknown }).ops)) return (parsed as { ops: unknown[] }).ops.length;
+    return 1;
+  } catch {
+    return 1;
+  }
+}
+
 export async function wipeAccountDataWithoutSession(keepUserId?: string): Promise<number> {
   const keep = keepUserId?.toLowerCase();
   return withCacheLock(async () => withQueueLock(async () => {
@@ -1689,13 +1701,14 @@ export async function wipeAccountDataWithoutSession(keepUserId?: string): Promis
     }
     const doomed = keys.filter((key) => ACCOUNT_DATA_PREFIXES.some((prefix) => key.startsWith(prefix)
       && !(keep && key.slice(prefix.length).toLowerCase().startsWith(keep))));
+    // Counted from the stored JSON as it is: the queue's own reader would
+    // set aside what it cannot read under a new key, which the removal below
+    // (of the keys listed above) would then miss.
     let unsent = 0;
     for (const key of doomed) {
-      const owner = key.startsWith(QUEUE_KEY_PREFIX) ? key.slice(QUEUE_KEY_PREFIX.length)
-        : key.startsWith(REJECTED_KEY_PREFIX) ? key.slice(REJECTED_KEY_PREFIX.length) : '';
-      if (!isUuid(owner)) continue;
+      if (![QUEUE_KEY_PREFIX, REJECTED_KEY_PREFIX, UNREADABLE_KEY_PREFIX].some((prefix) => key.startsWith(prefix))) continue;
       try {
-        unsent += key.startsWith(QUEUE_KEY_PREFIX) ? (await readQueueUnlocked(owner)).length : (await readRejectedUnlocked(owner)).length;
+        unsent += storedChangeCount(await AsyncStorage.getItem(key));
       } catch {
         unsent += 1; // unreadable: something was there
       }
