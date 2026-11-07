@@ -50,6 +50,90 @@ export function tokenFromPath(pathname: string): string | null {
   return INTAKE_TOKEN_PATTERN.test(token) ? token : null;
 }
 
+// ─── The referralfit.com form (JSON + CORS) ─────────────────────────────────
+// https://referralfit.com/intake/<token> is a page on the website that calls
+// this function straight from the family's browser (so the function still
+// sees the family's own address for rate limiting). It speaks JSON:
+//   GET  ?format=json       200 { practice_name }
+//   POST application/json   200 { ok: true }
+// and every refusal as { error: { code, message } } with the same status
+// codes as the HTML pages. The HTML form below stays for links shared before
+// the website form existed. Contract: referralfit-web src/lib/intake.ts.
+
+export const ALLOWED_ORIGINS: readonly string[] = ['https://referralfit.com', 'https://www.referralfit.com'];
+
+// INTAKE_EXTRA_ORIGINS (comma separated) adds origins for local testing only,
+// e.g. http://localhost:3219. Never set in production. Anything that is not a
+// bare http(s) origin is ignored.
+export function allowedOrigins(extra: string | undefined): string[] {
+  const more = (extra || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => /^https?:\/\/[a-z0-9.-]+(:[0-9]{1,5})?$/i.test(origin));
+  return [...ALLOWED_ORIGINS, ...more];
+}
+
+// CORS headers for a response to `origin`: only an allowed origin is ever
+// named (never '*', never credentials), and Vary: Origin keeps a cache from
+// handing one origin's answer to another. A disallowed origin gets no
+// Access-Control headers, so its browser refuses the JSON POST at preflight.
+export function corsHeaders(origin: string | null, allowed: readonly string[]): Record<string, string> {
+  const headers: Record<string, string> = { vary: 'Origin' };
+  if (origin && allowed.includes(origin)) {
+    headers['access-control-allow-origin'] = origin;
+    headers['access-control-allow-methods'] = 'GET, POST, OPTIONS';
+    headers['access-control-allow-headers'] = 'Content-Type, Accept';
+    headers['access-control-max-age'] = '600';
+  }
+  return headers;
+}
+
+// Whether a request is from the website form (answer in JSON) or the
+// function's own HTML form.
+export function wantsJson(method: string, url: URL, contentType: string | null): boolean {
+  if (method === 'GET') return url.searchParams.get('format') === 'json';
+  if (method === 'POST') return (contentType || '').toLowerCase().startsWith('application/json');
+  return false;
+}
+
+// A real submission is well under 1 KB; anything bigger is not read.
+export const MAX_JSON_BYTES = 8 * 1024;
+
+const JSON_FIELDS = ['caller_name', 'phone', 'email', 'about_relationship', 'about_first_name', 'urgency', 'company'] as const;
+
+// The JSON body as the form fields parseSubmission reads, so every rule
+// (honeypot, limits, validation) applies unchanged. Only string values are
+// kept; other types and unknown keys are dropped. null: not a JSON object.
+export function formFromJson(text: string): URLSearchParams | null {
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const form = new URLSearchParams();
+  for (const key of JSON_FIELDS) {
+    const value = (body as Record<string, unknown>)[key];
+    if (typeof value === 'string') form.set(key, value);
+  }
+  return form;
+}
+
+export const JSON_MESSAGES = {
+  not_found: 'This link is not active.',
+  rate_limited: 'Please try again in a little while.',
+  bad_request: 'Please use the form on this page.',
+  check_fields: 'Please check your name and phone number and try again.',
+  server_error: 'Something went wrong on our side. Please try again in a moment, or call the practice directly.',
+} as const;
+
+export type JsonErrorCode = 'not_found' | 'invalid' | 'rate_limited' | 'server_error';
+
+export function jsonError(code: JsonErrorCode, message: string): { error: { code: JsonErrorCode; message: string } } {
+  return { error: { code, message } };
+}
+
 function field(form: URLSearchParams, name: string, max: number): string {
   // Collapse whitespace and cut hard: nothing longer than the column limit
   // ever reaches the database, and control characters never do.
