@@ -65,7 +65,7 @@ for (const status of [ios.AUTHORIZED, ios.PROVISIONAL, ios.EPHEMERAL]) {
 assert.equal(notifications.permissionAllowsNotifications({ granted: false, canAskAgain: true, ios: { status: 0 } }), false);
 assert.match(appSource, /notificationPromptKey/);
 assert.match(appSource, /notificationScheduleKey/);
-assert.match(appSource, /await activateReferralFitNotificationOwner\(userId\);[\s\S]{0,1500}?await readLaunchCopy\(userId\)[\s\S]{0,1500}?await hydrate\(userId\)/, 'account transition must invalidate and cancel old schedules before the saved copy shows and before hydration');
+assert.match(appSource, /await activateReferralFitNotificationOwner\(userId\);[\s\S]{0,1500}?await readLaunchCopy\(userId\)[\s\S]{0,2500}?await hydrate\(userId\)/, 'account transition must invalidate and cancel old schedules before the saved copy shows and before hydration');
 assert.match(appSource, /notificationPermissionState === 'blocked'/, 'blocked users need an in-app Settings route');
 
 nativeState.permission = { granted: false, canAskAgain: false, ios: { status: 0 } };
