@@ -59,7 +59,9 @@ async function readFlowEmails(): Promise<FlowEmails> {
 // first ([] when none was recorded: an older build, or storage failed).
 export async function readAuthFlowEmails(kind: AuthFlowKind, now = Date.now()): Promise<string[]> {
   const list = (await readFlowEmails())[kind] || [];
-  return list.filter((entry) => now - entry.at >= 0 && now - entry.at <= AUTH_FLOW_WINDOW_MS).map((entry) => entry.email);
+  // A future date (the clock was set back since) still counts: dropping it
+  // would leave nothing to check a link against.
+  return list.filter((entry) => now - entry.at <= AUTH_FLOW_WINDOW_MS).map((entry) => entry.email);
 }
 
 // Addresses older than the window leave this device (a shared computer
@@ -69,7 +71,7 @@ export async function pruneAuthFlowEmails(now = Date.now()): Promise<void> {
     const all = await readFlowEmails();
     let changed = false;
     for (const kind of ['signup', 'recovery'] as AuthFlowKind[]) {
-      const kept = (all[kind] || []).filter((entry) => now - entry.at >= 0 && now - entry.at <= AUTH_FLOW_WINDOW_MS);
+      const kept = (all[kind] || []).filter((entry) => now - entry.at <= AUTH_FLOW_WINDOW_MS);
       if (kept.length !== (all[kind] || []).length) changed = true;
       if (kept.length) all[kind] = kept;
       else delete all[kind];

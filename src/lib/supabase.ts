@@ -12,7 +12,7 @@ const DEV_BUILD = typeof __DEV__ !== 'undefined' && __DEV__;
 const LOCAL_URL = DEV_BUILD ? process.env.EXPO_PUBLIC_SUPABASE_URL : undefined;
 const LOCAL_KEY = DEV_BUILD ? process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY : undefined;
 export const SUPABASE_URL = LOCAL_URL && LOCAL_KEY ? LOCAL_URL : 'https://ovfafffvcpaahktvlsdm.supabase.co';
-const SUPABASE_PUBLISHABLE_KEY = LOCAL_URL && LOCAL_KEY ? LOCAL_KEY : 'sb_publishable_szOYQ5hbfqTsZi1uI7t8zQ_OzdpYBzi';
+export const SUPABASE_PUBLISHABLE_KEY = LOCAL_URL && LOCAL_KEY ? LOCAL_KEY : 'sb_publishable_szOYQ5hbfqTsZi1uI7t8zQ_OzdpYBzi';
 
 // SecureStore values are capped around 2KB, and Supabase auth session JSON
 // (access + refresh tokens) can exceed that, so chunk the value across a few

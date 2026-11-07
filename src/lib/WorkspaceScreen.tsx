@@ -231,7 +231,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   function signOutOtherDevices() {
     Alert.alert(
       'Sign out other devices?',
-      `Signs your account out on every other phone and browser. ${Platform.OS === 'web' ? 'This browser' : 'This phone'} stays signed in. A browser signed out this way removes its copy of your practice’s data the next time it opens ReferralFit.`,
+      `Signs your account out on every other phone and browser. Each one follows the next time ReferralFit opens or comes back to the screen there (within the hour otherwise), and a browser then removes its copy of your practice’s data. ${Platform.OS === 'web' ? 'This browser' : 'This phone'} stays signed in.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {

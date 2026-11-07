@@ -1,7 +1,7 @@
 import { decode } from 'base64-arraybuffer';
 import type { Session } from '@supabase/supabase-js';
 
-import { supabase } from './supabase';
+import { SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL, supabase } from './supabase';
 
 // offline: true means the identity was read from the session persisted on this
 // device because the server could not be reached to refresh an expired access
@@ -204,6 +204,52 @@ export async function resolveLaunchSession(timeoutMs = SESSION_LOOKUP_TIMEOUT_MS
   const fallback = await offlineSessionFallback();
   if (fallback) networkDownUntil = Date.now() + OFFLINE_RECHECK_MS;
   return { session: fallback, offline: Boolean(fallback) };
+}
+
+// The account an emailed link's access token belongs to, as the server reads
+// it. Not supabase-js's getUser(token): when the server says that token's
+// session is gone, it deletes THIS device's stored session, so a stale or
+// planted link would sign out whoever is signed in here before any check.
+export type LinkTokenCheck =
+  | { ok: true; userId: string; email: string }
+  | { ok: false; reason: 'expired' | 'unreachable' };
+
+export async function checkLinkToken(accessToken: string, timeoutMs = 15_000): Promise<LinkTokenCheck> {
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = setTimeout(() => controller?.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      headers: { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${accessToken}` },
+      signal: controller?.signal,
+    });
+    if (response.status >= 500) return { ok: false, reason: 'unreachable' };
+    if (!response.ok) return { ok: false, reason: 'expired' };
+    const body = await response.json() as { id?: unknown; email?: unknown };
+    if (typeof body?.id !== 'string' || !body.id) return { ok: false, reason: 'expired' };
+    return { ok: true, userId: body.id.toLowerCase(), email: typeof body.email === 'string' ? body.email : '' };
+  } catch {
+    return { ok: false, reason: 'unreachable' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Whether this device's session still stands, asked of the server ("Sign out
+// other devices" elsewhere, a changed password): supabase-js trusts a stored
+// session until its token needs refreshing. When the server says it is gone,
+// getUser() removes it here, which signs this device out (and, on the web,
+// removes the practice's data). Network trouble changes nothing. At most once
+// a minute.
+let lastSessionCheckAt = 0;
+
+export async function confirmSessionStillValid(minIntervalMs = 60_000): Promise<void> {
+  if (Date.now() - lastSessionCheckAt < minIntervalMs) return;
+  lastSessionCheckAt = Date.now();
+  try {
+    await supabase.auth.getUser();
+  } catch {
+    // offline or a passing failure: the next return asks again
+  }
 }
 
 // Sign this device out without the server. supabase-js's signOut() (both the

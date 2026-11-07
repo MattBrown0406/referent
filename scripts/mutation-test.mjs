@@ -286,9 +286,12 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   assert.match(login, /await recordAuthFlowStart\('signup', target\);\s*const \{ error: resendError \} = await supabase\.auth\.resend\(/, 'a resend is recorded');
   assert.match(login, /await recordAuthFlowStart\('recovery', normalizedEmail\);\s*const \{ error: resetError \} = await supabase\.auth\.resetPasswordForEmail\(/, 'a reset is recorded');
   const handler = source.slice(source.indexOf('async function handleAuthUrl('), source.indexOf('Linking.getInitialURL()'));
-  assert.match(handler, /const checked = await supabase\.auth\.getUser\(redirect\.accessToken\)/, 'the link\'s token is checked by the server, not read from its own claims');
-  assert.ok(handler.indexOf('supabase.auth.getUser(redirect.accessToken)') < handler.indexOf("'Switch accounts?'") && handler.indexOf("'Switch accounts?'") < handler.indexOf('supabase.auth.setSession('), 'checked before the switch question, and both before the session changes');
-  assert.match(handler, /if \(!linkEmailAllowed\(linkUser\.email, startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;/, 'a link for an account this device did not ask for is refused before it replaces any session');
+  assert.ok(!handler.includes('supabase.auth.getUser('), 'never supabase-js getUser(token): it deletes this device\'s session when the link\'s is gone');
+  assert.match(handler, /if \(!linkEmailAllowed\(jwtEmail\(redirect\.accessToken\), startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;\s*\}\s*const checked = await checkLinkToken\(redirect\.accessToken\);/,
+    'the token\'s own claims refuse another address first, with no network call; then the server reads the token');
+  assert.ok(handler.indexOf('checkLinkToken(redirect.accessToken)') < handler.indexOf("'Switch accounts?'") && handler.indexOf("'Switch accounts?'") < handler.indexOf('supabase.auth.setSession('), 'checked before the switch question, and both before the session changes');
+  assert.match(handler, /if \(!linkEmailAllowed\(checked\.email, startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;/, 'the server-read address is checked too');
+  assert.match(handler, /\/\/ Only when nobody is signed in here, so there is nothing to lose\.\s*if \(current\) \{\s*Alert\.alert\('That link has expired'/, 'an expired link signs in only where nobody is signed in');
   assert.match(handler, /if \(!linkEmailAllowed\(signedIn\?\.email, startedFor\) \|\| \(linkUserId && signedIn\?\.id\?\.toLowerCase\(\) !== linkUserId\)\) \{\s*let signedOut = !\(await supabase\.auth\.signOut\(\{ scope: 'local' \}\)\)\.error;/,
     'the account signed in is compared again, email and id, and signed out locally if it differs');
   assert.match(handler, /await flushWriteQueue\(current\.userId\)[\s\S]{0,900}will be removed from this browser\./, 'on the web, switching sends what it can and says what will be lost');

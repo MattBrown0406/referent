@@ -73,7 +73,7 @@ import {
 } from './src/lib/matching';
 import { bedForFromPopulation, bedsCadenceLine, bedsLine, type BedFor } from './src/lib/beds';
 import { supabase } from './src/lib/supabase';
-import { currentAuthSessionIdentity, forceLocalSignOut, isAuthNetworkError, offlineSessionFallback, resolveLaunchSession } from './src/lib/auth-session';
+import { checkLinkToken, confirmSessionStillValid, currentAuthSessionIdentity, forceLocalSignOut, isAuthNetworkError, offlineSessionFallback, resolveLaunchSession } from './src/lib/auth-session';
 import { describeError, LeadTakenError, OfflineError, RejectedWritesError } from './src/lib/errors';
 import { beginOverlay, overlayOpen, overlaysOpened } from './src/lib/overlay';
 import LoginScreen from './src/lib/LoginScreen';
@@ -97,7 +97,7 @@ import {
 } from './src/lib/outreach';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
-import { decideAuthLink, linkEmailAllowed, parseAuthRedirect } from './src/lib/auth-flows';
+import { decideAuthLink, jwtEmail, linkEmailAllowed, parseAuthRedirect } from './src/lib/auth-flows';
 import { clearAuthFlowStart, clearAuthLinkFromAddressBar, currentWebOrigin, pruneAuthFlowEmails, readAuthFlowEmails, readAuthFlowStarts } from './src/lib/auth-link-guard';
 import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, fetchWorkspaceMembers, memberDisplayName, type LeadSettings, type OrgMember } from './src/lib/org';
 import { refreshPushRegistration, unregisterThisDevice } from './src/lib/push';
@@ -1732,31 +1732,40 @@ export default function App() {
         'That link is for another account',
         `It was not sent to the email ${webOrigin ? 'this browser' : 'this phone'} asked for, so nothing was changed. Request a new link from the sign-in screen, and open it from your own email.`,
       );
-      // The link's account as the server reads its token (a token's own
-      // claims are not signed until checked), before anything about this
-      // device's session changes.
+      // The link's account, before anything about this device's session
+      // changes: first its token's own claims (no network: a link for
+      // another address is refused outright), then as the server reads the
+      // token (claims are not signed until checked).
       let linkUserId: string | null = null;
       if (redirect.kind === 'tokens') {
-        const checked = await supabase.auth.getUser(redirect.accessToken)
-          .catch((error: unknown) => ({ data: { user: null }, error }));
-        if (!active) return;
-        const linkUser = checked.data.user;
-        if (checked.error || !linkUser) {
-          Alert.alert(
-            isAuthNetworkError(checked.error) ? 'No connection' : 'That link has expired',
-            isAuthNetworkError(checked.error)
-              ? 'The link could not be checked. Connect, then open it again.'
-              : `Request a new one from the sign-in screen and open it in ${here}.`,
-          );
-          return;
-        }
-        if (!linkEmailAllowed(linkUser.email, startedFor)) {
+        if (!linkEmailAllowed(jwtEmail(redirect.accessToken), startedFor)) {
           refuseOtherAccount();
           return;
         }
-        linkUserId = linkUser.id.toLowerCase();
+        const checked = await checkLinkToken(redirect.accessToken);
+        if (!active) return;
         const current = await currentAuthSessionIdentity({ allowOffline: true }).catch(() => null);
         if (!active) return;
+        if (!checked.ok) {
+          // The link is single-use and has left the address bar: a new one.
+          if (checked.reason === 'unreachable') {
+            Alert.alert('No connection', 'The link could not be checked. Once you are connected, request a new link from the sign-in screen.');
+            return;
+          }
+          // Expired (left unopened for an hour): signing in refreshes with
+          // the link's other token, which only a check afterwards can read.
+          // Only when nobody is signed in here, so there is nothing to lose.
+          if (current) {
+            Alert.alert('That link has expired', `Request a new one from the sign-in screen and open it in ${here}.`);
+            return;
+          }
+        } else {
+          if (!linkEmailAllowed(checked.email, startedFor)) {
+            refuseOtherAccount();
+            return;
+          }
+          linkUserId = checked.userId;
+        }
         if (current && linkUserId !== current.userId.toLowerCase()) {
           // A browser keeps one account's data: the one signed in now loses
           // what has not reached its workspace. Send what can be sent first.
@@ -2013,6 +2022,8 @@ export default function App() {
         // A member who turned push on gets this device re-registered quietly;
         // this never prompts and never fails loudly.
         void refreshPushRegistration(userId);
+        // Signed out from another device while this one was closed: follow.
+        void confirmSessionStillValid(0);
 
         const pending = await pendingWriteCount(userId);
         if (!active || generation !== authGenerationRef.current) return;
@@ -2277,6 +2288,8 @@ export default function App() {
       && activeUserIdRef.current === userId;
     const subscription = AppState.addEventListener('change', (state) => {
       if (state !== 'active' || !stillCurrent()) return;
+      // Signed out from another device meanwhile: this one follows.
+      void confirmSessionStillValid();
       (async () => {
         const currentOrgId = await fetchCurrentOrgId();
         if (!stillCurrent()) return;

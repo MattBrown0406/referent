@@ -1677,12 +1677,19 @@ const ACCOUNT_DATA_PREFIXES = [
   CASE_LIST_KEY_PREFIX, CASE_FILE_INDEX_KEY_PREFIX, CASE_FILE_KEY_PREFIX, WORKSPACE_KEY_PREFIX,
 ];
 
+// The queue is { ops: [...] }; the set-aside and unreadable lists are
+// { entries: [...] } (each entry one change the person sees). An empty list
+// (left by Discard or Retry) counts nothing; anything unreadable counts one.
 function storedChangeCount(raw: string | null): number {
   if (!raw) return 0;
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (Array.isArray(parsed)) return parsed.length;
-    if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { ops?: unknown }).ops)) return (parsed as { ops: unknown[] }).ops.length;
+    if (parsed && typeof parsed === 'object') {
+      const record = parsed as { ops?: unknown; entries?: unknown };
+      if (Array.isArray(record.ops)) return record.ops.length;
+      if (Array.isArray(record.entries)) return record.entries.length;
+    }
     return 1;
   } catch {
     return 1;
