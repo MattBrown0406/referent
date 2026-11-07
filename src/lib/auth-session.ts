@@ -222,7 +222,8 @@ export async function checkLinkToken(accessToken: string, timeoutMs = 15_000): P
       headers: { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${accessToken}` },
       signal: controller?.signal,
     });
-    if (response.status >= 500) return { ok: false, reason: 'unreachable' };
+    // A server fault or a rate limit says nothing about the link.
+    if (response.status >= 500 || response.status === 429) return { ok: false, reason: 'unreachable' };
     if (!response.ok) return { ok: false, reason: 'expired' };
     const body = await response.json() as { id?: unknown; email?: unknown };
     if (typeof body?.id !== 'string' || !body.id) return { ok: false, reason: 'expired' };

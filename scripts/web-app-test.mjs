@@ -36,6 +36,7 @@ assert.ok(signOut.indexOf('wipeAccountDataWithoutSession()') < signOut.indexOf("
 const workspace = read('src/lib/WorkspaceScreen.tsx');
 assert.ok(workspace.includes("await supabase.auth.signOut({ scope: 'others' });") && workspace.includes('Sign out other devices'), 'a remote sign-out stays possible: Sign out other devices');
 assert.ok((app.match(/void confirmSessionStillValid\(/g) || []).length === 2, 'a device signed out from elsewhere follows at launch and on every return');
+assert.match(app, /await refreshFromServer\('foreground'\);[\s\S]{0,600}\}\)\.finally\(\(\) => \{[\s\S]{0,200}if \(stillCurrent\(\)\) void confirmSessionStillValid\(\);/, 'on a return, after the refresh has sent the queue');
 const authSession = read('src/lib/auth-session.ts');
 assert.match(authSession, /export async function checkLinkToken\([\s\S]{0,600}fetch\(`\$\{SUPABASE_URL\}\/auth\/v1\/user`/, 'a link\'s token is read by a plain request, which never touches this device\'s session');
 assert.ok(!app.includes('supabase.auth.signOut()'), 'signing out ends this device\'s session only, never the phone\'s');

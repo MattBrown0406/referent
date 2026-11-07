@@ -33,7 +33,7 @@ assert.match(app, /const applyMatchToForm = useCallback\(\(match: ReferralMatch 
   'loading a profile into the form records what was loaded');
 assert.match(app, /currentMatchFormRef\.current = matchFormSignature\(\[\s*selectedMatchId, matchClientLabel, matchType, matchState, matchInsurance, matchNetworkPreferences,\s*matchBudget, matchTherapies, matchMustHave, matchPopulation, matchLocationPreference,\s*\]\);/,
   'and the form on screen is compared field for field, in the same order');
-assert.match(app, /const formAsLaunched = launchMatchForm !== null\s*&& appliedMatchFormRef\.current === launchMatchForm && currentMatchFormRef\.current === launchMatchForm;/,
+assert.match(app, /const formAsLaunched = launchMatchForm !== null && matchFormLoadsRef\.current === launchMatchLoads\s*&& appliedMatchFormRef\.current === launchMatchForm && currentMatchFormRef\.current === launchMatchForm;/,
   'only a form exactly as launch loaded it (no profile picked, nothing typed, no new match) takes the server\'s version');
 assert.match(app, /if \(changedMeanwhile\(\) \|\| \(!caseListLoad && showingSaved\)\) \{[\s\S]{0,200}skippedServerCopy = true;\s*\}\s*if \(!changedMeanwhile\(\) && \(caseListLoad \|\| !showingSaved\)\) \{/,
   'a failed case-list read leaves the saved list on screen and is read again soon');

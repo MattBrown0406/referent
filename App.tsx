@@ -1305,6 +1305,9 @@ export default function App() {
   // means nothing was typed since (launch then loads the server's version).
   const appliedMatchFormRef = useRef('');
   const currentMatchFormRef = useRef('');
+  // Every load into the form (a profile picked, a new match started, launch):
+  // a load that leaves the form looking the same still counts as a choice.
+  const matchFormLoadsRef = useRef(0);
   const [matchClientLabel, setMatchClientLabel] = useState('');
   const [matchType, setMatchType] = useState('Any type');
   const [matchInsurance, setMatchInsurance] = useState('Cash pay');
@@ -1502,6 +1505,7 @@ export default function App() {
   // never a case link carried over from an earlier "Find placement".
   const applyMatchToForm = useCallback((match: ReferralMatch | null) => {
     appliedMatchFormRef.current = matchFormSignature(matchFormValuesFor(match));
+    matchFormLoadsRef.current += 1;
     setPendingCaseMatchId(null);
     setSelectedMatchId(match?.id || null);
     setMatchClientLabel(match?.clientLabel || '');
@@ -1908,9 +1912,11 @@ export default function App() {
         // The Match form as this launch loaded it from the saved copy: a
         // profile picked or a new match started meanwhile changes it.
         let launchMatchForm: string | null = null;
+        let launchMatchLoads = -1;
         if (launchCopy) {
           applySnapshot(launchCopy.snapshot);
           launchMatchForm = appliedMatchFormRef.current;
+          launchMatchLoads = matchFormLoadsRef.current;
           if (launchCopy.caseList) {
             setCases(launchCopy.caseList.list.cases);
             setAllCaseContacts(launchCopy.caseList.list.contacts);
@@ -1943,7 +1949,7 @@ export default function App() {
           // showed (typed, a profile picked, a new match started); exactly as
           // launch loaded it, it loads the server's profile (edited elsewhere
           // since).
-          const formAsLaunched = launchMatchForm !== null
+          const formAsLaunched = launchMatchForm !== null && matchFormLoadsRef.current === launchMatchLoads
             && appliedMatchFormRef.current === launchMatchForm && currentMatchFormRef.current === launchMatchForm;
           applySnapshot(result.snapshot, !showingSaved || formAsLaunched);
         }
@@ -2288,8 +2294,6 @@ export default function App() {
       && activeUserIdRef.current === userId;
     const subscription = AppState.addEventListener('change', (state) => {
       if (state !== 'active' || !stillCurrent()) return;
-      // Signed out from another device meanwhile: this one follows.
-      void confirmSessionStillValid();
       (async () => {
         const currentOrgId = await fetchCurrentOrgId();
         if (!stillCurrent()) return;
@@ -2306,6 +2310,10 @@ export default function App() {
         // on screen; alerting on every foreground return would be noise.
         if (stillCurrent() && isPagingLimitError(error)) setRefreshNotice(describeError(error));
         else if (stillCurrent() && !isServerUnreachable(error)) Alert.alert('Sync issue', describeError(error));
+      }).finally(() => {
+        // Signed out from another device meanwhile: this one follows, after
+        // the refresh has sent what the still-valid token could save.
+        if (stillCurrent()) void confirmSessionStillValid();
       });
     });
     return () => {
