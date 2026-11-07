@@ -36,6 +36,7 @@ const {
   linkEmailAllowed,
   parseAuthRedirect,
   passwordProblem,
+  retryWhileOffline,
 } = require(path.join(tmpDir, 'auth-flows.js'));
 
 let failures = 0;
@@ -219,6 +220,54 @@ for (const text of [
 const appReview = readFileSync(path.join(repoRoot, 'APP_REVIEW.md'), 'utf8');
 assert.ok(!/there is no self-serve sign-up/.test(appReview), 'APP_REVIEW.md still claims there is no sign-up');
 assert.ok(appReview.includes('5.1.1(v)'), 'APP_REVIEW.md must document account deletion');
+
+// A link opened while iOS wakes the app: its first request can fail on a
+// stale connection without reaching the server. The app retries a request
+// that failed for lack of a connection, and only that.
+{
+  const run = async (outcomes, options = {}) => {
+    const calls = [];
+    const waits = [];
+    let clock = 0;
+    const result = await retryWhileOffline(
+      async () => { calls.push(clock); return outcomes[Math.min(calls.length - 1, outcomes.length - 1)]; },
+      (outcome) => outcome === 'offline',
+      { sleep: async (ms) => { waits.push(ms); clock += ms; }, now: () => clock, ...options },
+    );
+    return { result, calls: calls.length, waits };
+  };
+  check('a request that goes through is not repeated', await run(['ok']), { result: 'ok', calls: 1, waits: [] });
+  check('a dropped first request is tried again after a moment', await run(['offline', 'ok']), { result: 'ok', calls: 2, waits: [500] });
+  check('it keeps trying with longer waits', await run(['offline', 'offline', 'offline', 'ok']), { result: 'ok', calls: 4, waits: [500, 1500, 3000] });
+  check('then gives up and returns the last answer', await run(['offline']), { result: 'offline', calls: 4, waits: [500, 1500, 3000] });
+  check('an answer from the server (expired, refused) is never retried', await run(['expired', 'ok']), { result: 'expired', calls: 1, waits: [] });
+  check('retrying stops when the screen goes away', await run(['offline', 'ok'], { keepGoing: () => false }), { result: 'offline', calls: 1, waits: [] });
+  check('and within its time budget', await run(['offline', 'offline', 'ok'], { budgetMs: 1000 }), { result: 'offline', calls: 2, waits: [500] });
+}
+{
+  const appSource = readFileSync(path.join(repoRoot, 'App.tsx'), 'utf8');
+  const handler = appSource.slice(appSource.indexOf('async function handleAuthUrl('), appSource.indexOf('Linking.getInitialURL()'));
+  const effect = appSource.slice(appSource.indexOf('const whenActive = () =>'), appSource.indexOf('Linking.getInitialURL()'));
+  check('the handler waits for the app to be in front before any request',
+    handler.indexOf('await whenActive();') > 0 && handler.indexOf('await whenActive();') < handler.indexOf('checkLinkToken(redirect.accessToken)')
+      && handler.indexOf('await whenActive();') < handler.indexOf('supabase.auth.exchangeCodeForSession('), true);
+  check('waiting for the app is capped', /const timer = setTimeout\(finish, 2000\);/.test(effect), true);
+  check('the link check is retried while offline',
+    /await retryWhileOffline\(\s*\(\) => checkLinkToken\(redirect\.accessToken\),\s*\(outcome\) => !outcome\.ok && outcome\.reason === 'unreachable',/.test(handler), true);
+  check('still offline: Try again, not a new email',
+    /if \(checked\.reason === 'unreachable'\) \{\s*offerRetry\(url, decision\.path\);\s*return;/.test(handler), true);
+  check('signing in with the tokens is retried while offline',
+    /await retryWhileOffline\(\s*\(\) => supabase\.auth\.setSession\(\{ access_token: redirect\.accessToken, refresh_token: redirect\.refreshToken \}\),\s*\(outcome\) => isAuthNetworkError\(outcome\.error\),/.test(handler), true);
+  check('a dropped connection is not called an expired link',
+    /if \(redirect\.kind === 'tokens' && isAuthNetworkError\(result\.error\)\) \{\s*offerRetry\(url, decision\.path\);\s*return;\s*\}\s*Alert\.alert\('That link has expired'/.test(handler), true);
+  check('a code is exchanged once (its verifier is gone after a failure)',
+    /: await supabase\.auth\.exchangeCodeForSession\(redirect\.code\);/.test(handler), true);
+  check('Try again reopens the same link', /\{ text: 'Try again', onPress: \(\) => openAuthUrl\(url, \{ retry: true \}\) \}/.test(effect), true);
+  check('a link delivered twice at launch is handled once',
+    /if \(!url \|\| \(seenAuthUrls\.has\(url\) && !retry\)\) return;\s*seenAuthUrls\.add\(url\);\s*void handleAuthUrl\(url\);/.test(effect), true);
+  check('both deliveries go through that gate',
+    appSource.includes("Linking.getInitialURL().then((url) => { openAuthUrl(url); })") && appSource.includes("Linking.addEventListener('url', ({ url }) => { openAuthUrl(url); })"), true);
+}
 
 if (failures) {
   console.error(`self-serve-accounts-test: ${failures} failure(s)`);
