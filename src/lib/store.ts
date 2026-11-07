@@ -59,7 +59,9 @@ export type FollowUpStatus = 'open' | 'done' | 'skipped';
 // partner-relationship touch (Done → Log touch); the rest are self-evident.
 // 'check_in' (migration 20261001160000) is a post-placement outcome check-in
 // created by the server 7, 30 and 90 days after admission.
-export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch' | 'check_in';
+// 'referral_handshake' (migration 20261106130000): a referral handoff's
+// reminder, written by the server as the program steps it forward.
+export type FollowUpKind = 'follow_up' | 'first_call' | 'promised_call' | 'waiting_on' | 'consult' | 'touch' | 'check_in' | 'referral_handshake';
 
 export type FollowUp = {
   id: string;
@@ -1662,6 +1664,72 @@ export async function forgetWorkspaceBinding(expectedUserId: string): Promise<vo
   }));
 }
 
+// The web app with nobody signed in holds no practice data: a session that
+// ended any way (signed out on another device, a revoked token, another
+// account signing in in this browser) leaves the saved copies, the case
+// files and the queue behind otherwise, on what may be a shared computer.
+// No session is needed (there is none to check). `keepUserId`: the account
+// signed in now, whose data stays; omitted, nobody's does. Returns how many
+// changes still waiting to be sent (queued or set aside) went with it. Ids and flags kept per account
+// (the welcome, snoozes, placement "seen") hold no client data and stay.
+const ACCOUNT_DATA_PREFIXES = [
+  CACHE_KEY_PREFIX, QUEUE_KEY_PREFIX, REJECTED_KEY_PREFIX, UNREADABLE_KEY_PREFIX,
+  CASE_LIST_KEY_PREFIX, CASE_FILE_INDEX_KEY_PREFIX, CASE_FILE_KEY_PREFIX, WORKSPACE_KEY_PREFIX,
+];
+
+// The queue is { ops: [...] }; the set-aside and unreadable lists are
+// { entries: [...] } (each entry one change the person sees). An empty list
+// (left by Discard or Retry) counts nothing; anything unreadable counts one.
+function storedChangeCount(raw: string | null): number {
+  if (!raw) return 0;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) return parsed.length;
+    if (parsed && typeof parsed === 'object') {
+      const record = parsed as { ops?: unknown; entries?: unknown };
+      if (Array.isArray(record.ops)) return record.ops.length;
+      if (Array.isArray(record.entries)) return record.entries.length;
+    }
+    return 1;
+  } catch {
+    return 1;
+  }
+}
+
+export async function wipeAccountDataWithoutSession(keepUserId?: string): Promise<number> {
+  const keep = keepUserId?.toLowerCase();
+  return withCacheLock(async () => withQueueLock(async () => {
+    forgetCacheWrite();
+    let keys: readonly string[];
+    try {
+      keys = await AsyncStorage.getAllKeys();
+    } catch (error) {
+      throw persistenceError('cache', error);
+    }
+    const doomed = keys.filter((key) => ACCOUNT_DATA_PREFIXES.some((prefix) => key.startsWith(prefix)
+      && !(keep && key.slice(prefix.length).toLowerCase().startsWith(keep))));
+    // Counted from the stored JSON as it is: the queue's own reader would
+    // set aside what it cannot read under a new key, which the removal below
+    // (of the keys listed above) would then miss.
+    let unsent = 0;
+    for (const key of doomed) {
+      if (![QUEUE_KEY_PREFIX, REJECTED_KEY_PREFIX, UNREADABLE_KEY_PREFIX].some((prefix) => key.startsWith(prefix))) continue;
+      try {
+        unsent += storedChangeCount(await AsyncStorage.getItem(key));
+      } catch {
+        unsent += 1; // unreadable: something was there
+      }
+    }
+    if (!doomed.length) return 0;
+    try {
+      await AsyncStorage.multiRemove(doomed);
+    } catch (error) {
+      throw persistenceError('cache', error);
+    }
+    return unsent;
+  }));
+}
+
 // The workspace this account's local cache and queue were last bound to, or
 // null if never bound on this device. Used only when the server cannot be
 // asked: an offline launch reads the caches under their last verified
@@ -1933,6 +2001,7 @@ function mapPartnerRow(row: PartnerRow, balance: BalanceRow | undefined): Partne
     inbound: toNumber(balance?.inbound),
     outbound: toNumber(balance?.outbound),
     lastContact: toDateStamp(row.last_contact_at, toDateStamp(row.created_at, '')),
+    contactedAt: row.last_contact_at || undefined,
     favorite: Boolean(row.favorite),
     touchCadenceDays: row.touch_cadence_days ?? undefined,
     createdAt: row.created_at,
@@ -2070,11 +2139,19 @@ function mapScorecardRow(row: ScorecardRow): PartnerScorecard {
 async function fetchNetworkTrackRecords(globalPartnerIds: string[]): Promise<Map<string, NetworkTrackRecord>> {
   const result = new Map<string, NetworkTrackRecord>();
   const ids = Array.from(new Set(globalPartnerIds.filter(Boolean)));
-  for (let index = 0; index < ids.length; index += 200) {
-    const chunk = ids.slice(index, index + 200);
-    const { data, error } = await supabase.rpc('fetch_global_partner_stats', { p_ids: chunk });
-    if (error) return result;
-    for (const row of (data || []) as NetworkStatsRow[]) {
+  const chunks: string[][] = [];
+  for (let index = 0; index < ids.length; index += 200) chunks.push(ids.slice(index, index + 200));
+  // Four chunks at a time: a large network's 10+ calls no longer queue one
+  // behind another on every launch. A failed chunk ranks on local history.
+  const answers: NetworkStatsRow[][] = [];
+  for (let start = 0; start < chunks.length; start += 4) {
+    answers.push(...await Promise.all(chunks.slice(start, start + 4).map(async (chunk) => {
+      const { data, error } = await supabase.rpc('fetch_global_partner_stats', { p_ids: chunk });
+      return error ? [] : (data || []) as NetworkStatsRow[];
+    })));
+  }
+  for (const rows of answers) {
+    for (const row of rows) {
       if (!row.disclosed) continue;
       result.set(row.global_partner_id, {
         admitRate: toNullableNumber(row.admit_rate),
@@ -2293,6 +2370,11 @@ async function writeCacheUnlocked(fence: SessionFence, snapshot: Snapshot): Prom
 }
 
 async function readCacheUnlocked(fence: SessionFence): Promise<Snapshot | null> {
+  // What this process last wrote is what the key holds (every write goes
+  // through writeCacheUnlocked, every removal forgets it, and snapshots are
+  // never changed in place), so it is not read back and parsed again: in a
+  // large practice that was megabytes of JSON for every saved edit (savedRow).
+  if (lastCacheWrite && lastCacheWrite.userId === fence.userId) return lastCacheWrite.snapshot;
   let raw: string | null;
   try {
     raw = await AsyncStorage.getItem(accountStorageKey(CACHE_KEY_PREFIX, fence.userId));
@@ -2694,8 +2776,13 @@ function isPendingRow(set: Set<string>, id: string): boolean {
 //     A row the server has wins (kept if still open, dropped if completed)
 //     unless a pending change writes it. An id the server does not know
 //     survives only while a pending op creates it.
-async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null, pending: PendingRows): Promise<{ snapshot: Snapshot }> {
+async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null, pending: PendingRows, windowStart = touchWindowStart()): Promise<{ snapshot: Snapshot }> {
   if (!local) return { snapshot: remote };
+  // A saved touch older than the window is not missing from the server, just
+  // outside the load: drop it (no per-id lookup) unless a pending change
+  // still writes it.
+  const localTouches = local.touches.filter((touch) => inTouchWindow(touch.occurredAt, windowStart)
+    || isPendingRow(pending.touches, touch.id) || isPendingRow(pending.written.touches, touch.id));
   const keepUnsynced = async <T extends { id: string }>(
     table: ProbedTable, r: T[], l: T[], created: Set<string>, written: Set<string>, deleted?: Set<string>,
   ): Promise<T[]> => {
@@ -2722,7 +2809,7 @@ async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null, pend
       partners: await keepUnsynced('partners', remote.partners, local.partners, pending.partners, pending.written.partners),
       referrals: await keepUnsynced('referrals', remote.referrals, local.referrals, pending.referrals, pending.written.referrals),
       referralMatches: await keepUnsynced('match_profiles', remote.referralMatches, local.referralMatches, pending.matches, pending.written.matches, pending.deletedMatches),
-      touches: await keepUnsynced('touches', remote.touches, local.touches, pending.touches, pending.written.touches),
+      touches: await keepUnsynced('touches', remote.touches, localTouches, pending.touches, pending.written.touches),
       followUps: [
         ...remote.followUps.map((row) => devicesCopy(row.id) ?? row),
         ...serverCopies.filter((row) => row.status === 'open' || devicesCopy(row.id)).map((row) => devicesCopy(row.id) ?? mapFollowUpRow(row)),
@@ -2741,9 +2828,24 @@ async function mergeUnsyncedLocal(remote: Snapshot, local: Snapshot | null, pend
 // 50,000). Raising it further is not free: every row is held in memory and
 // written to the saved copy (one AsyncStorage value) on every save — about
 // 25-40 MB of JSON at this ceiling. Past it the launch shows the saved copy
-// with a notice (hydrate) instead of failing. The real fix is a time window
-// for touches (see the round-11 report), not a higher ceiling.
+// with a notice (hydrate) instead of failing.
 export const TOUCH_MAX_PAGES = 100;
+
+// ...and they load for the last year only. The partner sheet's recent
+// activity and outreach history are their only readers; each partner's last
+// contact comes from the server (partners.last_contact_at, kept by a trigger
+// on every touch), never from this list. The saved copy keeps the same window
+// (mergeUnsyncedLocal), apart from touches a pending change still writes.
+export const TOUCH_WINDOW_DAYS = 365;
+
+export function touchWindowStart(now = Date.now()): string {
+  return new Date(now - TOUCH_WINDOW_DAYS * 86_400_000).toISOString();
+}
+
+function inTouchWindow(occurredAt: string, windowStart: string): boolean {
+  const at = Date.parse(occurredAt);
+  return !Number.isFinite(at) || at >= Date.parse(windowStart);
+}
 
 // Every list is paged (see paging.ts) and ordered on an immutable key plus the
 // primary key, so a teammate's edit landing mid-fetch cannot move a row across
@@ -2754,12 +2856,12 @@ export const TOUCH_MAX_PAGES = 100;
 // follow-ups, so those load in full and are never count-limited. Completed
 // rows (done/skipped) are not loaded at all — nothing renders them, and the old
 // due_on-ordered read was what dropped the newest open items past 1,000 rows.
-async function fetchSnapshot(): Promise<Snapshot> {
+async function fetchSnapshot(windowStart = touchWindowStart()): Promise<Snapshot> {
   const [partnerRows, referralRows, matchRows, touchRows, balanceRows, followUpRows, scorecardRows] = await Promise.all([
     fetchAllPages<PartnerRow>((from, to) => supabase.from('partners').select('*').order('created_at', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<ReferralRow>((from, to) => supabase.from('referrals').select('*').order('referred_on', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<MatchRow>((from, to) => supabase.from('match_profiles').select('*').order('created_at', { ascending: false }).order('id').range(from, to)),
-    fetchAllPages<TouchRow>((from, to) => supabase.from('touches').select('*').order('occurred_at', { ascending: false }).order('id').range(from, to), { maxPages: TOUCH_MAX_PAGES }),
+    fetchAllPages<TouchRow>((from, to) => supabase.from('touches').select('*').gte('occurred_at', windowStart).order('occurred_at', { ascending: false }).order('id').range(from, to), { maxPages: TOUCH_MAX_PAGES }),
     fetchAllPages<BalanceRow>((from, to) => supabase.from('partner_balances').select('partner_id, inbound, outbound').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
     fetchAllPages<FollowUpRow>((from, to) => supabase.from('follow_ups').select('*').eq('status', 'open').order('created_at', { ascending: false }).order('id').range(from, to)),
     fetchAllPages<ScorecardRow>((from, to) => supabase.from('partner_scorecard').select('partner_id, referrals_sent, admits, non_admits, avg_family_experience, last_referral_on, completed, decided_placements, completion_rate, median_days_to_admit, still_enrolled').order('partner_id').range(from, to), { keyOf: (row) => row.partner_id }),
@@ -2890,17 +2992,48 @@ export async function hydrate(expectedUserId: string): Promise<HydrateResult> {
   }
 }
 
+// What a returning user sees at launch while hydrate() reads the server
+// (App.tsx): this account's saved copy with every change still pending on
+// this device applied, and its saved case list. null when this device has no
+// saved copy for the account (a first sign-in waits for the server as before).
+export type LaunchCopy = { snapshot: Snapshot; caseList: { list: CaseList; savedAt: string } | null };
+
+export async function readLaunchCopy(expectedUserId: string): Promise<LaunchCopy | null> {
+  const fence = await sessionFence(expectedUserId);
+  // A saved copy is required: queued changes alone (the cache was wiped by a
+  // re-bind, or unreadable) are not a workspace to show.
+  const snapshot = await withCacheLock(async () => {
+    await assertSessionFence(fence);
+    const cached = await readCacheUnlocked(fence);
+    const pendingOps = cached ? await readPendingOps(fence) : [];
+    await assertSessionFence(fence);
+    return cached ? overlayPendingOps(cached, pendingOps) : null;
+  });
+  if (!snapshot) return null;
+  const caseList = await withCacheLock(async () => {
+    await assertSessionFence(fence);
+    const copy = await readCaseListCacheUnlocked(fence);
+    await assertSessionFence(fence);
+    return copy;
+  });
+  return { snapshot, caseList: caseList ? { list: caseList.list, savedAt: caseList.savedAt } : null };
+}
+
 // Refresh the account-scoped offline cache from the latest in-memory state.
 // Offline it still saves: the binding last verified on this device is the
 // fence (assertCacheWorkspaceFence — no server round trip). Writing the very
 // snapshot object that is already saved (refreshSnapshot's result, handed
-// back by App.tsx's syncDerived) is skipped.
-export async function persistCache(snapshot: Snapshot, expectedUserId: string): Promise<void> {
+// back by App.tsx's syncDerived) is skipped. `snapshotOrg`: the workspace the
+// snapshot was taken in. A save that waited on the lock behind a workspace
+// switch is skipped: the old workspace's rows never land in the new one's
+// copy (its queued changes are already durable on their own).
+export async function persistCache(snapshot: Snapshot, expectedUserId: string, snapshotOrg?: string): Promise<void> {
   // Acquire the cache lock before resolving the session so concurrent persists
   // commit in call order rather than getSession() completion order.
   await withCacheLock(async () => {
     const fence = await sessionFence(expectedUserId);
     const boundOrg = await assertCacheWorkspaceFence(fence);
+    if (snapshotOrg && boundOrg !== snapshotOrg) return;
     if (lastCacheWrite && lastCacheWrite.userId === fence.userId && lastCacheWrite.snapshot === snapshot) return;
     await writeCacheUnlocked(fence, snapshot);
     await assertCacheWorkspaceFence(fence, boundOrg);

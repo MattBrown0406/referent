@@ -41,7 +41,9 @@ assert.doesNotMatch(matchingSource, /\.(inbound|outbound)\b|['"](inbound|outboun
 assert.match(matchingSource, /disclosure: hasFinancialRelationship\(partner\),/, 'the disclosure is a flag on the result');
 assert.doesNotMatch(matchingSource.slice(matchingSource.indexOf('export function compareScored'), matchingSource.indexOf('export function rankPrograms')), /disclosure|financialRelationship/, 'ties never look at the disclosure');
 // A pick below the top needs a reason; a disclosed relationship needs one more tap, in both assignment flows.
-assert.match(source, /function addReferral\(disclosureConfirmed = false\)/);
+assert.match(source, /function addReferral\(disclosureConfirmed = false, licenseOverride: LicenseConcern \| null = null\)/);
+// Program Integrity Watch: a license shown expired or not confirmed also needs one more tap (an Alert), in both flows.
+assert.match(source, /confirmLicenseConcern\(chosenPartner, 'refer', \(concern\) => addReferral\(disclosureConfirmed, concern\)\)/);
 assert.match(source, /function finalizePacketSend\(disclosureConfirmed = false\)/);
 assert.ok((source.match(/confirmDisclosedRelationship\(/g) || []).length >= 3, 'both assignment flows must route through the disclosure confirmation');
 assert.ok((source.match(/await recordPlacementDecision\(decision, activeUserId\)/g) || []).length === 2, 'both assignment flows must write the placement record after the assignment');
@@ -160,7 +162,7 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
 
 // ─── Round 11: placement integrity ──────────────────────────────────────────
 {
-  const addReferralBody = source.slice(source.indexOf('function addReferral(disclosureConfirmed = false)'), source.indexOf('function openTouchLogger('));
+  const addReferralBody = source.slice(source.indexOf('function addReferral(disclosureConfirmed = false'), source.indexOf('function openTouchLogger('));
   assert.match(addReferralBody, /\.\.\.\(matchForReferral \? \{ matchProfileId: matchForReferral\.id, caseId: matchForReferral\.caseId \} : \{\}\)/, 'Assign & refer links the referral to its match and case');
   assert.match(addReferralBody, /title: 'Check in — did they admit\?'/, 'Assign & refer sets the same admit check as the packet path');
   assert.match(addReferralBody, /await assignMatchReferral\([\s\S]{0,300}if \(admitCheck\) await createFollowUp\(admitCheck, activeUserId\);[\s\S]{0,80}if \(decision\) await recordPlacementDecision/, 'the admit check is written after the assignment, before the placement record');
@@ -170,7 +172,7 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   const composerBody = source.slice(source.indexOf('async function openPacketComposer('), source.indexOf('function openPacketForAssigned('));
   assert.match(composerBody, /const alreadyReferred = matchProfile\.status === 'Referred' && matchProfile\.assignedPartnerId === partner\.id && Boolean\(matchProfile\.referralId\);[\s\S]*assignOnSend: !alreadyReferred/, 'a second packet to the same program does not assign again');
   const finalizeBody = source.slice(source.indexOf('function finalizePacketSend('), source.indexOf('// ─── Case files ───', source.indexOf('function finalizePacketSend(')));
-  assert.match(finalizeBody, /const admitCheckOpen = followUps\.some\(\(item\) => item\.referralId === referralId && item\.status === 'open' && item\.kind !== 'check_in'\);\s*const needsAdmitCheck = assignOnSend \|\| \(!admitCheckOpen && referral\.admitted == null\);/, 'no second admit check while one is open or the answer is in');
+  assert.match(finalizeBody, /const admitCheckOpen = followUps\.some\(\(item\) => item\.referralId === referralId && item\.status === 'open' && item\.kind !== 'check_in' && item\.kind !== 'referral_handshake'\);\s*const needsAdmitCheck = assignOnSend \|\| \(!admitCheckOpen && referral\.admitted == null\);/, 'no second admit check while one is open or the answer is in (a check-in or a handoff reminder is not one)');
   assert.match(finalizeBody, /: async \(\) => \{\s*await updateReferralPacketStamp\(/, 'without a new admit check the packet only stamps the referral');
 }
 
@@ -236,7 +238,11 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   assert.equal(picker.microphonePermission, false, 'no microphone usage string');
   assert.match(picker.photosPermission || '', /photo/i);
   const secureStore = appJson.expo.plugins.find((plugin) => Array.isArray(plugin) && plugin[0] === 'expo-secure-store')?.[1] || {};
-  assert.equal(secureStore.faceIDPermission, false, 'no Face ID usage string');
+  // Face ID is used now (Lock with Face ID, modules/app-lock): the usage
+  // string is required, and only alongside the code that asks for it.
+  const appLockSwift = await readFile(new URL('../modules/app-lock/ios/AppLockModule.swift', import.meta.url), 'utf8');
+  assert.match(secureStore.faceIDPermission || '', /Face ID/, 'the Face ID usage string says why');
+  assert.match(appLockSwift, /evaluatePolicy\(\.deviceOwnerAuthentication/, 'and the app does ask for Face ID');
   assert.ok(!(appJson.expo.android?.permissions || []).includes('android.permission.RECORD_AUDIO'), 'no RECORD_AUDIO');
 }
 
@@ -276,13 +282,23 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   assert.equal(flows.jwtSubject('not-a-jwt'), null);
   assert.equal(flows.jwtSubject(jwt({ name: 'x' })), null);
   const login = await readFile(new URL('../src/lib/LoginScreen.tsx', import.meta.url), 'utf8');
-  assert.match(login, /await recordAuthFlowStart\('signup'\);[\s\S]{0,400}supabase\.auth\.signUp\(/, 'sign-up is recorded before its email can arrive');
-  assert.match(login, /await recordAuthFlowStart\('signup'\);\s*const \{ error: resendError \} = await supabase\.auth\.resend\(/, 'a resend is recorded');
-  assert.match(login, /await recordAuthFlowStart\('recovery'\);\s*const \{ error: resetError \} = await supabase\.auth\.resetPasswordForEmail\(/, 'a reset is recorded');
+  assert.match(login, /await recordAuthFlowStart\('signup', normalizedEmail\);[\s\S]{0,400}supabase\.auth\.signUp\(/, 'sign-up is recorded, with its email, before its email can arrive');
+  assert.match(login, /await recordAuthFlowStart\('signup', target\);\s*const \{ error: resendError \} = await supabase\.auth\.resend\(/, 'a resend is recorded');
+  assert.match(login, /await recordAuthFlowStart\('recovery', normalizedEmail\);\s*const \{ error: resetError \} = await supabase\.auth\.resetPasswordForEmail\(/, 'a reset is recorded');
   const handler = source.slice(source.indexOf('async function handleAuthUrl('), source.indexOf('Linking.getInitialURL()'));
-  assert.match(handler, /const decision = decideAuthLink\(url, await readAuthFlowStarts\(\)\);/);
+  assert.ok(!handler.includes('supabase.auth.getUser('), 'never supabase-js getUser(token): it deletes this device\'s session when the link\'s is gone');
+  assert.match(handler, /if \(!linkEmailAllowed\(jwtEmail\(redirect\.accessToken\), startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;\s*\}\s*const checked = await checkLinkToken\(redirect\.accessToken\);/,
+    'the token\'s own claims refuse another address first, with no network call; then the server reads the token');
+  assert.ok(handler.indexOf('checkLinkToken(redirect.accessToken)') < handler.indexOf("'Switch accounts?'") && handler.indexOf("'Switch accounts?'") < handler.indexOf('supabase.auth.setSession('), 'checked before the switch question, and both before the session changes');
+  assert.match(handler, /if \(!linkEmailAllowed\(checked\.email, startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;/, 'the server-read address is checked too');
+  assert.match(handler, /\/\/ Only when nobody is signed in here, so there is nothing to lose\.\s*if \(current\) \{\s*Alert\.alert\('That link has expired'/, 'an expired link signs in only where nobody is signed in');
+  assert.match(handler, /if \(!linkEmailAllowed\(signedIn\?\.email, startedFor\) \|\| \(linkUserId && signedIn\?\.id\?\.toLowerCase\(\) !== linkUserId\)\) \{\s*let signedOut = !\(await supabase\.auth\.signOut\(\{ scope: 'local' \}\)\)\.error;/,
+    'the account signed in is compared again, email and id, and signed out locally if it differs');
+  assert.match(handler, /await flushWriteQueue\(current\.userId\)[\s\S]{0,900}will be removed from this browser\./, 'on the web, switching sends what it can and says what will be lost');
+  assert.match(handler, /const decision = decideAuthLink\(url, await readAuthFlowStarts\(\), Date\.now\(\), webOrigin\);/);
+  assert.ok(handler.indexOf('clearAuthLinkFromAddressBar();') < handler.indexOf('const decision = decideAuthLink('), 'in a browser the tokens leave the address bar first');
   assert.ok(handler.indexOf("decision.action === 'not_started'") < handler.indexOf('supabase.auth.setSession('), 'nothing is exchanged for a flow this device did not start');
-  assert.match(handler, /if \(current && \(!linkUser \|\| linkUser !== current\.userId\.toLowerCase\(\)\)\) \{[\s\S]{0,200}'Switch accounts\?'/, 'a link for another account asks before switching');
+  assert.match(handler, /if \(current && linkUserId !== current\.userId\.toLowerCase\(\)\) \{[\s\S]{0,1200}'Switch accounts\?'/, 'a link for another account asks before switching');
   assert.ok(handler.indexOf("'Switch accounts?'") < handler.indexOf('supabase.auth.setSession('), 'the question comes before the switch');
   assert.match(handler, /await clearAuthFlowStart\(decision\.flow\);/, 'a used link needs a fresh start for the next one');
   assert.doesNotMatch(source, /flowType: 'pkce'/);

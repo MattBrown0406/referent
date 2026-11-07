@@ -26,7 +26,11 @@ import {
 } from './directory';
 import { isIndividualProfessional } from './directory-submission';
 import ListingBedsEditor from './ListingBedsEditor';
+import { fetchListingCredentials } from './credentials';
+import CredentialsCard, { ShieldChip } from './CredentialsCard';
+import { localTodayStamp, programIntegrity, type ProgramCredential } from './integrity';
 import type { Partner } from '../data';
+import { WEB_PAGE } from './web-layout';
 
 type Props = {
   visible: boolean;
@@ -131,6 +135,12 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
   // set_listing_beds re-checks on the server.
   const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
   const [editingBedsId, setEditingBedsId] = useState<string | null>(null);
+  // Program Integrity Watch: each listing's credentials, for the shield chip
+  // (display only; the search order never reads it). null hides the chips:
+  // not loaded, offline, or a server without the credentials migration.
+  const [credentials, setCredentials] = useState<Record<string, ProgramCredential[]> | null>(null);
+  // ReferralFit admins add a listing's credentials from its card.
+  const [editingCredentialsId, setEditingCredentialsId] = useState<string | null>(null);
   const typeFilterTypes = TYPE_FILTERS.find((filter) => filter.key === typeFilter)?.types ?? [];
   const operationGenerationRef = useRef(0);
   const searchGenerationRef = useRef(0);
@@ -163,6 +173,9 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
           if (generation !== searchGenerationRef.current) return;
           setListings(page);
           setHasMore(page.length === PAGE_SIZE);
+          fetchListingCredentials(page.map((listing) => listing.id))
+            .then((next) => { if (generation === searchGenerationRef.current) setCredentials(next.available ? next.byListing : null); })
+            .catch(() => { if (generation === searchGenerationRef.current) setCredentials(null); });
           return fetchGlobalPartnerStats(page.map((listing) => listing.id))
             .then((next) => { if (generation === searchGenerationRef.current) setStats(next); })
             .catch(() => { /* stats are decoration */ });
@@ -182,6 +195,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
   }, [visible, entitled, userId]);
 
   const filtered = useMemo(() => listings || [], [listings]);
+  const today = localTodayStamp();
 
   function loadMore() {
     if (loadingMore || !hasMore || listings === null) return;
@@ -194,6 +208,12 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
         const fresh = page.filter((listing) => !seen.has(listing.id));
         setListings([...listings, ...fresh]);
         setHasMore(page.length === PAGE_SIZE);
+        fetchListingCredentials(fresh.map((listing) => listing.id))
+          .then((next) => {
+            if (generation !== searchGenerationRef.current || !next.available) return;
+            setCredentials((current) => (current ? { ...current, ...next.byListing } : current));
+          })
+          .catch(() => { /* chips are decoration */ });
         return fetchGlobalPartnerStats(fresh.map((listing) => listing.id))
           .then((next) => {
             if (generation !== searchGenerationRef.current) return;
@@ -234,6 +254,16 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
   // round trip; the next search re-reads it from the server anyway.
   function applyBeds(listingId: string, beds: ListingBeds) {
     setListings((current) => (current ? current.map((listing) => (listing.id === listingId ? { ...listing, beds } : listing)) : current));
+  }
+
+  // After an admin changes a listing's credentials, read that listing's again.
+  function reloadListingCredentials(listingId: string) {
+    fetchListingCredentials([listingId])
+      .then((next) => {
+        if (!next.available) return;
+        setCredentials((current) => (current ? { ...current, [listingId]: next.byListing[listingId] || [] } : current));
+      })
+      .catch(() => { /* the next search reads them again */ });
   }
 
   function addToNetwork(listing: GlobalPartner) {
@@ -351,7 +381,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                 ))}
               </ScrollView>
             </View>
-            <ScrollView contentContainerStyle={styles.list} keyboardShouldPersistTaps="handled">
+            <ScrollView contentContainerStyle={styles.list} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
               {filtered.length === 0 ? (
                 <Text style={styles.emptyText}>
                   {listings.length === 0
@@ -366,6 +396,11 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                 const carriesBeds = listingCarriesBeds(listing.types);
                 const beds = carriesBeds ? bedsLine(listing.beds) : '';
                 const cadence = carriesBeds ? bedsCadenceLine(listing.beds) : '';
+                // Programs always; an individual professional once something is on file.
+                const listingCredentials = credentials ? credentials[listing.id] || [] : null;
+                const integrity = listingCredentials && (listingCredentials.length || !isIndividualProfessional(listing.types))
+                  ? programIntegrity(listingCredentials, today)
+                  : null;
                 const contact = carriesBeds && listing.beds?.admissionsContactName
                   ? [listing.beds.admissionsContactName, listing.beds.admissionsContactPhone].filter(Boolean).join(' · ')
                   : '';
@@ -378,6 +413,11 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                           <Text style={styles.cardContact}>{listing.name}</Text>
                         ) : null}
                         <Text style={styles.cardSubtitle}>{listingSubtitle(listing)}</Text>
+                        {integrity ? (
+                          <View style={styles.credentialChip}>
+                            <ShieldChip integrity={integrity} label={integrity.chip === 'verified' ? 'Credentials verified' : undefined} />
+                          </View>
+                        ) : null}
                         {beds ? <Text style={beds.endsWith('Unconfirmed') ? styles.bedsUnconfirmed : styles.beds}>{beds}</Text> : null}
                         {cadence ? <Text style={styles.cadence}>{cadence}</Text> : null}
                         {contact ? <Text style={styles.cardInsurance}>Admissions: {contact}</Text> : null}
@@ -424,6 +464,32 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                         </TouchableOpacity>
                       )
                     ) : null}
+                    {isPlatformAdmin && credentials ? (
+                      editingCredentialsId === listing.id ? (
+                        <>
+                          <CredentialsCard
+                            program={{ partnerId: null, globalPartnerId: listing.id, name: listing.organization || listing.name, state: listing.state, website: listing.website }}
+                            state={{ status: 'ready', index: { available: true, listing: { [listing.id]: credentials[listing.id] || [] }, local: {} }, error: '' }}
+                            today={today}
+                            whoLabel={() => ''}
+                            onChanged={() => reloadListingCredentials(listing.id)}
+                            canEditListing
+                          />
+                          <TouchableOpacity accessibilityRole="button" onPress={() => setEditingCredentialsId(null)} style={styles.bedsButton}>
+                            <Text style={styles.bedsButtonText}>Done with credentials</Text>
+                          </TouchableOpacity>
+                        </>
+                      ) : (
+                        <TouchableOpacity
+                          accessibilityRole="button"
+                          accessibilityLabel={`Credentials for ${listing.organization || listing.name}`}
+                          onPress={() => setEditingCredentialsId(listing.id)}
+                          style={styles.bedsButton}
+                        >
+                          <Text style={styles.bedsButtonText}>Credentials (ReferralFit admin)</Text>
+                        </TouchableOpacity>
+                      )
+                    ) : null}
                     {imported ? (
                       <View style={styles.importedBadge}><Text style={styles.importedText}>In your network</Text></View>
                     ) : (
@@ -463,7 +529,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: COLORS.bg },
+  safe: { flex: 1, backgroundColor: COLORS.bg, ...WEB_PAGE },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -520,6 +586,7 @@ const styles = StyleSheet.create({
   cardTitle: { fontSize: 16, fontWeight: '700', color: COLORS.ink },
   cardContact: { fontSize: 14, color: COLORS.ink },
   cardSubtitle: { fontSize: 13, color: COLORS.gray },
+  credentialChip: { marginTop: 6 },
   cardInsurance: { fontSize: 13, color: COLORS.gray, marginTop: 2 },
   cardDescription: { fontSize: 13, color: COLORS.gray, lineHeight: 18, marginTop: 4 },
   verified: { fontSize: 12, fontWeight: '600', color: COLORS.green, marginTop: 4 },

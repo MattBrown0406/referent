@@ -464,12 +464,15 @@ function revenueForCase(record: CaseRecord, integrations: CaseIntegration[]): Ca
   }, { quoted: 0, collected: 0, outstanding: 0, refundsUntracked: 0 });
 }
 
+// `stages` is this case's own history (groupByCase): looking each case's
+// rows up once, instead of filtering the whole workspace history per case per
+// question, is what keeps "All time" quick for a large practice.
 function hasReached(
   record: CaseRecord,
   stages: CaseStageHistory[],
   target: 'consult' | 'engaged' | 'placed',
 ): boolean {
-  const reached = new Set(stages.filter((item) => item.caseId === record.id).map((item) => item.status));
+  const reached = new Set(stages.map((item) => item.status));
   reached.add(record.status);
   if (target === 'consult') {
     return [...reached].some((status) => ['consult', 'deciding', 'engaged', 'intervention', 'placed', 'aftercare'].includes(status));
@@ -478,6 +481,16 @@ function hasReached(
     return [...reached].some((status) => ['engaged', 'intervention', 'placed', 'aftercare'].includes(status));
   }
   return reached.has('placed') || reached.has('aftercare');
+}
+
+function groupByCase<T extends { caseId: string }>(rows: T[]): Map<string, T[]> {
+  const byCase = new Map<string, T[]>();
+  for (const row of rows) {
+    const list = byCase.get(row.caseId);
+    if (list) list.push(row);
+    else byCase.set(row.caseId, [row]);
+  }
+  return byCase;
 }
 
 function localDateStamp(date: Date): string {
@@ -498,14 +511,16 @@ export function computeBusinessDashboard(
   const start = periodStart(period, now);
   const scopedCases = cases.filter((record) => new Date(record.createdAt).getTime() >= start);
   const scopedIds = new Set(scopedCases.map((record) => record.id));
-  const scopedStages = data.stages.filter((item) => scopedIds.has(item.caseId));
-  const consulted = scopedCases.filter((record) => hasReached(record, scopedStages, 'consult')).length;
-  const engaged = scopedCases.filter((record) => hasReached(record, scopedStages, 'engaged')).length;
-  const placed = scopedCases.filter((record) => hasReached(record, scopedStages, 'placed')).length;
+  const stagesByCase = groupByCase(data.stages.filter((item) => scopedIds.has(item.caseId)));
+  const stagesOf = (record: CaseRecord) => stagesByCase.get(record.id) ?? [];
+  const consulted = scopedCases.filter((record) => hasReached(record, stagesOf(record), 'consult')).length;
+  const engaged = scopedCases.filter((record) => hasReached(record, stagesOf(record), 'engaged')).length;
+  const placed = scopedCases.filter((record) => hasReached(record, stagesOf(record), 'placed')).length;
   const base = scopedCases.length || 1;
   // One row per linked record per case, whoever linked it (uniqueIntegrations).
   const scopedIntegrations = uniqueIntegrations(data.integrations.filter((item) => scopedIds.has(item.caseId)));
-  const revenueByCase = new Map(scopedCases.map((record) => [record.id, revenueForCase(record, scopedIntegrations)]));
+  const integrationsByCase = groupByCase(scopedIntegrations);
+  const revenueByCase = new Map(scopedCases.map((record) => [record.id, revenueForCase(record, integrationsByCase.get(record.id) ?? [])]));
 
   const sourceMap = new Map<string, LeadSourceMetric>();
   for (const record of scopedCases) {
@@ -515,7 +530,7 @@ export function computeBusinessDashboard(
     metric.cases += 1;
     metric.quoted += revenue.quoted;
     metric.collected += revenue.collected;
-    if (hasReached(record, scopedStages, 'placed')) metric.placed += 1;
+    if (hasReached(record, stagesOf(record), 'placed')) metric.placed += 1;
     if (record.leadCapturedAt) {
       metric.leads += 1;
       const minutes = leadResponseMinutes(record);
@@ -525,8 +540,8 @@ export function computeBusinessDashboard(
   }
 
   const engagedDurations = scopedCases.flatMap((record) => {
-    const firstEngaged = scopedStages
-      .filter((item) => item.caseId === record.id && ['engaged', 'intervention', 'placed', 'aftercare'].includes(item.status))
+    const firstEngaged = stagesOf(record)
+      .filter((item) => ['engaged', 'intervention', 'placed', 'aftercare'].includes(item.status))
       .sort((a, b) => a.enteredAt.localeCompare(b.enteredAt))[0];
     if (!firstEngaged) return [];
     const duration = new Date(firstEngaged.enteredAt).getTime() - new Date(record.createdAt).getTime();

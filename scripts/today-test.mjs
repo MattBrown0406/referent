@@ -202,7 +202,7 @@ check('case-card call/text reads the in-memory contact list, never the server',
   /const contacts = allCaseContacts\.filter\(\(item\) => item\.caseId === card\.caseId && item\.phone\.trim\(\)\)/.test(appSource)
   && !/function cardContactAction[\s\S]*?fetchCase[\s\S]*?function logCardContact/.test(appSource));
 check('hydration seeds contacts through the cache-aware case loader',
-  /const load = await loadCaseList\(userId\);[\s\S]{0,700}setAllCaseContacts\(activeContacts\)/.test(appSource));
+  /const load = await loadCaseList\(userId\);[\s\S]{0,1400}setAllCaseContacts\(activeContacts\)/.test(appSource));
 check('the saved case list falls back only when the server is unreachable',
   /remote = await fetchCaseList\(\);\s*\} catch \(error\) \{\s*if \(!isNetworkError\(error\)\) throw error;/.test(storeSource));
 // The sections are rebuilt when the local day changes (midnight, or a return
@@ -327,8 +327,9 @@ console.log('\n── Closed and lost cases ──');
 // ─── The admit question follows the referral, not the packet ────────────────
 // An outbound referral with no admit answer yet asks "did they admit?" when
 // its check is done, whether it went out by packet or by Assign & refer.
-check('admit question gated on direction Outbound and admitted == null',
-  /referralAwaitingAnswer: Boolean\(referral && referral\.direction === 'Outbound' && referral\.admitted == null\)/.test(appSource)
+// A handoff's reminder carries the referral too, but asks about the handoff.
+check('admit question gated on direction Outbound and admitted == null (not for a handoff reminder)',
+  /referralAwaitingAnswer: Boolean\(referral && referral\.direction === 'Outbound' && referral\.admitted == null && followUp\.kind !== 'referral_handshake'\)/.test(appSource)
   && !/referralAwaitingAnswer: Boolean\(referral\?\.packetSentAt/.test(appSource));
 check('Today context lookups use Maps, not a find per card',
   /function followUpContext\(followUp: FollowUp\) \{\s*const partner = followUp\.partnerId \? partnerById\.get\(followUp\.partnerId\)/.test(appSource));

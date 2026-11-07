@@ -65,7 +65,7 @@ for (const status of [ios.AUTHORIZED, ios.PROVISIONAL, ios.EPHEMERAL]) {
 assert.equal(notifications.permissionAllowsNotifications({ granted: false, canAskAgain: true, ios: { status: 0 } }), false);
 assert.match(appSource, /notificationPromptKey/);
 assert.match(appSource, /notificationScheduleKey/);
-assert.match(appSource, /await activateReferralFitNotificationOwner\(userId\);[\s\S]{0,180}await hydrate\(userId\)/, 'account transition must invalidate and cancel old schedules before hydration');
+assert.match(appSource, /await activateReferralFitNotificationOwner\(userId\);[\s\S]{0,1500}?await readLaunchCopy\(userId\)[\s\S]{0,2500}?await hydrate\(userId\)/, 'account transition must invalidate and cancel old schedules before the saved copy shows and before hydration');
 assert.match(appSource, /notificationPermissionState === 'blocked'/, 'blocked users need an in-app Settings route');
 
 nativeState.permission = { granted: false, canAskAgain: false, ios: { status: 0 } };
@@ -103,6 +103,20 @@ assert.equal(scheduledPartners.includes('a'), false, 'superseded schedule must n
 assert.equal(scheduledPartners.includes('b'), true, 'latest schedule must be installed');
 assert.equal(nativeState.scheduled.some((item) => /Account [AB]/.test(`${item.content.title} ${item.content.body}`)), false, 'a partner name never reaches the lock screen');
 
+// A save that leaves the reminders as they were does not cancel and re-add
+// them; one that changes them does.
+{
+  const input = { partners: [partner('b', 'Account B')], referrals: [], referralMatches: [], followUps: [] };
+  const cancelsBefore = nativeState.cancelCount;
+  const scheduledBefore = nativeState.scheduled.length;
+  await notifications.rescheduleNotifications(input, 'user-b');
+  assert.equal(nativeState.cancelCount, cancelsBefore, 'an unchanged plan is not re-applied');
+  assert.equal(nativeState.scheduled.length, scheduledBefore, 'and its reminders stay as scheduled');
+  await notifications.rescheduleNotifications({ ...input, partners: [...input.partners, partner('c', 'Account C')] }, 'user-b');
+  assert.equal(nativeState.cancelCount, cancelsBefore + 1, 'a changed plan replaces the schedule');
+  assert.ok(nativeState.scheduled.some((item) => item.content.data.partnerId === 'c'), 'with the new reminder in it');
+}
+
 await notifications.cancelReferralFitNotifications();
 assert.equal(nativeState.scheduled.length, 0, 'sign-out cancellation removes app schedules');
 assert.ok(nativeState.dismissCount > 0, 'account transitions dismiss delivered account notifications');
@@ -129,6 +143,52 @@ nativeState.responseListener({ notification: { request: { identifier: 'push-4', 
 assert.deepEqual(remote, [['case', undefined, 'c1'], ['workspace', undefined, undefined], ['home', undefined, undefined]], 'server-sent pushes deep-link once, only for the addressed account');
 assert.deepEqual(notifications.remotePushTarget({ kind: 'new_lead' }), { target: 'home' }, 'a lead push without a case id lands on Today');
 unsubscribeRemote();
+
+// A program answered a placement request: the tap opens that request's answers.
+const PLACEMENT_ID = '91000000-0000-4000-8000-0000000000B8';
+const answered = [];
+const unsubscribeAnswered = notifications.subscribeToNotificationResponses((target, partnerId, caseId, placementRequestId) => answered.push([target, placementRequestId]));
+nativeState.responseListener({ notification: { request: { identifier: 'push-5', content: { data: { kind: 'placement_response', user_id: 'user-b', placement_request_id: PLACEMENT_ID } } } } });
+nativeState.responseListener({ notification: { request: { identifier: 'push-6', content: { data: { kind: 'placement_response', user_id: 'user-a', placement_request_id: PLACEMENT_ID } } } } });
+assert.deepEqual(answered, [['placement', PLACEMENT_ID.toLowerCase()]], 'a placement answer push opens its request, only for the addressed account');
+assert.deepEqual(notifications.remotePushTarget({ kind: 'placement_response', placement_request_id: 'not-an-id' }), { target: 'home' }, 'a placement push without a valid id lands on Today');
+unsubscribeAnswered();
+assert.ok(/if \(target === 'placement'\) \{[\s\S]{0,200}openPlacementCompare\(placementRequestId\)/.test(appSource), 'App routes a placement tap to the answers screen');
+
+// The push preference and its migration.
+const pushSource = readFileSync(path.join(repoRoot, 'src/lib/push.ts'), 'utf8');
+assert.ok(pushSource.includes("{ key: 'placement_response', label: 'A program answers my placement request'"), 'the Notify me card lists the new kind');
+assert.ok(pushSource.includes("placement_response: 'placementResponse'") && pushSource.includes('placementResponse: true,'), 'placement_response maps to its preference, on by default like the database');
+assert.ok(pushSource.includes("const OPTIONAL_PREFERENCE_COLUMNS = ['placement_response', 'bed_opened'] as const;"), 'an older server without the column still loads and saves the other switches');
+assert.ok(pushSource.includes("return error?.code === '42703' || error?.code === 'PGRST204';")
+  && (pushSource.match(/while \(isMissingColumn\(error\) && /g) || []).length === 2,
+  'a read (42703) and a save (PostgREST PGRST204) both drop a column the server lacks');
+const pushMigration = readFileSync(path.join(repoRoot, 'supabase/migrations/20261106120000_placement_response_push.sql'), 'utf8');
+assert.ok(/^[\x00-\x7F]*$/.test(pushMigration) && !pushMigration.includes('\\'), 'push migration: ASCII only, no backslashes');
+{
+  const statements = [];
+  let start = 0;
+  let dollar = null;
+  for (let index = 0; index < pushMigration.length; index += 1) {
+    if (dollar) { if (pushMigration.startsWith(dollar, index)) { index += dollar.length - 1; dollar = null; } continue; }
+    const tag = /^\$[A-Za-z_]*\$/.exec(pushMigration.slice(index, index + 20));
+    if (tag) { dollar = tag[0]; index += tag[0].length - 1; continue; }
+    if (pushMigration[index] === '-' && pushMigration[index + 1] === '-') { const end = pushMigration.indexOf('\n', index); index = end < 0 ? pushMigration.length : end; continue; }
+    if (pushMigration[index] === ';') { statements.push(pushMigration.slice(start, index + 1)); start = index + 1; }
+  }
+  assert.equal(dollar, null, 'push migration: every dollar quote is closed');
+  assert.equal(pushMigration.slice(start).trim(), '', 'push migration: nothing after the last statement');
+  assert.ok(Math.max(...statements.map((statement) => statement.length)) < 3700, 'push migration: every statement is under 3,700 characters');
+  assert.ok(statements[0].trim().endsWith('BEGIN;') && statements[statements.length - 1].trim().endsWith('COMMIT;'), 'push migration: one BEGIN/COMMIT');
+}
+for (const text of [
+  "WHEN 'placement_response' THEN v_pref.placement_response",
+  "WHEN 'placement_response' THEN 'A program answered'",
+  'AFTER UPDATE ON public.placement_request_recipients',
+  'IF NEW.entered_by_practice OR',
+  "public.push_dispatch_setting('referralfit_push_dispatch_secret')",
+  'REVOKE ALL ON FUNCTION public.push_dispatch_setting(text) FROM PUBLIC, anon, authenticated, service_role;',
+]) assert.ok(pushMigration.includes(text), `push migration missing: ${text}`);
 
 // ─── Reminders follow Today's Mine rule ─────────────────────────────────────
 // Assigned to me, or to nobody (and its case assigned to me or to nobody).

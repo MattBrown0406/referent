@@ -131,6 +131,7 @@ function query(table) {
     select() { if (b.op !== 'select') b.returning = true; return api; },
     order(col) { b.order.push([col]); return api; },
     eq(col, value) { b.filters.push((row) => row[col] === value); return api; },
+    gte(col, value) { b.filters.push((row) => row[col] == null || String(row[col]) >= String(value)); return api; },
     in(col, values) { b.filters.push((row) => values.includes(row[col])); return api; },
     range(from, to) { b.range = [from, to]; return api; },
     limit() { return api; },
@@ -493,6 +494,11 @@ await check('persistCache with no connection (valid token) uses the verified bin
   assert.deepEqual(state.rpcCalls, [], 'no server round trip inside the cache lock');
   assert.equal(await store.bindLocalWorkspace(U, state.org), true);
   assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${U}`), false, 'the new workspace never reads the old copy');
+  // A save of the old workspace's screen that waited behind the switch.
+  await store.persistCache(relaunch.snapshot, U, ORG);
+  assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${U}`), false, 'the old workspace\'s rows never land in the new copy');
+  await store.persistCache(relaunch.snapshot, U, state.org);
+  assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${U}`), true, 'a save taken in the bound workspace is written');
   state.org = ORG;
 });
 
@@ -520,6 +526,28 @@ await check('a server outage (5xx) queues the change AND saves its copy, so a re
   state.failOn = null;
   await store.hydrate(U);
   assert.equal(state.db.touches.filter((row) => row.id === T).length, 1, 'the touch lands once when the server recovers');
+});
+
+await check('touches load for the last year only, and an older saved one leaves the copy without a lookup', async () => {
+  await freshAccount();
+  const P = '77777777-7777-4777-8777-77777777778a';
+  const OLD = '77777777-7777-4777-8777-77777777778b';
+  const NEW = '77777777-7777-4777-8777-77777777778c';
+  const daysAgo = (days) => new Date(Date.now() - days * 86_400_000).toISOString();
+  state.db.partners.push({ id: P, name: 'Hope House', organization: 'Org', types: ['Inpatient'], created_at: daysAgo(500), org_id: ORG });
+  state.db.touches.push(
+    { id: OLD, partner_id: P, kind: 'call', note: '', occurred_at: daysAgo(400), org_id: ORG },
+    { id: NEW, partner_id: P, kind: 'call', note: '', occurred_at: daysAgo(10), org_id: ORG },
+  );
+  const first = await store.hydrate(U);
+  assert.deepEqual(first.snapshot.touches.map((row) => row.id), [NEW], 'a touch older than a year is not loaded');
+  assert.equal(store.TOUCH_WINDOW_DAYS, 365);
+  // A copy saved by an earlier build still holds the old touch.
+  await store.persistCache({ ...first.snapshot, touches: [...first.snapshot.touches, { id: OLD, partnerId: P, kind: 'call', note: '', occurredAt: daysAgo(400) }] }, U);
+  state.log = [];
+  const second = await store.hydrate(U);
+  assert.deepEqual(second.snapshot.touches.map((row) => row.id), [NEW], 'it leaves the saved copy');
+  assert.equal(state.log.filter((line) => line === 'select touches').length, 1, 'with no per-id lookup of old touches');
 });
 
 await check('scorecards carry how many referrals the family-experience average covers', async () => {
@@ -1070,6 +1098,7 @@ await check('a join that fails after the pre-join sync leaves the device saving 
   state.asyncStorage.delete(`referralfit-workspace-v1:${U}`);
   assert.equal(await store.bindLocalWorkspace(U, ORG), true);
   assert.equal(await store.pendingWriteCount(U), 1, 'the queued edit survives');
+  assert.equal(await store.readLaunchCopy(U), null, 'queued changes without a saved copy are not shown as the workspace');
   await store.flushWriteQueue(U);
   assert.equal(state.db.partners.find((row) => row.id === P).note, 'queued while unbound');
   // A positively different workspace still wipes everything.
@@ -1078,6 +1107,36 @@ await check('a join that fails after the pre-join sync leaves the device saving 
   state.offline = false;
   assert.equal(await store.bindLocalWorkspace(U, '33333333-3333-4333-8333-333333333397'), true);
   assert.equal(await store.pendingWriteCount(U), 0);
+});
+
+await check('the web wipe needs no session and takes every account\'s data, counting what was unsent', async () => {
+  await freshAccount();
+  const P = '77777777-7777-4777-8777-77777777777a';
+  await store.persistCache({ partners: [partner(P, 'Shared PC partner')], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} }, U);
+  state.offline = true;
+  await store.updatePartner({ ...partner(P, 'Shared PC partner'), note: 'typed on the front-desk PC' }, U);
+  state.offline = false;
+  const other = '99999999-9999-4999-8999-999999999991';
+  state.asyncStorage.set(`referralfit-cache-v2:${other}`, '{}');
+  state.asyncStorage.set('referralfit.welcome.v1', 'seen');
+  assert.equal(await store.wipeAccountDataWithoutSession(U), 0, 'with an account signed in, the others go');
+  assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${other}`), false);
+  assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${U}`), true, 'and the signed-in account\'s stays');
+  assert.equal(await store.pendingWriteCount(U), 1, 'its queue too');
+  state.asyncStorage.set(`referralfit-cache-v2:${other}`, '{}');
+  // A queue written by a newer build (an envelope this one cannot read) is
+  // counted and removed whole: nothing is set aside under a key the wipe
+  // would then miss.
+  state.asyncStorage.set(`referralfit-write-queue-v2:${other}`, JSON.stringify({ version: 3, userId: other, ops: [{ kind: 'futureOp', note: 'client text' }, { kind: 'futureOp' }] }));
+  // Set-aside and unreadable lists are { entries: [...] }; an empty one (left
+  // by Discard or Retry) is nothing to report.
+  state.asyncStorage.set(`referralfit-rejected-writes-v1:${other}`, JSON.stringify({ version: 1, userId: other, entries: [{ id: 'r1', ops: [{}, {}] }, { id: 'r2', ops: [{}] }] }));
+  state.asyncStorage.set(`referralfit-unreadable-writes-v1:${other}`, JSON.stringify({ version: 1, userId: other, entries: [] }));
+  const unsent = await store.wipeAccountDataWithoutSession();
+  assert.equal(unsent, 5, 'every unsent change is counted (1 queued here, 2 in the unreadable queue, 2 set aside, none in an empty list)');
+  const left = [...state.asyncStorage.keys()].filter((key) => /referralfit-(cache|write-queue|rejected-writes|unreadable-writes|case-list|case-file|workspace)/.test(key));
+  assert.deepEqual(left, [], 'no saved copy, queue, case file or binding is left for any account');
+  assert.equal(state.asyncStorage.get('referralfit.welcome.v1'), 'seen', 'flags that hold no client data stay');
 });
 
 // ─── Round 3: queued edits are not reverted by a refresh ────────────────────

@@ -69,6 +69,8 @@ export type Partner = {
   inbound: number;
   outbound: number;
   lastContact: string;
+  /** partners.last_contact_at as the server keeps it (any touch); unset when never contacted. lastContact falls back to the creation date. */
+  contactedAt?: string;
   favorite?: boolean;
   touchCadenceDays?: number;
   createdAt?: string;
@@ -320,6 +322,21 @@ export function insuranceProvidersForState(stateCode: string) {
   const medicaid = stateCode === 'ANY' ? [] : medicaidPlansByState[stateCode] || [];
   const regional = stateCode === 'ANY' ? [] : regionalInsuranceByState[stateCode] || [];
   return Array.from(new Set(['Cash pay', ...medicaid, ...regional, ...nationalInsuranceProviders.filter((provider) => provider !== 'Cash pay')]));
+}
+
+/**
+ * The match form's PAYMENT / INSURANCE choices for a state, with the match's
+ * own payment kept in the list (right after Cash pay) when the state's list
+ * lacks it: a case plan's carrier, or a saved match's carrier from another
+ * list. The form then always shows the payment that drives the ranking,
+ * never "Cash pay" in its place (a dropdown shows its first option for a
+ * value it does not list), as the case's benefits editor does for its
+ * carrier.
+ */
+export function paymentOptionsForState(stateCode: string, current: string): string[] {
+  const options = insuranceProvidersForState(stateCode);
+  if (!current.trim() || options.includes(current)) return options;
+  return [options[0], current, ...options.slice(1)];
 }
 
 export const initialPartners: Partner[] = [];

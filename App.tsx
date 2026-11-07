@@ -6,6 +6,7 @@ import {
   ActivityIndicator,
   Alert,
   AppState,
+  FlatList,
   Image,
   KeyboardAvoidingView,
   Linking,
@@ -41,6 +42,7 @@ import {
   nationalInsuranceProviders,
   Partner,
   partnerTypes,
+  paymentOptionsForState,
   PlacementReason,
   placementReasonOptions,
   Referral,
@@ -71,7 +73,7 @@ import {
 } from './src/lib/matching';
 import { bedForFromPopulation, bedsCadenceLine, bedsLine, type BedFor } from './src/lib/beds';
 import { supabase } from './src/lib/supabase';
-import { currentAuthSessionIdentity, forceLocalSignOut, isAuthNetworkError, offlineSessionFallback, resolveLaunchSession } from './src/lib/auth-session';
+import { checkLinkToken, confirmSessionStillValid, currentAuthSessionIdentity, forceLocalSignOut, isAuthNetworkError, offlineSessionFallback, resolveLaunchSession } from './src/lib/auth-session';
 import { describeError, LeadTakenError, OfflineError, RejectedWritesError } from './src/lib/errors';
 import { beginOverlay, overlayOpen, overlaysOpened } from './src/lib/overlay';
 import LoginScreen from './src/lib/LoginScreen';
@@ -95,8 +97,8 @@ import {
 } from './src/lib/outreach';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
-import { decideAuthLink, jwtSubject, parseAuthRedirect } from './src/lib/auth-flows';
-import { clearAuthFlowStart, readAuthFlowStarts } from './src/lib/auth-link-guard';
+import { decideAuthLink, jwtEmail, linkEmailAllowed, parseAuthRedirect } from './src/lib/auth-flows';
+import { clearAuthFlowStart, clearAuthLinkFromAddressBar, currentWebOrigin, pruneAuthFlowEmails, readAuthFlowEmails, readAuthFlowStarts } from './src/lib/auth-link-guard';
 import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, fetchWorkspaceMembers, memberDisplayName, type LeadSettings, type OrgMember } from './src/lib/org';
 import { refreshPushRegistration, unregisterThisDevice } from './src/lib/push';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
@@ -114,13 +116,19 @@ import {
 import { billsOutOfNetwork, checkInSchedule, formatDays, formatRate } from './src/lib/outcomes';
 import {
   type CaseBenefits,
+  EMPTY_NETWORK_BENEFITS,
+  EMPTY_VOB_COSTS,
   type PartnerPlanStatus,
+  type PlanCosts,
   type SubscriberRelationship,
+  type VobCosts,
   type VobRequest,
   type VobStatus,
   VOB_STATUSES,
   SUBSCRIBER_RELATIONSHIPS,
+  changedVobCostsPatch,
   isVobAnswered,
+  mergePlanCostsChanges,
   memberIdLast4,
   nextBusinessDay,
   planLabel,
@@ -129,8 +137,37 @@ import {
   sortPlanStatuses,
   subscriberRelationshipLabel,
   vobChaseTitle,
+  vobCostsFromRow,
+  vobCostsToPatch,
   vobStatusLabel,
 } from './src/lib/insurance';
+import { DEFAULT_STAY_DAYS, familyCostCardLine, familyCostForProgram, familyCostPacketLines, perProgramNetwork, type FamilyCostEstimate } from './src/lib/family-cost';
+import {
+  NETWORK_BENEFIT_FIELDS,
+  TRISTATE_OPTIONS,
+  VOB_COST_FIELDS,
+  parsePlanCostsDraft,
+  parseVobCostsDraft,
+  planCostsDraft,
+  vobCostsDraft,
+  type NetworkBenefitsDraft,
+  type PlanCostsDraft,
+  type VobCostsDraft,
+} from './src/lib/family-cost-form';
+import FamilyCostPanel from './src/lib/FamilyCostPanel';
+import CredentialsCard, { ShieldChip, credentialProgramForPartner, credentialsForPartner, useCredentialIndex } from './src/lib/CredentialsCard';
+import { credentialWatchItems, credentialWatchSubtitle, licenseConcernAlert, licenseOverrideNote, programIntegrity, type LicenseConcern, type ProgramIntegrity } from './src/lib/integrity';
+import PlacementRequestSheet, { clearUnansweredSendKeys, type PlacementSheetRequest } from './src/lib/PlacementRequestSheet';
+import { openCallOrText } from './src/lib/phone-actions';
+import { IS_WEB, useWideWeb, WEB_PAGE, WEB_SHEET, WEB_SHEET_OVERLAY } from './src/lib/web-layout';
+import PlacementCompare, { type CompareChoice } from './src/lib/PlacementCompare';
+import HandoffsSheet from './src/lib/HandoffsSheet';
+import { usePlacementRequests } from './src/lib/placement-api';
+import { latestRequestForMatch, placementTodayItems, requestProgress, type PlacementRequest, type PlacementRequestView } from './src/lib/placement-requests';
+import LevelOfCareSheet from './src/lib/LevelOfCareSheet';
+import LevelOfCareCard, { AssessedLevelNote } from './src/lib/LevelOfCareCard';
+import { useCaseAssessments } from './src/lib/level-of-care-api';
+import { levelOfCarePacketLines, reasonNames, type PlacementLevel } from './src/lib/level-of-care';
 import {
   assignMatchReferral,
   completeFollowUpWithNext,
@@ -144,10 +181,12 @@ import {
   createTouch,
   bindLocalWorkspace,
   flushWriteQueue,
+  wipeAccountDataWithoutSession,
   finalizeMatchPacket,
   FollowUp,
   FollowUpKind,
   hydrate,
+  readLaunchCopy,
   discardAllRejectedWrites,
   discardRejectedWrite,
   discardWaitingWrite,
@@ -308,8 +347,34 @@ function makeId(_prefix?: string) {
 // A foreground return within this window of the last refresh that reached the
 // server is skipped; pull-to-refresh always runs.
 const FOREGROUND_REFRESH_MIN_INTERVAL_MS = 30_000;
+// A server read set aside because something was saved while it was in
+// flight is tried again this long after, once no save is running; a few
+// times in a row at most.
+const CATCH_UP_REFRESH_MS = 2_000;
+const CATCH_UP_REFRESH_TRIES = 3;
+
+// The Match form's fields in one comparable string (App's appliedMatchFormRef).
+function matchFormSignature(values: unknown[]): string {
+  return JSON.stringify(values);
+}
+
+function matchFormValuesFor(match: ReferralMatch | null): unknown[] {
+  return [
+    match?.id || null, match?.clientLabel || '', match?.levelOfCare || 'Any type', match?.state || 'ANY',
+    match?.insurance || 'Cash pay', match?.networkPreferences?.length ? match.networkPreferences : ['In-network'],
+    match?.maxBudget ? String(match.maxBudget) : '', match?.therapies || [],
+    match ? (match.mustHaveTherapies ?? defaultMustHaveNeeds(match.therapies)) : [],
+    match?.population || 'Any', match?.locationPreference || 'No preference',
+  ];
+}
 // Long enough for an iOS sheet's dismissal to finish before the next presents.
 const SHEET_SWAP_MS = 600;
+// Rows a long list shows before "Show more" (closed cases, referral history).
+const LIST_ROWS_SHOWN = 100;
+// Cards each Today section shows before "Show more": every card carries its
+// own call / text / done actions, and Today is the screen every launch opens.
+const TODAY_ROWS_SHOWN = 25;
+type TodayListSection = 'overdue' | 'today' | 'partnersDue';
 
 // Where the case list / open case file on screen came from. 'cache' is the
 // saved offline copy (read-only until the server is reached again);
@@ -401,6 +466,10 @@ type CaseBenefitsFormState = {
   planName: string;
   memberIdLast4: string;
   subscriberRelationship: SubscriberRelationship;
+  costs: PlanCostsDraft; // deductible, out-of-pocket, coinsurance as typed (family-cost-form.ts)
+  // The cost sharing the editor opened with: only amounts changed from it
+  // are saved, so a teammate's update meanwhile is never sent back over.
+  openedCosts: PlanCosts | null;
 };
 
 type VobRequestFormState = {
@@ -416,6 +485,8 @@ type VobAnswerFormState = {
   answeredBy: string;
   note: string;
   quoted: string; // whole dollars as typed
+  costs: VobCostsDraft; // daily rates, copay, pre-authorization as typed
+  openedCosts: VobCosts; // what the form opened with: only changed rates are saved
 };
 
 // "2:14 PM" in the device's local time.
@@ -474,6 +545,7 @@ function todayKindIcon(card: TodayCard): IconName {
     case 'waiting_on': return 'hourglass-outline';
     case 'touch': return 'hand-left-outline';
     case 'check_in': return 'clipboard-outline';
+    case 'referral_handshake': return 'paper-plane-outline';
     case 'cadence': return 'repeat';
     default: return 'return-up-back';
   }
@@ -884,12 +956,15 @@ function PartnerCard({
   onShare,
   compact = false,
   lastReferralOn,
+  integrity,
 }: {
   partner: Partner;
   onPress: () => void;
   onShare?: () => void;
   compact?: boolean;
   lastReferralOn?: string;
+  // Credentials on file (Program Integrity Watch); undefined hides the chip.
+  integrity?: ProgramIntegrity;
 }) {
   const insurancePlanCount = partner.insurance.filter((plan) => plan !== 'Cash pay').length;
   return (
@@ -921,6 +996,7 @@ function PartnerCard({
               {hasFinancialRelationship(partner) ? (
                 <View style={[styles.disclosureBadge, { alignSelf: 'flex-start', marginTop: 6 }]}><AppIcon name="information-circle-outline" size={12} color={COLORS.coral} /><Text style={styles.disclosureBadgeText}>Disclosed relationship · {financialRelationshipLabel(partner.financialRelationship)}</Text></View>
               ) : null}
+              {integrity ? <View style={styles.credentialChipRow}><ShieldChip integrity={integrity} /></View> : null}
             </View>
             {onShare ? (
               <TouchableOpacity accessibilityLabel={`Share ${partner.organization}`} accessibilityRole="button" onPress={onShare} style={styles.cardShareButton}>
@@ -977,6 +1053,8 @@ function twelveHourToStoredTime(value: string, period: TimePeriod): string | nul
 }
 
 export default function App() {
+  // A wide browser window: sidebar instead of the bottom tabs (web-layout.ts).
+  const wideWeb = useWideWeb();
   const [tab, setTab] = useState<Tab>('home');
   const [partners, setPartners] = useState<Partner[]>(initialPartners);
   const [referrals, setReferrals] = useState<Referral[]>(initialReferrals);
@@ -1053,8 +1131,18 @@ export default function App() {
   const [benefitsLoadedFor, setBenefitsLoadedFor] = useState<Record<string, 'remote' | 'unavailable'>>({});
   const [benefitsForm, setBenefitsForm] = useState<CaseBenefitsFormState | null>(null);
   const [vobForm, setVobForm] = useState<VobRequestFormState | null>(null);
+  // Referrals > Handoffs (src/lib/HandoffsSheet.tsx).
+  const [showHandoffs, setShowHandoffs] = useState(false);
+  const [vobRowLimit, setVobRowLimit] = useState(LIST_ROWS_SHOWN);
+  const vobFormOpen = Boolean(vobForm);
+  useEffect(() => { if (!vobFormOpen) setVobRowLimit(LIST_ROWS_SHOWN); }, [vobFormOpen]);
   const [vobAnswerForm, setVobAnswerForm] = useState<VobAnswerFormState | null>(null);
   const [vobSaving, setVobSaving] = useState(false);
+  // True cost to the family (src/lib/family-cost.ts): the length of stay each
+  // case's estimates use (30 days until changed; this device, this session),
+  // and whether the server stores the amounts (false before 20261104120000).
+  const [costDaysByCase, setCostDaysByCase] = useState<Record<string, number>>({});
+  const [benefitCostsAvailable, setBenefitCostsAvailable] = useState(true);
   // "Which of my partners take this plan?" from partners_for_plan, keyed by
   // "<plan>|<state>". The Directory filter and the VOB suggestion list read it.
   const [planStatuses, setPlanStatuses] = useState<Record<string, PartnerPlanStatus[]>>({});
@@ -1071,8 +1159,16 @@ export default function App() {
   const [rejectedBusy, setRejectedBusy] = useState(false);
   const lastServerRefreshAtRef = useRef(0);
   const refreshInFlightRef = useRef<Promise<'ok' | 'offline'> | null>(null);
+  const catchUpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const catchUpTriesRef = useRef(0);
+  const refreshFromServerRef = useRef<((trigger: 'foreground' | 'pull') => Promise<'ok' | 'offline'>) | null>(null);
   const [showNewCase, setShowNewCase] = useState(false);
   const [showClosedCases, setShowClosedCases] = useState(false);
+  // Long lists show this many rows, then "Show more" (search reaches them all):
+  // a large practice's closed cases and referral history ran to thousands of
+  // rows rendered at once, again on every keystroke anywhere in the app.
+  const [closedCaseLimit, setClosedCaseLimit] = useState(LIST_ROWS_SHOWN);
+  const [todayRowLimits, setTodayRowLimits] = useState<Record<TodayListSection, number>>({ overdue: TODAY_ROWS_SHOWN, today: TODAY_ROWS_SHOWN, partnersDue: TODAY_ROWS_SHOWN });
   const [caseSearch, setCaseSearch] = useState('');
   const [caseSearchResults, setCaseSearchResults] = useState<CaseSearchResult[] | null>(null);
   const [pendingCaseMatchId, setPendingCaseMatchId] = useState<string | null>(null);
@@ -1091,7 +1187,9 @@ export default function App() {
   const [docView, setDocView] = useState<{ url: string; mimeType: string; label: string } | null>(null);
   // Match Packet compose state: which partner + which match profile the
   // packet is for, and whether the assign-on-send flow should run.
-  const [packetTarget, setPacketTarget] = useState<{ partner: Partner; match: ReferralMatch; assignOnSend: boolean } | null>(null);
+  // licenseOverride: the practitioner went ahead past a license concern
+  // (Program Integrity Watch); the packet's timeline entry says so.
+  const [packetTarget, setPacketTarget] = useState<{ partner: Partner; match: ReferralMatch; assignOnSend: boolean; licenseOverride?: LicenseConcern | null } | null>(null);
   const [packetAudience, setPacketAudience] = useState<PacketAudience>('family');
   const [packetText, setPacketText] = useState('');
   // The financial-relationship disclosure was missing from the edited packet
@@ -1143,6 +1241,8 @@ export default function App() {
   const [referralForm, setReferralForm] = useState(emptyReferral);
   const [referralSearch, setReferralSearch] = useState('');
   const [referralDirectionFilter, setReferralDirectionFilter] = useState<'All' | ReferralDirection>('All');
+  const [referralRowLimit, setReferralRowLimit] = useState(LIST_ROWS_SHOWN);
+  useEffect(() => { setReferralRowLimit(LIST_ROWS_SHOWN); }, [referralSearch, referralDirectionFilter]);
   const [showBusinessDashboard, setShowBusinessDashboard] = useState(false);
   const [showWorkspace, setShowWorkspace] = useState(false);
   // Lead capture: the "New lead" quick-add sheet, the workspace's first-call
@@ -1201,6 +1301,13 @@ export default function App() {
   const [selectedMatchId, setSelectedMatchId] = useState<string | null>(null);
   const selectedMatchIdRef = useRef<string | null>(null);
   selectedMatchIdRef.current = selectedMatchId;
+  // The Match form as last loaded from a profile, and as on screen now: equal
+  // means nothing was typed since (launch then loads the server's version).
+  const appliedMatchFormRef = useRef('');
+  const currentMatchFormRef = useRef('');
+  // Every load into the form (a profile picked, a new match started, launch):
+  // a load that leaves the form looking the same still counts as a choice.
+  const matchFormLoadsRef = useRef(0);
   const [matchClientLabel, setMatchClientLabel] = useState('');
   const [matchType, setMatchType] = useState('Any type');
   const [matchInsurance, setMatchInsurance] = useState('Cash pay');
@@ -1220,6 +1327,20 @@ export default function App() {
   const [bedFilterOn, setBedFilterOn] = useState(false);
   const [bedFor, setBedFor] = useState<BedFor>('any');
   const [listingBeds, setListingBeds] = useState<Record<string, ListingBedsStatus>>({});
+  // Program Integrity Watch: bumped by every full refresh so credentials
+  // (online only, never cached) are read again with everything else.
+  const [credentialsNonce, setCredentialsNonce] = useState(0);
+  // Placement Request: the "Ask programs" sheet, the answers screen, and a
+  // program chosen there, handed to Assign & refer / Send packet once the
+  // answers screen has closed. Answers never change the ranking.
+  const [placementSheet, setPlacementSheet] = useState<PlacementSheetRequest | null>(null);
+  const [placementCompareId, setPlacementCompareId] = useState<string | null>(null);
+  const [pendingPlacementChoice, setPendingPlacementChoice] = useState<{ matchId: string; partnerId: string; choice: CompareChoice } | null>(null);
+  // Level-of-care assessment: the case whose assessment sheet is showing,
+  // inside the case file's own sheet (CaseDetailModal swaps its contents).
+  // The sheet's guarded "back" for the Modal's onRequestClose.
+  const [assessmentCaseId, setAssessmentCaseId] = useState<string | null>(null);
+  const assessmentBackRef = useRef<() => void>(() => setAssessmentCaseId(null));
   // The shortlist the clinician saw when they started an assignment, so the
   // placement record can say what was shown and at what rank the pick sat.
   const [pendingPlacement, setPendingPlacement] = useState<{ matchProfileId: string; rankedIds: string[]; candidates: PlacementCandidate[] } | null>(null);
@@ -1290,9 +1411,12 @@ export default function App() {
     if (!userId) throw new Error('The account changed before local data could be saved.');
     const generation = authGenerationRef.current;
     const accountIsCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
+    // Taken now: a workspace switch while this waits on the cache lock never
+    // gets this workspace's rows.
+    const snapshotOrg = activeOrgIdRef.current || undefined;
     const data = snapshot || { partners, referrals, referralMatches, touches, followUps, scorecards };
     const activeCases = caseList ?? cases;
-    await persistCache(data, userId);
+    await persistCache(data, userId, snapshotOrg);
     if (!accountIsCurrent()) throw new Error('The account changed before local data could be saved.');
     // Pending: still to send. Waiting (on a record the server lacks) and
     // rejected: the user's to review, so they sit in the banner, not the badge.
@@ -1380,6 +1504,8 @@ export default function App() {
   // Every match field the form edits, from one saved profile (or blank), and
   // never a case link carried over from an earlier "Find placement".
   const applyMatchToForm = useCallback((match: ReferralMatch | null) => {
+    appliedMatchFormRef.current = matchFormSignature(matchFormValuesFor(match));
+    matchFormLoadsRef.current += 1;
     setPendingCaseMatchId(null);
     setSelectedMatchId(match?.id || null);
     setMatchClientLabel(match?.clientLabel || '');
@@ -1410,7 +1536,12 @@ export default function App() {
   }, [applyMatchToForm]);
 
   const resetAccountState = useCallback(() => {
+    clearUnansweredSendKeys();
     setOutreach(null);
+    setAssessmentCaseId(null);
+    setPlacementSheet(null);
+    setPlacementCompareId(null);
+    setPendingPlacementChoice(null);
     setPendingNav(null);
     setPacketSendConfirm(false);
     packetClosingRef.current = false;
@@ -1433,6 +1564,8 @@ export default function App() {
     setBenefitsByCase({});
     setVobsByCase({});
     setBenefitsLoadedFor({});
+    setCostDaysByCase({});
+    setBenefitCostsAvailable(true);
     setBenefitsForm(null);
     setVobForm(null);
     setVobAnswerForm(null);
@@ -1444,6 +1577,12 @@ export default function App() {
     setRefreshNotice('');
     lastServerRefreshAtRef.current = 0;
     refreshInFlightRef.current = null;
+    if (catchUpTimerRef.current) clearTimeout(catchUpTimerRef.current);
+    catchUpTimerRef.current = null;
+    catchUpTriesRef.current = 0;
+    setClosedCaseLimit(LIST_ROWS_SHOWN);
+    setReferralRowLimit(LIST_ROWS_SHOWN);
+    setTodayRowLimits({ overdue: TODAY_ROWS_SHOWN, today: TODAY_ROWS_SHOWN, partnersDue: TODAY_ROWS_SHOWN });
     setActiveCaseId(null);
     setSelectedPartner(null);
     setTouchPartner(null);
@@ -1553,20 +1692,26 @@ export default function App() {
     };
   }, []);
 
-  // Auth deep links (referralfit://auth/recovery, referralfit://auth/confirmed).
-  // supabase.ts sets detectSessionInUrl: false, so the tokens in the link are
-  // exchanged here explicitly. A recovery link then opens ResetPasswordScreen.
-  // Any app or page can open a referralfit:// URL, so tokens are used only on
-  // those two paths and only for a sign-up or reset this device started in
-  // the last 24 hours (decideAuthLink, src/lib/auth-flows.ts); a link for a
-  // different account than the one signed in asks before switching.
+  // Auth deep links (referralfit://auth/recovery, referralfit://auth/confirmed;
+  // in a browser, the same paths on the web app's origin, read from the page
+  // URL). supabase.ts sets detectSessionInUrl: false, so the tokens in the
+  // link are exchanged here explicitly. A recovery link then opens
+  // ResetPasswordScreen. Any app or page can open such a URL, so tokens are
+  // used only on those two paths and only for a sign-up or reset this device
+  // started in the last 24 hours (decideAuthLink, src/lib/auth-flows.ts); a
+  // link for a different account than the one signed in asks before
+  // switching. In a browser the tokens are then cleared from the address bar.
   useEffect(() => {
     let active = true;
+    const webOrigin = currentWebOrigin();
+    const here = webOrigin ? 'this browser' : 'this device';
+    void pruneAuthFlowEmails();
     async function handleAuthUrl(url: string | null) {
       if (!url || !active) return;
       // Only parsed so non-auth URLs stay cheap; decideAuthLink re-checks.
-      if (!parseAuthRedirect(url)) return;
-      const decision = decideAuthLink(url, await readAuthFlowStarts());
+      if (!parseAuthRedirect(url, webOrigin)) return;
+      clearAuthLinkFromAddressBar();
+      const decision = decideAuthLink(url, await readAuthFlowStarts(), Date.now(), webOrigin);
       if (!active || decision.action === 'ignore') return;
       if (decision.action === 'error') {
         Alert.alert('That link could not be used', `It has expired or was already used. Request a new one from the sign-in screen${decision.path === 'recovery' ? ' with “Forgot password?”' : ''}.`);
@@ -1576,21 +1721,70 @@ export default function App() {
         Alert.alert(
           decision.path === 'recovery' ? 'Request a new reset link' : 'Sign in to continue',
           decision.path === 'recovery'
-            ? 'For your security, a password reset link works only on the device that asked for it, within a day. Use “Forgot password?” on this device to get a new one.'
-            : 'If you just confirmed your email, sign in with your email and password. A confirmation link signs you in only on the device where you created the account.',
+            ? `For your security, a password reset link works only on the ${webOrigin ? 'browser' : 'device'} that asked for it, within a day. Use “Forgot password?” in ${here} to get a new one.`
+            : `If you just confirmed your email, sign in with your email and password. A confirmation link signs you in only on the ${webOrigin ? 'browser' : 'device'} where you created the account.`,
         );
         return;
       }
       const redirect = decision.redirect;
+      // Only for an email this device asked for: a real link to someone
+      // else's account (a look-alike email right after "Forgot password?")
+      // never signs this device into that account.
+      const startedFor = await readAuthFlowEmails(decision.flow);
+      if (!active) return;
+      const refuseOtherAccount = () => Alert.alert(
+        'That link is for another account',
+        `It was not sent to the email ${webOrigin ? 'this browser' : 'this phone'} asked for, so nothing was changed. Request a new link from the sign-in screen, and open it from your own email.`,
+      );
+      // The link's account, before anything about this device's session
+      // changes: first its token's own claims (no network: a link for
+      // another address is refused outright), then as the server reads the
+      // token (claims are not signed until checked).
+      let linkUserId: string | null = null;
       if (redirect.kind === 'tokens') {
-        const linkUser = jwtSubject(redirect.accessToken);
+        if (!linkEmailAllowed(jwtEmail(redirect.accessToken), startedFor)) {
+          refuseOtherAccount();
+          return;
+        }
+        const checked = await checkLinkToken(redirect.accessToken);
+        if (!active) return;
         const current = await currentAuthSessionIdentity({ allowOffline: true }).catch(() => null);
         if (!active) return;
-        if (current && (!linkUser || linkUser !== current.userId.toLowerCase())) {
+        if (!checked.ok) {
+          // The link is single-use and has left the address bar: a new one.
+          if (checked.reason === 'unreachable') {
+            Alert.alert('No connection', 'The link could not be checked. Once you are connected, request a new link from the sign-in screen.');
+            return;
+          }
+          // Expired (left unopened for an hour): signing in refreshes with
+          // the link's other token, which only a check afterwards can read.
+          // Only when nobody is signed in here, so there is nothing to lose.
+          if (current) {
+            Alert.alert('That link has expired', `Request a new one from the sign-in screen and open it in ${here}.`);
+            return;
+          }
+        } else {
+          if (!linkEmailAllowed(checked.email, startedFor)) {
+            refuseOtherAccount();
+            return;
+          }
+          linkUserId = checked.userId;
+        }
+        if (current && linkUserId !== current.userId.toLowerCase()) {
+          // A browser keeps one account's data: the one signed in now loses
+          // what has not reached its workspace. Send what can be sent first.
+          let unsentNote = '';
+          if (webOrigin) {
+            await flushWriteQueue(current.userId).catch(() => undefined);
+            const status = await syncStatus(current.userId).catch(() => null);
+            if (!active) return;
+            const unsent = status ? status.pending + status.waiting + status.rejected : 0;
+            if (unsent) unsentNote = ` ${unsent} ${unsent === 1 ? 'change' : 'changes'} made here for the account signed in now ${unsent === 1 ? 'has' : 'have'} not reached its workspace and will be removed from this browser.`;
+          }
           const switchAccounts = await new Promise<boolean>((resolve) => {
             Alert.alert(
               'Switch accounts?',
-              'This link is for a different ReferralFit account than the one signed in on this phone. Switching signs this phone into that account.',
+              `This link is for a different ReferralFit account than the one signed in on ${webOrigin ? 'this browser' : 'this phone'}. Switching signs ${webOrigin ? 'this browser' : 'this phone'} into that account.${unsentNote}`,
               [
                 { text: 'Stay signed in', style: 'cancel', onPress: () => resolve(false) },
                 { text: 'Switch', style: 'destructive', onPress: () => resolve(true) },
@@ -1606,7 +1800,18 @@ export default function App() {
         : await supabase.auth.exchangeCodeForSession(redirect.code);
       if (!active) return;
       if (result.error) {
-        Alert.alert('That link has expired', 'Request a new one from the sign-in screen and open it on this device.');
+        Alert.alert('That link has expired', `Request a new one from the sign-in screen and open it in ${here}.`);
+        return;
+      }
+      // The account the server signed in, checked again: the same one the
+      // token was checked for (a code link has no token to check first).
+      const signedIn = result.data.session?.user;
+      if (!linkEmailAllowed(signedIn?.email, startedFor) || (linkUserId && signedIn?.id?.toLowerCase() !== linkUserId)) {
+        let signedOut = !(await supabase.auth.signOut({ scope: 'local' })).error;
+        if (!signedOut) signedOut = await forceLocalSignOut().then(() => true, () => false);
+        if (!active) return;
+        if (signedOut) refuseOtherAccount();
+        else Alert.alert('Sign out now', `That link signed ${webOrigin ? 'this browser' : 'this phone'} into an account it did not ask for. Sign out from Settings.`);
         return;
       }
       // One link per start: a second link needs the flow started again.
@@ -1629,6 +1834,23 @@ export default function App() {
     const userId = session?.user?.id;
     resetAccountState();
 
+    // The web app keeps practice data only for the account signed in here
+    // now, and none when nobody is: a session that ended any way (another
+    // device signed out, a revoked token, another account signing in, a
+    // browser reopened after any of these) takes it out, as Sign out does.
+    if (IS_WEB) {
+      void wipeAccountDataWithoutSession(userId)
+        .then((unsent) => {
+          if (unsent <= 0 || generation !== authGenerationRef.current) return;
+          const lost = `${unsent} ${unsent === 1 ? 'change' : 'changes'} made here had not reached ${userId ? 'that account’s' : 'your'} workspace and could not be saved.`;
+          if (!userId) Alert.alert('Signed out', `You were signed out, and this browser’s copy of your practice’s data was removed. ${lost}`);
+          else Alert.alert('Another account’s data was removed', `This browser held data for the account signed in here before. ${lost}`);
+        })
+        .catch((error) => {
+          if (!userId) Alert.alert('Practice data still in this browser', `It could not be removed: ${describeError(error)}. Clear this site’s data in the browser’s settings.`);
+        });
+    }
+
     if (!userId) {
       cancelReferralFitNotifications().catch(() => undefined);
       setLoaded(true);
@@ -1637,6 +1859,22 @@ export default function App() {
 
     setLoaded(false);
     let active = true;
+    // Once the saved copy is on screen, sheets can be open: an alert or a
+    // prompt waits for them to close (iOS wedges a sheet presented over one).
+    let showingSaved = false;
+    const launchStartedAt = Date.now();
+    const whenScreenClear = (open: () => void, untilRefreshed = false) => {
+      // Up to about 2 minutes, and not once a refresh since has worked:
+      // "Could not load account" is the only sign a launch failed while the
+      // saved copy shows.
+      if (showingSaved) {
+        afterSheetCloses(open, {
+          ifScreenBusy: 'wait',
+          maxWaits: 200,
+          stillWanted: () => !untilRefreshed || lastServerRefreshAtRef.current < launchStartedAt,
+        });
+      } else open();
+    };
     (async () => {
       try {
         // With no signal the server cannot name the workspace; the caches are
@@ -1662,9 +1900,59 @@ export default function App() {
         activeOrgIdRef.current = orgId;
         await activateReferralFitNotificationOwner(userId);
         if (!active || generation !== authGenerationRef.current) return;
+
+        // A returning user sees the saved copy at once; the server copy read
+        // below replaces it, unless something was saved meanwhile (then the
+        // screen is newer than that read, and the next refresh brings the
+        // rest). A first sign-in has no copy and waits for the server.
+        const serialBeforeRead = localChangeSerialRef.current;
+        const launchCopy = await readLaunchCopy(userId).catch(() => null);
+        if (!active || generation !== authGenerationRef.current) return;
+        showingSaved = Boolean(launchCopy);
+        // The Match form as this launch loaded it from the saved copy: a
+        // profile picked or a new match started meanwhile changes it.
+        let launchMatchForm: string | null = null;
+        let launchMatchLoads = -1;
+        if (launchCopy) {
+          applySnapshot(launchCopy.snapshot);
+          launchMatchForm = appliedMatchFormRef.current;
+          launchMatchLoads = matchFormLoadsRef.current;
+          if (launchCopy.caseList) {
+            setCases(launchCopy.caseList.list.cases);
+            setAllCaseContacts(launchCopy.caseList.list.contacts);
+            setCaseListSource({ userId, source: 'cache', savedAt: launchCopy.caseList.savedAt, truncated: false });
+          }
+          setLoaded(true);
+          // The saved copy shows its waiting changes: so do the badge and the
+          // banner (sign-out on the web reads them to warn about unsent work).
+          const savedStatus = await syncStatus(userId).catch(() => null);
+          if (!active || generation !== authGenerationRef.current) return;
+          if (savedStatus) {
+            setQueuedWrites(savedStatus.pending);
+            setRejectedWrites(savedStatus.waiting + savedStatus.rejected);
+            if (savedStatus.pending > 0) setOffline(true);
+          }
+        }
+        const changedMeanwhile = () => showingSaved
+          && (localChangeSerialRef.current !== serialBeforeRead || Boolean(mutationActiveRef.current));
+        // Set when the server's copy was left unshown: read again once the
+        // change that beat it is saved.
+        let skippedServerCopy = false;
+
         const result = await hydrate(userId);
         if (!active || generation !== authGenerationRef.current) return;
-        applySnapshot(result.snapshot);
+        if (changedMeanwhile()) {
+          lastServerRefreshAtRef.current = 0;
+          skippedServerCopy = true;
+        } else {
+          // The Match form keeps anything done to it while the saved copy
+          // showed (typed, a profile picked, a new match started); exactly as
+          // launch loaded it, it loads the server's profile (edited elsewhere
+          // since).
+          const formAsLaunched = launchMatchForm !== null && matchFormLoadsRef.current === launchMatchLoads
+            && appliedMatchFormRef.current === launchMatchForm && currentMatchFormRef.current === launchMatchForm;
+          applySnapshot(result.snapshot, !showingSaved || formAsLaunched);
+        }
         const hydratedStatus = await syncStatus(userId).catch(() => null);
         if (!active || generation !== authGenerationRef.current) return;
         const setAside = hydratedStatus ? hydratedStatus.waiting + hydratedStatus.rejected : 0;
@@ -1685,13 +1973,22 @@ export default function App() {
         } catch (error) {
           // Only when there is no saved copy at all (or a real server error).
           if (active && generation === authGenerationRef.current) {
-            Alert.alert('Case files unavailable', `Case files could not be loaded: ${describeError(error)}`);
+            const detail = describeError(error);
+            whenScreenClear(() => Alert.alert('Case files unavailable', `Case files could not be loaded: ${detail}`));
           }
         }
         if (!active || generation !== authGenerationRef.current) return;
-        setCases(activeCaseList);
-        setAllCaseContacts(activeContacts);
-        setCaseListSource(caseListLoad);
+        if (changedMeanwhile() || (!caseListLoad && showingSaved)) {
+          // Not shown (newer screen) or not read (a failed read keeps the
+          // saved list): read again soon.
+          skippedServerCopy = true;
+        }
+        if (!changedMeanwhile() && (caseListLoad || !showingSaved)) {
+          // A failed read leaves the saved case list on screen.
+          setCases(activeCaseList);
+          setAllCaseContacts(activeContacts);
+          setCaseListSource(caseListLoad);
+        }
 
         try {
           const nextBusinessData = await fetchBusinessData();
@@ -1731,18 +2028,25 @@ export default function App() {
         // A member who turned push on gets this device re-registered quietly;
         // this never prompts and never fails loudly.
         void refreshPushRegistration(userId);
+        // Signed out from another device while this one was closed: follow.
+        void confirmSessionStillValid(0);
 
         const pending = await pendingWriteCount(userId);
         if (!active || generation !== authGenerationRef.current) return;
         setQueuedWrites(pending);
         setOffline(result.source === 'cache' || caseListLoad?.source === 'cache' || pending > 0);
-        if (result.source === 'remote') lastServerRefreshAtRef.current = Date.now();
+        if (skippedServerCopy || changedMeanwhile()) {
+          lastServerRefreshAtRef.current = 0;
+          scheduleCatchUpRefresh();
+        } else if (result.source === 'remote') {
+          lastServerRefreshAtRef.current = Date.now();
+        }
 
         const welcomeSeen = await AsyncStorage.getItem(welcomeKey(userId));
         if (!active || generation !== authGenerationRef.current) return;
         const showWelcome = welcomeSeen !== 'seen';
         notifPromptDeferredRef.current = false;
-        if (showWelcome) setWelcomeVisible(true);
+        if (showWelcome) whenScreenClear(() => setWelcomeVisible(true));
 
         const permission = await getNotificationPermissionState();
         if (!active || generation !== authGenerationRef.current) return;
@@ -1751,21 +2055,30 @@ export default function App() {
           const scheduling = await AsyncStorage.getItem(notificationScheduleKey(userId));
           if (!active || generation !== authGenerationRef.current) return;
           if (scheduling !== 'disabled') {
-            rescheduleNotifications({ ...result.snapshot, cases: activeCaseList }, userId)
+            // From what is on screen when something was saved during launch
+            // (a reminder completed or added is in it, not in the read above).
+            const scheduleFrom = (changedMeanwhile() || !caseListLoad) && latestSnapshotRef.current
+              ? { ...latestSnapshotRef.current, cases: latestCasesRef.current }
+              : { ...result.snapshot, cases: activeCaseList };
+            rescheduleNotifications(scheduleFrom, userId)
               .catch((error) => {
-                if (active && generation === authGenerationRef.current) Alert.alert('Notifications unavailable', describeError(error));
+                if (active && generation === authGenerationRef.current) {
+                  const detail = describeError(error);
+                  whenScreenClear(() => Alert.alert('Notifications unavailable', detail));
+                }
               });
           }
         } else if (permission === 'askable') {
           const decision = await AsyncStorage.getItem(notificationPromptKey(userId));
           if (active && generation === authGenerationRef.current && decision !== 'dismissed') {
             if (showWelcome) notifPromptDeferredRef.current = true;
-            else setNotifPrePromptVisible(true);
+            else whenScreenClear(() => setNotifPrePromptVisible(true));
           }
         }
       } catch (error) {
         if (active && generation === authGenerationRef.current) {
-          Alert.alert('Could not load account', describeError(error));
+          const detail = describeError(error);
+          whenScreenClear(() => Alert.alert('Could not load account', detail), true);
         }
       } finally {
         if (active && generation === authGenerationRef.current) setLoaded(true);
@@ -1814,6 +2127,28 @@ export default function App() {
   // calls share one run; a foreground return inside the debounce window is
   // skipped. Resolves 'offline' (nothing reached the server) instead of
   // throwing so callers can show a quiet notice rather than an alert.
+  // What a skipped read would have shown arrives a moment later: the screen
+  // never keeps an older copy as if it were current (and the next edit is
+  // never compared against it).
+  const scheduleCatchUpRefresh = useCallback(() => {
+    if (catchUpTimerRef.current || catchUpTriesRef.current >= CATCH_UP_REFRESH_TRIES) return;
+    const userId = activeUserIdRef.current;
+    const generation = authGenerationRef.current;
+    const wait = (waits: number) => {
+      catchUpTimerRef.current = setTimeout(() => {
+        catchUpTimerRef.current = null;
+        if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation) return;
+        if ((mutationActiveRef.current || refreshInFlightRef.current) && waits < 20) {
+          wait(waits + 1);
+          return;
+        }
+        catchUpTriesRef.current += 1;
+        void refreshFromServerRef.current?.('pull').catch(() => undefined);
+      }, CATCH_UP_REFRESH_MS);
+    };
+    wait(0);
+  }, []);
+
   const refreshFromServer = useCallback(async (trigger: 'foreground' | 'pull'): Promise<'ok' | 'offline'> => {
     const userId = session?.user?.id;
     if (!userId) return 'ok';
@@ -1848,8 +2183,9 @@ export default function App() {
       if (!refreshed) return 'offline';
       if (changedMeanwhile()) {
         // Something was saved while this read was in flight; what was read is
-        // older than the screen. Leave it, and let the next refresh run soon.
+        // older than the screen. Leave it, and read again once the save is done.
         lastServerRefreshAtRef.current = 0;
+        scheduleCatchUpRefresh();
         return 'ok';
       }
       lastServerRefreshAtRef.current = Date.now();
@@ -1860,6 +2196,7 @@ export default function App() {
       if (!stillCurrent()) return 'ok';
       if (changedMeanwhile()) {
         lastServerRefreshAtRef.current = 0;
+        scheduleCatchUpRefresh();
         return 'ok';
       }
       setCases(caseLoad.list.cases);
@@ -1910,9 +2247,13 @@ export default function App() {
       } catch {
         // Keep the last known member list.
       }
+      setCredentialsNonce((nonce) => nonce + 1);
       // A change that landed meanwhile saves its own copy; never overwrite it with this read.
       if (!changedMeanwhile()) await syncDerived(refreshed, caseLoad.list.cases);
-      if (stillCurrent()) setRefreshNotice('');
+      if (stillCurrent()) {
+        setRefreshNotice('');
+        catchUpTriesRef.current = 0;
+      }
       return 'ok';
     })();
     refreshInFlightRef.current = run;
@@ -1921,7 +2262,8 @@ export default function App() {
     } finally {
       if (refreshInFlightRef.current === run) refreshInFlightRef.current = null;
     }
-  }, [session?.user?.id, activeCaseId, applySnapshot, syncDerived]);
+  }, [session?.user?.id, activeCaseId, applySnapshot, syncDerived, scheduleCatchUpRefresh]);
+  refreshFromServerRef.current = refreshFromServer;
 
   // Pull-to-refresh: always runs, stops the spinner on failure, and reports
   // a lost connection inline instead of with an alert.
@@ -1968,6 +2310,10 @@ export default function App() {
         // on screen; alerting on every foreground return would be noise.
         if (stillCurrent() && isPagingLimitError(error)) setRefreshNotice(describeError(error));
         else if (stillCurrent() && !isServerUnreachable(error)) Alert.alert('Sync issue', describeError(error));
+      }).finally(() => {
+        // Signed out from another device meanwhile: this one follows, after
+        // the refresh has sent what the still-valid token could save.
+        if (stillCurrent()) void confirmSessionStillValid();
       });
     });
     return () => {
@@ -1994,10 +2340,10 @@ export default function App() {
   // share sheet, or a picker is up, the tap waits (up to 10 minutes) until the
   // user closes it, then opens its target. Nothing is dismissed for them, so
   // no sheet can be left frozen half-closed.
-  const [pendingNav, setPendingNav] = useState<{ target: Parameters<Parameters<typeof subscribeToNotificationResponses>[0]>[0]; partnerId?: string; caseId?: string; at: number } | null>(null);
+  const [pendingNav, setPendingNav] = useState<{ target: Parameters<Parameters<typeof subscribeToNotificationResponses>[0]>[0]; partnerId?: string; caseId?: string; placementRequestId?: string; at: number } | null>(null);
   const notificationTapRef = useRef<(...args: Parameters<Parameters<typeof subscribeToNotificationResponses>[0]>) => void>(() => undefined);
-  notificationTapRef.current = (target, partnerId, caseId) => {
-    setPendingNav({ target, partnerId, caseId, at: Date.now() });
+  notificationTapRef.current = (target, partnerId, caseId, placementRequestId) => {
+    setPendingNav({ target, partnerId, caseId, placementRequestId, at: Date.now() });
     // A lead that arrived since the last refresh is not on this phone yet.
     if (target === 'case' && caseId && !latestCasesRef.current.some((item) => item.id === caseId)) {
       void refreshFromServer('pull').catch(() => undefined);
@@ -2018,8 +2364,14 @@ export default function App() {
         // The screen just cleared; let any closing sheet finish animating.
         clearSince = Date.now();
       } else if (Date.now() - clearSince >= SHEET_SWAP_MS) {
-        const { target, partnerId, caseId } = pendingNav;
+        const { target, partnerId, caseId, placementRequestId } = pendingNav;
         setPendingNav(null);
+        if (target === 'placement') {
+          // A program answered: its request's answers, read fresh on open.
+          setTab('home');
+          if (placementRequestId) openPlacementCompare(placementRequestId);
+          return;
+        }
         if (target === 'case') {
           setTab('home');
           if (caseId) {
@@ -2051,7 +2403,7 @@ export default function App() {
     if (!session?.user?.id) return undefined;
     // Through a ref, so the handler always sees this render's state (the
     // subscription itself lives for the whole sign-in).
-    return subscribeToNotificationResponses((target, partnerId, caseId) => notificationTapRef.current(target, partnerId, caseId));
+    return subscribeToNotificationResponses((target, partnerId, caseId, placementRequestId) => notificationTapRef.current(target, partnerId, caseId, placementRequestId));
   }, [session?.user?.id]);
 
   useEffect(() => {
@@ -2135,16 +2487,29 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [directoryPlan, directoryPlanStatuses]);
 
+  // Server answers by plan and state, then by partner: planStatusFor and the
+  // Directory filter look a partner up instead of scanning the whole list for
+  // every partner (millions of comparisons in a large network).
+  const planStatusIndex = useMemo(() => {
+    const index = new Map<string, Map<string, PartnerPlanStatus>>();
+    for (const [key, list] of Object.entries(planStatuses)) index.set(key, new Map(list.map((item) => [item.partnerId, item])));
+    return index;
+  }, [planStatuses]);
+
   const directoryPartners = useMemo(() => {
     const needle = search.trim().toLowerCase();
+    const fromServer = directoryPlan ? planStatusIndex.get(`${directoryPlan}|ANY`) : undefined;
     return partners
       .filter((partner) => directoryType === 'All' || typesForPartner(partner).includes(directoryType as Partner['type']))
       .filter((partner) => !needle || `${partner.name} ${partner.organization} ${partner.city} ${partner.state} ${partnerTypeLabel(partner)} ${partner.therapies.join(' ')}`.toLowerCase().includes(needle))
-      .filter((partner) => !directoryPlan || (directoryPlanStatuses?.find((item) => item.partnerId === partner.id)?.networkStatus || planNetworkStatusForPartner(partner, directoryPlan)) === 'in_network')
+      .filter((partner) => !directoryPlan || (fromServer?.get(partner.id)?.networkStatus || planNetworkStatusForPartner(partner, directoryPlan)) === 'in_network')
       .sort((a, b) => Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)) || a.organization.localeCompare(b.organization));
-  }, [partners, directoryType, search, directoryPlan, directoryPlanStatuses]);
+  }, [partners, directoryType, search, directoryPlan, planStatusIndex]);
 
-  const insuranceOptions = useMemo(() => insuranceProvidersForState(matchState), [matchState]);
+  // The match's own payment stays listed even when this state's list lacks
+  // it (paymentOptionsForState), so the form never shows Cash pay for a
+  // match that ranks by a carrier.
+  const insuranceOptions = useMemo(() => paymentOptionsForState(matchState, matchInsurance), [matchState, matchInsurance]);
 
   const insuranceDropdownOptions = useMemo(() => {
     const stateName = stateOptions.find((state) => state.code === matchState)?.name;
@@ -2158,6 +2523,8 @@ export default function App() {
         detail = `Regional commercial plan in ${stateName}`;
       } else if (provider !== 'Cash pay' && nationalInsuranceProviders.includes(provider)) {
         detail = 'Major national provider';
+      } else if (provider !== 'Cash pay' && !insuranceProvidersForState(matchState).includes(provider)) {
+        detail = 'This match\'s payment (not on this state\'s list)';
       }
       return { label: provider, value: provider, detail };
     });
@@ -2232,6 +2599,51 @@ export default function App() {
 
   const bedOptions = useMemo((): BedOptions => ({ bedFor: bedFilterOn ? bedFor : null, beds: listingBeds }), [bedFilterOn, bedFor, listingBeds]);
 
+  // Program Integrity Watch (src/lib/integrity.ts): each partner's
+  // credentials, its directory listing's plus the practice's own checks.
+  // DISPLAY ONLY: rankPrograms below never reads them. Online only; on a
+  // server without 20261104130000 the index is 'unavailable' and every
+  // credential chip, card and prompt stays hidden.
+  // Scoped to the account AND the workspace (workspaceEpoch): after a move to
+  // another workspace the last one's credentials never show, even when the
+  // first read for the new one fails. The same holds for the two hooks below.
+  const credentialIndex = useCredentialIndex(session?.user?.id, linkedListingIds, credentialsNonce, workspaceEpoch);
+  // Placement Request (src/lib/placement-requests.ts): this practice's
+  // requests and the programs' answers, read again on every full refresh.
+  // DISPLAY ONLY: rankPrograms below never reads them and nothing writes
+  // back to matching. Online only; on a server without 20261104140000 the
+  // state is 'unavailable' and every placement button, card and screen hides.
+  const placement = usePlacementRequests(session?.user?.id, credentialsNonce, workspaceEpoch);
+  const placementAvailable = placement.state.status === 'ready';
+  // Level-of-care assessment (src/lib/level-of-care.ts): the open case
+  // file's assessments and the match's case's, read again on every full
+  // refresh. Matching reads only the CHOSEN level, as the match's level of
+  // care; scores and ranking never read anything else. Online only; on a
+  // server without 20261104150000 every card, note and packet line hides.
+  const caseAssessments = useCaseAssessments(session?.user?.id, credentialsNonce, [activeCaseId, tab === 'match' ? matchCaseId : null], workspaceEpoch);
+  const matchAssessment = tab === 'match' ? caseAssessments.currentFor(matchCaseId) : null;
+  const integrityByPartner = useMemo(() => {
+    const result = new Map<string, ProgramIntegrity>();
+    if (credentialIndex.state.status !== 'ready') return result;
+    for (const partner of partners) result.set(partner.id, programIntegrity(credentialsForPartner(credentialIndex.state.index, partner), todayStamp));
+    return result;
+  }, [partners, credentialIndex.state, todayStamp]);
+  // The Directory list's chip: programs always; an interventionist or
+  // therapist only once something is on file (no accreditation to expect).
+  function directoryChipFor(partner: Partner): ProgramIntegrity | undefined {
+    const integrity = integrityByPartner.get(partner.id);
+    if (!integrity) return undefined;
+    return integrity.onFile > 0 || !isIndividualProfessional(typesForPartner(partner)) ? integrity : undefined;
+  }
+  // Today's one card: programs referred to in the last 12 months whose
+  // license or accreditation has expired or expires within 30 days.
+  const credentialWatch = useMemo(
+    () => (credentialIndex.state.status === 'ready'
+      ? credentialWatchItems({ partners, referrals, integrityFor: (id) => integrityByPartner.get(id) ?? null, today: todayStamp })
+      : []),
+    [credentialIndex.state.status, partners, referrals, integrityByPartner, todayStamp],
+  );
+
   function bedLineForPartner(partner: Partner): string {
     return partner.globalPartnerId ? bedsLine(listingBeds[partner.globalPartnerId]) : '';
   }
@@ -2249,7 +2661,48 @@ export default function App() {
   // of a linear find per row per render.
   const partnerById = useMemo(() => new Map(partners.map((item) => [item.id, item])), [partners]);
   const caseById = useMemo(() => new Map(cases.map((item) => [item.id, item])), [cases]);
+  // The contact each case card shows (CaseRow), found once per change rather
+  // than by scanning every contact for every row.
+  // What a handoff's alias must not contain: the case's title and its
+  // contacts' names (HandoffsSheet checks; the server checks again).
+  const handoffCaseNames = useCallback((caseId: string | undefined): string[] => {
+    if (!caseId) return [];
+    const title = caseById.get(caseId)?.title;
+    return [...(title ? [title] : []), ...allCaseContacts.filter((contact) => contact.caseId === caseId).map((contact) => contact.name)];
+  }, [caseById, allCaseContacts]);
+  const primaryContactByCase = useMemo(() => {
+    const index = new Map<string, CaseContact>();
+    for (const contact of allCaseContacts) if (contact.isPrimary && !index.has(contact.caseId)) index.set(contact.caseId, contact);
+    return index;
+  }, [allCaseContacts]);
   const referralById = useMemo(() => new Map(referrals.map((item) => [item.id, item])), [referrals]);
+  // Referrals' "Partner activity": the five most recently referred-with.
+  const recentPartnerActivity = useMemo(() => partners.slice()
+    .sort((a, b) => (lastReferralByPartner[b.id] || '').localeCompare(lastReferralByPartner[a.id] || '') || a.organization.localeCompare(b.organization))
+    .slice(0, 5), [partners, lastReferralByPartner]);
+
+  // "Choose this program" on the answers screen: the request's saved match
+  // is on the form by now (choosePlacementProgram loaded it), so the usual
+  // Assign & refer / Send packet flow runs exactly as from a match card,
+  // once the answers screen has finished closing. It is never duplicated.
+  useEffect(() => {
+    const pending = pendingPlacementChoice;
+    if (!pending || selectedMatchId !== pending.matchId) return;
+    setPendingPlacementChoice(null);
+    afterSheetCloses(() => {
+      const partner = partnerById.get(pending.partnerId);
+      if (!partner) return;
+      if (pending.choice === 'refer') {
+        void openMatchedReferral(partner.id);
+        return;
+      }
+      const shown = matches.find((item) => item.partner.id === partner.id);
+      const match = referralMatches.find((item) => item.id === pending.matchId);
+      if (!match) return;
+      void openPacketComposer(partner, shown ?? scoreProgram(match, partner, scorecards[partner.id], trackRecordPrior(scorecards)));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingPlacementChoice, selectedMatchId]);
 
   // Sorted once per change to the list (it was re-sorted on every render,
   // which also re-ran the filter below each time).
@@ -2435,6 +2888,89 @@ export default function App() {
     setShowAddReferral(true);
   }
 
+  // ─── Placement Request ──────────────────────────────────────────────────
+  // "Ask programs" sends ONE de-identified request (built on the server from
+  // the saved match) to up to 8 of the ranked programs; the answers screen
+  // shows their replies in that same ranked order. ETHICS: answers never
+  // change ranking or scores, programs cannot pay to be asked, and nothing
+  // identifies the client until the packet goes out through the usual flow.
+
+  // From the match results. The match is saved first (as for a packet),
+  // and the sheet lists the programs in the order on screen.
+  async function openPlacementSheet() {
+    const openings = screenOpenings();
+    const saved = await currentOrSavedMatch();
+    if (!saved) return;
+    if (anySheetOpenRef.current || overlayOpen() || screenOpenings() !== openings) return;
+    setPlacementSheet({
+      match: saved,
+      caseTitle: saved.caseId ? caseById.get(saved.caseId)?.title : undefined,
+      // The note may not name anyone on the case (identifying-text.ts).
+      contactNames: saved.caseId ? caseContactNames(saved.caseId) : [],
+      options: matches.map((score, index) => ({
+        partner: score.partner,
+        rank: index + 1,
+        line: `${partnerTypeLabel(score.partner)} · ${score.partner.city}, ${score.partner.state}`,
+        integrity: integrityByPartner.get(score.partner.id) ?? null,
+      })),
+    });
+  }
+
+  // The names on a case: what text programs read may never carry them.
+  function caseContactNames(caseId: string): string[] {
+    const id = caseId.toLowerCase();
+    return allCaseContacts.filter((item) => item.caseId.toLowerCase() === id).map((item) => item.name).filter((name) => name.trim() !== '');
+  }
+
+  // From Today or a saved match card (nothing else is up then), or after
+  // another sheet has finished closing.
+  function openPlacementCompare(requestId: string) {
+    const view = placement.state.requests.find((item) => item.request.id === requestId);
+    const match = view?.request.matchProfileId ? referralMatches.find((item) => item.id === view.request.matchProfileId) : undefined;
+    // The family-cost estimate beside each answer needs the case's benefits.
+    if (match?.caseId && !benefitsLoadedFor[match.caseId]) void loadCaseBenefits(match.caseId);
+    if (anySheetOpenRef.current || overlayOpen()) {
+      afterSheetCloses(() => setPlacementCompareId(requestId));
+      return;
+    }
+    setPlacementCompareId(requestId);
+  }
+
+  // How the practitioner knows the request: its saved match's label.
+  function placementLabelFor(request: PlacementRequest): string {
+    const match = request.matchProfileId ? referralMatches.find((item) => item.id === request.matchProfileId) : undefined;
+    return match?.clientLabel || (request.caseId ? caseById.get(request.caseId)?.title : '') || 'Placement request';
+  }
+
+  // The family's estimated cost at that program (true cost to the family),
+  // shown to the practitioner only. scoreProgram here reads the network
+  // status for the estimate; the order on the answers screen never moves.
+  function placementCostLine(view: PlacementRequestView, partner: Partner): string | null {
+    const match = view.request.matchProfileId ? referralMatches.find((item) => item.id === view.request.matchProfileId) : undefined;
+    if (!match) return null;
+    const score = scoreProgram(match, partner, scorecards[partner.id], trackRecordPrior(scorecards));
+    const cost = familyCostFor(match.caseId, match.insurance, partner, score.networkStatus);
+    return cost ? `${familyCostCardLine(cost)}${cost.known && cost.balanceBilling ? ' · balance billing possible' : ''}` : null;
+  }
+
+  function placementMatchSaved(view: PlacementRequestView): boolean {
+    return Boolean(view.request.matchProfileId && referralMatches.some((item) => item.id === view.request.matchProfileId));
+  }
+
+  // "Choose this program": close the answers screen, put the request's saved
+  // match on the form, and let the effect above start the usual flow.
+  function choosePlacementProgram(view: PlacementRequestView, partner: Partner, choice: CompareChoice) {
+    const match = view.request.matchProfileId ? referralMatches.find((item) => item.id === view.request.matchProfileId) : undefined;
+    if (!match) {
+      Alert.alert('Saved match removed', 'This request\'s saved match was removed. Open the program from the Directory to refer the family.');
+      return;
+    }
+    setPlacementCompareId(null);
+    loadReferralMatch(match);
+    setTab('match');
+    setPendingPlacementChoice({ matchId: match.id, partnerId: partner.id, choice });
+  }
+
   // iOS shows one sheet at a time from a screen: presenting the next while the
   // last is still animating away fails silently, and React Native then thinks
   // it is showing, so that sheet stays stuck until restart. Close first, then
@@ -2443,7 +2979,7 @@ export default function App() {
   // user moved on; default), 'wait' and try again (prompts the app offers on
   // its own), or 'ignore' (the step closes a sheet rather than opening one).
   // `stillWanted` lets the caller cancel, e.g. after a rollback.
-  function afterSheetCloses(open: () => void, options: { ifScreenBusy?: 'skip' | 'wait' | 'ignore'; stillWanted?: () => boolean } = {}) {
+  function afterSheetCloses(open: () => void, options: { ifScreenBusy?: 'skip' | 'wait' | 'ignore'; stillWanted?: () => boolean; maxWaits?: number } = {}) {
     const userId = activeUserIdRef.current;
     const generation = authGenerationRef.current;
     const attempt = (tries: number, settling = false) => {
@@ -2454,7 +2990,7 @@ export default function App() {
         if (options.ifScreenBusy !== 'ignore' && (busy || settling)) {
           // 'wait': once the screen is clear, give whatever just closed one
           // more delay to finish animating away before presenting.
-          if (options.ifScreenBusy === 'wait' && tries < 50) attempt(tries + 1, busy);
+          if (options.ifScreenBusy === 'wait' && tries < (options.maxWaits ?? 50)) attempt(tries + 1, busy);
           return;
         }
         open();
@@ -2494,6 +3030,36 @@ export default function App() {
     return packetFitInput(score, matchProfile);
   }
 
+  // True cost to the family (src/lib/family-cost.ts) for one program, from
+  // the linked case's plan and VOB answers. Display only: the ranking never
+  // reads it. Null when there is nothing to estimate from: no linked case,
+  // its benefits not loaded, or (insured) no plan on file.
+  // A match whose payment is not the plan on file (another carrier, or no
+  // carrier on the plan) gets no estimate from that plan's numbers: the
+  // card says "unknown — the match's payment isn't the plan on file".
+  function familyCostFor(caseId: string | null | undefined, insurance: string, partner: Partner, networkStatus: PacketFitInput['networkStatus']): FamilyCostEstimate | null {
+    if (!caseId || benefitsLoadedFor[caseId] !== 'remote' || !benefitCostsAvailable) return null;
+    const plan = benefitsByCase[caseId] ?? null;
+    if (insurance !== 'Cash pay' && !plan) return null;
+    return familyCostForProgram({ insurance, plan, planCarrier: plan?.carrier ?? '', requests: vobsByCase[caseId] || [], partner, perProgram: perProgramNetwork(networkStatus), days: costDaysByCase[caseId] });
+  }
+
+  // The family copy's side-by-side estimate. buildPacket leaves it out of
+  // the program's copy whatever is passed: the family's finances stay theirs.
+  function packetCostLines(matchProfile: ReferralMatch, partner: Partner, networkStatus: PacketFitInput['networkStatus']): string[] {
+    const caseId = matchProfile.caseId;
+    if (!caseId || !familyCostFor(caseId, matchProfile.insurance, partner, networkStatus)) return [];
+    return familyCostPacketLines({
+      insurance: matchProfile.insurance,
+      plan: benefitsByCase[caseId] ?? null,
+      planCarrier: benefitsByCase[caseId]?.carrier ?? '',
+      requests: vobsByCase[caseId] || [],
+      partner,
+      perProgram: perProgramNetwork(networkStatus),
+      days: costDaysByCase[caseId],
+    });
+  }
+
   // A program with a disclosed financial relationship needs one more tap
   // before it is assigned, in either flow. The wording is plain on purpose.
   function confirmDisclosedRelationship(partner: Partner, proceed: () => void) {
@@ -2511,10 +3077,37 @@ export default function App() {
     );
   }
 
+  // Program Integrity Watch: a program whose state license shows expired or
+  // could not be confirmed needs one more tap before a referral or a packet.
+  // An Alert, never a sheet. `proceed` gets the concern so the referral can
+  // record that the practitioner went ahead anyway. No concern (or no
+  // credentials loaded): proceed runs at once, exactly as before.
+  function licenseConcernFor(partner: Partner): LicenseConcern | null {
+    return integrityByPartner.get(partner.id)?.licenseConcern ?? null;
+  }
+
+  function confirmLicenseConcern(partner: Partner, action: 'refer' | 'packet', proceed: (concern: LicenseConcern | null) => void) {
+    const concern = licenseConcernFor(partner);
+    if (!concern) {
+      proceed(null);
+      return;
+    }
+    const prompt = licenseConcernAlert(partner.organization || partner.name, concern, action);
+    Alert.alert(prompt.title, prompt.message, [
+      { text: 'Go back', style: 'cancel' },
+      { text: prompt.proceed, onPress: () => proceed(concern) },
+    ]);
+  }
+
   // From a recommended match card: the profile only gets assigned (status →
   // Referred) if the packet is actually sent. The shortlist is captured now,
   // while the card order the clinician saw is still on screen.
-  async function openPacketComposer(partner: Partner, score: ProgramScore) {
+  async function openPacketComposer(partner: Partner, score: ProgramScore, licenseChecked = false, licenseOverride: LicenseConcern | null = null) {
+    if (!licenseChecked && licenseConcernFor(partner)) {
+      // The composer presents once the Alert has finished going away.
+      confirmLicenseConcern(partner, 'packet', (concern) => afterSheetCloses(() => { void openPacketComposer(partner, score, true, concern); }));
+      return;
+    }
     const openings = screenOpenings();
     const matchProfile = await currentOrSavedMatch();
     if (!matchProfile) return;
@@ -2529,22 +3122,30 @@ export default function App() {
     if (alreadyReferred) setPendingPlacement(null);
     else setPendingPlacement({ matchProfileId: matchProfile.id, rankedIds: matches.map((item) => item.partner.id), candidates: placementCandidates(matches) });
     const reasons = buildFitReasons(matchProfile, partner, packetFitInput(score, matchProfile));
+    // For the program's copy: the case's level-of-care rationale (read now if not yet).
+    if (matchProfile.caseId && !caseAssessments.entryFor(matchProfile.caseId)) void caseAssessments.load(matchProfile.caseId);
     setPacketDisclosureRestored(false);
-    setPacketTarget({ partner, match: matchProfile, assignOnSend: !alreadyReferred });
+    setPacketTarget({ partner, match: matchProfile, assignOnSend: !alreadyReferred, licenseOverride });
     setPacketAudience('family');
-    setPacketText(buildPacket(matchProfile, partner, reasons, 'family'));
+    setPacketText(buildPacket(matchProfile, partner, reasons, 'family', packetCostLines(matchProfile, partner, score.networkStatus)));
   }
 
   // From a Referred profile (assigned partner): the assignment already
   // exists, so sending only logs the packet + follow-up on that referral.
-  function openPacketForAssigned(matchProfile: ReferralMatch) {
+  function openPacketForAssigned(matchProfile: ReferralMatch, licenseChecked = false, licenseOverride: LicenseConcern | null = null) {
     const partner = partners.find((item) => item.id === matchProfile.assignedPartnerId);
     if (!partner) return;
-    const reasons = buildFitReasons(matchProfile, partner, fitInputForMatch(matchProfile, partner));
+    if (!licenseChecked && licenseConcernFor(partner)) {
+      confirmLicenseConcern(partner, 'packet', (concern) => afterSheetCloses(() => openPacketForAssigned(matchProfile, true, concern)));
+      return;
+    }
+    const fitInput = fitInputForMatch(matchProfile, partner);
+    const reasons = buildFitReasons(matchProfile, partner, fitInput);
+    if (matchProfile.caseId && !caseAssessments.entryFor(matchProfile.caseId)) void caseAssessments.load(matchProfile.caseId);
     setPacketDisclosureRestored(false);
-    setPacketTarget({ partner, match: matchProfile, assignOnSend: false });
+    setPacketTarget({ partner, match: matchProfile, assignOnSend: false, licenseOverride });
     setPacketAudience('family');
-    setPacketText(buildPacket(matchProfile, partner, reasons, 'family'));
+    setPacketText(buildPacket(matchProfile, partner, reasons, 'family', packetCostLines(matchProfile, partner, fitInput.networkStatus)));
   }
 
   // Regenerate the editable text when the audience toggle flips. Edits made
@@ -2554,7 +3155,10 @@ export default function App() {
     setPacketAudience(audience);
     setPacketDisclosureRestored(false);
     const fitInput = fitInputForMatch(packetTarget.match, packetTarget.partner);
-    setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput, audience), audience));
+    const costLines = audience === 'family' ? packetCostLines(packetTarget.match, packetTarget.partner, fitInput.networkStatus) : [];
+    // The level-of-care rationale: the program's copy only (buildPacket drops it from the family's).
+    const rationaleLines = audience === 'partner' ? levelOfCarePacketLines(caseAssessments.currentFor(packetTarget.match.caseId), packetTarget.match.levelOfCare) : [];
+    setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput, audience), audience, costLines, rationaleLines));
   }
 
   // The placement record for an assignment made from a match: what was
@@ -2683,7 +3287,8 @@ export default function App() {
       matchMustHave, matchPopulation, matchLocationPreference,
       tab, packetTarget, packetSendConfirm, packetAudience, packetText,
     };
-    const { partner, match, assignOnSend } = packetTarget;
+    const { partner, match, assignOnSend, licenseOverride } = packetTarget;
+    const overrideNote = licenseOverride ? licenseOverrideNote(partner.organization || partner.name, licenseOverride, 'packet') : '';
     const now = new Date();
     const todayStamp = localDateStamp();
     // A packet sent on a case-linked profile links everything it creates.
@@ -2701,7 +3306,8 @@ export default function App() {
         date: todayStamp,
         clientLabel: match.clientLabel,
         outcome: 'Introduced',
-        note: 'Match packet sent',
+        // With no case file to hold it, the override stays with the referral.
+        note: overrideNote && !match.caseId ? `Match packet sent. ${overrideNote}` : 'Match packet sent',
         packetSentAt: now.toISOString(),
         matchProfileId: match.id,
         caseId,
@@ -2742,7 +3348,7 @@ export default function App() {
     };
     // One admit check per referral: a packet sent again for a referral that
     // already has an open check, or already has its answer, adds none.
-    const admitCheckOpen = followUps.some((item) => item.referralId === referralId && item.status === 'open' && item.kind !== 'check_in');
+    const admitCheckOpen = followUps.some((item) => item.referralId === referralId && item.status === 'open' && item.kind !== 'check_in' && item.kind !== 'referral_handshake');
     const needsAdmitCheck = assignOnSend || (!admitCheckOpen && referral.admitted == null);
     const followUp: FollowUp | null = needsAdmitCheck ? {
       id: makeId('f'),
@@ -2783,7 +3389,7 @@ export default function App() {
         id: eventId,
         caseId,
         kind: 'referral',
-        body: `Sent packet to ${partner.organization}`,
+        body: overrideNote ? `Sent packet to ${partner.organization}. ${overrideNote}` : `Sent packet to ${partner.organization}`,
         referralId,
         occurredAt: now.toISOString(),
       };
@@ -2880,6 +3486,7 @@ export default function App() {
     setBenefitsForm(null);
     setVobForm(null);
     setVobAnswerForm(null);
+    setAssessmentCaseId(null);
     setCaseFileSource(null);
     setTimelineDraft('');
     setTimelineKind('note');
@@ -2976,6 +3583,7 @@ export default function App() {
     setBenefitsForm(null);
     setVobForm(null);
     setVobAnswerForm(null);
+    setAssessmentCaseId(null);
   }
 
   // ─── Insurance workflow: the Benefits card ──────────────────────────────
@@ -2989,6 +3597,7 @@ export default function App() {
       if (activeUserIdRef.current !== userId) return;
       setBenefitsByCase((current) => ({ ...current, [caseId]: file.plan }));
       setVobsByCase((current) => ({ ...current, [caseId]: file.requests }));
+      setBenefitCostsAvailable(file.costsAvailable);
       setBenefitsLoadedFor((current) => ({ ...current, [caseId]: 'remote' }));
     } catch {
       if (activeUserIdRef.current !== userId) return;
@@ -3018,7 +3627,7 @@ export default function App() {
   // the linked listing, which the server reads.
   function planStatusFor(partner: Partner, plan: string, state: string): PartnerPlanStatus {
     const key = `${plan}|${state || 'ANY'}`;
-    const fromServer = planStatuses[key]?.find((item) => item.partnerId === partner.id);
+    const fromServer = planStatusIndex.get(key)?.get(partner.id);
     if (fromServer) return fromServer;
     return {
       partnerId: partner.id,
@@ -3029,14 +3638,38 @@ export default function App() {
     };
   }
 
+  // The plan editor opens only on what the server holds for this case right
+  // now (benefitsLoadedFor 'remote'): an editor opened on nothing, or on a
+  // copy a failed refresh left behind, would save its blanks over the plan.
+  function benefitsEditorBlock(caseId: string): { title: string; message: string } | null {
+    const loaded = benefitsLoadedFor[caseId];
+    if (loaded === 'remote') return null;
+    return loaded === 'unavailable'
+      ? { title: 'Benefits need a connection', message: 'The plan could not be loaded, so it cannot be edited yet. Pull to refresh once you are back online.' }
+      : { title: 'Benefits are still loading', message: 'The plan is on its way from the server. Try again in a moment.' };
+  }
+
   function openBenefitsEditor(record: CaseRecord) {
+    const blocked = benefitsEditorBlock(record.id);
+    if (blocked) {
+      Alert.alert(blocked.title, blocked.message);
+      if (benefitsLoadedFor[record.id] === 'unavailable') void loadCaseBenefits(record.id);
+      return;
+    }
     const plan = benefitsByCase[record.id];
     setBenefitsForm({
       carrier: plan?.carrier || '',
       planName: plan?.planName || '',
       memberIdLast4: plan?.memberIdLast4 || '',
       subscriberRelationship: plan?.subscriberRelationship || '',
+      costs: planCostsDraft(plan),
+      openedCosts: plan ? { inNetwork: plan.inNetwork, outOfNetwork: plan.outOfNetwork, oonBenefits: plan.oonBenefits } : null,
     });
+  }
+
+  // One cost field of the plan editor (network: inNetwork / outOfNetwork).
+  function setBenefitsCost(network: 'inNetwork' | 'outOfNetwork', key: keyof NetworkBenefitsDraft, value: string) {
+    setBenefitsForm((current) => (current ? { ...current, costs: { ...current.costs, [network]: { ...current.costs[network], [key]: value } } } : current));
   }
 
   function saveBenefits(record: CaseRecord) {
@@ -3048,13 +3681,28 @@ export default function App() {
       Alert.alert('Member id', 'Enter the last four characters of the member id, or leave it blank.');
       return;
     }
+    // The amounts are whole dollars, checked as the server checks them. A
+    // server without them (benefitCostsAvailable) keeps what it had: none.
+    const parsedCosts = benefitCostsAvailable ? parsePlanCostsDraft(form.costs) : null;
+    if (parsedCosts && !parsedCosts.ok) {
+      Alert.alert('Plan benefits', parsedCosts.message);
+      return;
+    }
     const previousPlan = benefitsByCase[record.id] ?? null;
+    // Only the amounts changed in the editor move; the rest stay as the case
+    // holds them now (a teammate may have changed one meanwhile).
+    const costs = parsedCosts?.ok ? mergePlanCostsChanges(previousPlan, form.openedCosts, parsedCosts.value) : {
+      inNetwork: previousPlan?.inNetwork ?? EMPTY_NETWORK_BENEFITS,
+      outOfNetwork: previousPlan?.outOfNetwork ?? EMPTY_NETWORK_BENEFITS,
+      oonBenefits: previousPlan?.oonBenefits ?? null,
+    };
     const optimistic: CaseBenefits = {
       caseId: record.id,
       carrier: form.carrier.trim(),
       planName: form.planName.trim(),
       memberIdLast4: last4,
       subscriberRelationship: form.subscriberRelationship,
+      ...costs,
       updatedAt: new Date().toISOString(),
     };
     setBenefitsByCase((current) => ({ ...current, [record.id]: optimistic }));
@@ -3068,6 +3716,7 @@ export default function App() {
           planName: optimistic.planName,
           memberIdLast4: optimistic.memberIdLast4,
           subscriberRelationship: optimistic.subscriberRelationship,
+          ...(parsedCosts?.ok ? { costs: parsedCosts.value, costsOpened: form.openedCosts } : {}),
         });
       },
       { partners, referrals, referralMatches, touches, followUps, scorecards },
@@ -3126,6 +3775,7 @@ export default function App() {
       answeredBy: '',
       note: form.note.trim(),
       quotedOutOfPocket: null,
+      ...EMPTY_VOB_COSTS,
       followUpId,
     };
     const followUp: FollowUp = {
@@ -3226,6 +3876,8 @@ export default function App() {
       answeredBy: request.answeredBy,
       note: request.note,
       quoted: request.quotedOutOfPocket == null ? '' : String(request.quotedOutOfPocket),
+      costs: vobCostsDraft(request),
+      openedCosts: { allowedDailyRate: request.allowedDailyRate, billedDailyRate: request.billedDailyRate, copayPerDay: request.copayPerDay, precertRequired: request.precertRequired },
     });
   }
 
@@ -3242,6 +3894,11 @@ export default function App() {
       Alert.alert('Out of pocket', 'Enter whole dollars, or leave it blank.');
       return;
     }
+    const parsedCosts = benefitCostsAvailable ? parseVobCostsDraft(form.costs) : null;
+    if (parsedCosts && !parsedCosts.ok) {
+      Alert.alert('Daily rates', parsedCosts.message);
+      return;
+    }
     if (!mutationSlotAvailable('The VOB update')) return;
     const quoted = quotedParsed ?? null;
     const nowIso = new Date().toISOString();
@@ -3252,6 +3909,8 @@ export default function App() {
       answeredBy: form.answeredBy.trim(),
       note: form.note.trim(),
       quotedOutOfPocket: quoted,
+      // Only the rates changed in the form move; the rest stay as they are now.
+      ...(parsedCosts?.ok ? vobCostsFromRow({ ...vobCostsToPatch(current), ...changedVobCostsPatch(form.openedCosts, parsedCosts.value) }) : {}),
       answeredAt: isVobAnswered(form.status) ? (statusChanged || !current.answeredAt ? nowIso : current.answeredAt) : undefined,
     };
     const previousVobs = vobsByCase[record.id] || [];
@@ -3272,6 +3931,7 @@ export default function App() {
           answeredBy: optimistic.answeredBy,
           note: optimistic.note,
           quotedOutOfPocket: quoted,
+          ...(parsedCosts?.ok ? { costs: parsedCosts.value, costsOpened: form.openedCosts } : {}),
         });
       },
       { partners, referrals, referralMatches, touches, followUps: nextFollowUps, scorecards },
@@ -3873,12 +4533,17 @@ export default function App() {
     || (typeof session?.user?.user_metadata?.display_name === 'string' ? session.user.user_metadata.display_name : '')
     || '';
   latestSnapshotRef.current = { partners, referrals, referralMatches, touches, followUps, scorecards };
+  currentMatchFormRef.current = matchFormSignature([
+    selectedMatchId, matchClientLabel, matchType, matchState, matchInsurance, matchNetworkPreferences,
+    matchBudget, matchTherapies, matchMustHave, matchPopulation, matchLocationPreference,
+  ]);
   latestCasesRef.current = cases;
   const sheetOpenNow = Boolean(
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
     || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory
     || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
-    || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible,
+    || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible
+    || placementSheet || placementCompareId || showHandoffs,
   );
   if (sheetOpenNow && !anySheetOpenRef.current) sheetOpenedCountRef.current += 1;
   anySheetOpenRef.current = sheetOpenNow;
@@ -4050,14 +4715,34 @@ export default function App() {
       Alert.alert('Nothing to send to', kind === 'email' ? 'This contact has no email address.' : 'This contact has no phone number.');
       return;
     }
-    const url = kind === 'call' ? `tel:${target}` : kind === 'text' ? `sms:${target}` : `mailto:${target}`;
-    try {
-      const supported = await Linking.canOpenURL(url);
-      if (!supported) throw new Error('Unsupported contact action');
-      await Linking.openURL(url);
-    } catch {
-      Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
-      return;
+    if (kind === 'email') {
+      try {
+        const url = `mailto:${target}`;
+        const supported = await Linking.canOpenURL(url);
+        if (!supported) throw new Error('Unsupported contact action');
+        await Linking.openURL(url);
+      } catch {
+        Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
+        return;
+      }
+      // A browser says nothing about whether a mail app opened (a computer
+      // may have none): ask, as for a call or a text.
+      if (IS_WEB) {
+        const sent = await new Promise<boolean>((resolve) => {
+          Alert.alert(`Email ${contact.name}`, `${target}\n\nYour email app should open. Log it here once it is sent.`, [
+            { text: 'Not now', style: 'cancel', onPress: () => resolve(false) },
+            { text: 'I emailed', onPress: () => resolve(true) },
+          ], { cancelable: true, onDismiss: () => resolve(false) });
+        });
+        if (!sent) return;
+      }
+    } else {
+      const opened = await openCallOrText(kind, contact.phone, contact.name);
+      if (opened === 'declined') return;
+      if (opened === 'failed') {
+        Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
+        return;
+      }
     }
     const verbs = { call: 'Called', text: 'Texted', email: 'Emailed' } as const;
     const eventId = makeId('e');
@@ -4266,17 +4951,26 @@ export default function App() {
   // the case summary (state code, insurance name, cash budget). When the new
   // profile is saved on the Match tab it is linked back to the case
   // (pendingCaseMatchId), and the case row points at the profile.
-  function startMatchForCase(record: CaseRecord) {
+  //
+  // `level` (Level-of-care assessment: "Find placement with this level"):
+  // the chosen level goes on the match form as its level of care, exactly as
+  // if picked by hand. Nothing else changes; the practitioner saves as usual.
+  function startMatchForCase(record: CaseRecord, level?: PlacementLevel) {
     const existing = referralMatches.find((item) => item.id === record.matchProfileId);
     if (existing) {
       loadReferralMatch(existing);
+      if (level) setMatchType(level);
       setTab('match');
       closeCase();
       return;
     }
     const text = `${record.title} ${record.summary}`;
     const stateHint = stateOptions.find((state) => new RegExp(`\\b${state.code}\\b`).test(text) || text.toLowerCase().includes(state.name.toLowerCase()));
-    const insuranceHint = nationalInsuranceProviders.find((provider) => provider !== 'Cash pay' && text.toLowerCase().includes(provider.toLowerCase()));
+    // The plan on the case file is the family's payment; words in the
+    // title or summary are only a guess when no plan with a carrier is on
+    // file (so the match and the plan's cost estimate agree).
+    const planCarrier = (benefitsByCase[record.id]?.carrier || '').trim();
+    const insuranceHint = planCarrier || nationalInsuranceProviders.find((provider) => provider !== 'Cash pay' && text.toLowerCase().includes(provider.toLowerCase()));
     const budgetMatch = text.match(/\$\s?([\d,]{3,})/);
     const budgetHint = budgetMatch ? String(Number(budgetMatch[1].replace(/,/g, '')) || '') : '';
     applyMatchToForm(null); // nothing carried over from the previous family
@@ -4285,6 +4979,7 @@ export default function App() {
     setMatchState(stateHint?.code || 'ANY');
     setMatchInsurance(insuranceHint || 'Cash pay');
     setMatchBudget(insuranceHint ? '' : budgetHint);
+    if (level) setMatchType(level);
     setTab('match');
     closeCase();
   }
@@ -4305,7 +5000,8 @@ export default function App() {
       // Every outbound referral is waiting on the admit answer until one is
       // recorded, whether it went out by packet or by Assign & refer (which
       // never stamps packetSentAt).
-      referralAwaitingAnswer: Boolean(referral && referral.direction === 'Outbound' && referral.admitted == null),
+      // A handoff's reminder is about the handoff, not the admit answer.
+      referralAwaitingAnswer: Boolean(referral && referral.direction === 'Outbound' && referral.admitted == null && followUp.kind !== 'referral_handshake'),
     };
   }
 
@@ -4638,6 +5334,12 @@ export default function App() {
   }
 
   function openDoneSheet(card: TodayCard) {
+    // A handoff's reminder moves on when its step is marked, from the
+    // program's link or here: Done opens Handoffs.
+    if (card.kind === 'referral_handshake') {
+      setShowHandoffs(true);
+      return;
+    }
     if (card.virtual || (!card.caseId && !card.referralId)) {
       if (card.virtual) openTouchLogger(partners.find((item) => item.id === card.partnerId) as Partner);
       else if (card.followUp) completePlainFollowUp(card.followUp);
@@ -5008,17 +5710,10 @@ export default function App() {
   // → the partner's phone. Every completed action logs (case_event and/or
   // partner touch) and offers the same quick-note prompt the case file uses.
   function cardContactAction(card: TodayCard, action: 'call' | 'text') {
-    const launch = async (digits: string): Promise<boolean> => {
-      const url = `${action === 'call' ? 'tel' : 'sms'}:${digits}`;
-      try {
-        const supported = await Linking.canOpenURL(url);
-        if (!supported) throw new Error('Unsupported contact action');
-        await Linking.openURL(url);
-        return true;
-      } catch {
-        Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
-        return false;
-      }
+    const launch = async (digits: string, who: string): Promise<boolean> => {
+      const opened = await openCallOrText(action, digits, who);
+      if (opened === 'failed') Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
+      return opened === 'done';
     };
     const clean = (phone: string) => phone.replace(/[^\d+]/g, '');
     if (card.caseId) {
@@ -5035,7 +5730,7 @@ export default function App() {
         setContactPick({ card, action, contacts });
         return;
       }
-      launch(clean(primary.phone)).then((opened) => {
+      launch(primary.phone, primary.name).then((opened) => {
         if (opened) logCardContact(card, action, primary);
       });
       return;
@@ -5047,7 +5742,7 @@ export default function App() {
         Alert.alert('No phone on file', `${partner?.organization || 'This partner'} has no phone number — add one in the Directory.`);
         return;
       }
-      launch(digits).then((opened) => {
+      launch(partner?.phone ?? digits, partner?.organization || 'this partner').then((opened) => {
         if (opened) logCardContact(card, action, undefined);
       });
       return;
@@ -5483,7 +6178,7 @@ export default function App() {
     }
   }
 
-  function addReferral(disclosureConfirmed = false) {
+  function addReferral(disclosureConfirmed = false, licenseOverride: LicenseConcern | null = null) {
     if (!referralForm.partnerId || !referralForm.clientLabel.trim()) {
       Alert.alert('A little more detail', 'Choose a partner and add a client or family label.');
       return;
@@ -5501,6 +6196,13 @@ export default function App() {
         return;
       }
     }
+    // Referring a client out (Assign & refer, or an outbound referral) to a
+    // program whose state license shows expired or could not be confirmed:
+    // one more tap, and the referral records that it went ahead anyway.
+    if (chosenPartner && !licenseOverride && (activeReferralMatchId || referralForm.direction === 'Outbound') && licenseConcernFor(chosenPartner)) {
+      confirmLicenseConcern(chosenPartner, 'refer', (concern) => addReferral(disclosureConfirmed, concern));
+      return;
+    }
     if (!mutationSlotAvailable('The referral')) return;
     const previousReferralUi = {
       referralForm, showAddReferral, activeReferralMatchId, tab,
@@ -5514,6 +6216,10 @@ export default function App() {
     // offered on that form: admission is recorded through the admit check
     // below (record_placement_outcome), never typed onto the referral.
     const matchForReferral = activeReferralMatchId ? referralMatches.find((item) => item.id === activeReferralMatchId) || null : null;
+    // A license override goes on the case timeline when there is a case,
+    // otherwise on the referral's own note.
+    const overrideNote = licenseOverride && chosenPartner ? licenseOverrideNote(chosenPartner.organization || chosenPartner.name, licenseOverride) : '';
+    const overrideCaseId = overrideNote ? matchForReferral?.caseId : undefined;
     const referral: Referral = {
       id: makeId('r'),
       partnerId: referralForm.partnerId,
@@ -5521,9 +6227,17 @@ export default function App() {
       date: localDateStamp(),
       clientLabel: referralForm.clientLabel.trim(),
       outcome: matchForReferral && referralForm.outcome === 'Placed' ? 'Introduced' : referralForm.outcome,
-      note: referralForm.note.trim(),
+      note: [referralForm.note.trim(), overrideNote && !overrideCaseId ? overrideNote : ''].filter(Boolean).join('\n'),
       ...(matchForReferral ? { matchProfileId: matchForReferral.id, caseId: matchForReferral.caseId } : {}),
     };
+    const overrideEvent: CaseEvent | null = overrideCaseId ? {
+      id: makeId('e'),
+      caseId: overrideCaseId,
+      kind: 'referral',
+      body: overrideNote,
+      referralId: referral.id,
+      occurredAt: new Date().toISOString(),
+    } : null;
     // The same "did they admit?" check the packet path sets, so Today asks
     // and the outcome lands on the referral and the partner's track record.
     const admitCheck: FollowUp | null = matchForReferral ? {
@@ -5568,6 +6282,7 @@ export default function App() {
         }
       : partner);
     setPartners(nextPartners);
+    if (overrideEvent) applyCaseEvent(overrideEvent);
     setShowAddReferral(false);
     setReferralForm(emptyReferral);
     if (activeReferralMatchId) setTab('referrals');
@@ -5587,11 +6302,19 @@ export default function App() {
         } else {
           await createReferral(referral, activeUserId);
         }
+        // After the referral it names (queued behind it offline). Best
+        // effort: the referral stands even if the timeline entry does not.
+        if (overrideEvent) {
+          await logContactActivity(overrideEvent, null, activeUserId).catch(() => {
+            setCaseEvents((current) => current.filter((item) => item.id !== overrideEvent.id));
+          });
+        }
       },
       snapshot,
       { partners, referrals, referralMatches, touches, followUps, scorecards },
       () => {
         setPartners(partners); setReferrals(referrals); setReferralMatches(referralMatches);
+        if (overrideEvent) setCaseEvents((current) => current.filter((item) => item.id !== overrideEvent.id));
         if (admitCheck) setFollowUps(followUps);
         setReferralForm(previousReferralUi.referralForm);
         // The form reopens once its sheet has finished closing and nothing
@@ -5672,19 +6395,35 @@ export default function App() {
   }
 
   function confirmSignOut() {
-    Alert.alert('Sign out?', 'Offline data remains in this account’s isolated on-device cache.', [
+    // A browser may be shared, so signing out of the web app leaves none of
+    // the practice's data in it; the phone keeps its offline copy.
+    const unsaved = queuedWrites + rejectedWrites;
+    const message = IS_WEB
+      ? `This removes your practice’s data from this browser. Everything saved stays in your workspace.${unsaved ? ` ${unsaved} ${unsaved === 1 ? 'change has' : 'changes have'} not reached your workspace yet and will be lost if they cannot be saved now.` : ''}`
+      : 'Offline data remains in this account’s isolated on-device cache.';
+    Alert.alert('Sign out?', message, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Sign out', style: 'destructive', onPress: async () => {
         try {
+          const userId = activeUserIdRef.current;
           // Best effort: no signal must never trap someone signed in.
-          await unregisterThisDevice(activeUserIdRef.current || undefined).catch(() => undefined);
+          await unregisterThisDevice(userId || undefined).catch(() => undefined);
           await cancelReferralFitNotifications().catch(() => undefined);
+          if (IS_WEB && userId) {
+            // Save what can still be saved, then remove the cache, the
+            // queue and every saved case copy (store.ts). Needs no session,
+            // so it works when the session has already gone too.
+            await flushWriteQueue(userId).catch(() => undefined);
+            await wipeAccountDataWithoutSession();
+          }
           // Offline, supabase-js cannot sign out (it tries to refresh first and
           // gives up after ~25 s without clearing anything): clear it here.
+          // Only this device or browser: signing out of the web app on a
+          // shared computer never signs the phone out (nor the reverse).
           if (await isOfflineSession(activeUserIdRef.current).catch(() => false)) {
             await forceLocalSignOut();
           } else {
-            const { error } = await supabase.auth.signOut();
+            const { error } = await supabase.auth.signOut({ scope: 'local' });
             if (error) {
               if (isAuthNetworkError(error) || isNetworkError(error)) await forceLocalSignOut();
               else throw error;
@@ -5703,22 +6442,40 @@ export default function App() {
     return (
       <View style={styles.header}>
         <View style={styles.brandRow}>
-          <Image accessibilityLabel="ReferralFit partner network logo" source={require('./assets/icon-referent-symbiosis.png')} style={styles.brandMark} />
-          <TouchableOpacity accessibilityLabel={title || 'ReferralFit'} activeOpacity={0.7} onLongPress={confirmSignOut} delayLongPress={1200}>
-            <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
-          </TouchableOpacity>
+          {/* With the sidebar, the brand is in the sidebar; a title stays. */}
+          {wideWeb ? null : <Image accessibilityLabel="ReferralFit partner network logo" source={require('./assets/icon-referent-symbiosis.png')} style={styles.brandMark} />}
+          {wideWeb && !title ? null : (
+            <TouchableOpacity accessibilityLabel={title || 'ReferralFit'} activeOpacity={0.7} onLongPress={confirmSignOut} delayLongPress={1200}>
+              <Text style={styles.brandName}>{title || 'ReferralFit'}</Text>
+            </TouchableOpacity>
+          )}
         </View>
         <View style={styles.headerActions}>
+          {/* A browser has no pull to refresh. */}
+          {IS_WEB ? (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Refresh"
+              style={styles.headerIconButton}
+              disabled={pullRefreshing}
+              onPress={() => { void pullToRefresh(); }}
+            >
+              {pullRefreshing ? <ActivityIndicator size="small" color={COLORS.gray} /> : <AppIcon name="refresh-outline" size={20} color={COLORS.gray} />}
+            </TouchableOpacity>
+          ) : null}
           {/* Workspace: team, notifications, privacy, sign out, Delete account.
-              Its own icon, so it never reads as the Directory tab (people). */}
-          <TouchableOpacity
-            accessibilityRole="button"
-            accessibilityLabel="Workspace and settings"
-            style={styles.headerIconButton}
-            onPress={() => setShowWorkspace(true)}
-          >
-            <AppIcon name="settings-outline" size={20} color={COLORS.gray} />
-          </TouchableOpacity>
+              Its own icon, so it never reads as the Directory tab (people).
+              With the sidebar it is the sidebar's Settings. */}
+          {wideWeb ? null : (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Workspace and settings"
+              style={styles.headerIconButton}
+              onPress={() => setShowWorkspace(true)}
+            >
+              <AppIcon name="settings-outline" size={20} color={COLORS.gray} />
+            </TouchableOpacity>
+          )}
           {notificationPermissionState === 'blocked' ? (
             <TouchableOpacity
               accessibilityRole="button"
@@ -5953,6 +6710,36 @@ export default function App() {
     );
   }
 
+  // Placement Request on Today: one card while a request is open, and for
+  // answers that arrived since the practitioner last looked.
+  function PlacementTodaySection() {
+    const placementToday = placementAvailable
+      ? placementTodayItems({ requests: placement.state.requests, seen: placement.seen, now: new Date(), userId: activeUserId, scope: todayScope, labelFor: placementLabelFor })
+      : [];
+    return placementToday.length ? (
+      <View style={styles.todaySection}>
+        <Text style={styles.todaySectionHeader}>🛏️ PLACEMENT REQUESTS</Text>
+        <View style={styles.credentialWatchCard}>
+          {placementToday.map((item, index) => (
+            <TouchableOpacity
+              key={item.requestId}
+              accessibilityRole="button"
+              accessibilityLabel={`${item.title}. ${item.detail}. Open the answers.`}
+              onPress={() => openPlacementCompare(item.requestId)}
+              style={[styles.credentialWatchRow, index === 0 && styles.placementTodayFirstRow]}
+            >
+              <View style={{ flex: 1 }}>
+                <Text style={styles.credentialWatchName}>{item.title}</Text>
+                <Text style={item.newAnswers ? styles.placementTodayNew : styles.credentialWatchLine}>{item.detail}</Text>
+              </View>
+              <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+            </TouchableOpacity>
+          ))}
+        </View>
+      </View>
+    ) : null;
+  }
+
   // Today Command Center — the prioritized daily operating list. The old
   // home told you what happened; this one tells you WHAT TO DO NEXT.
   function HomeScreen() {
@@ -6006,21 +6793,50 @@ export default function App() {
           {todaySections.overdue.length ? (
             <View style={styles.todaySection}>
               <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderOverdue]}>🔴 OVERDUE</Text>
-              {todaySections.overdue.map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card, overdue: true })}</React.Fragment>)}
+              {todaySections.overdue.slice(0, todayRowLimits.overdue).map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card, overdue: true })}</React.Fragment>)}
+              {TodayShowMore('overdue', todaySections.overdue.length)}
             </View>
           ) : null}
 
           {todaySections.today.length ? (
             <View style={styles.todaySection}>
               <Text style={styles.todaySectionHeader}>📞 TODAY</Text>
-              {todaySections.today.map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
+              {todaySections.today.slice(0, todayRowLimits.today).map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
+              {TodayShowMore('today', todaySections.today.length)}
             </View>
           ) : null}
 
           {todaySections.partnersDue.length ? (
             <View style={styles.todaySection}>
               <Text style={styles.todaySectionHeader}>🤝 PARTNERS DUE</Text>
-              {todaySections.partnersDue.map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
+              {todaySections.partnersDue.slice(0, todayRowLimits.partnersDue).map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
+              {TodayShowMore('partnersDue', todaySections.partnersDue.length)}
+            </View>
+          ) : null}
+
+          {PlacementTodaySection()}
+
+          {credentialWatch.length ? (
+            <View style={styles.todaySection}>
+              <Text style={styles.todaySectionHeader}>🛡️ CREDENTIALS TO CHECK</Text>
+              <View style={styles.credentialWatchCard}>
+                <Text style={styles.credentialWatchIntro}>{credentialWatchSubtitle(credentialWatch)}</Text>
+                {credentialWatch.map((item) => (
+                  <TouchableOpacity
+                    key={item.partnerId}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${item.name}: ${item.lines.join(', ')}. Open the profile.`}
+                    onPress={() => { const partner = partnerById.get(item.partnerId); if (partner) setSelectedPartner(partner); }}
+                    style={styles.credentialWatchRow}
+                  >
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.credentialWatchName}>{item.name}</Text>
+                      <Text style={item.worst === 'expired' ? styles.credentialWatchLineExpired : styles.credentialWatchLine}>{item.lines.join(' · ')}</Text>
+                    </View>
+                    <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+                  </TouchableOpacity>
+                ))}
+              </View>
             </View>
           ) : null}
 
@@ -6166,6 +6982,18 @@ export default function App() {
                       <Text numberOfLines={1} style={styles.savedMatchMeta}>{item.levelOfCare === 'Any type' ? 'Any level' : item.levelOfCare} · {item.state === 'ANY' ? 'Any location' : item.state}</Text>
                       <Text style={[styles.savedMatchStatus, item.status === 'Referred' && styles.savedMatchStatusComplete]}>{assignedPartner ? `Referred to ${assignedPartner.organization}` : 'Matching in progress'}</Text>
                     </TouchableOpacity>
+                    {(() => {
+                      // Placement Request: the newest request for this match and how many answered.
+                      const asked = placementAvailable ? latestRequestForMatch(placement.state.requests, item.id) : null;
+                      if (!asked) return null;
+                      const progress = requestProgress(asked, new Date());
+                      return (
+                        <TouchableOpacity accessibilityLabel={`Program answers for ${item.clientLabel}: ${progress.label}`} accessibilityRole="button" style={styles.savedMatchAnswersButton} onPress={() => openPlacementCompare(asked.request.id)}>
+                          <AppIcon name="chatbubbles-outline" size={13} color={COLORS.forest} />
+                          <Text style={styles.savedMatchPacketButtonText}>Program answers {progress.answered}/{progress.total}</Text>
+                        </TouchableOpacity>
+                      );
+                    })()}
                     <View style={styles.savedMatchActions}>
                       {item.status === 'Referred' && assignedPartner ? (
                         <TouchableOpacity accessibilityLabel={`Send packet for ${item.clientLabel}`} accessibilityRole="button" style={styles.savedMatchPacketButton} onPress={() => openPacketForAssigned(item)}>
@@ -6206,6 +7034,8 @@ export default function App() {
             onChange={setMatchType}
             options={[{ label: 'Any level of care', value: 'Any type' }, ...partnerTypes.map((type) => ({ label: type, value: type }))]}
           />
+          {/* Level-of-care assessment of the match's case: still editable; a gentle note if moved away. */}
+          <AssessedLevelNote assessment={matchAssessment} matchLevel={matchType as ReferralMatch['levelOfCare']} />
 
           <DropdownField
             label="GEOGRAPHY"
@@ -6325,6 +7155,18 @@ export default function App() {
           <View style={styles.rankBadge}><AppIcon name="shield-checkmark" size={14} color={COLORS.forest} /><Text style={styles.rankBadgeText}>Fit ranked</Text></View>
         </View>
 
+        {/* Placement Request: ask several of these programs at once. Hidden on a server without the feature. */}
+        {placementAvailable && matches.length ? (
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Ask programs about beds, fit and cost" onPress={() => { void openPlacementSheet(); }} style={styles.askProgramsButton}>
+            <AppIcon name="paper-plane-outline" size={18} color={COLORS.forest} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.askProgramsTitle}>Ask programs</Text>
+              <Text style={styles.askProgramsBody}>One de-identified request to up to 8 of these programs. Compare their answers side by side.</Text>
+            </View>
+            <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+          </TouchableOpacity>
+        ) : null}
+
         {matches.length ? matches.slice(0, 8).map((match, index) => (
           <View key={match.partner.id} style={[styles.matchCard, index === 0 && styles.bestMatchCard]}>
             <TouchableOpacity onPress={() => setSelectedPartner(match.partner)} activeOpacity={0.85} style={styles.matchCardContent}>
@@ -6361,6 +7203,14 @@ export default function App() {
                   const line = planStatusLine(planNetworkStatusForPartner(match.partner, matchInsurance), matchCaseVobs, match.partner.id);
                   return <Text numberOfLines={1} style={line.confirmed ? styles.bedLineOpen : styles.bedLineUnconfirmed}>{line.text}</Text>;
                 })() : null}
+                {(() => {
+                  // What the family would pay, from the linked case's benefits.
+                  // Shown only; the score and the order above never read it.
+                  const cost = familyCostFor(matchCaseId, matchInsurance, match.partner, match.networkStatus);
+                  return cost ? <Text numberOfLines={2} style={cost.known ? styles.familyCostLine : styles.bedLineUnconfirmed}>{familyCostCardLine(cost)}{cost.known && cost.balanceBilling ? ' · balance billing possible' : ''}</Text> : null;
+                })()}
+                {/* Credentials on file (Program Integrity Watch). Shown only; the score and the order never read it. */}
+                {integrityByPartner.has(match.partner.id) ? <View style={styles.credentialChipRow}><ShieldChip integrity={integrityByPartner.get(match.partner.id)} /></View> : null}
                 {match.verifyBenefits || match.disclosure || matchInsurance !== 'Cash pay' ? (
                   <View style={styles.matchFlags}>
                     {match.verifyBenefits ? <View style={styles.verifyBadge}><AppIcon name="alert-circle-outline" size={12} color={COLORS.inkSoft} /><Text style={styles.verifyBadgeText}>Verify benefits</Text></View> : null}
@@ -6395,7 +7245,7 @@ export default function App() {
   // loaded with the cases, so it shows without opening the file.
   function CaseRow({ record, lastInGroup }: { record: CaseRecord; lastInGroup?: boolean }) {
     const colors = CASE_STATUS_COLORS[record.status];
-    const primary = allCaseContacts.find((item) => item.caseId === record.id && item.isPrimary);
+    const primary = primaryContactByCase.get(record.id);
     return (
       <TouchableOpacity onPress={() => openCase(record.id)} style={[styles.caseRow, lastInGroup && { borderBottomWidth: 0 }]}>
         <View style={[styles.caseRowIcon, { backgroundColor: colors.bg }]}><AppIcon name="folder" size={17} color={colors.fg} /></View>
@@ -6512,9 +7362,12 @@ export default function App() {
                   <Text style={styles.closedToggleText}>Closed ({closedCases.length})</Text>
                 </TouchableOpacity>
                 {showClosedCases ? (
-                  <View style={styles.followUpCard}>
-                    {closedCases.map((record, index) => <React.Fragment key={record.id}>{CaseRow({ record, lastInGroup: index === closedCases.length - 1 })}</React.Fragment>)}
-                  </View>
+                  <>
+                    <View style={styles.followUpCard}>
+                      {closedCases.slice(0, closedCaseLimit).map((record, index, shown) => <React.Fragment key={record.id}>{CaseRow({ record, lastInGroup: index === shown.length - 1 })}</React.Fragment>)}
+                    </View>
+                    {closedCases.length > closedCaseLimit ? ShowMoreButton(closedCases.length - closedCaseLimit, 'closed cases', () => setClosedCaseLimit((limit) => limit + LIST_ROWS_SHOWN)) : null}
+                  </>
                 ) : null}
               </View>
             ) : null}
@@ -6524,9 +7377,12 @@ export default function App() {
     );
   }
 
+  // A FlatList, not a ScrollView of cards: a large network renders only the
+  // cards on screen (a few thousand partners was tens of thousands of views
+  // re-rendered on every keystroke). Everything above the cards is its header.
   function DirectoryScreen() {
-    return (
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled" refreshControl={renderRefreshControl()}>
+    const header = (
+      <>
         {renderHeader('Directory')}
         {renderRefreshNotice()}
         <View style={styles.directoryTitleRow}>
@@ -6576,9 +7432,38 @@ export default function App() {
           </View>
         ) : null}
         <View style={styles.directoryCountRow}><Text style={styles.directoryCount}>{directoryPartners.length} RESULTS</Text><AppIcon name="options-outline" size={18} color={COLORS.gray} /></View>
-        {directoryPartners.map((partner) => <PartnerCard key={partner.id} partner={partner} lastReferralOn={lastReferralByPartner[partner.id]} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />)}
-        {!directoryPartners.length ? <EmptyState icon="people-outline" title={directoryPlan ? `Nobody lists ${directoryPlan} in-network` : 'No partners found'} body={directoryPlan ? 'Programs report their own networks and lists are often incomplete. Clear the plan filter, or request a VOB from the case to find out for sure.' : 'Try another search or add a new relationship.'} /> : null}
-      </ScrollView>
+      </>
+    );
+    return (
+      <FlatList
+        data={directoryPartners}
+        keyExtractor={(partner) => partner.id}
+        renderItem={({ item: partner }) => <PartnerCard partner={partner} lastReferralOn={lastReferralByPartner[partner.id]} integrity={directoryChipFor(partner)} onPress={() => setSelectedPartner(partner)} onShare={() => sharePartner(partner)} />}
+        ListHeaderComponent={header}
+        ListEmptyComponent={<EmptyState icon="people-outline" title={directoryPlan ? `Nobody lists ${directoryPlan} in-network` : 'No partners found'} body={directoryPlan ? 'Programs report their own networks and lists are often incomplete. Clear the plan filter, or request a VOB from the case to find out for sure.' : 'Try another search or add a new relationship.'} />}
+        initialNumToRender={12}
+        maxToRenderPerBatch={12}
+        windowSize={7}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.scrollContent}
+        keyboardShouldPersistTaps="handled"
+        refreshControl={renderRefreshControl()}
+      />
+    );
+  }
+
+  function TodayShowMore(section: TodayListSection, total: number) {
+    const remaining = total - todayRowLimits[section];
+    if (remaining <= 0) return null;
+    return ShowMoreButton(remaining, 'cards', () => setTodayRowLimits((limits) => ({ ...limits, [section]: limits[section] + TODAY_ROWS_SHOWN })), TODAY_ROWS_SHOWN);
+  }
+
+  function ShowMoreButton(remaining: number, what: string, onPress: () => void, step = LIST_ROWS_SHOWN) {
+    const next = Math.min(remaining, step);
+    return (
+      <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Show ${next} more ${what}, ${remaining} not shown`} style={styles.showMoreButton} onPress={onPress}>
+        <Text style={styles.showMoreText}>Show {next} more · {remaining} not shown</Text>
+      </TouchableOpacity>
     );
   }
 
@@ -6614,6 +7499,20 @@ export default function App() {
           <TouchableOpacity style={styles.quickLogButton} onPress={() => openReferral('Outbound')}><AppIcon name="arrow-up-circle" size={20} color={COLORS.blue} /><Text style={styles.quickLogText}>Log outbound</Text></TouchableOpacity>
         </View>
 
+        <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="Handoffs: send a program a private link to report each step"
+          style={styles.globalDirectoryBanner}
+          onPress={() => setShowHandoffs(true)}
+        >
+          <AppIcon name="paper-plane-outline" size={20} color={COLORS.blue} />
+          <View style={styles.globalDirectoryCopy}>
+            <Text style={styles.globalDirectoryTitle}>Handoffs</Text>
+            <Text style={styles.globalDirectorySubtitle}>Send the program a private link; they mark each step and your reminder follows</Text>
+          </View>
+          <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
+        </TouchableOpacity>
+
         <SectionTitle title="Referral history" />
         <View style={styles.searchBox}>
           <AppIcon name="search" size={19} color={COLORS.gray} />
@@ -6641,11 +7540,11 @@ export default function App() {
           <Text style={styles.referralFilterCount}>{filteredReferrals.length} records</Text>
         </View>
         {filteredReferrals.length ? <View style={styles.referralList}>
-          {filteredReferrals.map((referral, index) => {
+          {filteredReferrals.slice(0, referralRowLimit).map((referral, index, shown) => {
             const partner = partnerById.get(referral.partnerId);
             if (!partner) return null;
             return (
-              <TouchableOpacity key={referral.id} onPress={() => setSelectedPartner(partner)} style={[styles.referralRow, index === filteredReferrals.length - 1 && { borderBottomWidth: 0 }]}>
+              <TouchableOpacity key={referral.id} onPress={() => setSelectedPartner(partner)} style={[styles.referralRow, index === shown.length - 1 && { borderBottomWidth: 0 }]}>
                 <View style={[styles.referralDirectionLine, { backgroundColor: referral.direction === 'Inbound' ? COLORS.forest : COLORS.blue }]} />
                 <View style={{ flex: 1 }}>
                   <View style={styles.referralTop}><Text style={styles.referralClient}>{referral.clientLabel}</Text><Text style={styles.referralDate}>{shortDate(referral.date)}</Text></View>
@@ -6656,9 +7555,10 @@ export default function App() {
             );
           })}
         </View> : <EmptyState icon="swap-horizontal-outline" title="No matching referrals" body={referrals.length ? 'Try another search or direction filter.' : 'Add a partner, then log your first inbound or outbound referral.'} />}
+        {filteredReferrals.length > referralRowLimit ? ShowMoreButton(filteredReferrals.length - referralRowLimit, 'referrals', () => setReferralRowLimit((limit) => limit + LIST_ROWS_SHOWN)) : null}
 
         <SectionTitle title="Partner activity" />
-        {partners.length ? partners.slice().sort((a, b) => (lastReferralByPartner[b.id] || '').localeCompare(lastReferralByPartner[a.id] || '') || a.organization.localeCompare(b.organization)).slice(0, 5).map((partner) => (
+        {partners.length ? recentPartnerActivity.map((partner) => (
           <TouchableOpacity key={partner.id} onPress={() => setSelectedPartner(partner)} style={styles.balanceRow}>
             <View style={styles.balanceNameRow}><Text style={styles.balanceName} numberOfLines={1}>{partner.organization}</Text></View>
             <Text style={styles.balanceNumbers}>{partnerActivityLine(partner, lastReferralByPartner[partner.id])}</Text>
@@ -6668,14 +7568,16 @@ export default function App() {
     );
   }
 
+  const NAV_ITEMS: { key: Tab; label: string; icon: IconName; activeIcon: IconName }[] = [
+    { key: 'home', label: 'Home', icon: 'home-outline', activeIcon: 'home' },
+    { key: 'match', label: 'Match', icon: 'sparkles-outline', activeIcon: 'sparkles' },
+    { key: 'cases', label: 'Cases', icon: 'folder-outline', activeIcon: 'folder' },
+    { key: 'directory', label: 'Directory', icon: 'people-outline', activeIcon: 'people' },
+    { key: 'referrals', label: 'Referrals', icon: 'swap-horizontal-outline', activeIcon: 'swap-horizontal' },
+  ];
+
   function BottomNav() {
-    const items: { key: Tab; label: string; icon: IconName; activeIcon: IconName }[] = [
-      { key: 'home', label: 'Home', icon: 'home-outline', activeIcon: 'home' },
-      { key: 'match', label: 'Match', icon: 'sparkles-outline', activeIcon: 'sparkles' },
-      { key: 'cases', label: 'Cases', icon: 'folder-outline', activeIcon: 'folder' },
-      { key: 'directory', label: 'Directory', icon: 'people-outline', activeIcon: 'people' },
-      { key: 'referrals', label: 'Referrals', icon: 'swap-horizontal-outline', activeIcon: 'swap-horizontal' },
-    ];
+    const items = NAV_ITEMS;
     return (
       <View style={styles.bottomNav}>
         {items.map((item) => {
@@ -6687,6 +7589,44 @@ export default function App() {
             </TouchableOpacity>
           );
         })}
+      </View>
+    );
+  }
+
+  // A wide browser window: the same tabs down the left, with Settings.
+  function SideNav() {
+    return (
+      <View style={styles.sideNav} accessibilityRole="tablist">
+        <View style={styles.sideBrand}>
+          <Image accessibilityLabel="ReferralFit partner network logo" source={require('./assets/icon-referent-symbiosis.png')} style={styles.brandMark} />
+          <Text style={styles.brandName}>ReferralFit</Text>
+        </View>
+        {NAV_ITEMS.map((item) => {
+          const active = tab === item.key;
+          return (
+            <Pressable
+              key={item.key}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: active }}
+              accessibilityLabel={item.label}
+              onPress={() => setTab(item.key)}
+              style={({ hovered }: { pressed: boolean; hovered?: boolean }) => [styles.sideItem, active ? styles.sideItemActive : hovered ? styles.sideItemHover : null]}
+            >
+              <AppIcon name={active ? item.activeIcon : item.icon} size={19} color={active ? COLORS.forest : COLORS.gray} />
+              <Text style={[styles.sideLabel, active && styles.sideLabelActive]}>{item.label}</Text>
+            </Pressable>
+          );
+        })}
+        <View style={{ flex: 1 }} />
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Workspace and settings"
+          onPress={() => setShowWorkspace(true)}
+          style={({ hovered }: { pressed: boolean; hovered?: boolean }) => [styles.sideItem, hovered && styles.sideItemHover]}
+        >
+          <AppIcon name="settings-outline" size={19} color={COLORS.gray} />
+          <Text style={styles.sideLabel}>Settings</Text>
+        </Pressable>
       </View>
     );
   }
@@ -6710,6 +7650,7 @@ export default function App() {
     if (benefitsForm) return CaseBenefitsModal(activeCase);
     if (vobForm) return VobRequestModal(activeCase);
     if (vobAnswerForm) return VobAnswerModal(activeCase);
+    if (assessmentCaseId === activeCase.id) return LevelOfCareModal(activeCase);
     const record = activeCase;
     const colors = CASE_STATUS_COLORS[record.status];
     const linkedMatch = referralMatches.find((item) => item.id === record.matchProfileId)
@@ -6919,17 +7860,26 @@ export default function App() {
                 <Text style={styles.casePaymentHint}>Enter a quote to mark the case quoted automatically. Use “Record another payment” for each coaching session or installment. Every change lands on the timeline.</Text>
               </View>
 
+              {/* Level of care: the current assessment, chosen level, and "Find placement" at it */}
+              <LevelOfCareCard
+                entry={caseAssessments.entryFor(record.id)}
+                nameFor={(userId) => (userId && userId === activeUserId.toLowerCase() ? 'you' : memberDisplayName(members, userId))}
+                onStart={() => { flushPendingCaseFields(); setAssessmentCaseId(record.id); }}
+                onFindPlacement={(level) => startMatchForCase(record, level)}
+              />
+
               {/* Benefits: the family's plan and the VOB requests */}
               {(() => {
                 const plan = benefitsByCase[record.id] ?? null;
                 const requests = (vobsByCase[record.id] || []).slice().sort((a, b) => b.requestedAt.localeCompare(a.requestedAt));
                 const loaded = benefitsLoadedFor[record.id];
+                const linkedMatch = referralMatches.find((item) => item.id === record.matchProfileId) || referralMatches.find((item) => item.caseId === record.id);
                 return (
                   <View style={styles.infoCard}>
                     <View style={styles.caseSectionHeader}>
                       <View>
                         <Text style={styles.infoTitle}>Benefits</Text>
-                        <Text style={styles.caseSectionHint}>Carrier, plan, and the last four of the member id. Nothing more is kept.</Text>
+                        <Text style={styles.caseSectionHint}>Carrier, plan, the last four of the member id{benefitCostsAvailable ? ', and the plan’s cost sharing' : ''}. Nothing more is kept.</Text>
                       </View>
                       <TouchableOpacity
                         accessibilityRole="button"
@@ -6942,6 +7892,8 @@ export default function App() {
                     </View>
                     {loaded === 'unavailable' ? (
                       <Text style={styles.caseEmptyNote}>Benefits need a connection. Pull to refresh once you are back online.</Text>
+                    ) : !loaded ? (
+                      <Text style={styles.caseEmptyNote}>Benefits are still loading.</Text>
                     ) : null}
                     {plan && (plan.carrier || plan.planName || plan.memberIdLast4) ? (
                       <View style={styles.businessDetailRow}>
@@ -6995,6 +7947,18 @@ export default function App() {
                       );
                     }) : loaded === 'remote' ? (
                       <Text style={styles.caseEmptyNote}>No VOB requested yet. One tap asks a program and puts a reminder on Today for the next business day.</Text>
+                    ) : null}
+                    {loaded === 'remote' ? (
+                      <FamilyCostPanel
+                        plan={plan}
+                        requests={requests}
+                        partners={partners}
+                        insurance={linkedMatch?.insurance || plan?.carrier || ''}
+                        assignedPartnerId={linkedMatch?.assignedPartnerId}
+                        days={costDaysByCase[record.id] ?? DEFAULT_STAY_DAYS}
+                        onDaysChange={(days) => setCostDaysByCase((current) => ({ ...current, [record.id]: days }))}
+                        costsAvailable={benefitCostsAvailable}
+                      />
                     ) : null}
                     <Text style={styles.casePaymentHint}>Network status on partners and match results is what each program reports about itself. An answer recorded here is what the carrier said for this family only; it never changes the partner's listing.</Text>
                   </View>
@@ -7408,7 +8372,7 @@ export default function App() {
             <Text style={styles.modalHeaderTitle}>Partner profile</Text>
             <TouchableOpacity accessibilityRole="button" accessibilityLabel={selectedPartner.favorite ? 'Remove partner from favorites' : 'Add partner to favorites'} accessibilityState={{ selected: selectedPartner.favorite }} onPress={() => toggleFavorite(selectedPartner.id)} style={styles.closeButton}><AppIcon name={selectedPartner.favorite ? 'heart' : 'heart-outline'} size={21} color={selectedPartner.favorite ? COLORS.coral : COLORS.ink} /></TouchableOpacity>
           </View>
-          <ScrollView contentContainerStyle={styles.modalContent}>
+          <ScrollView contentContainerStyle={styles.modalContent} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
             <View style={styles.profileHero}>
               <Initials name={selectedPartner.organization} size={68} />
               <Text style={styles.profileOrg}>{selectedPartner.organization}</Text>
@@ -7417,7 +8381,7 @@ export default function App() {
             </View>
 
             <View style={styles.profileActions}>
-              <TouchableOpacity style={styles.profileAction} onPress={() => { if (selectedPartner.phone) Linking.openURL(`tel:${selectedPartner.phone.replace(/[^\d+]/g, '')}`).catch(() => Alert.alert('Unable to call', 'This device cannot place calls.')); else Alert.alert('No phone on file', 'Add a phone number in Edit.'); }}><AppIcon name="call" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Call</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.profileAction} onPress={() => { if (!selectedPartner.phone) Alert.alert('No phone on file', 'Add a phone number in Edit.'); else if (IS_WEB) Alert.alert(`Call ${selectedPartner.organization}`, `${selectedPartner.phone}\n\nA browser can't place calls. Use your phone.`); else Linking.openURL(`tel:${selectedPartner.phone.replace(/[^\d+]/g, '')}`).catch(() => Alert.alert('Unable to call', 'This device cannot place calls.')); }}><AppIcon name="call" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Call</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => { if (selectedPartner.email) Linking.openURL(`mailto:${selectedPartner.email}`).catch(() => Alert.alert('Unable to email', 'Set up a mail account on this device to send email.')); else Alert.alert('No email on file', 'Add an email address in Edit.'); }}><AppIcon name="mail" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Email</Text></TouchableOpacity>
               <TouchableOpacity style={styles.profileAction} onPress={() => openReferral('Outbound', selectedPartner.id)}><AppIcon name="paper-plane" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Refer</Text></TouchableOpacity>
               <TouchableOpacity accessibilityLabel={`Draft a follow-up to ${selectedPartner.organization || selectedPartner.name}`} style={styles.profileAction} onPress={() => openOutreachForPartner(selectedPartner, 'partner')}><AppIcon name="sparkles" size={20} color={COLORS.forest} /><Text style={styles.profileActionText}>Follow up</Text></TouchableOpacity>
@@ -7465,6 +8429,15 @@ export default function App() {
                 </View>
               );
             })()}
+            <CredentialsCard
+              key={selectedPartner.id}
+              program={credentialProgramForPartner(selectedPartner)}
+              state={credentialIndex.state}
+              today={todayStamp}
+              whoLabel={(userId) => (!userId ? '' : userId === activeUserId.toLowerCase() ? 'you' : memberDisplayName(members, userId))}
+              onChanged={credentialIndex.reload}
+              canEditListing={credentialIndex.isPlatformAdmin}
+            />
             <View style={styles.infoCard}>
               <Text style={styles.infoTitle}>Staying in touch</Text>
               <View style={styles.infoLine}><AppIcon name="calendar-outline" size={18} color={COLORS.gray} /><View style={{ flex: 1 }}><Text style={styles.infoLabel}>Cadence</Text><Text style={styles.infoValue}>{selectedPartner.touchCadenceDays ? `Every ${selectedPartner.touchCadenceDays} days` : 'No cadence set'}</Text></View></View>
@@ -8046,9 +9019,19 @@ export default function App() {
                 </>
               )}
               <Text style={styles.fieldLabel}>{matchedReferral ? 'ASSIGN REFERENT' : 'PARTNER'}</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.partnerPicker}>
-                {partners.slice().sort((a, b) => Number(b.id === referralForm.partnerId) - Number(a.id === referralForm.partnerId)).map((partner) => <TouchableOpacity key={partner.id} onPress={() => setReferralForm({ ...referralForm, partnerId: partner.id })} style={[styles.partnerPick, referralForm.partnerId === partner.id && styles.partnerPickActive]}><Initials name={partner.organization} size={34} /><Text numberOfLines={2} style={[styles.partnerPickText, referralForm.partnerId === partner.id && styles.partnerPickTextActive]}>{partner.organization}</Text></TouchableOpacity>)}
-              </ScrollView>
+              {/* Virtualized: a large network is thousands of picks. */}
+              <FlatList
+                horizontal
+                data={partners.slice().sort((a, b) => Number(b.id === referralForm.partnerId) - Number(a.id === referralForm.partnerId))}
+                keyExtractor={(partner) => partner.id}
+                renderItem={({ item: partner }) => <TouchableOpacity onPress={() => setReferralForm({ ...referralForm, partnerId: partner.id })} style={[styles.partnerPick, referralForm.partnerId === partner.id && styles.partnerPickActive]}><Initials name={partner.organization} size={34} /><Text numberOfLines={2} style={[styles.partnerPickText, referralForm.partnerId === partner.id && styles.partnerPickTextActive]}>{partner.organization}</Text></TouchableOpacity>}
+                initialNumToRender={8}
+                maxToRenderPerBatch={8}
+                windowSize={5}
+                showsHorizontalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+                contentContainerStyle={styles.partnerPicker}
+              />
               {matchedReferral && referralForm.partnerId ? (() => {
                 const chosen = partners.find((item) => item.id === referralForm.partnerId);
                 const rank = placementRankFor(matchedReferral.id, referralForm.partnerId);
@@ -8517,6 +9500,30 @@ export default function App() {
 
   // ─── Insurance workflow editors (swapped inside the case sheet) ──────────
 
+  // Level-of-care assessment (src/lib/LevelOfCareSheet.tsx), inside the case
+  // file's own native Modal: CaseDetailModal swaps the contents, so nothing
+  // is ever presented over the case sheet. "Find placement with this level"
+  // closes the case file and opens the match through startMatchForCase.
+  function LevelOfCareModal(record: CaseRecord) {
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => assessmentBackRef.current()}>
+        <LevelOfCareSheet
+          caseId={record.id}
+          names={reasonNames({ caseTitle: record.title, contactNames: caseContactNames(record.id) })}
+          previous={caseAssessments.currentFor(record.id)}
+          backRef={assessmentBackRef}
+          onClose={() => setAssessmentCaseId(null)}
+          onSaved={(saved) => {
+            caseAssessments.saved(saved.assessment);
+            // The server wrote the timeline entry under the assessment's id.
+            applyCaseEvent({ id: saved.assessment.id, caseId: record.id, kind: 'system', body: saved.eventBody, occurredAt: saved.assessment.assessedAt, actorId: activeUserId.toLowerCase() });
+          }}
+          onFindPlacement={(level) => startMatchForCase(record, level)}
+        />
+      </Modal>
+    );
+  }
+
   function CaseBenefitsModal(record: CaseRecord) {
     if (!benefitsForm) return null;
     const close = () => setBenefitsForm(null);
@@ -8538,11 +9545,33 @@ export default function App() {
               <TouchableOpacity accessibilityRole="button" style={styles.modalHeaderAction} onPress={() => saveBenefits(record)}><Text style={styles.saveText}>Save</Text></TouchableOpacity>
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
-              <Text style={styles.formIntro}>Just enough to ask a program for a VOB. Only the last four of the member id are kept; no date of birth, no SSN. Keep the card photo under Documents.</Text>
+              <Text style={styles.formIntro}>Just enough to ask a program for a VOB{benefitCostsAvailable ? ', and the plan’s numbers for an estimate of what the family would pay' : ''}. Only the last four of the member id are kept; no date of birth, no SSN. Keep the card photo under Documents.</Text>
               <DropdownField label="CARRIER" value={benefitsForm.carrier} icon="shield-checkmark-outline" onChange={(carrier) => setBenefitsForm((current) => (current ? { ...current, carrier } : current))} options={carrierOptions} />
               <FormField label="PLAN NAME (OPTIONAL)" value={benefitsForm.planName} onChangeText={(planName) => setBenefitsForm((current) => (current ? { ...current, planName } : current))} placeholder="PPO Choice, HMO, Medicaid plan name" />
               <FormField label="MEMBER ID, LAST FOUR ONLY" value={benefitsForm.memberIdLast4} onChangeText={(value) => setBenefitsForm((current) => (current ? { ...current, memberIdLast4: memberIdLast4(value) } : current))} placeholder="1234" />
               <DropdownField label="SUBSCRIBER" value={benefitsForm.subscriberRelationship} icon="person-outline" onChange={(value) => setBenefitsForm((current) => (current ? { ...current, subscriberRelationship: value as SubscriberRelationship } : current))} options={SUBSCRIBER_RELATIONSHIPS.map((item) => ({ label: item.label, value: item.value }))} />
+              {benefitCostsAvailable ? (
+                <>
+                  {/* True cost to the family: the plan's cost sharing (family-cost-form.ts). */}
+                  <Text style={styles.infoTitleStandalone}>In-network benefits</Text>
+                  <Text style={[styles.casePaymentHint, { marginBottom: 12 }]}>Whole dollars, from the VOB or the plan documents. Leave anything you do not know blank: the estimate says unknown instead of guessing.</Text>
+                  {NETWORK_BENEFIT_FIELDS.map((field) => (
+                    <FormField key={`in-${field.key}`} label={field.label} value={benefitsForm.costs.inNetwork[field.key]} onChangeText={(value) => setBenefitsCost('inNetwork', field.key, value)} placeholder={field.placeholder} keyboardType="number-pad" />
+                  ))}
+                  <Text style={styles.infoTitleStandalone}>Out-of-network benefits</Text>
+                  <Text style={[styles.fieldLabel, { marginTop: 10 }]}>DOES THE PLAN PAY ANYTHING OUT-OF-NETWORK?</Text>
+                  <View style={[styles.wrapPills, { marginBottom: 14 }]}>
+                    {TRISTATE_OPTIONS.map((option) => (
+                      <Pill key={option.label} label={option.label} active={benefitsForm.costs.oonBenefits === option.value} onPress={() => setBenefitsForm((current) => (current ? { ...current, costs: { ...current.costs, oonBenefits: option.value } } : current))} />
+                    ))}
+                  </View>
+                  {benefitsForm.costs.oonBenefits === false ? (
+                    <Text style={[styles.casePaymentHint, { marginBottom: 14 }]}>Then an out-of-network program costs the family its full price. The out-of-network amounts are cleared when you save.</Text>
+                  ) : NETWORK_BENEFIT_FIELDS.map((field) => (
+                    <FormField key={`oon-${field.key}`} label={field.label} value={benefitsForm.costs.outOfNetwork[field.key]} onChangeText={(value) => setBenefitsCost('outOfNetwork', field.key, value)} placeholder={field.placeholder} keyboardType="number-pad" />
+                  ))}
+                </>
+              ) : null}
               <TouchableOpacity accessibilityRole="button" style={styles.primaryButton} onPress={() => saveBenefits(record)}>
                 <Text style={styles.primaryButtonText}>Save plan</Text>
               </TouchableOpacity>
@@ -8564,6 +9593,8 @@ export default function App() {
       ? sortPlanStatuses(partners.map((partner) => planStatusFor(partner, plan.carrier, state)))
       : partners.slice().sort((a, b) => a.organization.localeCompare(b.organization)).map((partner): PartnerPlanStatus => ({ partnerId: partner.id, organization: partner.organization, networkStatus: 'unknown', source: 'none', sameState: null }));
     const serverAnswered = Boolean(plan?.carrier && planStatuses[`${plan.carrier}|${state}`]);
+    // The first rows (in-network first), plus the chosen one wherever it is.
+    const shownSuggestions = suggestions.filter((item, index) => index < vobRowLimit || item.partnerId === vobForm.partnerId);
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
         <SafeAreaView style={styles.modalPage}>
@@ -8582,9 +9613,9 @@ export default function App() {
               </Text>
               <Text style={styles.fieldLabel}>WHICH PROGRAM</Text>
               <View style={styles.followUpCard}>
-                {suggestions.map((item, index) => {
+                {shownSuggestions.map((item, index) => {
                   const selected = vobForm.partnerId === item.partnerId;
-                  const partner = partners.find((candidate) => candidate.id === item.partnerId);
+                  const partner = partnerById.get(item.partnerId);
                   const line = plan?.carrier ? planStatusLine(item.networkStatus, requests, item.partnerId) : null;
                   const open = requests.find((request) => request.partnerId === item.partnerId && !isVobAnswered(request.status));
                   return (
@@ -8593,7 +9624,7 @@ export default function App() {
                       accessibilityRole="button"
                       accessibilityState={{ selected }}
                       onPress={() => setVobForm((current) => (current ? { ...current, partnerId: selected ? null : item.partnerId, programName: '' } : current))}
-                      style={[styles.caseNextStepRow, index === suggestions.length - 1 && { borderBottomWidth: 0 }]}
+                      style={[styles.caseNextStepRow, index === shownSuggestions.length - 1 && { borderBottomWidth: 0 }]}
                     >
                       <View style={[styles.followUpIcon, { width: 30, height: 30 }]}><AppIcon name={selected ? 'radio-button-on' : 'radio-button-off'} size={17} color={selected ? COLORS.forest : COLORS.gray} /></View>
                       <View style={{ flex: 1 }}>
@@ -8607,6 +9638,7 @@ export default function App() {
                 })}
                 {!suggestions.length ? <Text style={styles.caseEmptyNote}>No partners in your network yet. Type the program below.</Text> : null}
               </View>
+              {suggestions.length > shownSuggestions.length ? ShowMoreButton(suggestions.length - shownSuggestions.length, 'programs', () => setVobRowLimit((limit) => limit + LIST_ROWS_SHOWN)) : null}
               <FormField label="OR A PROGRAM BY NAME" value={vobForm.programName} onChangeText={(programName) => setVobForm((current) => (current ? { ...current, programName, partnerId: programName.trim() ? null : current.partnerId } : current))} placeholder="A program outside your network" />
               <FormField label="NOTE (OPTIONAL)" value={vobForm.note} onChangeText={(note) => setVobForm((current) => (current ? { ...current, note } : current))} placeholder="Who you spoke with, fax or portal used, what they need from you" multiline />
               <TouchableOpacity accessibilityRole="button" style={styles.primaryButton} onPress={() => submitVobRequest(vobForm)}>
@@ -8645,11 +9677,25 @@ export default function App() {
               </View>
               <FormField label="WHO ANSWERED (OPTIONAL)" value={vobAnswerForm.answeredBy} onChangeText={(answeredBy) => setVobAnswerForm((current) => (current ? { ...current, answeredBy } : current))} placeholder="Maria in admissions" />
               <FormField label="QUOTED OUT OF POCKET, DOLLARS (OPTIONAL)" value={vobAnswerForm.quoted} onChangeText={(quoted) => setVobAnswerForm((current) => (current ? { ...current, quoted } : current))} placeholder="500" keyboardType="number-pad" />
-              <FormField label="NOTES" value={vobAnswerForm.note} onChangeText={(note) => setVobAnswerForm((current) => (current ? { ...current, note } : current))} placeholder="Deductible, coinsurance, authorization needed, what the family was told" multiline />
+              {benefitCostsAvailable ? (
+                <>
+                  {/* The program's rates feed the family's cost estimate (family-cost.ts). */}
+                  {VOB_COST_FIELDS.map((field) => (
+                    <FormField key={field.key} label={field.label} value={vobAnswerForm.costs[field.key]} onChangeText={(value) => setVobAnswerForm((current) => (current ? { ...current, costs: { ...current.costs, [field.key]: value } } : current))} placeholder={field.placeholder} keyboardType="number-pad" />
+                  ))}
+                  <Text style={styles.fieldLabel}>PRE-AUTHORIZATION REQUIRED?</Text>
+                  <View style={[styles.wrapPills, { marginBottom: 14 }]}>
+                    {TRISTATE_OPTIONS.map((option) => (
+                      <Pill key={option.label} label={option.label} active={vobAnswerForm.costs.precertRequired === option.value} onPress={() => setVobAnswerForm((current) => (current ? { ...current, costs: { ...current.costs, precertRequired: option.value } } : current))} />
+                    ))}
+                  </View>
+                </>
+              ) : null}
+              <FormField label="NOTES" value={vobAnswerForm.note} onChangeText={(note) => setVobAnswerForm((current) => (current ? { ...current, note } : current))} placeholder={benefitCostsAvailable ? 'What the family was told, anything the fields above do not cover' : 'Deductible, coinsurance, authorization needed, what the family was told'} multiline />
               <TouchableOpacity accessibilityRole="button" style={[styles.primaryButton, vobSaving && { opacity: 0.45 }]} onPress={() => saveVobAnswer(record)} disabled={vobSaving}>
                 <Text style={styles.primaryButtonText}>{vobSaving ? 'Saving…' : 'Save answer'}</Text>
               </TouchableOpacity>
-              <Text style={styles.casePaymentHint}>A status change is written to the timeline with your name. An answer also closes the reminder to check on it. This applies to this family only and never changes the partner's own network listing.</Text>
+              <Text style={styles.casePaymentHint}>A status change is written to the timeline with your name. An answer also closes the reminder to check on it. This applies to this family only and never changes the partner's own network listing.{benefitCostsAvailable ? ' The daily rates feed the family’s cost estimate on this case only; the program never sees it.' : ''}</Text>
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
@@ -8918,15 +9964,9 @@ export default function App() {
                 <TouchableOpacity key={contact.id} style={styles.contactPickRow} onPress={async () => {
                   const pick = contactPick;
                   setContactPick(null);
-                  const url = `${pick.action === 'call' ? 'tel' : 'sms'}:${contact.phone.replace(/[^\d+]/g, '')}`;
-                  try {
-                    const supported = await Linking.canOpenURL(url);
-                    if (!supported) throw new Error('Unsupported contact action');
-                    await Linking.openURL(url);
-                    logCardContact(pick.card, pick.action, contact, { deferNoteSheet: true });
-                  } catch {
-                    Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
-                  }
+                  const opened = await openCallOrText(pick.action, contact.phone, contact.name);
+                  if (opened === 'done') logCardContact(pick.card, pick.action, contact, { deferNoteSheet: true });
+                  else if (opened === 'failed') Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
                 }}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.contactPickName}>{contact.name}{contact.isPrimary ? ' · primary' : ''}</Text>
@@ -9003,9 +10043,12 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
-      <View style={styles.appShell}>
-        <View style={styles.screen}>{tab === 'home' ? HomeScreen() : tab === 'match' ? MatchScreen() : tab === 'cases' ? CasesScreen() : tab === 'directory' ? DirectoryScreen() : ReferralsScreen()}</View>
-        {BottomNav()}
+      <View style={wideWeb ? styles.desktopShell : styles.appShell}>
+        {wideWeb ? SideNav() : null}
+        <View style={wideWeb ? styles.desktopMain : styles.screen}>
+          <View style={wideWeb ? styles.desktopScreen : styles.screen}>{tab === 'home' ? HomeScreen() : tab === 'match' ? MatchScreen() : tab === 'cases' ? CasesScreen() : tab === 'directory' ? DirectoryScreen() : ReferralsScreen()}</View>
+        </View>
+        {wideWeb ? null : BottomNav()}
       </View>
       {PartnerDetailModal()}
       {AddPartnerModal()}
@@ -9090,6 +10133,37 @@ export default function App() {
           resetAccountState();
         }}
       />
+      <PlacementRequestSheet
+        request={placementSheet}
+        senderName={senderName}
+        onClose={() => setPlacementSheet(null)}
+        onSent={placement.replace}
+        onOpenAnswers={(requestId) => {
+          setPlacementSheet(null);
+          afterSheetCloses(() => setPlacementCompareId(requestId));
+        }}
+      />
+      <HandoffsSheet
+        visible={showHandoffs}
+        referrals={referrals}
+        partnersById={partnerById}
+        caseNamesFor={handoffCaseNames}
+        onClose={() => setShowHandoffs(false)}
+        onChanged={() => { void refreshFromServer('pull').catch(() => undefined); }}
+      />
+      <PlacementCompare
+        requestId={placementCompareId}
+        placement={placement}
+        partnersById={partnerById}
+        senderName={senderName}
+        labelFor={placementLabelFor}
+        integrityFor={(partnerId) => integrityByPartner.get(partnerId)}
+        familyCostLineFor={placementCostLine}
+        canChoose={placementMatchSaved}
+        onClose={() => setPlacementCompareId(null)}
+        onSwitch={setPlacementCompareId}
+        onChoose={choosePlacementProgram}
+      />
       {DoneSheet()}
       {outreach?.origin === 'root' ? OutreachSheetView() : null}
       {NextStepSheet()}
@@ -9125,6 +10199,16 @@ const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: COLORS.cream },
   appShell: { flex: 1, alignSelf: 'center', width: '100%', maxWidth: 520, backgroundColor: COLORS.cream, overflow: 'hidden' },
   screen: { flex: 1 },
+  desktopShell: { flex: 1, flexDirection: 'row', backgroundColor: COLORS.cream },
+  desktopMain: { flex: 1, alignItems: 'center' },
+  desktopScreen: { flex: 1, width: '100%', maxWidth: 860 },
+  sideNav: { width: 228, backgroundColor: COLORS.white, borderRightWidth: 1, borderRightColor: COLORS.line, paddingTop: 18, paddingBottom: 16, paddingHorizontal: 12, gap: 2 },
+  sideBrand: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 10, marginBottom: 18 },
+  sideItem: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10, paddingHorizontal: 12, borderRadius: 10 },
+  sideItemActive: { backgroundColor: COLORS.mint },
+  sideItemHover: { backgroundColor: COLORS.mintPale },
+  sideLabel: { color: COLORS.inkSoft, fontSize: 15, fontWeight: '600' },
+  sideLabelActive: { color: COLORS.forest, fontWeight: '800' },
   scrollContent: { paddingHorizontal: 16, paddingTop: Platform.OS === 'android' ? 18 : 8, paddingBottom: 28 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, paddingVertical: 10, marginBottom: 22 },
   headerActions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 6, flexShrink: 1 },
@@ -9197,8 +10281,8 @@ const styles = StyleSheet.create({
   dropdownButton: { minHeight: 52, flexDirection: 'row', alignItems: 'center', gap: 11, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, borderRadius: 15, paddingHorizontal: 12 },
   dropdownLeading: { width: 34, height: 34, borderRadius: 10, backgroundColor: COLORS.white, alignItems: 'center', justifyContent: 'center' },
   dropdownValue: { flex: 1, flexShrink: 1, color: COLORS.ink, fontSize: 13, fontWeight: '700' },
-  dropdownOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(11, 32, 27, 0.42)', paddingBottom: Platform.OS === 'ios' ? 16 : 0 },
-  dropdownSheet: { maxHeight: '82%', backgroundColor: COLORS.cream, borderTopLeftRadius: 26, borderTopRightRadius: 26, paddingBottom: Platform.OS === 'ios' ? 26 : 22, shadowColor: COLORS.ink, shadowOpacity: 0.18, shadowRadius: 20, shadowOffset: { width: 0, height: -5 }, elevation: 12 },
+  dropdownOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(11, 32, 27, 0.42)', paddingBottom: Platform.OS === 'ios' ? 16 : 0, ...WEB_SHEET_OVERLAY },
+  dropdownSheet: { maxHeight: '82%', backgroundColor: COLORS.cream, borderTopLeftRadius: 26, borderTopRightRadius: 26, paddingBottom: Platform.OS === 'ios' ? 26 : 22, shadowColor: COLORS.ink, shadowOpacity: 0.18, shadowRadius: 20, shadowOffset: { width: 0, height: -5 }, elevation: 12, ...WEB_SHEET },
   dropdownSheetHandle: { width: 42, height: 5, borderRadius: 3, backgroundColor: '#C4CEC9', alignSelf: 'center', marginTop: 9 },
   dropdownSheetHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: COLORS.line },
   dropdownSheetEyebrow: { color: COLORS.gray, fontSize: 9, fontWeight: '800', letterSpacing: 1.1, marginBottom: 3 },
@@ -9258,8 +10342,21 @@ const styles = StyleSheet.create({
   matchInsuranceText: { flex: 1, flexShrink: 1, marginRight: 8 },
   matchPriceText: { flexShrink: 0, color: COLORS.gray, fontSize: 10, fontWeight: '600', textAlign: 'right' },
   matchFlags: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 9 },
+  credentialChipRow: { flexDirection: 'row', marginTop: 7 },
+  askProgramsButton: { minHeight: 64, flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: COLORS.white, borderRadius: 18, borderWidth: 1, borderColor: COLORS.forest, padding: 14, marginBottom: 14 },
+  askProgramsTitle: { color: COLORS.forest, fontSize: 14, fontWeight: '800' },
+  askProgramsBody: { color: COLORS.inkSoft, fontSize: 12, lineHeight: 17, marginTop: 2 },
+  placementTodayFirstRow: { borderTopWidth: 0 },
+  placementTodayNew: { color: COLORS.forest, fontSize: 12, fontWeight: '800', marginTop: 2 },
+  credentialWatchCard: { backgroundColor: COLORS.white, borderRadius: 18, borderWidth: 1, borderColor: COLORS.line, padding: 14, gap: 4 },
+  credentialWatchIntro: { color: COLORS.inkSoft, fontSize: 12, lineHeight: 17, marginBottom: 4 },
+  credentialWatchRow: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8, borderTopWidth: 1, borderTopColor: '#EEF0EE' },
+  credentialWatchName: { color: COLORS.ink, fontSize: 13, fontWeight: '800' },
+  credentialWatchLine: { color: COLORS.inkSoft, fontSize: 12, marginTop: 2 },
+  credentialWatchLineExpired: { color: COLORS.coral, fontSize: 12, fontWeight: '700', marginTop: 2 },
   bedLineOpen: { color: COLORS.forest, fontSize: 11, fontWeight: '700', marginTop: 7 },
   bedLineUnconfirmed: { color: COLORS.gray, fontSize: 11, fontWeight: '700', marginTop: 7 },
+  familyCostLine: { color: COLORS.inkSoft, fontSize: 11, fontWeight: '700', marginTop: 7 },
   verifyBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#F3F3EF', borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5 },
   verifyBadgeText: { color: COLORS.inkSoft, fontSize: 9, fontWeight: '800' },
   disclosureBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.coralPale, borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5, flexShrink: 1 },
@@ -9346,7 +10443,7 @@ const styles = StyleSheet.create({
   navIconActive: { backgroundColor: COLORS.forest },
   navLabel: { color: COLORS.gray, fontSize: 9, fontWeight: '600' },
   navLabelActive: { color: COLORS.forest, fontWeight: '800' },
-  modalPage: { flex: 1, backgroundColor: COLORS.cream },
+  modalPage: { flex: 1, backgroundColor: COLORS.cream, ...WEB_PAGE },
   modalHandle: { width: 42, height: 5, borderRadius: 3, backgroundColor: '#C8D0CC', alignSelf: 'center', marginTop: 8 },
   modalHeader: { minHeight: 58, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, paddingHorizontal: 14, paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: COLORS.line },
   modalHeaderTitle: { flex: 1, flexShrink: 1, textAlign: 'center', color: COLORS.ink, fontSize: 15, fontWeight: '800' },
@@ -9448,6 +10545,7 @@ const styles = StyleSheet.create({
   packetButtonText: { color: COLORS.forest, fontSize: 11, fontWeight: '800' },
   savedMatchPacketButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 9, backgroundColor: COLORS.mint, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 6, alignSelf: 'flex-start' },
   savedMatchPacketButtonText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
+  savedMatchAnswersButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 6, backgroundColor: COLORS.mint, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 6, alignSelf: 'flex-start' },
   packetReminder: { color: COLORS.coral, fontSize: 10, lineHeight: 15, marginTop: -4, marginBottom: 14, fontWeight: '700' },
   packetEditor: { minHeight: 260, paddingTop: 13, textAlignVertical: 'top', lineHeight: 19 },
   packetShareHint: { color: COLORS.gray, fontSize: 10, lineHeight: 15, marginTop: 12, textAlign: 'center' },
@@ -9489,6 +10587,8 @@ const styles = StyleSheet.create({
   caseSearchHint: { color: COLORS.gray, fontSize: 12, lineHeight: 18, padding: 14 },
   closedToggle: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, paddingHorizontal: 2, marginBottom: 8 },
   closedToggleText: { color: COLORS.gray, fontSize: 12, fontWeight: '800' },
+  showMoreButton: { minHeight: 44, alignItems: 'center', justifyContent: 'center', paddingVertical: 8, marginBottom: 14 },
+  showMoreText: { color: COLORS.forest, fontSize: 14, fontWeight: '700' },
   caseSectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   caseSectionAction: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 3, paddingVertical: 6 },
   caseSectionActions: { flexDirection: 'row', alignItems: 'center', gap: 12 },

@@ -109,3 +109,57 @@ button.small { padding: 6px 10px; font-size: 13px; }
 .history ul { list-style: none; margin: 0; padding: 0; }
 .history li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 14px; }
 .history li span:first-child { color: var(--gray); }
+
+/* Credentials (Program Integrity Watch). */
+select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 15px;
+  font-family: inherit;
+  background: var(--bg);
+  color: var(--ink);
+}
+.credentials { list-style: none; margin: 0 0 4px; padding: 0; }
+.credentials li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+.credential-main { flex: 1 1 240px; display: flex; flex-direction: column; gap: 3px; font-size: 15px; }
+.credential-main a { font-size: 13px; color: var(--blue); }
+.credential-main .warn { color: var(--coral); font-size: 13px; }
+.credential-actions { display: flex; gap: 6px; }
+.badge.credential-verified { background: var(--green-soft); color: var(--green); }
+.badge.credential-pending { background: var(--blue-soft); color: var(--blue); }
+.badge.credential-expiring { background: #fffaeb; color: #b54708; }
+.badge.credential-expired, .badge.credential-rejected { background: var(--coral-soft); color: var(--coral); }
+
+/* Placement requests (a practice asks a few programs at once). */
+.placement .requests { list-style: none; margin: 0; padding: 0; }
+.placement .requests li { border-top: 1px solid var(--line); }
+button.request {
+  width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 0; background: none; color: var(--ink); border-radius: 0; text-align: left; font-weight: 400;
+}
+.request-main { display: flex; flex-direction: column; gap: 3px; font-size: 15px; }
+.request-main span { color: var(--gray); font-size: 14px; }
+.request-main small, .request-side small { color: var(--gray); font-size: 12px; }
+.request-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
+.placement dl.summary { margin: 12px 0 4px; }
+.placement dl.summary div { display: flex; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); }
+.placement dl.summary dt { flex: 0 0 150px; font-size: 13px; font-weight: 700; color: var(--gray); }
+.placement dl.summary dd { margin: 0; font-size: 15px; }
+.placement .choices { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.placement > button.ghost.small { margin-bottom: 12px; }
+
+/* Referral handoff page (/h, src/Handoff.tsx) */
+.handoff-muted { color: var(--gray); }
+.handoff-eyebrow { color: var(--gray); font-size: 12px; font-weight: 700; letter-spacing: 0.5px; margin: 0 0 4px; }
+.handoff-title { font-size: 24px; margin: 0 0 8px; }
+.handoff-steps { list-style: none; padding: 0; margin: 20px 0; }
+.handoff-steps li { display: grid; grid-template-columns: 34px 1fr; gap: 12px; align-items: start; padding: 8px 0; color: var(--gray); }
+.handoff-steps strong { display: block; font-size: 15px; }
+.handoff-steps small { display: block; font-size: 13px; margin-top: 2px; }
+.handoff-marker { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; border: 2px solid var(--line); background: var(--card); font-size: 13px; font-weight: 700; }
+.handoff-steps li.done, .handoff-steps li.current { color: var(--ink); }
+.handoff-steps li.done .handoff-marker { background: var(--green); border-color: var(--green); color: #fff; }
+.handoff-steps li.current .handoff-marker { border-color: var(--blue); color: var(--blue); box-shadow: 0 0 0 4px var(--blue-soft); }
+.handoff-action { width: 100%; min-height: 48px; font-size: 16px; }

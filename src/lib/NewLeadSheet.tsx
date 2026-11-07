@@ -16,6 +16,7 @@ import {
 import { LEAD_SOURCES } from './business';
 import type { LeadUrgency } from './cases';
 import { phoneDigits } from './phone';
+import { WEB_PAGE } from './web-layout';
 
 // "New lead": phone-first, under ten seconds. Caller name and phone are the
 // only required fields; everything else is optional and can be added from the
@@ -257,7 +258,7 @@ export default function NewLeadSheet({ visible, targetMinutes, initialDraft, not
 }
 
 const styles = StyleSheet.create({
-  page: { flex: 1, backgroundColor: COLORS.cream },
+  page: { flex: 1, backgroundColor: COLORS.cream, ...WEB_PAGE },
   flex: { flex: 1 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: COLORS.line, backgroundColor: COLORS.white },
   headerTitle: { fontSize: 17, fontWeight: '800', color: COLORS.ink },

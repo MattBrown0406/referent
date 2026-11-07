@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 
+import Credentials from './Credentials';
+import PlacementRequests from './PlacementRequests';
 import { supabase } from './supabase';
 
 // ReferralFit for Programs — the treatment-center side of the platform.
@@ -536,6 +538,7 @@ export default function App() {
               controlled by ReferralFit.
             </p>
           </div>
+          <PlacementRequests onNotice={setNotice} onError={setError} />
           {carriesBeds(listing.types) ? (
             <form className="card beds" onSubmit={saveBeds}>
               <h2>Beds available today</h2>
@@ -591,6 +594,7 @@ export default function App() {
               ) : null}
             </form>
           ) : null}
+          <Credentials listingId={listing.id} listingState={listing.state} onNotice={setNotice} onError={setError} />
           <form className="card" onSubmit={saveListing}>
             <h2>Listing details</h2>
             <label>Organization</label>

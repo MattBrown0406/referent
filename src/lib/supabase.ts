@@ -5,8 +5,14 @@ import { Platform } from 'react-native';
 // PUBLIC client values — the publishable (anon) key is designed to ship inside
 // the app bundle and is safe to commit. Row Level Security on every table
 // (owner-only policies) is what actually protects the data.
-export const SUPABASE_URL = 'https://ovfafffvcpaahktvlsdm.supabase.co';
-const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_szOYQ5hbfqTsZi1uI7t8zQ_OzdpYBzi';
+// A development build (never a release: __DEV__ is false there) can point at
+// the local Supabase stack with EXPO_PUBLIC_SUPABASE_URL and
+// EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY, to try the app without production.
+const DEV_BUILD = typeof __DEV__ !== 'undefined' && __DEV__;
+const LOCAL_URL = DEV_BUILD ? process.env.EXPO_PUBLIC_SUPABASE_URL : undefined;
+const LOCAL_KEY = DEV_BUILD ? process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY : undefined;
+export const SUPABASE_URL = LOCAL_URL && LOCAL_KEY ? LOCAL_URL : 'https://ovfafffvcpaahktvlsdm.supabase.co';
+export const SUPABASE_PUBLISHABLE_KEY = LOCAL_URL && LOCAL_KEY ? LOCAL_KEY : 'sb_publishable_szOYQ5hbfqTsZi1uI7t8zQ_OzdpYBzi';
 
 // SecureStore values are capped around 2KB, and Supabase auth session JSON
 // (access + refresh tokens) can exceed that, so chunk the value across a few

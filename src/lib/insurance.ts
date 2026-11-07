@@ -4,8 +4,10 @@
 // the matching migration is 20261001170000_insurance_workflow.sql.
 //
 // What is stored about the plan: carrier, plan name, the LAST FOUR
-// characters of the member id, and who the subscriber is. Never the full
-// member id, never a date of birth, never an SSN. This is case-file data:
+// characters of the member id, who the subscriber is, and the plan's cost
+// sharing (deductible, out-of-pocket max, coinsurance; family-cost.ts turns
+// it into an estimate). Never the full member id, never a date of birth,
+// never an SSN. This is case-file data:
 // it stays under the workspace RLS and never reaches the directory, the
 // portal, a push payload, or an aggregate.
 
@@ -51,12 +53,36 @@ export function subscriberRelationshipLabel(value: string): string {
   return SUBSCRIBER_RELATIONSHIPS.find((item) => item.value === value)?.label || 'Not set';
 }
 
+/**
+ * One network's cost sharing on the family's plan (migration
+ * 20261104120000_family_cost.sql). Whole dollars; null is "not entered",
+ * never 0. The estimate built from it lives in family-cost.ts.
+ */
+export type NetworkBenefits = {
+  deductible: number | null;
+  deductibleMet: number | null; // never more than the deductible
+  oopMax: number | null; // out-of-pocket maximum
+  oopMet: number | null; // never more than the out-of-pocket max
+  coinsurancePct: number | null; // 0-100: the family's share after the deductible
+};
+
+export const EMPTY_NETWORK_BENEFITS: NetworkBenefits = {
+  deductible: null,
+  deductibleMet: null,
+  oopMax: null,
+  oopMet: null,
+  coinsurancePct: null,
+};
+
 export type CaseBenefits = {
   caseId: string;
   carrier: string;
   planName: string;
   memberIdLast4: string; // exactly four characters or empty; the server refuses more
   subscriberRelationship: SubscriberRelationship;
+  inNetwork: NetworkBenefits;
+  outOfNetwork: NetworkBenefits; // all null when oonBenefits is false
+  oonBenefits: boolean | null; // does the plan pay anything out-of-network? null = not known
   updatedAt: string;
 };
 
@@ -73,7 +99,26 @@ export type VobRequest = {
   answeredBy: string; // the person at the program, free text
   note: string;
   quotedOutOfPocket: number | null; // whole dollars
+  // What the stay costs per day and what the plan needs (20261104120000).
+  // Whole dollars; null is "not known", never 0.
+  allowedDailyRate: number | null; // the plan's (estimated) allowed amount per day
+  billedDailyRate: number | null; // the program's billed price per day
+  copayPerDay: number | null;
+  precertRequired: boolean | null; // pre-authorization needed? null = not known
   followUpId?: string;
+};
+
+/** The plan's cost sharing as one value (what save_case_benefits stores alongside the plan). */
+export type PlanCosts = Pick<CaseBenefits, 'inNetwork' | 'outOfNetwork' | 'oonBenefits'>;
+
+/** A VOB answer's cost fields (what update_vob_status stores alongside the answer). */
+export type VobCosts = Pick<VobRequest, 'allowedDailyRate' | 'billedDailyRate' | 'copayPerDay' | 'precertRequired'>;
+
+export const EMPTY_VOB_COSTS: VobCosts = {
+  allowedDailyRate: null,
+  billedDailyRate: null,
+  copayPerDay: null,
+  precertRequired: null,
 };
 
 export type PlanNetworkStatus = 'in_network' | 'out_of_network' | 'unknown';
@@ -87,6 +132,115 @@ export type PartnerPlanStatus = {
   source: PlanNetworkSource;
   sameState: boolean | null;
 };
+
+// ─── Cost columns on the wire (20261104120000_family_cost.sql) ──────────────
+// Row and p_patch shapes for the plan's cost sharing and an answer's rates.
+// Kept here, beside the types, so cases.ts needs nothing heavier.
+
+export const PLAN_COST_COLUMNS = [
+  'in_deductible', 'in_deductible_met', 'in_oop_max', 'in_oop_met', 'in_coinsurance_pct', 'oon_benefits',
+  'oon_deductible', 'oon_deductible_met', 'oon_oop_max', 'oon_oop_met', 'oon_coinsurance_pct',
+] as const;
+
+export const VOB_COST_COLUMNS = ['allowed_daily_rate', 'billed_daily_rate', 'copay_per_day', 'precert_required'] as const;
+
+type Row = Record<string, unknown>;
+
+function wholeOrNull(value: unknown): number | null {
+  if (value == null || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function tristate(value: unknown): boolean | null {
+  return value === true || value === false ? value : null;
+}
+
+function networkFromRow(row: Row, prefix: 'in' | 'oon'): NetworkBenefits {
+  return {
+    deductible: wholeOrNull(row[`${prefix}_deductible`]),
+    deductibleMet: wholeOrNull(row[`${prefix}_deductible_met`]),
+    oopMax: wholeOrNull(row[`${prefix}_oop_max`]),
+    oopMet: wholeOrNull(row[`${prefix}_oop_met`]),
+    coinsurancePct: wholeOrNull(row[`${prefix}_coinsurance_pct`]),
+  };
+}
+
+/** A case_benefits row's cost columns; a server without them reads as all "not entered". */
+export function planCostsFromRow(row: Row): PlanCosts {
+  return { inNetwork: networkFromRow(row, 'in'), outOfNetwork: networkFromRow(row, 'oon'), oonBenefits: tristate(row.oon_benefits) };
+}
+
+function networkToPatch(prefix: 'in' | 'oon', benefits: NetworkBenefits): Row {
+  return {
+    [`${prefix}_deductible`]: benefits.deductible,
+    [`${prefix}_deductible_met`]: benefits.deductibleMet,
+    [`${prefix}_oop_max`]: benefits.oopMax,
+    [`${prefix}_oop_met`]: benefits.oopMet,
+    [`${prefix}_coinsurance_pct`]: benefits.coinsurancePct,
+  };
+}
+
+/** The save_case_benefits p_patch keys for a plan's cost sharing (null clears). */
+export function planCostsToPatch(plan: PlanCosts): Row {
+  const outOfNetwork = plan.oonBenefits === false ? EMPTY_NETWORK_BENEFITS : plan.outOfNetwork;
+  return { ...networkToPatch('in', plan.inNetwork), oon_benefits: plan.oonBenefits, ...networkToPatch('oon', outOfNetwork) };
+}
+
+export const EMPTY_PLAN_COSTS: PlanCosts = { inNetwork: EMPTY_NETWORK_BENEFITS, outOfNetwork: EMPTY_NETWORK_BENEFITS, oonBenefits: null };
+
+function changedKeys(before: Row, after: Row, always: string[] = []): Row {
+  const patch: Row = {};
+  for (const [key, value] of Object.entries(after)) {
+    if (always.includes(key) || before[key] !== value) patch[key] = value;
+  }
+  return patch;
+}
+
+const OON_AMOUNT_KEYS = ['oon_deductible', 'oon_deductible_met', 'oon_oop_max', 'oon_oop_met', 'oon_coinsurance_pct'];
+
+/**
+ * The save_case_benefits p_patch keys for only the amounts the editor
+ * changed from what it opened with (`opened`), so a teammate's update to
+ * another amount made meanwhile is never sent back over. Changing
+ * out-of-network benefits to "No" clears those amounts; a plan that already
+ * read "No" when the editor opened sends only what changed, so a teammate
+ * who switched it back to "Yes" meanwhile (with amounts) is not undone.
+ */
+export function changedPlanCostsPatch(opened: PlanCosts | null | undefined, edited: PlanCosts): Row {
+  const clearsOutOfNetwork = edited.oonBenefits === false && opened?.oonBenefits !== false;
+  return changedKeys(planCostsToPatch(opened ?? EMPTY_PLAN_COSTS), planCostsToPatch(edited), clearsOutOfNetwork ? ['oon_benefits', ...OON_AMOUNT_KEYS] : []);
+}
+
+/** `current` (what the case holds now) with the editor's changes from `opened` laid over it: the optimistic copy of a changed-keys save. */
+export function mergePlanCostsChanges(current: PlanCosts | null | undefined, opened: PlanCosts | null | undefined, edited: PlanCosts): PlanCosts {
+  const patch = changedPlanCostsPatch(opened, edited);
+  return planCostsFromRow({ ...planCostsToPatch(current ?? EMPTY_PLAN_COSTS), ...patch });
+}
+
+/** The update_vob_status p_patch keys for only the rates the answer form changed from what it opened with. */
+export function changedVobCostsPatch(opened: VobCosts | null | undefined, edited: VobCosts): Row {
+  return changedKeys(vobCostsToPatch(opened ?? EMPTY_VOB_COSTS), vobCostsToPatch(edited));
+}
+
+export function vobCostsFromRow(row: Row): VobCosts {
+  return {
+    allowedDailyRate: wholeOrNull(row.allowed_daily_rate),
+    billedDailyRate: wholeOrNull(row.billed_daily_rate),
+    copayPerDay: wholeOrNull(row.copay_per_day),
+    precertRequired: tristate(row.precert_required),
+  };
+}
+
+/** The update_vob_status p_patch keys for an answer's rates (null clears). */
+export function vobCostsToPatch(costs: VobCosts): Row {
+  return {
+    allowed_daily_rate: costs.allowedDailyRate,
+    billed_daily_rate: costs.billedDailyRate,
+    copay_per_day: costs.copayPerDay,
+    precert_required: costs.precertRequired,
+  };
+}
 
 // ─── The plan: what the app keeps and what it refuses ───────────────────────
 

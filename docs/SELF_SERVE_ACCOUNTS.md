@@ -40,22 +40,47 @@ turning on Confirm email for prospects.
 ### Authentication → URL Configuration
 
 Both the reset link and the confirmation link redirect into the app via its
-custom scheme (`"scheme": "referralfit"` in `app.json`). Supabase only
-redirects to allow-listed URLs, so add both:
+custom scheme (`"scheme": "referralfit"` in `app.json`), or, when the person
+started in the web app, back to the web app's own origin (see
+[WEB_APP.md](WEB_APP.md)). Supabase only redirects to allow-listed URLs, so
+add all four:
 
 | Field | Value |
 | --- | --- |
 | Site URL | keep as is (used only when a redirect is not allow-listed) |
 | Redirect URLs (add) | `referralfit://auth/recovery` |
 | Redirect URLs (add) | `referralfit://auth/confirmed` |
+| Redirect URLs (add) | `https://app.referralfit.com/auth/recovery` |
+| Redirect URLs (add) | `https://app.referralfit.com/auth/confirmed` |
 
 If these are missing, the email link lands on the Site URL in a browser tab
 instead of opening the app, and the user cannot set a new password.
 
-### Email templates (optional)
+### Authentication -> Emails -> Templates
 
-The default **Reset Password** and **Confirm signup** templates work. If you
-edit them, keep `{{ .ConfirmationURL }}` in the link.
+The app sends two emails, branded in `supabase/templates/` (the local stack
+uses the same files, so they can be checked in Mailpit). Production does not
+read the repo: paste each one by hand. Never run `supabase config push` to do
+it; that overwrites every production auth setting with the local ones.
+
+| Template | Subject | Message body |
+| --- | --- | --- |
+| **Confirm signup** | `Confirm your email for ReferralFit` | all of `supabase/templates/confirmation.html` |
+| **Reset password** | `Reset your ReferralFit password` | all of `supabase/templates/recovery.html` |
+
+Keep `{{ .ConfirmationURL }}` as the link: it is Supabase's own verify URL,
+and it carries `redirect_to` back to the app or to the web page that asked.
+The other templates (Invite user, Magic link, Change email address,
+Reauthentication) are not used by the app; leave them as they are.
+
+The emails go out through the referralfit.com SMTP sender (Resend). Keep
+Resend's click tracking off for that domain: it would send these sign-in
+links through a tracking redirect.
+
+If people on company email (Microsoft 365 / Outlook) report that a fresh link
+says it has expired, their mail scanner is opening the link before they do.
+The fix is a confirm page that verifies only on a button press
+(`{{ .TokenHash }}` + `verifyOtp`); not built, since nobody has hit it yet.
 
 ## 2. Apply the migration
 
@@ -102,10 +127,12 @@ metadata. `handle_new_user()` turns that into the workspace name and the
 owner's display name. Password is never logged or echoed.
 
 **Forgot password**: `supabase.auth.resetPasswordForEmail(email, { redirectTo:
-'referralfit://auth/recovery' })`. Opening the link on the phone launches the
-app; `App.tsx` exchanges the tokens in the link for a session and shows
-`src/lib/ResetPasswordScreen.tsx`, which calls `supabase.auth.updateUser`.
-The link must be opened on a device with the app installed.
+authRedirectUrl('recovery', currentWebOrigin()) })` — `referralfit://auth/recovery`
+on a phone, `https://app.referralfit.com/auth/recovery` in a browser. Opening
+the link launches the app (or the web app); `App.tsx` exchanges the tokens in
+the link for a session and shows `src/lib/ResetPasswordScreen.tsx`, which
+calls `supabase.auth.updateUser`. The link works only on the device or
+browser that asked for it, within a day.
 
 **Delete account** (`src/lib/WorkspaceScreen.tsx` → `src/lib/account.ts` →
 `public.prepare_account_deletion()` → files → `public.delete_own_account()`):

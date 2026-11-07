@@ -24,6 +24,7 @@ import {
   invoiceIsOpen,
   uniqueIntegrations,
 } from './business';
+import { WEB_PAGE } from './web-layout';
 
 type Props = {
   visible: boolean;
@@ -370,7 +371,7 @@ export default function BusinessDashboard({
 }
 
 const styles = StyleSheet.create({
-  safeArea: { flex: 1, backgroundColor: '#F6F4EE' },
+  safeArea: { flex: 1, backgroundColor: '#F6F4EE', ...WEB_PAGE },
   header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#DDE4DF', backgroundColor: '#FFFFFF' },
   headerCopy: { flex: 1, alignItems: 'center' },
   headerTitle: { color: '#16352E', fontSize: 17, fontWeight: '800' },

@@ -2,10 +2,15 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 
 import App from './App';
+import Handoff from './Handoff';
 import './styles.css';
+
+// /h is a referral handoff's page (signed out, src/Handoff.tsx); everything
+// else is the center portal.
+const isHandoff = /^\/h\/?$/.test(window.location.pathname);
 
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    {isHandoff ? <Handoff /> : <App />}
   </React.StrictMode>,
 );

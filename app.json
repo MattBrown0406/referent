@@ -28,7 +28,13 @@
     },
     "web": {
       "favicon": "./assets/icon-referent-symbiosis.png",
-      "bundler": "metro"
+      "bundler": "metro",
+      "output": "single",
+      "name": "ReferralFit",
+      "shortName": "ReferralFit",
+      "description": "ReferralFit for practices: cases, placement matches, and your referral network.",
+      "themeColor": "#1F5A49",
+      "backgroundColor": "#F6F4EE"
     },
     "scheme": "referralfit",
     "plugins": [
@@ -36,7 +42,7 @@
       [
         "expo-secure-store",
         {
-          "faceIDPermission": false
+          "faceIDPermission": "ReferralFit uses Face ID to unlock the app, so your cases stay private if someone else picks up your phone."
         }
       ],
       [

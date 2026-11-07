@@ -248,16 +248,28 @@ function isScheduleCurrent(generation: number, ownerId: string): boolean {
   return generation === scheduleGeneration && ownerId === scheduleOwnerId;
 }
 
+// What replaceSchedule last put on the system, per account: identical plans
+// are not re-applied. Forgotten whenever the system's copy is cleared.
+let lastAppliedSchedule: { ownerId: string; signature: string } | null = null;
+
 async function replaceSchedule(input: NotificationInput, generation: number, ownerId: string): Promise<void> {
   const permission = await getNotificationPermissionState();
   if (!isScheduleCurrent(generation, ownerId)) return;
   if (permission !== 'authorized') {
-    await Notifications.cancelAllScheduledNotificationsAsync();
+    lastAppliedSchedule = null;
+    if (permission !== 'unsupported') await Notifications.cancelAllScheduledNotificationsAsync();
     return;
   }
 
-  await Notifications.cancelAllScheduledNotificationsAsync();
-  if (!isScheduleCurrent(generation, ownerId)) return;
+  // Planned first, then applied only when it differs from what this device
+  // last scheduled: most saves leave the reminders exactly as they were, and
+  // cancelling and re-adding up to MAX_SCHEDULED of them on every save held
+  // the save lock for no change.
+  const requests: Notifications.NotificationRequestInput[] = [];
+  const plan = (request: Notifications.NotificationRequestInput): boolean => {
+    requests.push(request);
+    return true;
+  };
 
   const { partners } = input;
   // The user's own follow-ups and consult alerts come before partner cadence
@@ -269,7 +281,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
 
   // Static copy is intentional: a repeating notification cannot carry a live
   // count. The current count is shown after the user opens the app.
-  if (remaining > 0 && await scheduleIfCurrent(generation, ownerId, {
+  if (remaining > 0 && plan({
     content: {
       title: 'ReferralFit briefing',
       body: "Open ReferralFit to review today's actions.",
@@ -293,7 +305,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
     const [hour, minute] = followUp.dueTime.split(':').map(Number);
     const when = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), hour || 0, (minute || 0) - 30, 0);
     if (when.getTime() <= now.getTime()) continue;
-    if (await scheduleIfCurrent(generation, ownerId, {
+    if (plan({
       content: {
         title: 'Consult in 30 minutes',
         body: `Consult at ${clockLabel(followUp.dueTime)}`,
@@ -330,7 +342,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
     const body = pastDue.length === 1
       ? GENERIC_FOLLOW_UP_BODY
       : allOverdue ? `${pastDue.length} overdue follow-ups` : `${pastDue.length} follow-ups due or overdue`;
-    if (await scheduleIfCurrent(generation, ownerId, {
+    if (plan({
       content: {
         title: pastDue.length === 1 ? 'Follow-up due' : 'Follow-ups due',
         body,
@@ -346,7 +358,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   }
   for (const { when } of upcoming) {
     if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;
-    if (await scheduleIfCurrent(generation, ownerId, {
+    if (plan({
       content: {
         title: 'Follow-up due',
         body: GENERIC_FOLLOW_UP_BODY,
@@ -391,7 +403,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
     for (const when of dates) {
       if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;
       const ageAtDelivery = daysSince + Math.max(0, daysBetween(now, when));
-      if (await scheduleIfCurrent(generation, ownerId, {
+      if (plan({
         content: {
           title: 'ReferralFit',
           body: `Time to reach out to a referral partner — it's been ${ageAtDelivery} ${ageAtDelivery === 1 ? 'day' : 'days'}`,
@@ -406,6 +418,25 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
       })) remaining -= 1;
     }
   }
+
+  if (!isScheduleCurrent(generation, ownerId)) return;
+  const signature = JSON.stringify(requests);
+  if (lastAppliedSchedule && lastAppliedSchedule.ownerId === ownerId && lastAppliedSchedule.signature === signature) return;
+  lastAppliedSchedule = null;
+  await Notifications.cancelAllScheduledNotificationsAsync();
+  for (const request of requests) {
+    if (!(await scheduleIfCurrent(generation, ownerId, request))) return;
+  }
+  lastAppliedSchedule = { ownerId, signature };
+}
+// Scheduled reminders, delivered ones, and the last tap, as the system holds
+// them. A browser has none of these (the web app shows what is due on Today).
+async function clearSystemNotifications(): Promise<void> {
+  if (Platform.OS === 'web') return;
+  lastAppliedSchedule = null;
+  await Notifications.cancelAllScheduledNotificationsAsync();
+  await Notifications.dismissAllNotificationsAsync();
+  await Notifications.clearLastNotificationResponseAsync();
 }
 
 export function activateReferralFitNotificationOwner(ownerId: string): Promise<void> {
@@ -414,11 +445,7 @@ export function activateReferralFitNotificationOwner(ownerId: string): Promise<v
   // A tap that launched the app arrived before anyone was signed in: hand it
   // over now (for this account only) — the work below clears the OS copy.
   deliverHeldTaps();
-  return queueScheduleWork(async () => {
-    await Notifications.cancelAllScheduledNotificationsAsync();
-    await Notifications.dismissAllNotificationsAsync();
-    await Notifications.clearLastNotificationResponseAsync();
-  });
+  return queueScheduleWork(clearSystemNotifications);
 }
 
 export function rescheduleNotifications(input: NotificationInput, ownerId: string): Promise<void> {
@@ -430,11 +457,7 @@ export function rescheduleNotifications(input: NotificationInput, ownerId: strin
 export function cancelReferralFitNotifications(): Promise<void> {
   scheduleOwnerId = null;
   ++scheduleGeneration;
-  return queueScheduleWork(async () => {
-    await Notifications.cancelAllScheduledNotificationsAsync();
-    await Notifications.dismissAllNotificationsAsync();
-    await Notifications.clearLastNotificationResponseAsync();
-  });
+  return queueScheduleWork(clearSystemNotifications);
 }
 
 // ─── Tap handling ───────────────────────────────────────────────────────────
@@ -443,7 +466,7 @@ export function cancelReferralFitNotifications(): Promise<void> {
 // (see docs/NOTIFICATIONS.md) carry { kind, user_id, case_id, ... } and
 // nothing private: the app resolves the item after sign-in. Either way a tap
 // is honored only for the account the notification was addressed to.
-export type NotificationTarget = 'home' | 'directory' | 'case' | 'workspace';
+export type NotificationTarget = 'home' | 'directory' | 'case' | 'workspace' | 'placement';
 
 export type RemotePushData = {
   kind?: string;
@@ -451,9 +474,12 @@ export type RemotePushData = {
   case_id?: string;
   follow_up_id?: string;
   global_partner_id?: string;
+  placement_request_id?: string;
 };
 
-export function remotePushTarget(data: RemotePushData): { target: NotificationTarget; caseId?: string } | null {
+const PUSH_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function remotePushTarget(data: RemotePushData): { target: NotificationTarget; caseId?: string; placementRequestId?: string } | null {
   switch (data.kind) {
     case 'new_lead':
     case 'assigned_to_me':
@@ -467,13 +493,19 @@ export function remotePushTarget(data: RemotePushData): { target: NotificationTa
       // The listing id is in data; the app opens the Directory, where the
       // live count shows. Nothing about the program is in the push itself.
       return { target: 'directory' };
+    case 'placement_response':
+      // The request's answers, side by side (PlacementCompare reads them
+      // fresh); Today if the id is missing.
+      return typeof data.placement_request_id === 'string' && PUSH_UUID_RE.test(data.placement_request_id)
+        ? { target: 'placement', placementRequestId: data.placement_request_id.toLowerCase() }
+        : { target: 'home' };
     default:
       return null;
   }
 }
 
-type TapListener = (target: NotificationTarget, partnerId?: string, caseId?: string) => void;
-type Tap = { requestId: string; ownerId: string; target: NotificationTarget; partnerId?: string; caseId?: string };
+type TapListener = (target: NotificationTarget, partnerId?: string, caseId?: string, placementRequestId?: string) => void;
+type Tap = { requestId: string; ownerId: string; target: NotificationTarget; partnerId?: string; caseId?: string; placementRequestId?: string };
 
 const tapListeners = new Set<TapListener>();
 // Taps that arrived while no account was active yet (the app was launched by
@@ -491,7 +523,7 @@ function tapOf(response: Notifications.NotificationResponse | null): Tap | null 
     if (typeof data.user_id !== 'string' || !data.user_id) return null;
     const remote = remotePushTarget(data);
     if (!remote) return null;
-    return { requestId, ownerId: data.user_id.toLowerCase(), target: remote.target, caseId: remote.caseId };
+    return { requestId, ownerId: data.user_id.toLowerCase(), target: remote.target, caseId: remote.caseId, placementRequestId: remote.placementRequestId };
   }
   if (typeof data.ownerId !== 'string' || !data.ownerId) return null;
   if (data.target !== 'home' && data.target !== 'directory') return null;
@@ -506,7 +538,7 @@ function deliverTap(tap: Tap): boolean {
   if (tap.ownerId !== scheduleOwnerId.toLowerCase()) return true;
   if (!tapListeners.size) return false;
   handledResponseIds.add(tap.requestId);
-  for (const listener of Array.from(tapListeners)) listener(tap.target, tap.partnerId, tap.caseId);
+  for (const listener of Array.from(tapListeners)) listener(tap.target, tap.partnerId, tap.caseId, tap.placementRequestId);
   return true;
 }
 
@@ -523,12 +555,13 @@ function deliverHeldTaps(): void {
   for (const tap of waiting) if (!deliverTap(tap)) heldTaps.push(tap);
 }
 
-// The callback receives (target, partnerId, caseId). A tap is delivered once,
+// The callback receives (target, partnerId, caseId, placementRequestId). A tap is delivered once,
 // only while its account is the active notification owner; a tap that
 // arrives before the owner is set (cold start) is held and delivered when
 // activateReferralFitNotificationOwner names that same account.
 export function subscribeToNotificationResponses(onTarget: TapListener): () => void {
   tapListeners.add(onTarget);
+  if (Platform.OS === 'web') return () => { tapListeners.delete(onTarget); };
   const subscription = Notifications.addNotificationResponseReceivedListener(receiveResponse);
   deliverHeldTaps();
   Notifications.getLastNotificationResponseAsync()

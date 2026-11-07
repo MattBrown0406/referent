@@ -86,6 +86,7 @@ trigger / hourly job  ->  notification_outbox  ->  push-dispatch (edge fn)  ->  
 | `global_partners` moves from `pending` to `active` or `archived` | every member of the submitting workspace except the reviewer | `directory_decision` |
 | hourly job finds open follow-ups past their day that are mine (own assignee, or the case's assignee when the follow-up has none). Steps open when a case closed or was lost are skipped then (`TEAM_BASICS.md`), so they no longer count; a step scheduled after the close does | the member, once a day at 9 AM in their timezone | `overdue_mine` |
 | `set_listing_beds` moves a gender's count from 0 or unknown to open (`BED_AVAILABILITY.md`) | every member of a workspace that favorited or imported the listing, except the person who set it; opt-in, default off; at most once per listing per six hours | `bed_opened` |
+| a program answers a placement request in the center portal, or changes its answer (`respond_to_placement_request`; an answer the practitioner logs sends nothing) | the practitioner who sent the request, while still in that workspace and while the request is open (never for an answer they gave themselves); on by default. Answers that arrive before the next send fold into one push per request, a program editing its answer pushes at most once every 15 minutes per request, and closing, cancelling or deleting the request drops a push not yet sent (one the sender claimed in the last 5 minutes is left to it; if that send fails and is retried, the push can still arrive after the close, a rare edge accepted). The push says only "A program answered"; its data is the request id, and a tap opens that request's answers | `placement_response` |
 
 Timezone: the app reports the device offset on every registration and
 preference save (`tz_offset_minutes`, minutes east of UTC). Until a device
@@ -97,11 +98,13 @@ Deployment and APNs setup are done by hand (they need a Supabase access
 token and EAS credentials). Order matters: migration, then function and
 secrets, then cron settings, then a build with the push entitlement.
 
-### 1. Migration
+### 1. Extensions, then migrations
 
-Follow `TEAM_BASICS.md` (paste the file in the SQL editor, then record the
-version). The cron jobs are created by the migration where `pg_cron` is
-installed, but they do nothing until step 3.
+Enable `pg_cron` and `pg_net` first (Database > Extensions). Then paste
+`20261106120000_placement_response_push.sql` (after the team-basics and
+bed-availability migrations, which production already has): it schedules
+the three cron jobs below where `pg_cron` is on, and they do nothing until
+step 3.
 
 ### 2. Function and secrets
 
@@ -121,18 +124,19 @@ any database call.
 
 ### 3. Schedule (pg_cron + pg_net)
 
-Enable both extensions in the dashboard (Database > Extensions:
-`pg_cron`, `pg_net`) if they are not already on, then tell the database
-where the function lives. Run in the SQL editor:
+Tell the database where the function lives and the secret it expects, in
+Vault (Supabase no longer lets the `postgres` role `ALTER DATABASE ... SET
+app.*`; `push_dispatch_tick()` reads Vault first and still accepts those
+settings where they exist). Run in the SQL editor:
 
 ```sql
-ALTER DATABASE postgres SET app.push_dispatch_url = 'https://<ref>.supabase.co/functions/v1/push-dispatch';
-ALTER DATABASE postgres SET app.push_dispatch_secret = '<the PUSH_DISPATCH_SECRET value>';
-SELECT pg_reload_conf();
+SELECT vault.create_secret('https://<ref>.supabase.co/functions/v1/push-dispatch', 'referralfit_push_dispatch_url');
+SELECT vault.create_secret('<the PUSH_DISPATCH_SECRET value>', 'referralfit_push_dispatch_secret');
 ```
 
-The three jobs the migration created (re-run that `DO` block from the
-migration if `pg_cron` was enabled after the migration):
+To change one later, `vault.update_secret(id, new_value)` with its id from
+`vault.secrets`. The three jobs (scheduled by 20261106120000 where `pg_cron`
+is on; re-run its `DO` block if `pg_cron` was enabled after it):
 
 | job | schedule | runs |
 | --- | --- | --- |

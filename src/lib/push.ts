@@ -17,7 +17,7 @@ import { supabase } from './supabase';
 // Workspace screen calls when the member turns push on. Sign-in refreshes a
 // registration silently and never prompts.
 
-export type NotificationKind = 'new_lead' | 'assigned_to_me' | 'overdue_mine' | 'directory_decision' | 'directory_submission' | 'bed_opened';
+export type NotificationKind = 'new_lead' | 'assigned_to_me' | 'overdue_mine' | 'directory_decision' | 'directory_submission' | 'bed_opened' | 'placement_response';
 
 export type NotificationPreferences = {
   pushEnabled: boolean;
@@ -27,6 +27,7 @@ export type NotificationPreferences = {
   directoryDecision: boolean;
   directorySubmission: boolean; // platform admins only; ignored server-side for everyone else
   bedOpened: boolean; // opt-in: a program you favorited or added to your network opens a bed
+  placementResponse: boolean; // a program answers a placement request you sent
 };
 
 export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
@@ -37,6 +38,7 @@ export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
   directoryDecision: true,
   directorySubmission: false,
   bedOpened: false,
+  placementResponse: true,
 };
 
 export const NOTIFICATION_KIND_ROWS: { key: NotificationKind; label: string; description: string; adminOnly?: boolean }[] = [
@@ -44,6 +46,7 @@ export const NOTIFICATION_KIND_ROWS: { key: NotificationKind; label: string; des
   { key: 'assigned_to_me', label: 'Something is assigned to me', description: 'A case or follow-up a teammate hands to you.' },
   { key: 'overdue_mine', label: 'My follow-ups are past due', description: 'One reminder a day, around 9 AM your time.' },
   { key: 'directory_decision', label: 'A directory decision', description: 'When ReferralFit reviews a listing your practice submitted.' },
+  { key: 'placement_response', label: 'A program answers my placement request', description: 'Bed, fit and cost answers, as they come in. Several at once arrive as one heads-up.' },
   { key: 'bed_opened', label: 'A bed opens at a program I follow', description: 'When a program you favorited or added to your network goes from full or unknown to a bed open. Off until you turn it on.' },
   { key: 'directory_submission', label: 'A new directory submission', description: 'Platform admins only.', adminOnly: true },
 ];
@@ -55,6 +58,7 @@ const KIND_COLUMNS: Record<NotificationKind, keyof NotificationPreferences> = {
   directory_decision: 'directoryDecision',
   directory_submission: 'directorySubmission',
   bed_opened: 'bedOpened',
+  placement_response: 'placementResponse',
 };
 
 export function preferenceFor(preferences: NotificationPreferences, kind: NotificationKind): boolean {
@@ -80,6 +84,8 @@ type PreferencesRow = {
   directory_submission: boolean;
   // Added by 20261001150000_bed_availability.sql; absent on an older server.
   bed_opened?: boolean | null;
+  // Added by 20261106120000_placement_response_push.sql; same.
+  placement_response?: boolean | null;
 };
 
 function mapPreferences(row: PreferencesRow | null): NotificationPreferences {
@@ -92,6 +98,7 @@ function mapPreferences(row: PreferencesRow | null): NotificationPreferences {
     directoryDecision: Boolean(row.directory_decision),
     directorySubmission: Boolean(row.directory_submission),
     bedOpened: Boolean(row.bed_opened),
+    placementResponse: Boolean(row.placement_response),
   };
 }
 
@@ -104,21 +111,30 @@ export type PreferencesState = {
 
 const BASE_PREFERENCE_COLUMNS = 'push_enabled, new_lead, assigned_to_me, overdue_mine, directory_decision, directory_submission';
 
-// 42703: a column the server does not have yet (the bed-availability
-// migration is newer than the database). Read and write without it so the
-// other switches keep working; bed_opened then reads as off.
-const UNDEFINED_COLUMN = '42703';
+// A column the server does not have yet (bed_opened, placement_response:
+// their migrations are newer than the database). Read and write without it
+// so the other switches keep working (turning push off too); it then reads
+// as off. A select reports it as Postgres's 42703; an upsert never reaches
+// Postgres: PostgREST checks its schema cache and answers PGRST204.
+export function isMissingColumn(error: { code?: string } | null | undefined): boolean {
+  return error?.code === '42703' || error?.code === 'PGRST204';
+}
+
+// The newer columns, newest first: an older server drops one at a time.
+const OPTIONAL_PREFERENCE_COLUMNS = ['placement_response', 'bed_opened'] as const;
 
 export async function fetchNotificationPreferences(userId: string): Promise<PreferencesState> {
+  let optional: readonly string[] = OPTIONAL_PREFERENCE_COLUMNS;
   let { data, error } = await supabase
     .from('notification_preferences')
-    .select(`${BASE_PREFERENCE_COLUMNS}, bed_opened`)
+    .select([BASE_PREFERENCE_COLUMNS, ...optional].join(', '))
     .eq('user_id', userId)
     .maybeSingle();
-  if (error?.code === UNDEFINED_COLUMN) {
+  while (isMissingColumn(error) && optional.length) {
+    optional = optional.slice(1);
     ({ data, error } = await supabase
       .from('notification_preferences')
-      .select(BASE_PREFERENCE_COLUMNS)
+      .select([BASE_PREFERENCE_COLUMNS, ...optional].join(', '))
       .eq('user_id', userId)
       .maybeSingle());
   }
@@ -138,9 +154,16 @@ export async function saveNotificationPreferences(userId: string, preferences: N
     directory_submission: preferences.directorySubmission,
     tz_offset_minutes: deviceTzOffsetMinutes(),
   };
-  let { error } = await supabase.from('notification_preferences').upsert({ ...row, bed_opened: preferences.bedOpened }, { onConflict: 'user_id' });
-  if (error?.code === UNDEFINED_COLUMN) {
-    ({ error } = await supabase.from('notification_preferences').upsert(row, { onConflict: 'user_id' }));
+  const optional: Record<(typeof OPTIONAL_PREFERENCE_COLUMNS)[number], boolean> = {
+    placement_response: preferences.placementResponse,
+    bed_opened: preferences.bedOpened,
+  };
+  let names: readonly (typeof OPTIONAL_PREFERENCE_COLUMNS)[number][] = OPTIONAL_PREFERENCE_COLUMNS;
+  const withOptional = () => ({ ...row, ...Object.fromEntries(names.map((name) => [name, optional[name]])) });
+  let { error } = await supabase.from('notification_preferences').upsert(withOptional(), { onConflict: 'user_id' });
+  while (isMissingColumn(error) && names.length) {
+    names = names.slice(1);
+    ({ error } = await supabase.from('notification_preferences').upsert(withOptional(), { onConflict: 'user_id' }));
   }
   if (error) throw new StoreError(error.message || 'Could not save notification settings.', false);
 }

@@ -97,7 +97,7 @@ assert.doesNotMatch(source, /from\('follow_ups'\)\.select\('\*'\)\.order\('due_o
 // verified against the server by id. A cache-only row survives only while a
 // change that creates it is still waiting on this device (queue or rejected
 // list); otherwise it was deleted on the server and must not be resurrected.
-assert.match(source, /async function mergeUnsyncedLocal\(remote: Snapshot, local: Snapshot \| null, pending: PendingRows\)/);
+assert.match(source, /async function mergeUnsyncedLocal\(remote: Snapshot, local: Snapshot \| null, pending: PendingRows, windowStart = touchWindowStart\(\)\)/);
 assert.match(source, /local\.followUps\.filter\(\(row\) => row\.id && row\.status === 'open' && !remoteFollowUpIds\.has\(row\.id\)\)/, 'only open cached follow-ups may be merge candidates');
 assert.match(source, /from\('follow_ups'\)\.select\('\*'\)\.in\('id', chunk\)/, 'merge candidates must be verified against the server by id');
 assert.match(source, /openCandidates\.filter\(\(row\) => !serverById\.has\(row\.id\) && isPendingRow\(pending\.followUps, row\.id\)\)/, 'only ids unknown to the server AND still created by a pending op may survive');
@@ -112,7 +112,10 @@ assert.match(casesSource, /export async function fetchCaseList\(\): Promise<Case
 assert.match(casesSource, /from\('case_contacts'\)\.select\('\*'\)\.eq\('org_id', orgId\)\.order\('created_at'/, 'case contacts must load for the whole workspace, not per case');
 assert.doesNotMatch(casesSource, /from\('case_contacts'\)\.select\('\*'\)\.eq\('org_id', orgId\)\.eq\('case_id'/, 'case contacts must not be lazy per case');
 assert.match(appSource, /const \[allCaseContacts, setAllCaseContacts\] = useState<CaseContact\[\]>\(\[\]\)/, 'App must keep the workspace-wide contact list');
-assert.match(appSource, /const primary = allCaseContacts\.find\(\(item\) => item\.caseId === record\.id && item\.isPrimary\)/, 'case cards must read the primary contact from the workspace-wide list');
+// Indexed once per change (a large practice has thousands of contacts),
+// first primary contact per case, as find() returned.
+assert.match(appSource, /const primaryContactByCase = useMemo\(\(\) => \{[\s\S]{0,200}for \(const contact of allCaseContacts\) if \(contact\.isPrimary && !index\.has\(contact\.caseId\)\) index\.set\(contact\.caseId, contact\);/, 'case cards must read the primary contact from the workspace-wide list');
+assert.match(appSource, /const primary = primaryContactByCase\.get\(record\.id\);/);
 assert.match(appSource, /setAllCaseContacts\(activeContacts\)/, 'hydration must store the workspace-wide contacts');
 assert.match(appSource, /setAllCaseContacts\(caseLoad\.list\.contacts\)/, 'foreground refresh must store the workspace-wide contacts');
 assert.match(casesSource, /export async function fetchCaseFile\(caseId: string\): Promise<CaseFile>/);
@@ -179,7 +182,7 @@ assert.match(source, /export async function readBoundWorkspace\(expectedUserId: 
 assert.match(source, /return stored && isUuid\(stored\) \? stored\.toLowerCase\(\) : null;/);
 assert.match(appSource, /orgId = await fetchCurrentOrgId\(\);\s*\} catch \(error\) \{\s*if \(!(?:isNetworkError|isServerUnreachable)\(error\)\) throw error;\s*const bound = await readBoundWorkspace\(userId\);\s*if \(!bound\) throw error;\s*orgId = bound;/, 'hydration must survive an offline workspace lookup using the last verified binding');
 // The App renders the saved copy instead of a blocking alert whenever one exists.
-assert.match(appSource, /const load = await loadCaseList\(userId\);[\s\S]{0,400}Alert\.alert\('Case files unavailable'/, 'hydration must load the case list through the cache-aware loader');
+assert.match(appSource, /const load = await loadCaseList\(userId\);[\s\S]{0,500}Alert\.alert\('Case files unavailable'/, 'hydration must load the case list through the cache-aware loader');
 assert.match(appSource, /setCaseListSource\(caseListLoad\)/);
 assert.match(appSource, /loadCaseFile\(userId, caseId\)[\s\S]{0,600}source: 'unavailable'/, 'opening a case must use the cache-aware loader and mark a missing copy');
 assert.match(appSource, /renderSavedCopyNotice\(caseFileSource, 'case file'\)/, 'a cached case file must say it is a saved copy');
@@ -367,7 +370,7 @@ const expectedSignatures = [
   /export async function discardRejectedWrite\(expectedUserId: string, rejectedId: string\)/,
   /export async function retryRejectedWrite\(expectedUserId: string, rejectedId: string\): Promise<number>/,
   /export async function bindLocalWorkspace\(expectedUserId: string, orgId: string\)/,
-  /export async function persistCache\(snapshot: Snapshot, expectedUserId: string\)/,
+  /export async function persistCache\(snapshot: Snapshot, expectedUserId: string, snapshotOrg\?: string\)/,
   /export async function refreshSnapshot\(expectedUserId: string\)/,
   /export async function createPartner\(partner: Partner, expectedUserId: string\)/,
   /export async function deleteMatchProfile\(matchId: string, expectedUserId: string\)/,

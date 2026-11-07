@@ -14,16 +14,15 @@ import {
 } from 'react-native';
 
 import {
+  authRedirectUrl,
   type AuthMode,
-  EMAIL_CONFIRM_REDIRECT,
   friendlyAuthError,
   isPlausibleEmail,
   normalizeEmail,
-  PASSWORD_RECOVERY_REDIRECT,
   PASSWORD_REQUIREMENTS,
   passwordProblem,
 } from './auth-flows';
-import { recordAuthFlowStart } from './auth-link-guard';
+import { currentWebOrigin, recordAuthFlowStart } from './auth-link-guard';
 import { openPrivacyPolicy } from './privacy';
 import { supabase } from './supabase';
 
@@ -48,7 +47,9 @@ type Props = {
 // A "notice" replaces the form after an email has been sent, so the user
 // knows exactly what to do next instead of staring at the same fields.
 type Notice =
-  | { kind: 'confirmEmail'; email: string }
+  // notConfirmed: reached from Sign in with the right password for an address
+  // that was never confirmed (its link may have expired).
+  | { kind: 'confirmEmail'; email: string; notConfirmed?: boolean }
   | { kind: 'resetSent'; email: string };
 
 const TAGLINES: Record<AuthMode, string> = {
@@ -92,6 +93,14 @@ export default function LoginScreen({ onSignedIn }: Props) {
     });
     setBusy(false);
     if (authError) {
+      // Supabase says this only once the password matched. Without a resend
+      // here, an expired confirmation link leaves no way into the account:
+      // signing up again only reports that it already exists.
+      if (authError.code === 'email_not_confirmed' || authError.message.toLowerCase().includes('email not confirmed')) {
+        setPassword('');
+        setNotice({ kind: 'confirmEmail', email: normalizeEmail(email), notConfirmed: true });
+        return;
+      }
       setError(friendlyAuthError(authError.message, 'signIn'));
       return;
     }
@@ -125,7 +134,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
     // The confirmation link signs in only on a device that started a sign-up
     // in the last day (App.tsx, decideAuthLink). Recorded before the email
     // can arrive.
-    await recordAuthFlowStart('signup');
+    await recordAuthFlowStart('signup', normalizedEmail);
     // handle_new_user() (supabase/migrations/20260929174333_self_serve_accounts.sql)
     // reads practice_name and display_name from raw_user_meta_data to create the
     // workspace and the owner membership.
@@ -134,7 +143,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
       password,
       options: {
         data: { practice_name: practice, display_name: name },
-        emailRedirectTo: EMAIL_CONFIRM_REDIRECT,
+        emailRedirectTo: authRedirectUrl('confirmed', currentWebOrigin()),
       },
     });
     setBusy(false);
@@ -163,11 +172,11 @@ export default function LoginScreen({ onSignedIn }: Props) {
     setBusy(true);
     setError(null);
     setInfo(null);
-    await recordAuthFlowStart('signup');
+    await recordAuthFlowStart('signup', target);
     const { error: resendError } = await supabase.auth.resend({
       type: 'signup',
       email: target,
-      options: { emailRedirectTo: EMAIL_CONFIRM_REDIRECT },
+      options: { emailRedirectTo: authRedirectUrl('confirmed', currentWebOrigin()) },
     });
     setBusy(false);
     if (resendError) {
@@ -188,9 +197,9 @@ export default function LoginScreen({ onSignedIn }: Props) {
     const normalizedEmail = normalizeEmail(email);
     // The reset link opens the new-password screen only on a device that
     // asked for a reset in the last day (App.tsx, decideAuthLink).
-    await recordAuthFlowStart('recovery');
+    await recordAuthFlowStart('recovery', normalizedEmail);
     const { error: resetError } = await supabase.auth.resetPasswordForEmail(normalizedEmail, {
-      redirectTo: PASSWORD_RECOVERY_REDIRECT,
+      redirectTo: authRedirectUrl('recovery', currentWebOrigin()),
     });
     setBusy(false);
     if (resetError) {
@@ -204,9 +213,11 @@ export default function LoginScreen({ onSignedIn }: Props) {
     const isConfirm = current.kind === 'confirmEmail';
     return (
       <>
-        <Text style={styles.noticeTitle}>{isConfirm ? 'Check your email' : 'Reset link sent'}</Text>
+        <Text style={styles.noticeTitle}>{isConfirm ? (current.notConfirmed ? 'Confirm your email first' : 'Check your email') : 'Reset link sent'}</Text>
         <Text style={styles.noticeBody}>
-          {isConfirm
+          {isConfirm && current.notConfirmed
+            ? `${current.email} has not been confirmed yet. Resend the confirmation email and open its link on this device, then sign in.`
+            : isConfirm
             ? `We sent a confirmation link to ${current.email}. Open it on this device to finish creating your account, then sign in.`
             : `If an account exists for ${current.email}, a link to set a new password is on its way. Open it on this device to continue.`}
         </Text>
@@ -365,7 +376,9 @@ export default function LoginScreen({ onSignedIn }: Props) {
 
             {notice ? renderNotice(notice) : renderForm()}
 
-            <Text style={styles.footnote}>Free for your practice. Create an account in a minute. Your practice's data is private to your workspace — other practices can never see it, and it is not sold or shared with advertisers. Your session stays on this device in secure storage.</Text>
+            <Text style={styles.footnote}>Free for your practice. Create an account in a minute. Your practice's data is private to your workspace — other practices can never see it, and it is not sold or shared with advertisers. {Platform.OS === 'web'
+              ? 'You stay signed in in this browser until you sign out, so sign out when you finish on a shared computer.'
+              : 'Your session stays on this device in secure storage.'}</Text>
             <TouchableOpacity accessibilityRole="link" accessibilityLabel="Privacy policy" accessibilityHint="Opens the ReferralFit privacy policy in your browser" onPress={openPrivacyPolicy} style={styles.privacyLink}>
               <Text style={styles.privacyLinkText}>Privacy policy</Text>
             </TouchableOpacity>

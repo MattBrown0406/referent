@@ -27,7 +27,7 @@ const OUTREACH_KINDS: FollowUpKind[] = ['first_call', 'follow_up', 'promised_cal
 
 export type OutreachTarget =
   | { kind: 'case'; caseId: string; title: string; status: CaseStatus; assignedTo?: string }
-  | { kind: 'partner'; partnerId: string; organization: string; name: string; types: string[] };
+  | { kind: 'partner'; partnerId: string; organization: string; name: string; types: string[]; contactedAt?: string };
 
 export type OutreachRecipient = {
   key: string; // contact id for a case contact, partner id for a partner
@@ -39,9 +39,12 @@ export type OutreachRecipient = {
 };
 
 export type OutreachHistory = {
-  count: number; // calls, texts, and emails already logged for the target
+  count: number; // calls, texts, and emails already logged for the target (a partner's: those loaded, the last year's)
   lastChannel: OutreachChannel | '';
   lastAt: string; // ISO; '' when there has been none
+  // A partner last contacted before the touches loaded (store.ts
+  // TOUCH_WINDOW_DAYS) and not since: reached before, never a first outreach.
+  earlier?: true;
 };
 
 export type TextDraft = { channel: 'text'; body: string };
@@ -55,13 +58,14 @@ export function caseTarget(record: Pick<CaseRecord, 'id' | 'title' | 'status' | 
   return { kind: 'case', caseId: record.id, title: record.title, status: record.status, assignedTo: record.assignedTo };
 }
 
-export function partnerTarget(partner: Pick<Partner, 'id' | 'organization' | 'name' | 'type' | 'types'>): OutreachTarget {
+export function partnerTarget(partner: Pick<Partner, 'id' | 'organization' | 'name' | 'type' | 'types' | 'contactedAt'>): OutreachTarget {
   return {
     kind: 'partner',
     partnerId: partner.id,
     organization: partner.organization,
     name: partner.name,
     types: partner.types?.length ? partner.types : [partner.type],
+    ...(partner.contactedAt ? { contactedAt: partner.contactedAt } : {}),
   };
 }
 
@@ -214,10 +218,14 @@ function isChannel(kind: string): kind is OutreachChannel {
   return kind === 'call' || kind === 'text' || kind === 'email';
 }
 
+// `touchesSince`: where the loaded touches start (store.ts
+// touchWindowStart()); a partner's last contact before it, with nothing
+// logged since, still counts as reached before.
 export function outreachHistory(
   target: OutreachTarget,
   caseEvents: Pick<CaseEvent, 'caseId' | 'kind' | 'occurredAt'>[],
   touches: Pick<Touch, 'partnerId' | 'kind' | 'occurredAt'>[],
+  touchesSince?: string,
 ): OutreachHistory {
   const entries = target.kind === 'case'
     ? caseEvents.filter((event) => event.caseId === target.caseId && isChannel(event.kind))
@@ -229,6 +237,10 @@ export function outreachHistory(
       lastAt = entry.occurredAt;
       lastChannel = entry.kind as OutreachChannel;
     }
+  }
+  if (!entries.length && target.kind === 'partner' && target.contactedAt && touchesSince
+      && Date.parse(target.contactedAt) < Date.parse(touchesSince)) {
+    return { count: 0, lastChannel: '', lastAt: target.contactedAt, earlier: true };
   }
   return { count: entries.length, lastChannel, lastAt };
 }
@@ -344,7 +356,7 @@ export function suggestedChannel(
   purposeKind?: FollowUpKind,
 ): OutreachChannel {
   const order: OutreachChannel[] = (() => {
-    if (purposeKind === 'first_call' || purposeKind === 'promised_call' || history.count === 0) return ['call', 'text', 'email'];
+    if (purposeKind === 'first_call' || purposeKind === 'promised_call' || (history.count === 0 && !history.earlier)) return ['call', 'text', 'email'];
     if (history.lastChannel === 'call') return ['text', 'email', 'call'];
     if (history.lastChannel === 'text') return ['email', 'call', 'text'];
     return ['call', 'text', 'email'];
@@ -420,7 +432,7 @@ export function buildDraftRequest(params: {
     situation: {
       stage: target.kind === 'case' && CASE_STAGES.includes(target.status) ? target.status : '',
       partnerTypes: target.kind === 'partner' ? target.types.slice(0, 6) : [],
-      attempt: Math.min(20, history.count + 1),
+      attempt: Math.min(20, history.count + (history.earlier ? 2 : 1)),
       lastChannel: history.lastChannel,
       daysSinceLastContact: daysSince(history.lastAt, params.now),
       purpose,
@@ -455,7 +467,7 @@ export function templateDraft(params: {
   const itsMe = name ? `it's ${name}` : 'just me';
   const thisIs = name ? `this is ${name}${practice ? ` with ${practice}` : ''}` : practice ? `this is ${practice}` : 'checking in';
   const signOff = name ? `${name}${practice ? `\n${practice}` : ''}` : practice;
-  const later = params.history.count > 0;
+  const later = params.history.count > 0 || Boolean(params.history.earlier);
   if (params.target.kind === 'partner') {
     // Never the contact's full name standing in for an organization.
     const org = partnerOrganization(params.target) || 'your work';

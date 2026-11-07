@@ -9,6 +9,10 @@ Migration: `supabase/migrations/20261001170000_insurance_workflow.sql`.
 pgTAP: `supabase/tests/insurance_workflow_test.sql`. Pure logic and its
 node test: `src/lib/insurance.ts`, `scripts/insurance-test.mjs`.
 
+The plan's cost sharing (deductible, out-of-pocket, coinsurance), each
+answer's daily rates, and the family-cost estimate built from them are in
+[FAMILY_COST.md](FAMILY_COST.md) (migration 20261104120000).
+
 ## What is stored
 
 **The plan** (`case_benefits`, one row per case):

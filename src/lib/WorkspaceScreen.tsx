@@ -2,7 +2,9 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   Modal,
+  Platform,
   SafeAreaView,
   ScrollView,
   Share,
@@ -28,13 +30,25 @@ import {
 } from './org';
 import { INTAKE_LINK_ENABLED, intakeLinkUrl, intakeShareMessage } from './intake-link';
 import { openPrivacyPolicy } from './privacy';
-import { SUPABASE_URL } from './supabase';
+import { SUPABASE_URL, supabase } from './supabase';
 import { type Entitlement, type EntitlementState } from './entitlements';
 import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySubmissions, type OrgDirectoryProfileState } from './directory';
 import DirectoryReviewQueue from './DirectoryReviewQueue';
+import CredentialReviewQueue from './CredentialReviewQueue';
+import { fetchPendingListingCredentials } from './credentials';
 import { prepareForWorkspaceChange } from './store';
 import { deleteOwnAccount } from './account';
 import { AiDraftsCard } from './AiDraftKey';
+import {
+  APP_LOCK_GRACE_OPTIONS,
+  appLockEnableMessage,
+  appLockName,
+  appLockStatus,
+  disableAppLock,
+  enableAppLock,
+  setAppLockGrace,
+  type AppLockStatus,
+} from './app-lock';
 import { removeAnthropicKey } from './outreach-api';
 import {
   enablePush,
@@ -47,6 +61,7 @@ import {
   type NotificationKind,
   type PreferencesState,
 } from './push';
+import { WEB_PAGE } from './web-layout';
 
 type Props = {
   visible: boolean;
@@ -120,12 +135,20 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   // for everyone else, which hides the card), and whether the queue is open.
   const [pendingSubmissions, setPendingSubmissions] = useState<number | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
+  // Program Integrity Watch: listing credentials waiting for ReferralFit
+  // (null hides the card: not an admin, or the server has no credentials yet).
+  const [pendingCredentials, setPendingCredentials] = useState<number | null>(null);
+  const [credentialReviewOpen, setCredentialReviewOpen] = useState(false);
   // "Notify me about..." (server-sent push). null while loading; available
   // false when the server does not have push yet, in which case the card
   // explains instead of offering switches.
   const [notify, setNotify] = useState<PreferencesState | null>(null);
   const [notifyError, setNotifyError] = useState('');
   const [notifyNote, setNotifyNote] = useState('');
+  // "Lock with Face ID" on this phone (null: no lock here, e.g. the web).
+  const [lock, setLock] = useState<AppLockStatus | null>(() => appLockStatus());
+  const [lockBusy, setLockBusy] = useState(false);
+  const [lockNote, setLockNote] = useState<string | null>(null);
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
 
@@ -155,17 +178,37 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       setDirectoryProfileError((error as Error).message);
     }
     // Display-only check; the queue RPCs enforce platform-admin status.
+    let admin = false;
     try {
-      setPendingSubmissions(await fetchIsPlatformAdmin() ? (await fetchPendingDirectorySubmissions()).length : null);
+      admin = await fetchIsPlatformAdmin();
+      setPendingSubmissions(admin ? (await fetchPendingDirectorySubmissions()).length : null);
     } catch {
       setPendingSubmissions(null);
+    }
+    try {
+      const pending = admin ? await fetchPendingListingCredentials() : null;
+      setPendingCredentials(pending?.available ? pending.items.length : null);
+    } catch {
+      setPendingCredentials(null);
     }
   }, [userId]);
 
   useEffect(() => {
     if (visible) void load();
-    else setReviewOpen(false);
+    else { setReviewOpen(false); setCredentialReviewOpen(false); }
   }, [visible, load]);
+
+  // The screen stays mounted while hidden, and the lock can change outside
+  // it: a passcode set in Settings makes it available; one removed turns it
+  // off at the next unlock. Read again on opening and on every return.
+  useEffect(() => {
+    if (!visible) return undefined;
+    setLock(appLockStatus());
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') setLock(appLockStatus());
+    });
+    return () => subscription.remove();
+  }, [visible]);
 
   const isOwner = workspace?.myRole === 'owner';
   const soloOwner = isOwner && (workspace?.members.length ?? 0) <= 1;
@@ -180,6 +223,28 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
     } finally {
       setBusy(false);
     }
+  }
+
+  // Signing out here ends this device's session only; this ends every other
+  // one (a browser left signed in on a shared computer, a lost phone). A
+  // browser signed out this way removes its practice data when it next opens.
+  function signOutOtherDevices() {
+    Alert.alert(
+      'Sign out other devices?',
+      `Signs your account out on every other phone and browser. Each one follows the next time ReferralFit opens or comes back to the screen there (within the hour otherwise), and a browser then removes its copy of your practice’s data. ${Platform.OS === 'web' ? 'This browser' : 'This phone'} stays signed in.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Sign out others',
+          style: 'destructive',
+          onPress: () => void run(async () => {
+            const { error } = await supabase.auth.signOut({ scope: 'others' });
+            if (error) throw error;
+            Alert.alert('Other devices signed out', 'They need your password to sign back in.');
+          }, 'Could not sign out other devices'),
+        },
+      ],
+    );
   }
 
   // App Store guideline 5.1.1(v): in-app account deletion. Two confirmations,
@@ -280,6 +345,32 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       await load();
       onLeadSettingsChanged?.();
     }, 'Could not save the target');
+  }
+
+  // Turning the lock on asks for Face ID (or the passcode) first, natively.
+  async function toggleLock(on: boolean) {
+    if (lockBusy) return;
+    setLockNote(null);
+    if (!on) {
+      disableAppLock();
+      setLock(appLockStatus());
+      return;
+    }
+    setLockBusy(true);
+    try {
+      const result = await enableAppLock(lock?.graceSeconds ?? 60);
+      setLockNote(result.ok ? null : appLockEnableMessage(result.error));
+    } catch {
+      setLockNote(appLockEnableMessage('failed'));
+    } finally {
+      setLock(appLockStatus());
+      setLockBusy(false);
+    }
+  }
+
+  function chooseLockGrace(seconds: number) {
+    setAppLockGrace(seconds);
+    setLock(appLockStatus());
   }
 
   // Turning push on is the only place the OS permission prompt is raised.
@@ -385,6 +476,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       <SafeAreaView style={styles.safe}>
         {reviewOpen && pendingSubmissions !== null ? (
           <DirectoryReviewQueue onBack={() => setReviewOpen(false)} onCountChange={setPendingSubmissions} />
+        ) : credentialReviewOpen && pendingCredentials !== null ? (
+          <CredentialReviewQueue onBack={() => setCredentialReviewOpen(false)} onCountChange={setPendingCredentials} />
         ) : (
         <>
         <View style={styles.header}>
@@ -531,7 +624,9 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
 
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Notify me about...</Text>
-              {notify === null ? (
+              {Platform.OS === 'web' ? (
+                <Text style={styles.helpText}>Push notifications go to the ReferralFit iPhone app; turn them on there. In a browser, everything due is on Home, and Refresh brings in new answers.</Text>
+              ) : notify === null ? (
                 notifyError ? <Text style={styles.helpText}>Notification settings could not be loaded: {notifyError}</Text> : <ActivityIndicator color={COLORS.blue} />
               ) : !notify.available ? (
                 <Text style={styles.helpText}>Push notifications are not available yet. They switch on here once the server update is applied; nothing else is needed from you.</Text>
@@ -571,6 +666,58 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 </>
               )}
             </View>
+
+            {lock ? (
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>Privacy on this phone</Text>
+                {!lock.available ? (
+                  <Text style={styles.helpText}>To lock ReferralFit, first set a passcode for this iPhone in Settings &gt; Face ID &amp; Passcode.</Text>
+                ) : (
+                  <>
+                    <View style={styles.memberRow}>
+                      <View style={styles.memberInfo}>
+                        <Text style={styles.memberName}>Lock with {appLockName(lock.biometry)}</Text>
+                        <Text style={styles.memberRole}>
+                          {lock.biometry === 'none'
+                            ? 'Asks for this iPhone\u2019s passcode to open ReferralFit.'
+                            : `Asks for ${appLockName(lock.biometry)} to open ReferralFit. Your passcode works too.`}
+                        </Text>
+                      </View>
+                      <Switch
+                        accessibilityLabel={`Lock with ${appLockName(lock.biometry)}`}
+                        value={lock.enabled}
+                        disabled={lockBusy}
+                        onValueChange={toggleLock}
+                        trackColor={{ true: COLORS.blue }}
+                      />
+                    </View>
+                    {lock.enabled ? (
+                      <>
+                        <Text style={styles.memberRole}>Lock again when you come back to the app:</Text>
+                        <View style={styles.choiceRow} accessibilityRole="radiogroup">
+                          {APP_LOCK_GRACE_OPTIONS.map((option) => {
+                            const selected = lock.graceSeconds === option.seconds;
+                            return (
+                              <TouchableOpacity
+                                key={option.seconds}
+                                accessibilityRole="radio"
+                                accessibilityState={{ selected }}
+                                onPress={() => chooseLockGrace(option.seconds)}
+                                style={[styles.choice, selected && styles.choiceSelected]}
+                              >
+                                <Text style={[styles.choiceText, selected && styles.choiceTextSelected]}>{option.label}</Text>
+                              </TouchableOpacity>
+                            );
+                          })}
+                        </View>
+                      </>
+                    ) : null}
+                    {lockNote ? <Text style={styles.helpText}>{lockNote}</Text> : null}
+                  </>
+                )}
+                <Text style={styles.helpText}>The app switcher always shows a blank ReferralFit screen, never a case.</Text>
+              </View>
+            ) : null}
 
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Your directory profile</Text>
@@ -637,6 +784,25 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 </View>
                 <TouchableOpacity accessibilityRole="button" onPress={() => setReviewOpen(true)} style={styles.primaryButton}>
                   <Text style={styles.primaryButtonText}>Review submissions</Text>
+                </TouchableOpacity>
+                <Text style={styles.helpText}>Only ReferralFit platform admins see this card.</Text>
+              </View>
+            ) : null}
+
+            {pendingCredentials !== null ? (
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>Program credentials</Text>
+                <View style={styles.memberRow}>
+                  <View style={styles.memberInfo}>
+                    <Text style={styles.memberName}>{pendingCredentials === 0 ? 'Nothing waiting' : `${pendingCredentials} waiting for review`}</Text>
+                    <Text style={styles.memberRole}>Licenses, accreditations, LegitScript and NPIs that programs added to their directory listings</Text>
+                  </View>
+                  <View style={pendingCredentials > 0 ? styles.planBadgeActive : styles.planBadge}>
+                    <Text accessibilityLabel={`${pendingCredentials} pending`} style={pendingCredentials > 0 ? styles.planBadgeActiveText : styles.planBadgeText}>{pendingCredentials}</Text>
+                  </View>
+                </View>
+                <TouchableOpacity accessibilityRole="button" onPress={() => setCredentialReviewOpen(true)} style={styles.primaryButton}>
+                  <Text style={styles.primaryButtonText}>Review credentials</Text>
                 </TouchableOpacity>
                 <Text style={styles.helpText}>Only ReferralFit platform admins see this card.</Text>
               </View>
@@ -730,9 +896,13 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
 
             <View style={styles.card}>
               <Text style={styles.cardLabel}>Sign out</Text>
-              <Text style={styles.helpText}>Signs this phone out of ReferralFit. Your workspace stays as it is, and you can sign back in any time.</Text>
+              <Text style={styles.helpText}>{Platform.OS === 'web' ? 'Signs this browser out of ReferralFit and removes your practice’s data from it. Your workspace stays as it is, and you can sign back in any time.' : 'Signs this phone out of ReferralFit. Your workspace stays as it is, and you can sign back in any time.'}</Text>
               <TouchableOpacity accessibilityRole="button" accessibilityLabel="Sign out" disabled={busy} onPress={onSignOut} style={[styles.smallButton, styles.helpTextSpaced, { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center' }]}>
                 <Text style={styles.smallButtonText}>Sign out</Text>
+              </TouchableOpacity>
+              <Text style={[styles.helpText, styles.helpTextSpaced]}>Left signed in somewhere else, such as a shared computer or a lost phone?</Text>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Sign out other devices" disabled={busy} onPress={signOutOtherDevices} style={[styles.smallButton, styles.helpTextSpaced, { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center' }]}>
+                <Text style={styles.smallButtonText}>Sign out other devices</Text>
               </TouchableOpacity>
             </View>
 
@@ -770,7 +940,7 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: COLORS.bg },
+  safe: { flex: 1, backgroundColor: COLORS.bg, ...WEB_PAGE },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -830,6 +1000,11 @@ const styles = StyleSheet.create({
   targetRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   targetInput: { width: 72, borderWidth: 1, borderColor: COLORS.line, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, fontSize: 16, color: COLORS.ink, backgroundColor: COLORS.bg, textAlign: 'center' },
   helpTextSpaced: { marginTop: 10 },
+  choiceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  choice: { minHeight: 36, justifyContent: 'center', borderWidth: 1, borderColor: COLORS.line, borderRadius: 999, paddingVertical: 7, paddingHorizontal: 12 },
+  choiceSelected: { backgroundColor: COLORS.blueSoft, borderColor: COLORS.blue },
+  choiceText: { fontSize: 14, fontWeight: '600', color: COLORS.gray },
+  choiceTextSelected: { color: COLORS.blue },
   inviteRow: {
     flexDirection: 'row',
     alignItems: 'center',
