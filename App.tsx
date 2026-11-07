@@ -97,8 +97,8 @@ import {
 } from './src/lib/outreach';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
-import { decideAuthLink, jwtSubject, parseAuthRedirect } from './src/lib/auth-flows';
-import { clearAuthFlowStart, clearAuthLinkFromAddressBar, currentWebOrigin, readAuthFlowStarts } from './src/lib/auth-link-guard';
+import { decideAuthLink, jwtEmail, jwtSubject, linkEmailAllowed, parseAuthRedirect } from './src/lib/auth-flows';
+import { clearAuthFlowStart, clearAuthLinkFromAddressBar, currentWebOrigin, readAuthFlowEmails, readAuthFlowStarts } from './src/lib/auth-link-guard';
 import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, fetchWorkspaceMembers, memberDisplayName, type LeadSettings, type OrgMember } from './src/lib/org';
 import { refreshPushRegistration, unregisterThisDevice } from './src/lib/push';
 import { fetchEntitlements, NO_ENTITLEMENTS, type EntitlementState } from './src/lib/entitlements';
@@ -181,7 +181,7 @@ import {
   createTouch,
   bindLocalWorkspace,
   flushWriteQueue,
-  forgetWorkspaceBinding,
+  wipeAccountDataWithoutSession,
   finalizeMatchPacket,
   FollowUp,
   FollowUpKind,
@@ -1701,6 +1701,19 @@ export default function App() {
         return;
       }
       const redirect = decision.redirect;
+      // Only for an email this device asked for: a real link to someone
+      // else's account (a look-alike email right after "Forgot password?")
+      // never signs this device into that account.
+      const startedFor = await readAuthFlowEmails(decision.flow);
+      if (!active) return;
+      const refuseOtherAccount = () => Alert.alert(
+        'That link is for another account',
+        `It was not sent to the email ${webOrigin ? 'this browser' : 'this phone'} asked for, so nothing was changed. Request a new link from the sign-in screen, and open it from your own email.`,
+      );
+      if (redirect.kind === 'tokens' && !linkEmailAllowed(jwtEmail(redirect.accessToken), startedFor)) {
+        refuseOtherAccount();
+        return;
+      }
       if (redirect.kind === 'tokens') {
         const linkUser = jwtSubject(redirect.accessToken);
         const current = await currentAuthSessionIdentity({ allowOffline: true }).catch(() => null);
@@ -1728,6 +1741,14 @@ export default function App() {
         Alert.alert('That link has expired', `Request a new one from the sign-in screen and open it in ${here}.`);
         return;
       }
+      // The account the server signed in, checked again (a code link has no
+      // token to read first).
+      if (!linkEmailAllowed(result.data.session?.user?.email, startedFor)) {
+        const { error: outError } = await supabase.auth.signOut({ scope: 'local' });
+        if (outError) await forceLocalSignOut().catch(() => undefined);
+        if (active) refuseOtherAccount();
+        return;
+      }
       // One link per start: a second link needs the flow started again.
       await clearAuthFlowStart(decision.flow);
       if (!active) return;
@@ -1747,6 +1768,22 @@ export default function App() {
     mutationActiveRef.current = null;
     const userId = session?.user?.id;
     resetAccountState();
+
+    // The web app keeps practice data only for the account signed in here
+    // now, and none when nobody is: a session that ended any way (another
+    // device signed out, a revoked token, another account signing in, a
+    // browser reopened after any of these) takes it out, as Sign out does.
+    if (IS_WEB) {
+      void wipeAccountDataWithoutSession(userId)
+        .then((unsent) => {
+          if (!userId && unsent > 0 && generation === authGenerationRef.current) {
+            Alert.alert('Signed out', `You were signed out, and this browser’s copy of your practice’s data was removed. ${unsent} ${unsent === 1 ? 'change' : 'changes'} made here had not reached your workspace and could not be saved.`);
+          }
+        })
+        .catch((error) => {
+          if (!userId) Alert.alert('Practice data still in this browser', `It could not be removed: ${describeError(error)}. Clear this site’s data in the browser’s settings.`);
+        });
+    }
 
     if (!userId) {
       cancelReferralFitNotifications().catch(() => undefined);
@@ -4588,6 +4625,17 @@ export default function App() {
         Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
         return;
       }
+      // A browser says nothing about whether a mail app opened (a computer
+      // may have none): ask, as for a call or a text.
+      if (IS_WEB) {
+        const sent = await new Promise<boolean>((resolve) => {
+          Alert.alert(`Email ${contact.name}`, `${target}\n\nYour email app should open. Log it here once it is sent.`, [
+            { text: 'Not now', style: 'cancel', onPress: () => resolve(false) },
+            { text: 'I emailed', onPress: () => resolve(true) },
+          ], { cancelable: true, onDismiss: () => resolve(false) });
+        });
+        if (!sent) return;
+      }
     } else {
       const opened = await openCallOrText(kind, contact.phone, contact.name);
       if (opened === 'declined') return;
@@ -6263,16 +6311,19 @@ export default function App() {
           await cancelReferralFitNotifications().catch(() => undefined);
           if (IS_WEB && userId) {
             // Save what can still be saved, then remove the cache, the
-            // queue and every saved case copy (store.ts).
+            // queue and every saved case copy (store.ts). Needs no session,
+            // so it works when the session has already gone too.
             await flushWriteQueue(userId).catch(() => undefined);
-            await forgetWorkspaceBinding(userId).catch(() => undefined);
+            await wipeAccountDataWithoutSession(userId);
           }
           // Offline, supabase-js cannot sign out (it tries to refresh first and
           // gives up after ~25 s without clearing anything): clear it here.
+          // Only this device or browser: signing out of the web app on a
+          // shared computer never signs the phone out (nor the reverse).
           if (await isOfflineSession(activeUserIdRef.current).catch(() => false)) {
             await forceLocalSignOut();
           } else {
-            const { error } = await supabase.auth.signOut();
+            const { error } = await supabase.auth.signOut({ scope: 'local' });
             if (error) {
               if (isAuthNetworkError(error) || isNetworkError(error)) await forceLocalSignOut();
               else throw error;

@@ -1664,6 +1664,52 @@ export async function forgetWorkspaceBinding(expectedUserId: string): Promise<vo
   }));
 }
 
+// The web app with nobody signed in holds no practice data: a session that
+// ended any way (signed out on another device, a revoked token, another
+// account signing in in this browser) leaves the saved copies, the case
+// files and the queue behind otherwise, on what may be a shared computer.
+// No session is needed (there is none to check). `keepUserId`: the account
+// signed in now, whose data stays; omitted, nobody's does. Returns how many
+// changes still waiting to be sent (queued or set aside) went with it. Ids and flags kept per account
+// (the welcome, snoozes, placement "seen") hold no client data and stay.
+const ACCOUNT_DATA_PREFIXES = [
+  CACHE_KEY_PREFIX, QUEUE_KEY_PREFIX, REJECTED_KEY_PREFIX, UNREADABLE_KEY_PREFIX,
+  CASE_LIST_KEY_PREFIX, CASE_FILE_INDEX_KEY_PREFIX, CASE_FILE_KEY_PREFIX, WORKSPACE_KEY_PREFIX,
+];
+
+export async function wipeAccountDataWithoutSession(keepUserId?: string): Promise<number> {
+  const keep = keepUserId?.toLowerCase();
+  return withCacheLock(async () => withQueueLock(async () => {
+    forgetCacheWrite();
+    let keys: readonly string[];
+    try {
+      keys = await AsyncStorage.getAllKeys();
+    } catch (error) {
+      throw persistenceError('cache', error);
+    }
+    const doomed = keys.filter((key) => ACCOUNT_DATA_PREFIXES.some((prefix) => key.startsWith(prefix)
+      && !(keep && key.slice(prefix.length).toLowerCase().startsWith(keep))));
+    let unsent = 0;
+    for (const key of doomed) {
+      const owner = key.startsWith(QUEUE_KEY_PREFIX) ? key.slice(QUEUE_KEY_PREFIX.length)
+        : key.startsWith(REJECTED_KEY_PREFIX) ? key.slice(REJECTED_KEY_PREFIX.length) : '';
+      if (!isUuid(owner)) continue;
+      try {
+        unsent += key.startsWith(QUEUE_KEY_PREFIX) ? (await readQueueUnlocked(owner)).length : (await readRejectedUnlocked(owner)).length;
+      } catch {
+        unsent += 1; // unreadable: something was there
+      }
+    }
+    if (!doomed.length) return 0;
+    try {
+      await AsyncStorage.multiRemove(doomed);
+    } catch (error) {
+      throw persistenceError('cache', error);
+    }
+    return unsent;
+  }));
+}
+
 // The workspace this account's local cache and queue were last bound to, or
 // null if never bound on this device. Used only when the server cannot be
 // asked: an offline launch reads the caches under their last verified

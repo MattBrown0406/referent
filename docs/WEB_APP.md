@@ -9,7 +9,7 @@ iPhone build.
 
 | On the phone | In a browser |
 | --- | --- |
-| Native alerts | An in-page dialog (`src/lib/web-alert.tsx`); Escape is Cancel, Enter the main button |
+| Native alerts | An in-page dialog (`src/lib/web-alert.tsx`); Escape is Cancel, Enter the main button (none in a list of three or more choices; a button reached with Tab presses itself) |
 | Bottom tabs | A sidebar from 960px wide (`src/lib/web-layout.ts`); sheets are a centered column |
 | Pull to refresh | A Refresh button in the header |
 | Messages compose sheet | The text is copied, with the number to send it to from the phone |
@@ -39,8 +39,19 @@ iPhone build.
 ## Checking a deploy
 
 - Open `https://app.referralfit.com`, sign in, and open a case.
-- Settings → Sign out, then check the browser keeps nothing: DevTools →
-  Application → Local Storage shows only the welcome flag.
+- Settings → Sign out, then check the browser keeps no practice data:
+  DevTools → Application → Local Storage has no `referralfit-cache-`,
+  `-write-queue-`, `-rejected-writes-`, `-case-list-`, `-case-file-` or
+  `-workspace-` key. What stays holds ids and flags only, no client data:
+  the welcome flag, partner snoozes, placement "seen" markers, the
+  notification prompt choice, and `referralfit.authFlowStarts.v1` /
+  `referralfit.authFlowEmails.v1` (the last day's sign-up and reset
+  requests, so their emailed links work here).
+- The same holds when the session ends any other way: signed out on the
+  phone (sign-out is per device), a changed password, an account deleted.
+  The next time the app sees no session it removes the data, and says so if
+  changes made in the browser had not been sent.
+- An emailed link works only for the address this browser asked for.
 - "Forgot password?" from the web app: the email's link opens
   `app.referralfit.com/auth/recovery` and shows **Set a new password**, and
   the address bar is back to `/`.

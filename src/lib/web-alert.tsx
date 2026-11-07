@@ -96,6 +96,10 @@ export function WebAlertHost() {
   // The dialog a button already closed: a click and a key press arriving
   // together never run its action twice.
   const handledRef = useRef<number | null>(null);
+  // Set when the person moves focus with Tab: Enter then presses the button
+  // they reached. The dialog's own first focus (React Native Web focuses the
+  // first button when it opens) never decides what Enter does.
+  const tabbedRef = useRef(false);
 
   useEffect(() => {
     listeners.add(setDialogs);
@@ -104,6 +108,7 @@ export function WebAlertHost() {
 
   useEffect(() => {
     setText(dialog?.prompt?.defaultValue ?? '');
+    tabbedRef.current = false;
   }, [dialog?.id]);
 
   function press(button: AlertButton) {
@@ -133,6 +138,8 @@ export function WebAlertHost() {
   function enter() {
     const current = dialogRef.current;
     if (!current) return;
+    // A list of choices (three or more) has no default: Enter picks none.
+    if (current.buttons.length > 2) return;
     const main = [...current.buttons].reverse().find((button) => button.style !== 'cancel' && button.style !== 'destructive');
     if (main) press(main);
   }
@@ -140,9 +147,11 @@ export function WebAlertHost() {
   useEffect(() => {
     if (!dialog || typeof window === 'undefined') return undefined;
     const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Tab') { tabbedRef.current = true; return; }
       if (event.key !== 'Enter' || event.shiftKey) return;
-      const target = event.target as { getAttribute?: (name: string) => string | null } | null;
-      if (target?.getAttribute?.('role') === 'button') return; // the focused button presses itself
+      const target = event.target as { getAttribute?: (name: string) => string | null; tagName?: string } | null;
+      const onButton = target?.getAttribute?.('role') === 'button' || target?.tagName === 'BUTTON';
+      if (onButton && tabbedRef.current) return; // the button they tabbed to presses itself
       event.preventDefault();
       event.stopPropagation();
       enter();

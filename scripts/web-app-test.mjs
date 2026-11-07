@@ -14,6 +14,9 @@ const alert = read('src/lib/web-alert.tsx');
 assert.match(alert, /if \(Platform\.OS !== 'web' \|\| installed\) return;/);
 assert.match(alert, /if \(!current \|\| handledRef\.current === current\.id\) return;/, 'a dialog runs one button action at most');
 assert.match(alert, /button\.style !== 'cancel' && button\.style !== 'destructive'/, 'Enter never presses a destructive button');
+assert.match(alert, /if \(current\.buttons\.length > 2\) return;/, 'a list of choices has no Enter default');
+assert.match(alert, /if \(event\.key === 'Tab'\) \{ tabbedRef\.current = true; return; \}[\s\S]{0,400}if \(onButton && tabbedRef\.current\) return;/,
+  'Enter follows a focused button only when the person tabbed to it (never the dialog\'s own first focus)');
 assert.match(read('src/lib/web-share.ts'), /if \(Platform\.OS !== 'web' \|\| installed\) return;/);
 
 // A browser never logs a call or text it could not make.
@@ -25,8 +28,13 @@ assert.match(app, /else if \(IS_WEB\) Alert\.alert\(`Call \$\{selectedPartner\.o
 
 // Signing out of a browser leaves none of the practice's data behind.
 const signOut = app.slice(app.indexOf('function confirmSignOut()'), app.indexOf('function renderHeader('));
-assert.match(signOut, /if \(IS_WEB && userId\) \{\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*await flushWriteQueue\(userId\)\.catch\(\(\) => undefined\);\s*await forgetWorkspaceBinding\(userId\)\.catch\(\(\) => undefined\);/);
-assert.ok(signOut.indexOf('forgetWorkspaceBinding(userId)') < signOut.indexOf('supabase.auth.signOut()'), 'data goes before the session');
+assert.match(signOut, /if \(IS_WEB && userId\) \{(\s*\/\/[^\n]*\n)+\s*await flushWriteQueue\(userId\)\.catch\(\(\) => undefined\);\s*await wipeAccountDataWithoutSession\(userId\);/,
+  'sign-out removes the data with no session needed, and says so if it cannot');
+assert.ok(signOut.indexOf('wipeAccountDataWithoutSession(userId)') < signOut.indexOf("supabase.auth.signOut({ scope: 'local' })"), 'data goes before the session');
+assert.ok(!app.includes('supabase.auth.signOut()'), 'signing out ends this device\'s session only, never the phone\'s');
+// ...and a session that ended any other way does the same.
+assert.match(app, /resetAccountState\(\);\s*(\/\/[^\n]*\n\s*)+if \(IS_WEB\) \{\s*void wipeAccountDataWithoutSession\(userId\)/,
+  'signed out elsewhere, revoked, or another account: the browser keeps practice data only for the account signed in now');
 
 // System notifications are never touched in a browser.
 const notifications = read('src/lib/notifications.ts');

@@ -1109,6 +1109,28 @@ await check('a join that fails after the pre-join sync leaves the device saving 
   assert.equal(await store.pendingWriteCount(U), 0);
 });
 
+await check('the web wipe needs no session and takes every account\'s data, counting what was unsent', async () => {
+  await freshAccount();
+  const P = '77777777-7777-4777-8777-77777777777a';
+  await store.persistCache({ partners: [partner(P, 'Shared PC partner')], referrals: [], referralMatches: [], touches: [], followUps: [], scorecards: {} }, U);
+  state.offline = true;
+  await store.updatePartner({ ...partner(P, 'Shared PC partner'), note: 'typed on the front-desk PC' }, U);
+  state.offline = false;
+  const other = '99999999-9999-4999-8999-999999999991';
+  state.asyncStorage.set(`referralfit-cache-v2:${other}`, '{}');
+  state.asyncStorage.set('referralfit.welcome.v1', 'seen');
+  assert.equal(await store.wipeAccountDataWithoutSession(U), 0, 'with an account signed in, the others go');
+  assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${other}`), false);
+  assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${U}`), true, 'and the signed-in account\'s stays');
+  assert.equal(await store.pendingWriteCount(U), 1, 'its queue too');
+  state.asyncStorage.set(`referralfit-cache-v2:${other}`, '{}');
+  const unsent = await store.wipeAccountDataWithoutSession();
+  assert.equal(unsent, 1, 'the unsent change is counted, so the person can be told');
+  const left = [...state.asyncStorage.keys()].filter((key) => /referralfit-(cache|write-queue|rejected-writes|unreadable-writes|case-list|case-file|workspace)/.test(key));
+  assert.deepEqual(left, [], 'no saved copy, queue, case file or binding is left for any account');
+  assert.equal(state.asyncStorage.get('referralfit.welcome.v1'), 'seen', 'flags that hold no client data stay');
+});
+
 // ─── Round 3: queued edits are not reverted by a refresh ────────────────────
 
 await check('a completion held by a passing server failure stays done through a refresh', async () => {

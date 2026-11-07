@@ -15,9 +15,16 @@ export type AuthLinkPath = 'recovery' | 'confirmed';
 // Where an auth email sends the person back: the app's own URL on a phone,
 // the page they started on in a browser (webOrigin, e.g.
 // https://app.referralfit.com). A web origin is always scheme + host only.
+// The web app's address, and the local ones `npm run web` serves on. A page
+// on any other origin (a preview deployment) sends people to the web app
+// itself: Supabase allows only these, and for any other address it falls
+// back to the Site URL with the tokens in it.
+export const WEB_APP_ORIGIN = 'https://app.referralfit.com';
+const WEB_APP_ORIGINS = [WEB_APP_ORIGIN, 'http://localhost:3222', 'http://127.0.0.1:3222'];
+
 export function authRedirectUrl(path: AuthLinkPath, webOrigin?: string | null): string {
   const origin = webOrigin ? cleanOrigin(webOrigin) : null;
-  if (origin) return `${origin}/auth/${path}`;
+  if (origin) return `${WEB_APP_ORIGINS.includes(origin) ? origin : WEB_APP_ORIGIN}/auth/${path}`;
   return path === 'recovery' ? PASSWORD_RECOVERY_REDIRECT : EMAIL_CONFIRM_REDIRECT;
 }
 
@@ -165,6 +172,28 @@ export function jwtSubject(token: string): string | null {
   } catch {
     return null;
   }
+}
+
+// The email in a Supabase access token (its `email` claim), unverified: only
+// to refuse a link for another account before it replaces any session. The
+// server checks the token when the session is set; the app checks the
+// account's email again after that.
+export function jwtEmail(token: string): string | null {
+  const payload = token.split('.')[1];
+  if (!payload) return null;
+  try {
+    const json = JSON.parse(decodeBase64Url(payload)) as { email?: unknown };
+    return typeof json.email === 'string' && json.email ? normalizeEmail(json.email) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Whether a link's account is one this device started the flow for. No
+// recorded email (an older build started it): not checked.
+export function linkEmailAllowed(linkEmail: string | null | undefined, startedFor: readonly string[]): boolean {
+  if (!startedFor.length) return true;
+  return Boolean(linkEmail) && startedFor.includes(normalizeEmail(linkEmail as string));
 }
 
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';

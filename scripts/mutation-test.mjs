@@ -282,10 +282,15 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   assert.equal(flows.jwtSubject('not-a-jwt'), null);
   assert.equal(flows.jwtSubject(jwt({ name: 'x' })), null);
   const login = await readFile(new URL('../src/lib/LoginScreen.tsx', import.meta.url), 'utf8');
-  assert.match(login, /await recordAuthFlowStart\('signup'\);[\s\S]{0,400}supabase\.auth\.signUp\(/, 'sign-up is recorded before its email can arrive');
-  assert.match(login, /await recordAuthFlowStart\('signup'\);\s*const \{ error: resendError \} = await supabase\.auth\.resend\(/, 'a resend is recorded');
-  assert.match(login, /await recordAuthFlowStart\('recovery'\);\s*const \{ error: resetError \} = await supabase\.auth\.resetPasswordForEmail\(/, 'a reset is recorded');
+  assert.match(login, /await recordAuthFlowStart\('signup', normalizedEmail\);[\s\S]{0,400}supabase\.auth\.signUp\(/, 'sign-up is recorded, with its email, before its email can arrive');
+  assert.match(login, /await recordAuthFlowStart\('signup', target\);\s*const \{ error: resendError \} = await supabase\.auth\.resend\(/, 'a resend is recorded');
+  assert.match(login, /await recordAuthFlowStart\('recovery', normalizedEmail\);\s*const \{ error: resetError \} = await supabase\.auth\.resetPasswordForEmail\(/, 'a reset is recorded');
   const handler = source.slice(source.indexOf('async function handleAuthUrl('), source.indexOf('Linking.getInitialURL()'));
+  assert.match(handler, /if \(redirect\.kind === 'tokens' && !linkEmailAllowed\(jwtEmail\(redirect\.accessToken\), startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;/,
+    'a link for an account this device did not ask for is refused before it replaces any session');
+  assert.ok(handler.indexOf('linkEmailAllowed(jwtEmail(') < handler.indexOf("'Switch accounts?'"), 'and before the switch-accounts question');
+  assert.match(handler, /if \(!linkEmailAllowed\(result\.data\.session\?\.user\?\.email, startedFor\)\) \{\s*const \{ error: outError \} = await supabase\.auth\.signOut\(\{ scope: 'local' \}\);/,
+    'the server-checked account is compared again after the session is set');
   assert.match(handler, /const decision = decideAuthLink\(url, await readAuthFlowStarts\(\), Date\.now\(\), webOrigin\);/);
   assert.ok(handler.indexOf('clearAuthLinkFromAddressBar();') < handler.indexOf('const decision = decideAuthLink('), 'in a browser the tokens leave the address bar first');
   assert.ok(handler.indexOf("decision.action === 'not_started'") < handler.indexOf('supabase.auth.setSession('), 'nothing is exchanged for a flow this device did not start');

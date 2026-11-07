@@ -134,7 +134,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
     // The confirmation link signs in only on a device that started a sign-up
     // in the last day (App.tsx, decideAuthLink). Recorded before the email
     // can arrive.
-    await recordAuthFlowStart('signup');
+    await recordAuthFlowStart('signup', normalizedEmail);
     // handle_new_user() (supabase/migrations/20260929174333_self_serve_accounts.sql)
     // reads practice_name and display_name from raw_user_meta_data to create the
     // workspace and the owner membership.
@@ -172,7 +172,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
     setBusy(true);
     setError(null);
     setInfo(null);
-    await recordAuthFlowStart('signup');
+    await recordAuthFlowStart('signup', target);
     const { error: resendError } = await supabase.auth.resend({
       type: 'signup',
       email: target,
@@ -197,7 +197,7 @@ export default function LoginScreen({ onSignedIn }: Props) {
     const normalizedEmail = normalizeEmail(email);
     // The reset link opens the new-password screen only on a device that
     // asked for a reset in the last day (App.tsx, decideAuthLink).
-    await recordAuthFlowStart('recovery');
+    await recordAuthFlowStart('recovery', normalizedEmail);
     const { error: resetError } = await supabase.auth.resetPasswordForEmail(normalizedEmail, {
       redirectTo: authRedirectUrl('recovery', currentWebOrigin()),
     });

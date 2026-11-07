@@ -32,6 +32,8 @@ const {
   friendlyAuthError,
   isPlausibleEmail,
   isRecoveryRedirect,
+  jwtEmail,
+  linkEmailAllowed,
   parseAuthRedirect,
   passwordProblem,
 } = require(path.join(tmpDir, 'auth-flows.js'));
@@ -41,6 +43,19 @@ function check(label, actual, expected) {
   const pass = JSON.stringify(actual) === JSON.stringify(expected);
   if (!pass) failures += 1;
   console.log(`${pass ? 'PASS' : 'FAIL'}  ${label}${pass ? '' : `  → ${JSON.stringify(actual)} (expected ${JSON.stringify(expected)})`}`);
+}
+
+// A link is used only for an email this device started the flow for.
+{
+  const token = (claims) => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
+  check('the link token\'s email is read (lower case)', jwtEmail(token({ sub: 'u1', email: 'Pat@Example.TEST' })), 'pat@example.test');
+  check('a token without one reads as none', jwtEmail(token({ sub: 'u1' })), null);
+  check('garbage reads as none', jwtEmail('not-a-token'), null);
+  check('the email asked for is allowed', linkEmailAllowed('pat@example.test', ['pat@example.test']), true);
+  check('another account is not', linkEmailAllowed('attacker@example.test', ['pat@example.test']), false);
+  check('nor a link with no email at all', linkEmailAllowed(null, ['pat@example.test']), false);
+  check('a flow started by an older build (no email recorded) is not checked', linkEmailAllowed('anyone@example.test', []), true);
+  check('case and spacing do not matter', linkEmailAllowed(' PAT@example.test ', ['pat@example.test']), true);
 }
 
 // ─── Deep-link scheme matches app.json ───────────────────────────────────────
@@ -72,6 +87,7 @@ check('web confirm redirect', authRedirectUrl('confirmed', 'http://localhost:322
 check('phone redirect without an origin', authRedirectUrl('recovery', null), 'referralfit://auth/recovery');
 check('a bad origin falls back to the app scheme', authRedirectUrl('confirmed', 'null'), 'referralfit://auth/confirmed');
 check('an origin with a path is refused', authRedirectUrl('confirmed', 'https://app.referralfit.com/x'), 'referralfit://auth/confirmed');
+check('a preview deployment sends people to the web app itself', authRedirectUrl('recovery', 'https://referralfit-web-git-x.vercel.app'), 'https://app.referralfit.com/auth/recovery');
 check('web link path', authLinkPath('https://app.referralfit.com/auth/recovery#access_token=AT&refresh_token=RT', WEB), 'recovery');
 check('web link path, any case and a trailing slash', authLinkPath('HTTPS://APP.REFERRALFIT.COM/auth/confirmed/?code=c', WEB), 'confirmed');
 check('web link needs the origin', authLinkPath('https://app.referralfit.com/auth/recovery#access_token=AT', null), null);
