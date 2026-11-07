@@ -347,6 +347,11 @@ function makeId(_prefix?: string) {
 // A foreground return within this window of the last refresh that reached the
 // server is skipped; pull-to-refresh always runs.
 const FOREGROUND_REFRESH_MIN_INTERVAL_MS = 30_000;
+// A server read set aside because something was saved while it was in
+// flight is tried again this long after, once no save is running; a few
+// times in a row at most.
+const CATCH_UP_REFRESH_MS = 2_000;
+const CATCH_UP_REFRESH_TRIES = 3;
 // Long enough for an iOS sheet's dismissal to finish before the next presents.
 const SHEET_SWAP_MS = 600;
 // Rows a long list shows before "Show more" (closed cases, referral history).
@@ -1139,6 +1144,9 @@ export default function App() {
   const [rejectedBusy, setRejectedBusy] = useState(false);
   const lastServerRefreshAtRef = useRef(0);
   const refreshInFlightRef = useRef<Promise<'ok' | 'offline'> | null>(null);
+  const catchUpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const catchUpTriesRef = useRef(0);
+  const refreshFromServerRef = useRef<((trigger: 'foreground' | 'pull') => Promise<'ok' | 'offline'>) | null>(null);
   const [showNewCase, setShowNewCase] = useState(false);
   const [showClosedCases, setShowClosedCases] = useState(false);
   // Long lists show this many rows, then "Show more" (search reaches them all):
@@ -1381,9 +1389,12 @@ export default function App() {
     if (!userId) throw new Error('The account changed before local data could be saved.');
     const generation = authGenerationRef.current;
     const accountIsCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
+    // Taken now: a workspace switch while this waits on the cache lock never
+    // gets this workspace's rows.
+    const snapshotOrg = activeOrgIdRef.current || undefined;
     const data = snapshot || { partners, referrals, referralMatches, touches, followUps, scorecards };
     const activeCases = caseList ?? cases;
-    await persistCache(data, userId);
+    await persistCache(data, userId, snapshotOrg);
     if (!accountIsCurrent()) throw new Error('The account changed before local data could be saved.');
     // Pending: still to send. Waiting (on a record the server lacks) and
     // rejected: the user's to review, so they sit in the banner, not the badge.
@@ -1542,6 +1553,11 @@ export default function App() {
     setRefreshNotice('');
     lastServerRefreshAtRef.current = 0;
     refreshInFlightRef.current = null;
+    if (catchUpTimerRef.current) clearTimeout(catchUpTimerRef.current);
+    catchUpTimerRef.current = null;
+    catchUpTriesRef.current = 0;
+    setClosedCaseLimit(LIST_ROWS_SHOWN);
+    setTodayRowLimits({ overdue: TODAY_ROWS_SHOWN, today: TODAY_ROWS_SHOWN, partnersDue: TODAY_ROWS_SHOWN });
     setActiveCaseId(null);
     setSelectedPartner(null);
     setTouchPartner(null);
@@ -1740,6 +1756,13 @@ export default function App() {
 
     setLoaded(false);
     let active = true;
+    // Once the saved copy is on screen, sheets can be open: an alert or a
+    // prompt waits for them to close (iOS wedges a sheet presented over one).
+    let showingSaved = false;
+    const whenScreenClear = (open: () => void) => {
+      if (showingSaved) afterSheetCloses(open, { ifScreenBusy: 'wait' });
+      else open();
+    };
     (async () => {
       try {
         // With no signal the server cannot name the workspace; the caches are
@@ -1773,7 +1796,7 @@ export default function App() {
         const serialBeforeRead = localChangeSerialRef.current;
         const launchCopy = await readLaunchCopy(userId).catch(() => null);
         if (!active || generation !== authGenerationRef.current) return;
-        const showingSaved = Boolean(launchCopy);
+        showingSaved = Boolean(launchCopy);
         if (launchCopy) {
           applySnapshot(launchCopy.snapshot);
           if (launchCopy.caseList) {
@@ -1782,14 +1805,31 @@ export default function App() {
             setCaseListSource({ userId, source: 'cache', savedAt: launchCopy.caseList.savedAt, truncated: false });
           }
           setLoaded(true);
+          // The saved copy shows its waiting changes: so do the badge and the
+          // banner (sign-out on the web reads them to warn about unsent work).
+          const savedStatus = await syncStatus(userId).catch(() => null);
+          if (!active || generation !== authGenerationRef.current) return;
+          if (savedStatus) {
+            setQueuedWrites(savedStatus.pending);
+            setRejectedWrites(savedStatus.waiting + savedStatus.rejected);
+            if (savedStatus.pending > 0) setOffline(true);
+          }
         }
         const changedMeanwhile = () => showingSaved
           && (localChangeSerialRef.current !== serialBeforeRead || Boolean(mutationActiveRef.current));
+        // Set when the server's copy was left unshown: read again once the
+        // change that beat it is saved.
+        let skippedServerCopy = false;
 
         const result = await hydrate(userId);
         if (!active || generation !== authGenerationRef.current) return;
-        if (changedMeanwhile()) lastServerRefreshAtRef.current = 0;
-        else applySnapshot(result.snapshot);
+        if (changedMeanwhile()) {
+          lastServerRefreshAtRef.current = 0;
+          skippedServerCopy = true;
+        } else {
+          // The Match form keeps anything typed while the saved copy showed.
+          applySnapshot(result.snapshot, !showingSaved);
+        }
         const hydratedStatus = await syncStatus(userId).catch(() => null);
         if (!active || generation !== authGenerationRef.current) return;
         const setAside = hydratedStatus ? hydratedStatus.waiting + hydratedStatus.rejected : 0;
@@ -1810,7 +1850,8 @@ export default function App() {
         } catch (error) {
           // Only when there is no saved copy at all (or a real server error).
           if (active && generation === authGenerationRef.current) {
-            Alert.alert('Case files unavailable', `Case files could not be loaded: ${describeError(error)}`);
+            const detail = describeError(error);
+            whenScreenClear(() => Alert.alert('Case files unavailable', `Case files could not be loaded: ${detail}`));
           }
         }
         if (!active || generation !== authGenerationRef.current) return;
@@ -1818,6 +1859,8 @@ export default function App() {
           setCases(activeCaseList);
           setAllCaseContacts(activeContacts);
           setCaseListSource(caseListLoad);
+        } else {
+          skippedServerCopy = true;
         }
 
         try {
@@ -1863,13 +1906,18 @@ export default function App() {
         if (!active || generation !== authGenerationRef.current) return;
         setQueuedWrites(pending);
         setOffline(result.source === 'cache' || caseListLoad?.source === 'cache' || pending > 0);
-        if (result.source === 'remote') lastServerRefreshAtRef.current = Date.now();
+        if (skippedServerCopy || changedMeanwhile()) {
+          lastServerRefreshAtRef.current = 0;
+          scheduleCatchUpRefresh();
+        } else if (result.source === 'remote') {
+          lastServerRefreshAtRef.current = Date.now();
+        }
 
         const welcomeSeen = await AsyncStorage.getItem(welcomeKey(userId));
         if (!active || generation !== authGenerationRef.current) return;
         const showWelcome = welcomeSeen !== 'seen';
         notifPromptDeferredRef.current = false;
-        if (showWelcome) setWelcomeVisible(true);
+        if (showWelcome) whenScreenClear(() => setWelcomeVisible(true));
 
         const permission = await getNotificationPermissionState();
         if (!active || generation !== authGenerationRef.current) return;
@@ -1878,21 +1926,30 @@ export default function App() {
           const scheduling = await AsyncStorage.getItem(notificationScheduleKey(userId));
           if (!active || generation !== authGenerationRef.current) return;
           if (scheduling !== 'disabled') {
-            rescheduleNotifications({ ...result.snapshot, cases: activeCaseList }, userId)
+            // From what is on screen when something was saved during launch
+            // (a reminder completed or added is in it, not in the read above).
+            const scheduleFrom = changedMeanwhile() && latestSnapshotRef.current
+              ? { ...latestSnapshotRef.current, cases: latestCasesRef.current }
+              : { ...result.snapshot, cases: activeCaseList };
+            rescheduleNotifications(scheduleFrom, userId)
               .catch((error) => {
-                if (active && generation === authGenerationRef.current) Alert.alert('Notifications unavailable', describeError(error));
+                if (active && generation === authGenerationRef.current) {
+                  const detail = describeError(error);
+                  whenScreenClear(() => Alert.alert('Notifications unavailable', detail));
+                }
               });
           }
         } else if (permission === 'askable') {
           const decision = await AsyncStorage.getItem(notificationPromptKey(userId));
           if (active && generation === authGenerationRef.current && decision !== 'dismissed') {
             if (showWelcome) notifPromptDeferredRef.current = true;
-            else setNotifPrePromptVisible(true);
+            else whenScreenClear(() => setNotifPrePromptVisible(true));
           }
         }
       } catch (error) {
         if (active && generation === authGenerationRef.current) {
-          Alert.alert('Could not load account', describeError(error));
+          const detail = describeError(error);
+          whenScreenClear(() => Alert.alert('Could not load account', detail));
         }
       } finally {
         if (active && generation === authGenerationRef.current) setLoaded(true);
@@ -1941,6 +1998,28 @@ export default function App() {
   // calls share one run; a foreground return inside the debounce window is
   // skipped. Resolves 'offline' (nothing reached the server) instead of
   // throwing so callers can show a quiet notice rather than an alert.
+  // What a skipped read would have shown arrives a moment later: the screen
+  // never keeps an older copy as if it were current (and the next edit is
+  // never compared against it).
+  const scheduleCatchUpRefresh = useCallback(() => {
+    if (catchUpTimerRef.current || catchUpTriesRef.current >= CATCH_UP_REFRESH_TRIES) return;
+    const userId = activeUserIdRef.current;
+    const generation = authGenerationRef.current;
+    const wait = (waits: number) => {
+      catchUpTimerRef.current = setTimeout(() => {
+        catchUpTimerRef.current = null;
+        if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation) return;
+        if ((mutationActiveRef.current || refreshInFlightRef.current) && waits < 20) {
+          wait(waits + 1);
+          return;
+        }
+        catchUpTriesRef.current += 1;
+        void refreshFromServerRef.current?.('pull').catch(() => undefined);
+      }, CATCH_UP_REFRESH_MS);
+    };
+    wait(0);
+  }, []);
+
   const refreshFromServer = useCallback(async (trigger: 'foreground' | 'pull'): Promise<'ok' | 'offline'> => {
     const userId = session?.user?.id;
     if (!userId) return 'ok';
@@ -1975,8 +2054,9 @@ export default function App() {
       if (!refreshed) return 'offline';
       if (changedMeanwhile()) {
         // Something was saved while this read was in flight; what was read is
-        // older than the screen. Leave it, and let the next refresh run soon.
+        // older than the screen. Leave it, and read again once the save is done.
         lastServerRefreshAtRef.current = 0;
+        scheduleCatchUpRefresh();
         return 'ok';
       }
       lastServerRefreshAtRef.current = Date.now();
@@ -1987,6 +2067,7 @@ export default function App() {
       if (!stillCurrent()) return 'ok';
       if (changedMeanwhile()) {
         lastServerRefreshAtRef.current = 0;
+        scheduleCatchUpRefresh();
         return 'ok';
       }
       setCases(caseLoad.list.cases);
@@ -2040,7 +2121,10 @@ export default function App() {
       setCredentialsNonce((nonce) => nonce + 1);
       // A change that landed meanwhile saves its own copy; never overwrite it with this read.
       if (!changedMeanwhile()) await syncDerived(refreshed, caseLoad.list.cases);
-      if (stillCurrent()) setRefreshNotice('');
+      if (stillCurrent()) {
+        setRefreshNotice('');
+        catchUpTriesRef.current = 0;
+      }
       return 'ok';
     })();
     refreshInFlightRef.current = run;
@@ -2049,7 +2133,8 @@ export default function App() {
     } finally {
       if (refreshInFlightRef.current === run) refreshInFlightRef.current = null;
     }
-  }, [session?.user?.id, activeCaseId, applySnapshot, syncDerived]);
+  }, [session?.user?.id, activeCaseId, applySnapshot, syncDerived, scheduleCatchUpRefresh]);
+  refreshFromServerRef.current = refreshFromServer;
 
   // Pull-to-refresh: always runs, stops the spinner on failure, and reports
   // a lost connection inline instead of with an alert.
@@ -9402,7 +9487,7 @@ export default function App() {
                 })}
                 {!suggestions.length ? <Text style={styles.caseEmptyNote}>No partners in your network yet. Type the program below.</Text> : null}
               </View>
-              {suggestions.length > vobRowLimit ? ShowMoreButton(suggestions.length - vobRowLimit, 'programs', () => setVobRowLimit((limit) => limit + LIST_ROWS_SHOWN)) : null}
+              {suggestions.length > shownSuggestions.length ? ShowMoreButton(suggestions.length - shownSuggestions.length, 'programs', () => setVobRowLimit((limit) => limit + LIST_ROWS_SHOWN)) : null}
               <FormField label="OR A PROGRAM BY NAME" value={vobForm.programName} onChangeText={(programName) => setVobForm((current) => (current ? { ...current, programName, partnerId: programName.trim() ? null : current.partnerId } : current))} placeholder="A program outside your network" />
               <FormField label="NOTE (OPTIONAL)" value={vobForm.note} onChangeText={(note) => setVobForm((current) => (current ? { ...current, note } : current))} placeholder="Who you spoke with, fax or portal used, what they need from you" multiline />
               <TouchableOpacity accessibilityRole="button" style={styles.primaryButton} onPress={() => submitVobRequest(vobForm)}>

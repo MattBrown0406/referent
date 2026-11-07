@@ -69,6 +69,8 @@ export type Partner = {
   inbound: number;
   outbound: number;
   lastContact: string;
+  /** partners.last_contact_at as the server keeps it (any touch); unset when never contacted. lastContact falls back to the creation date. */
+  contactedAt?: string;
   favorite?: boolean;
   touchCadenceDays?: number;
   createdAt?: string;

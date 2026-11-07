@@ -28,6 +28,7 @@ import {
   type CallDraft,
   type CallResult,
   type OutreachChannel,
+  type OutreachHistory,
   type OutreachDraft,
   type OutreachRecipient,
   type OutreachTarget,
@@ -44,7 +45,7 @@ import {
   sendEmailMessage,
   sendTextMessage,
 } from './outreach-api';
-import type { FollowUp, Touch } from './store';
+import { touchWindowStart, type FollowUp, type Touch } from './store';
 import { WEB_PAGE } from './web-layout';
 
 // The outreach sheet: pick who and how (text, email, or call), start from a
@@ -123,7 +124,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
   const [edited, setEdited] = useState<Partial<Record<OutreachChannel, boolean>>>({});
   const [instructions, setInstructions] = useState('');
   const [practiceName, setPracticeName] = useState('');
-  const [history, setHistory] = useState(() => ({ count: 0, lastChannel: '' as OutreachChannel | '', lastAt: '' }));
+  const [history, setHistory] = useState<OutreachHistory>(() => ({ count: 0, lastChannel: '', lastAt: '' }));
   const [drafting, setDrafting] = useState(false);
   const [draftNotice, setDraftNotice] = useState('');
   const [sending, setSending] = useState(false);
@@ -168,7 +169,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
     if (!request) return;
     const generation = ++openGeneration.current;
     const first = request.recipients.find((item) => item.key === request.initialRecipientKey) || request.recipients[0] || null;
-    const knownHistory = outreachHistory(request.target, caseEvents, touches);
+    const knownHistory = outreachHistory(request.target, caseEvents, touches, touchWindowStart());
     setStage('compose');
     setRecipientKey(first?.key || '');
     setDrafts({});
@@ -197,7 +198,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
       void loadCaseEvents(caseId)
         .then((events) => {
           if (openGeneration.current !== generation) return;
-          const loaded = outreachHistory(request.target, events, touches);
+          const loaded = outreachHistory(request.target, events, touches, touchWindowStart());
           setHistory(loaded);
         })
         .catch(() => undefined);
@@ -485,7 +486,7 @@ export default function OutreachSheet({ request, userId, senderName, touches, ca
           })}
         </View>
         <Text style={styles.hint}>
-          {history.count === 0 ? 'First outreach on this timeline.' : `Outreach #${history.count + 1}${history.lastChannel ? ` · last was a ${history.lastChannel === 'call' ? 'call' : history.lastChannel}` : ''}.`}
+          {history.count === 0 ? (history.earlier ? 'Reached before; nothing logged in the last year.' : 'First outreach on this timeline.') : `Outreach #${history.count + 1}${history.lastChannel ? ` · last was a ${history.lastChannel === 'call' ? 'call' : history.lastChannel}` : ''}.`}
         </Text>
 
         <Text style={styles.label}>ANYTHING TO MENTION? (OPTIONAL)</Text>

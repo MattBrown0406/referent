@@ -182,7 +182,7 @@ assert.match(source, /export async function readBoundWorkspace\(expectedUserId: 
 assert.match(source, /return stored && isUuid\(stored\) \? stored\.toLowerCase\(\) : null;/);
 assert.match(appSource, /orgId = await fetchCurrentOrgId\(\);\s*\} catch \(error\) \{\s*if \(!(?:isNetworkError|isServerUnreachable)\(error\)\) throw error;\s*const bound = await readBoundWorkspace\(userId\);\s*if \(!bound\) throw error;\s*orgId = bound;/, 'hydration must survive an offline workspace lookup using the last verified binding');
 // The App renders the saved copy instead of a blocking alert whenever one exists.
-assert.match(appSource, /const load = await loadCaseList\(userId\);[\s\S]{0,400}Alert\.alert\('Case files unavailable'/, 'hydration must load the case list through the cache-aware loader');
+assert.match(appSource, /const load = await loadCaseList\(userId\);[\s\S]{0,500}Alert\.alert\('Case files unavailable'/, 'hydration must load the case list through the cache-aware loader');
 assert.match(appSource, /setCaseListSource\(caseListLoad\)/);
 assert.match(appSource, /loadCaseFile\(userId, caseId\)[\s\S]{0,600}source: 'unavailable'/, 'opening a case must use the cache-aware loader and mark a missing copy');
 assert.match(appSource, /renderSavedCopyNotice\(caseFileSource, 'case file'\)/, 'a cached case file must say it is a saved copy');
@@ -370,7 +370,7 @@ const expectedSignatures = [
   /export async function discardRejectedWrite\(expectedUserId: string, rejectedId: string\)/,
   /export async function retryRejectedWrite\(expectedUserId: string, rejectedId: string\): Promise<number>/,
   /export async function bindLocalWorkspace\(expectedUserId: string, orgId: string\)/,
-  /export async function persistCache\(snapshot: Snapshot, expectedUserId: string\)/,
+  /export async function persistCache\(snapshot: Snapshot, expectedUserId: string, snapshotOrg\?: string\)/,
   /export async function refreshSnapshot\(expectedUserId: string\)/,
   /export async function createPartner\(partner: Partner, expectedUserId: string\)/,
   /export async function deleteMatchProfile\(matchId: string, expectedUserId: string\)/,

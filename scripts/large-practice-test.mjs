@@ -27,10 +27,26 @@ assert.match(credentials, /fetchAllPages<unknown>\(\(from, to\) => supabase\.rpc
 
 // Launch: a returning user sees the saved copy first; the server copy
 // replaces it only if nothing was saved meanwhile.
-assert.match(app, /await readLaunchCopy\(userId\)[\s\S]{0,900}setLoaded\(true\);[\s\S]{0,600}await hydrate\(userId\);[\s\S]{0,200}if \(changedMeanwhile\(\)\) lastServerRefreshAtRef\.current = 0;\s*else applySnapshot\(result\.snapshot\);/,
-  'the saved copy shows before hydrate, and a newer screen is not overwritten');
+assert.match(app, /await readLaunchCopy\(userId\)[\s\S]{0,900}setLoaded\(true\);[\s\S]{0,1400}await hydrate\(userId\);[\s\S]{0,200}if \(changedMeanwhile\(\)\) \{\s*lastServerRefreshAtRef\.current = 0;\s*skippedServerCopy = true;\s*\} else \{[\s\S]{0,120}applySnapshot\(result\.snapshot, !showingSaved\);/,
+  'the saved copy shows before hydrate, a newer screen is not overwritten, and the Match form keeps what was typed');
+assert.match(app, /setLoaded\(true\);\s*\/\/ The saved copy shows its waiting changes[\s\S]{0,300}const savedStatus = await syncStatus\(userId\)[\s\S]{0,200}setQueuedWrites\(savedStatus\.pending\);\s*setRejectedWrites\(savedStatus\.waiting \+ savedStatus\.rejected\);/,
+  'the badge and banner count the saved copy\'s waiting changes at once');
+assert.match(app, /if \(skippedServerCopy \|\| changedMeanwhile\(\)\) \{\s*lastServerRefreshAtRef\.current = 0;\s*scheduleCatchUpRefresh\(\);\s*\} else if \(result\.source === 'remote'\) \{/,
+  'a server copy left unshown is read again soon, and never marked as fresh');
+assert.ok((app.match(/scheduleCatchUpRefresh\(\);/g) || []).length === 3, 'launch and both skips in refreshFromServer catch up');
+assert.match(app, /if \(\(mutationActiveRef\.current \|\| refreshInFlightRef\.current\) && waits < 20\)[\s\S]{0,120}catchUpTriesRef\.current \+= 1;\s*void refreshFromServerRef\.current\?\.\('pull'\)/,
+  'the catch-up waits for the save to finish');
+assert.match(app, /const scheduleFrom = changedMeanwhile\(\) && latestSnapshotRef\.current\s*\? \{ \.\.\.latestSnapshotRef\.current, cases: latestCasesRef\.current \}/,
+  'reminders scheduled at launch come from the screen when something was saved meanwhile');
+for (const prompt of ["Alert.alert('Case files unavailable'", "Alert.alert('Notifications unavailable'", "Alert.alert('Could not load account'", 'setWelcomeVisible(true)', 'setNotifPrePromptVisible(true)']) {
+  assert.ok(app.includes(`whenScreenClear(() => ${prompt}`), `launch waits for open sheets before: ${prompt}`);
+}
+assert.match(app, /suggestions\.length > shownSuggestions\.length \? ShowMoreButton\(suggestions\.length - shownSuggestions\.length, 'programs'/,
+  'the VOB list counts what it hides, not the limit');
+assert.match(app, /setClosedCaseLimit\(LIST_ROWS_SHOWN\);\s*setTodayRowLimits\(/, 'show-more limits reset with the account');
 assert.match(app, /if \(!changedMeanwhile\(\)\) \{\s*setCases\(activeCaseList\);/, 'the case list read at launch does not overwrite a newer screen either');
-assert.match(store, /export async function readLaunchCopy\(expectedUserId: string\)[\s\S]{0,200}readCacheWithPending\(fence\)/, 'the launch copy carries the changes still pending on this device');
+assert.match(store, /export async function readLaunchCopy\(expectedUserId: string\)[\s\S]{0,500}return cached \? overlayPendingOps\(cached, pendingOps\) : null;/,
+  'the launch copy carries the changes still pending on this device, and needs a saved copy to show');
 
 // Touches: a year at most, on the server read and in the saved copy.
 assert.match(store, /supabase\.from\('touches'\)\.select\('\*'\)\.gte\('occurred_at', windowStart\)/, 'touches load for the window only');

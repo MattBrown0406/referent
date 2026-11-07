@@ -1935,6 +1935,7 @@ function mapPartnerRow(row: PartnerRow, balance: BalanceRow | undefined): Partne
     inbound: toNumber(balance?.inbound),
     outbound: toNumber(balance?.outbound),
     lastContact: toDateStamp(row.last_contact_at, toDateStamp(row.created_at, '')),
+    contactedAt: row.last_contact_at || undefined,
     favorite: Boolean(row.favorite),
     touchCadenceDays: row.touch_cadence_days ?? undefined,
     createdAt: row.created_at,
@@ -2933,7 +2934,15 @@ export type LaunchCopy = { snapshot: Snapshot; caseList: { list: CaseList; saved
 
 export async function readLaunchCopy(expectedUserId: string): Promise<LaunchCopy | null> {
   const fence = await sessionFence(expectedUserId);
-  const snapshot = await readCacheWithPending(fence);
+  // A saved copy is required: queued changes alone (the cache was wiped by a
+  // re-bind, or unreadable) are not a workspace to show.
+  const snapshot = await withCacheLock(async () => {
+    await assertSessionFence(fence);
+    const cached = await readCacheUnlocked(fence);
+    const pendingOps = cached ? await readPendingOps(fence) : [];
+    await assertSessionFence(fence);
+    return cached ? overlayPendingOps(cached, pendingOps) : null;
+  });
   if (!snapshot) return null;
   const caseList = await withCacheLock(async () => {
     await assertSessionFence(fence);
@@ -2948,13 +2957,17 @@ export async function readLaunchCopy(expectedUserId: string): Promise<LaunchCopy
 // Offline it still saves: the binding last verified on this device is the
 // fence (assertCacheWorkspaceFence — no server round trip). Writing the very
 // snapshot object that is already saved (refreshSnapshot's result, handed
-// back by App.tsx's syncDerived) is skipped.
-export async function persistCache(snapshot: Snapshot, expectedUserId: string): Promise<void> {
+// back by App.tsx's syncDerived) is skipped. `snapshotOrg`: the workspace the
+// snapshot was taken in. A save that waited on the lock behind a workspace
+// switch is skipped: the old workspace's rows never land in the new one's
+// copy (its queued changes are already durable on their own).
+export async function persistCache(snapshot: Snapshot, expectedUserId: string, snapshotOrg?: string): Promise<void> {
   // Acquire the cache lock before resolving the session so concurrent persists
   // commit in call order rather than getSession() completion order.
   await withCacheLock(async () => {
     const fence = await sessionFence(expectedUserId);
     const boundOrg = await assertCacheWorkspaceFence(fence);
+    if (snapshotOrg && boundOrg !== snapshotOrg) return;
     if (lastCacheWrite && lastCacheWrite.userId === fence.userId && lastCacheWrite.snapshot === snapshot) return;
     await writeCacheUnlocked(fence, snapshot);
     await assertCacheWorkspaceFence(fence, boundOrg);

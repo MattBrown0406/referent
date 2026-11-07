@@ -169,6 +169,17 @@ check('history counts only calls, texts, and emails for this case', () => {
   assert.deepEqual(outreach.outreachHistory(caseTarget, events, []), { count: 2, lastChannel: 'text', lastAt: '2026-10-20T18:00:00.000Z' });
 });
 
+check('a partner last reached before the loaded year is not a first outreach', () => {
+  const since = '2025-11-06T00:00:00.000Z';
+  const reachedLongAgo = outreach.partnerTarget({ ...PARTNER, contactedAt: '2025-03-01T16:00:00.000Z' });
+  const history = outreach.outreachHistory(reachedLongAgo, [], [], since);
+  assert.deepEqual(history, { count: 0, lastChannel: '', lastAt: '2025-03-01T16:00:00.000Z', earlier: true });
+  assert.equal(outreach.suggestedChannel({ key: 'p', name: 'X', relationship: '', phone: '(541) 555-0100', email: 'x@example.test' }, { ...history, lastChannel: 'call' }), 'text', 'the channel order is a follow-up\'s, not a first contact\'s');
+  assert.deepEqual(outreach.outreachHistory(outreach.partnerTarget({ ...PARTNER, contactedAt: '2026-10-01T16:00:00.000Z' }), [], [], since),
+    { count: 0, lastChannel: '', lastAt: '' }, 'contact within the loaded year is read from the touches themselves');
+  assert.deepEqual(outreach.outreachHistory(outreach.partnerTarget(PARTNER), [], [], since), { count: 0, lastChannel: '', lastAt: '' }, 'never contacted: a first outreach');
+});
+
 const ana = { key: 'cc1', name: 'Ana Maria Rivera', relationship: 'mother', phone: '(541) 555-0142', email: 'ana@example.test', contactId: 'cc1' };
 
 check('channel suggestions vary and respect what is on file', () => {

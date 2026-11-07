@@ -494,6 +494,11 @@ await check('persistCache with no connection (valid token) uses the verified bin
   assert.deepEqual(state.rpcCalls, [], 'no server round trip inside the cache lock');
   assert.equal(await store.bindLocalWorkspace(U, state.org), true);
   assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${U}`), false, 'the new workspace never reads the old copy');
+  // A save of the old workspace's screen that waited behind the switch.
+  await store.persistCache(relaunch.snapshot, U, ORG);
+  assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${U}`), false, 'the old workspace\'s rows never land in the new copy');
+  await store.persistCache(relaunch.snapshot, U, state.org);
+  assert.equal(state.asyncStorage.has(`referralfit-cache-v2:${U}`), true, 'a save taken in the bound workspace is written');
   state.org = ORG;
 });
 
@@ -1093,6 +1098,7 @@ await check('a join that fails after the pre-join sync leaves the device saving 
   state.asyncStorage.delete(`referralfit-workspace-v1:${U}`);
   assert.equal(await store.bindLocalWorkspace(U, ORG), true);
   assert.equal(await store.pendingWriteCount(U), 1, 'the queued edit survives');
+  assert.equal(await store.readLaunchCopy(U), null, 'queued changes without a saved copy are not shown as the workspace');
   await store.flushWriteQueue(U);
   assert.equal(state.db.partners.find((row) => row.id === P).note, 'queued while unbound');
   // A positively different workspace still wipes everything.
