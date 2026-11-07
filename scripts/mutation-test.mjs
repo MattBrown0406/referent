@@ -287,7 +287,7 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   assert.match(login, /await recordAuthFlowStart\('recovery', normalizedEmail\);\s*const \{ error: resetError \} = await supabase\.auth\.resetPasswordForEmail\(/, 'a reset is recorded');
   const handler = source.slice(source.indexOf('async function handleAuthUrl('), source.indexOf('Linking.getInitialURL()'));
   assert.ok(!handler.includes('supabase.auth.getUser('), 'never supabase-js getUser(token): it deletes this device\'s session when the link\'s is gone');
-  assert.match(handler, /if \(!linkEmailAllowed\(jwtEmail\(redirect\.accessToken\), startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;\s*\}\s*const checked = await checkLinkToken\(redirect\.accessToken\);/,
+  assert.match(handler, /if \(!linkEmailAllowed\(jwtEmail\(redirect\.accessToken\), startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;\s*\}\s*const checked = await retryWhileOffline\(\s*\(\) => checkLinkToken\(redirect\.accessToken\),/,
     'the token\'s own claims refuse another address first, with no network call; then the server reads the token');
   assert.ok(handler.indexOf('checkLinkToken(redirect.accessToken)') < handler.indexOf("'Switch accounts?'") && handler.indexOf("'Switch accounts?'") < handler.indexOf('supabase.auth.setSession('), 'checked before the switch question, and both before the session changes');
   assert.match(handler, /if \(!linkEmailAllowed\(checked\.email, startedFor\)\) \{\s*refuseOtherAccount\(\);\s*return;/, 'the server-read address is checked too');

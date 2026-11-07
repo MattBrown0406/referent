@@ -97,7 +97,7 @@ import {
 } from './src/lib/outreach';
 import WorkspaceScreen from './src/lib/WorkspaceScreen';
 import ResetPasswordScreen from './src/lib/ResetPasswordScreen';
-import { decideAuthLink, jwtEmail, linkEmailAllowed, parseAuthRedirect } from './src/lib/auth-flows';
+import { decideAuthLink, jwtEmail, linkEmailAllowed, parseAuthRedirect, retryWhileOffline } from './src/lib/auth-flows';
 import { clearAuthFlowStart, clearAuthLinkFromAddressBar, currentWebOrigin, pruneAuthFlowEmails, readAuthFlowEmails, readAuthFlowStarts } from './src/lib/auth-link-guard';
 import { DEFAULT_LEAD_SETTINGS, fetchCurrentOrgId, fetchLeadSettings, fetchWorkspaceMembers, memberDisplayName, type LeadSettings, type OrgMember } from './src/lib/org';
 import { refreshPushRegistration, unregisterThisDevice } from './src/lib/push';
@@ -1706,6 +1706,46 @@ export default function App() {
     const webOrigin = currentWebOrigin();
     const here = webOrigin ? 'this browser' : 'this device';
     void pruneAuthFlowEmails();
+    // iOS hands over the link while it is still waking the app, and requests
+    // sent then are the ones that fail on a connection that went stale in the
+    // background. Wait until the app is in front (at most 2 s).
+    const whenActive = () => new Promise<void>((resolve) => {
+      if (AppState.currentState === 'active') {
+        resolve();
+        return;
+      }
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        subscription.remove();
+        resolve();
+      };
+      const subscription = AppState.addEventListener('change', (state) => { if (state === 'active') finish(); });
+      const timer = setTimeout(finish, 2000);
+    });
+    // Still no connection after the retries: the link's tokens are in hand
+    // (the email link itself is used up), so keep them for Try again rather
+    // than sending the person back for a new email.
+    const offerRetry = (url: string, path: 'recovery' | 'confirmed') => Alert.alert(
+      'No connection',
+      `ReferralFit could not reach the server to finish ${path === 'recovery' ? 'your password reset' : 'confirming your email'}. Check your connection, then tap Try again. You only need a new link if you close ${webOrigin ? 'this page' : 'ReferralFit'} first.`,
+      [
+        { text: 'Not now', style: 'cancel' },
+        { text: 'Try again', onPress: () => openAuthUrl(url, { retry: true }) },
+      ],
+    );
+    // getInitialURL and the 'url' event can both deliver the link that
+    // launched the app: each link is handled once, and again only from Try
+    // again. (A link opened twice from the email arrives with different
+    // contents the second time: Supabase's "already used" answer.)
+    const seenAuthUrls = new Set<string>();
+    function openAuthUrl(url: string | null, { retry = false }: { retry?: boolean } = {}) {
+      if (!url || (seenAuthUrls.has(url) && !retry)) return;
+      seenAuthUrls.add(url);
+      void handleAuthUrl(url);
+    }
     async function handleAuthUrl(url: string | null) {
       if (!url || !active) return;
       // Only parsed so non-auth URLs stay cheap; decideAuthLink re-checks.
@@ -1727,6 +1767,8 @@ export default function App() {
         return;
       }
       const redirect = decision.redirect;
+      await whenActive();
+      if (!active) return;
       // Only for an email this device asked for: a real link to someone
       // else's account (a look-alike email right after "Forgot password?")
       // never signs this device into that account.
@@ -1746,14 +1788,17 @@ export default function App() {
           refuseOtherAccount();
           return;
         }
-        const checked = await checkLinkToken(redirect.accessToken);
+        const checked = await retryWhileOffline(
+          () => checkLinkToken(redirect.accessToken),
+          (outcome) => !outcome.ok && outcome.reason === 'unreachable',
+          { keepGoing: () => active },
+        );
         if (!active) return;
         const current = await currentAuthSessionIdentity({ allowOffline: true }).catch(() => null);
         if (!active) return;
         if (!checked.ok) {
-          // The link is single-use and has left the address bar: a new one.
           if (checked.reason === 'unreachable') {
-            Alert.alert('No connection', 'The link could not be checked. Once you are connected, request a new link from the sign-in screen.');
+            offerRetry(url, decision.path);
             return;
           }
           // Expired (left unopened for an hour): signing in refreshes with
@@ -1796,10 +1841,21 @@ export default function App() {
         }
       }
       const result = redirect.kind === 'tokens'
-        ? await supabase.auth.setSession({ access_token: redirect.accessToken, refresh_token: redirect.refreshToken })
+        ? await retryWhileOffline(
+          () => supabase.auth.setSession({ access_token: redirect.accessToken, refresh_token: redirect.refreshToken }),
+          (outcome) => isAuthNetworkError(outcome.error),
+          { keepGoing: () => active },
+        )
+        // Exchanged once: supabase-js drops the code's verifier even when the
+        // request fails, so a retry could not succeed.
         : await supabase.auth.exchangeCodeForSession(redirect.code);
       if (!active) return;
       if (result.error) {
+        // No connection is not an expired link: the tokens still work.
+        if (redirect.kind === 'tokens' && isAuthNetworkError(result.error)) {
+          offerRetry(url, decision.path);
+          return;
+        }
         Alert.alert('That link has expired', `Request a new one from the sign-in screen and open it in ${here}.`);
         return;
       }
@@ -1819,8 +1875,8 @@ export default function App() {
       if (!active) return;
       if (decision.path === 'recovery') setPasswordRecovery(true);
     }
-    Linking.getInitialURL().then((url) => { void handleAuthUrl(url); }).catch(() => undefined);
-    const listener = Linking.addEventListener('url', ({ url }) => { void handleAuthUrl(url); });
+    Linking.getInitialURL().then((url) => { openAuthUrl(url); }).catch(() => undefined);
+    const listener = Linking.addEventListener('url', ({ url }) => { openAuthUrl(url); });
     return () => {
       active = false;
       listener.remove();

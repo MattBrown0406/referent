@@ -161,6 +161,52 @@ export function decideAuthLink(
   return { action: 'accept', path, flow, redirect };
 }
 
+// ─── Finishing a link when the connection drops ─────────────────────────────
+// The link reaches the app as iOS wakes it from the background (the person
+// was in Mail, then Safari). The first request the app sends then can fail on
+// a connection that went stale while it was paused ("The network connection
+// was lost") without ever reaching the server, and a retry a moment later
+// goes through. The link's tokens are already in hand, so trying again is
+// safe: the email link itself was used up when it was opened.
+//
+// The waits before each retry, and how long retrying may take in all (a
+// network that hangs makes each attempt wait out its own deadline).
+export const AUTH_LINK_RETRY_DELAYS_MS: readonly number[] = [500, 1500, 3000];
+export const AUTH_LINK_RETRY_BUDGET_MS = 20_000;
+
+// Runs `attempt`, then again after each delay while `retryable` says its
+// result failed for lack of a connection, until it succeeds, the delays run
+// out, the time budget is spent or `keepGoing` says stop. Returns the last
+// result. `sleep` and `now` are for tests.
+export async function retryWhileOffline<T>(
+  attempt: () => Promise<T>,
+  retryable: (result: T) => boolean,
+  options: {
+    delaysMs?: readonly number[];
+    budgetMs?: number;
+    keepGoing?: () => boolean;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+  } = {},
+): Promise<T> {
+  const {
+    delaysMs = AUTH_LINK_RETRY_DELAYS_MS,
+    budgetMs = AUTH_LINK_RETRY_BUDGET_MS,
+    keepGoing = () => true,
+    sleep = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }),
+    now = Date.now,
+  } = options;
+  const startedAt = now();
+  let result = await attempt();
+  for (const delay of delaysMs) {
+    if (!retryable(result) || !keepGoing() || now() - startedAt + delay > budgetMs) return result;
+    await sleep(delay);
+    if (!keepGoing()) return result;
+    result = await attempt();
+  }
+  return result;
+}
+
 // The account a Supabase access token belongs to (its `sub` claim), read
 // without verifying it: only to ask before replacing a signed-in account.
 export function jwtSubject(token: string): string | null {

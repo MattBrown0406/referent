@@ -134,6 +134,18 @@ the link for a session and shows `src/lib/ResetPasswordScreen.tsx`, which
 calls `supabase.auth.updateUser`. The link works only on the device or
 browser that asked for it, within a day.
 
+Opening the email link uses it up: Supabase hands the app a sign-in, and the
+app finishes with it. The link usually arrives while iOS is still waking the
+app from the background (the person was in Mail and Safari), and the first
+request then can fail on a connection that went stale while the app was
+paused, without reaching the server. So the app waits until it is in front,
+retries a request that failed for lack of a connection (after 0.5 s, 1.5 s
+and 3 s), and if it is still offline shows **No connection** with **Try
+again**, which uses the sign-in it already holds. It never calls a dropped
+connection an expired link (`retryWhileOffline` in `src/lib/auth-flows.ts`,
+the link handler in `App.tsx`). Before this, 1.0.4 (2) and earlier showed
+"That link has expired" and the person needed a new email.
+
 **Delete account** (`src/lib/WorkspaceScreen.tsx` → `src/lib/account.ts` →
 `public.prepare_account_deletion()` → files → `public.delete_own_account()`):
 
