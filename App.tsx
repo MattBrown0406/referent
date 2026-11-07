@@ -352,6 +352,21 @@ const FOREGROUND_REFRESH_MIN_INTERVAL_MS = 30_000;
 // times in a row at most.
 const CATCH_UP_REFRESH_MS = 2_000;
 const CATCH_UP_REFRESH_TRIES = 3;
+
+// The Match form's fields in one comparable string (App's appliedMatchFormRef).
+function matchFormSignature(values: unknown[]): string {
+  return JSON.stringify(values);
+}
+
+function matchFormValuesFor(match: ReferralMatch | null): unknown[] {
+  return [
+    match?.id || null, match?.clientLabel || '', match?.levelOfCare || 'Any type', match?.state || 'ANY',
+    match?.insurance || 'Cash pay', match?.networkPreferences?.length ? match.networkPreferences : ['In-network'],
+    match?.maxBudget ? String(match.maxBudget) : '', match?.therapies || [],
+    match ? (match.mustHaveTherapies ?? defaultMustHaveNeeds(match.therapies)) : [],
+    match?.population || 'Any', match?.locationPreference || 'No preference',
+  ];
+}
 // Long enough for an iOS sheet's dismissal to finish before the next presents.
 const SHEET_SWAP_MS = 600;
 // Rows a long list shows before "Show more" (closed cases, referral history).
@@ -1286,6 +1301,10 @@ export default function App() {
   const [selectedMatchId, setSelectedMatchId] = useState<string | null>(null);
   const selectedMatchIdRef = useRef<string | null>(null);
   selectedMatchIdRef.current = selectedMatchId;
+  // The Match form as last loaded from a profile, and as on screen now: equal
+  // means nothing was typed since (launch then loads the server's version).
+  const appliedMatchFormRef = useRef('');
+  const currentMatchFormRef = useRef('');
   const [matchClientLabel, setMatchClientLabel] = useState('');
   const [matchType, setMatchType] = useState('Any type');
   const [matchInsurance, setMatchInsurance] = useState('Cash pay');
@@ -1482,6 +1501,7 @@ export default function App() {
   // Every match field the form edits, from one saved profile (or blank), and
   // never a case link carried over from an earlier "Find placement".
   const applyMatchToForm = useCallback((match: ReferralMatch | null) => {
+    appliedMatchFormRef.current = matchFormSignature(matchFormValuesFor(match));
     setPendingCaseMatchId(null);
     setSelectedMatchId(match?.id || null);
     setMatchClientLabel(match?.clientLabel || '');
@@ -1557,6 +1577,7 @@ export default function App() {
     catchUpTimerRef.current = null;
     catchUpTriesRef.current = 0;
     setClosedCaseLimit(LIST_ROWS_SHOWN);
+    setReferralRowLimit(LIST_ROWS_SHOWN);
     setTodayRowLimits({ overdue: TODAY_ROWS_SHOWN, today: TODAY_ROWS_SHOWN, partnersDue: TODAY_ROWS_SHOWN });
     setActiveCaseId(null);
     setSelectedPartner(null);
@@ -1797,7 +1818,9 @@ export default function App() {
     // prompt waits for them to close (iOS wedges a sheet presented over one).
     let showingSaved = false;
     const whenScreenClear = (open: () => void) => {
-      if (showingSaved) afterSheetCloses(open, { ifScreenBusy: 'wait' });
+      // Up to about 10 minutes: "Could not load account" is the only sign a
+      // launch failed while the saved copy shows.
+      if (showingSaved) afterSheetCloses(open, { ifScreenBusy: 'wait', maxWaits: 1000 });
       else open();
     };
     (async () => {
@@ -1864,8 +1887,9 @@ export default function App() {
           lastServerRefreshAtRef.current = 0;
           skippedServerCopy = true;
         } else {
-          // The Match form keeps anything typed while the saved copy showed.
-          applySnapshot(result.snapshot, !showingSaved);
+          // The Match form keeps anything typed while the saved copy showed;
+          // untouched, it loads the server's profile (edited elsewhere since).
+          applySnapshot(result.snapshot, !showingSaved || currentMatchFormRef.current === appliedMatchFormRef.current);
         }
         const hydratedStatus = await syncStatus(userId).catch(() => null);
         if (!active || generation !== authGenerationRef.current) return;
@@ -1892,12 +1916,13 @@ export default function App() {
           }
         }
         if (!active || generation !== authGenerationRef.current) return;
-        if (!changedMeanwhile()) {
+        if (changedMeanwhile()) {
+          skippedServerCopy = true;
+        } else if (caseListLoad || !showingSaved) {
+          // A failed read leaves the saved case list on screen.
           setCases(activeCaseList);
           setAllCaseContacts(activeContacts);
           setCaseListSource(caseListLoad);
-        } else {
-          skippedServerCopy = true;
         }
 
         try {
@@ -1965,7 +1990,7 @@ export default function App() {
           if (scheduling !== 'disabled') {
             // From what is on screen when something was saved during launch
             // (a reminder completed or added is in it, not in the read above).
-            const scheduleFrom = changedMeanwhile() && latestSnapshotRef.current
+            const scheduleFrom = (changedMeanwhile() || !caseListLoad) && latestSnapshotRef.current
               ? { ...latestSnapshotRef.current, cases: latestCasesRef.current }
               : { ...result.snapshot, cases: activeCaseList };
             rescheduleNotifications(scheduleFrom, userId)
@@ -2883,7 +2908,7 @@ export default function App() {
   // user moved on; default), 'wait' and try again (prompts the app offers on
   // its own), or 'ignore' (the step closes a sheet rather than opening one).
   // `stillWanted` lets the caller cancel, e.g. after a rollback.
-  function afterSheetCloses(open: () => void, options: { ifScreenBusy?: 'skip' | 'wait' | 'ignore'; stillWanted?: () => boolean } = {}) {
+  function afterSheetCloses(open: () => void, options: { ifScreenBusy?: 'skip' | 'wait' | 'ignore'; stillWanted?: () => boolean; maxWaits?: number } = {}) {
     const userId = activeUserIdRef.current;
     const generation = authGenerationRef.current;
     const attempt = (tries: number, settling = false) => {
@@ -2894,7 +2919,7 @@ export default function App() {
         if (options.ifScreenBusy !== 'ignore' && (busy || settling)) {
           // 'wait': once the screen is clear, give whatever just closed one
           // more delay to finish animating away before presenting.
-          if (options.ifScreenBusy === 'wait' && tries < 50) attempt(tries + 1, busy);
+          if (options.ifScreenBusy === 'wait' && tries < (options.maxWaits ?? 50)) attempt(tries + 1, busy);
           return;
         }
         open();
@@ -4437,6 +4462,10 @@ export default function App() {
     || (typeof session?.user?.user_metadata?.display_name === 'string' ? session.user.user_metadata.display_name : '')
     || '';
   latestSnapshotRef.current = { partners, referrals, referralMatches, touches, followUps, scorecards };
+  currentMatchFormRef.current = matchFormSignature([
+    selectedMatchId, matchClientLabel, matchType, matchState, matchInsurance, matchNetworkPreferences,
+    matchBudget, matchTherapies, matchMustHave, matchPopulation, matchLocationPreference,
+  ]);
   latestCasesRef.current = cases;
   const sheetOpenNow = Boolean(
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp

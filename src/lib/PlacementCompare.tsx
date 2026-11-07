@@ -137,7 +137,10 @@ export default function PlacementCompare({
   const view = requestId ? placement.state.requests.find((item) => item.request.id === requestId) || null : null;
 
   useEffect(() => {
-    if (!requestId) releaseComposeOverlay();
+    if (!requestId) {
+      releaseComposeOverlay();
+      placementRef.current.releaseKept();
+    }
   }, [requestId]);
   useEffect(() => () => {
     generationRef.current += 1;

@@ -339,6 +339,8 @@ export type PlacementRequestsHook = {
   replace: (view: PlacementRequestView) => void;
   /** The practitioner looked at this request's answers. */
   markSeen: (view: PlacementRequestView) => void;
+  /** Its answers closed: later reads no longer fetch it by id. */
+  releaseKept: () => void;
 };
 
 // The account and workspace a read belongs to: one workspace's requests
@@ -436,5 +438,7 @@ export function usePlacementRequests(userId: string | undefined, refreshKey: num
     void savePlacementSeen(userId, next, keep);
   }, [userId]);
 
-  return { state, seen, reload: load, replace, markSeen };
+  const releaseKept = useCallback(() => { alsoIdRef.current = null; }, []);
+
+  return { state, seen, reload: load, replace, markSeen, releaseKept };
 }

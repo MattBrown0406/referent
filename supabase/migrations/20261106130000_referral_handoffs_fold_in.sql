@@ -152,7 +152,7 @@ BEGIN
          AND pg_catalog.lower(pg_catalog.btrim(p_recipient_email)) !~ '^[^[:space:]@]+@[^[:space:]@]+[.][^[:space:]@]+$') THEN
     RAISE EXCEPTION 'Invalid handoff details' USING ERRCODE = '22023';
   END IF;
-  SELECT * INTO v_referral FROM public.referrals WHERE id = p_referral_id AND org_id = v_org FOR UPDATE;
+  SELECT * INTO v_referral FROM public.referrals WHERE id = p_referral_id AND org_id = v_org FOR NO KEY UPDATE;
   IF NOT FOUND OR v_referral.partner_id IS DISTINCT FROM p_partner_id
      OR (p_case_id IS NOT NULL AND v_referral.case_id IS DISTINCT FROM p_case_id) THEN
     RAISE EXCEPTION 'Referral links do not match this workspace' USING ERRCODE = 'P0002';

@@ -5,7 +5,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(21);
+SELECT plan(22);
 
 -- p1 owns practice P and sends the request; p2 is a teammate; c1 is the
 -- center that claimed listing L1 (answers in the portal); L2 is unclaimed
@@ -93,8 +93,19 @@ RESET ROLE;
 SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response' AND sent_at IS NULL), 0,
   'a program editing its answer within 15 minutes of the last push sends nothing more');
 
+-- Queued long ago but sent a minute ago: still within the quiet time.
+UPDATE public.notification_outbox SET created_at = now() - interval '20 minutes', sent_at = now() - interval '1 minute'
+ WHERE kind = 'placement_response';
+SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000b8', true);
+SET LOCAL ROLE authenticated;
+SELECT public.respond_to_placement_request(current_setting('test.portal_recipient')::uuid, 'no', 'maybe', NULL, NULL, NULL, NULL);
+RESET ROLE;
+SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response' AND sent_at IS NULL), 0,
+  'the quiet time counts from the last push sent, not queued');
+
 -- Later than that, a changed answer is news again.
-UPDATE public.notification_outbox SET created_at = now() - interval '20 minutes' WHERE kind = 'placement_response';
+UPDATE public.notification_outbox SET created_at = now() - interval '20 minutes', sent_at = now() - interval '20 minutes'
+ WHERE kind = 'placement_response';
 SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000b8', true);
 SET LOCAL ROLE authenticated;
 SELECT public.respond_to_placement_request(current_setting('test.portal_recipient')::uuid, 'yes', 'maybe', NULL, NULL, NULL, NULL);
@@ -103,7 +114,7 @@ SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind =
   'a changed answer after the quiet time queues a new push');
 
 -- The same answer saved again is not news.
-UPDATE public.notification_outbox SET sent_at = now(), created_at = now() - interval '20 minutes' WHERE kind = 'placement_response';
+UPDATE public.notification_outbox SET sent_at = now() - interval '20 minutes', created_at = now() - interval '20 minutes' WHERE kind = 'placement_response';
 SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000b8', true);
 SET LOCAL ROLE authenticated;
 SELECT public.respond_to_placement_request(current_setting('test.portal_recipient')::uuid, 'yes', 'maybe', NULL, NULL, NULL, NULL);
@@ -149,12 +160,19 @@ UPDATE public.placement_request_recipients SET bed_available = 'waitlist'
  WHERE id = current_setting('test.portal_recipient')::uuid;
 SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response' AND sent_at IS NULL), 1,
   '(a push is waiting)');
+-- Two more like it: one being sent right now, one whose send stalled
+-- 10 minutes ago (its claim has lapsed; it would be sent again).
+INSERT INTO public.notification_outbox (user_id, kind, title, body, data, claimed_at)
+SELECT user_id, kind, title, body, data || jsonb_build_object('copy', n), now() - make_interval(mins => m)
+  FROM public.notification_outbox, (VALUES (1, 0), (2, 10)) AS v(n, m)
+ WHERE kind = 'placement_response' AND claimed_at IS NULL;
 SELECT set_config('request.jwt.claim.sub', 'b1000000-0000-0000-0000-0000000000b8', true);
 SET LOCAL ROLE authenticated;
 SELECT public.close_placement_request('91000000-0000-0000-0000-0000000000b8');
 RESET ROLE;
-SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response'), 0,
-  'closing the request drops the push not yet sent');
+SELECT is((SELECT string_agg(coalesce(data ->> 'copy', 'queued'), ',') FROM public.notification_outbox WHERE kind = 'placement_response'), '1',
+  'closing the request drops the pushes not yet sent, a stalled send too; one being sent right now is left to the sender');
+DELETE FROM public.notification_outbox WHERE kind = 'placement_response';
 UPDATE public.placement_request_recipients SET bed_available = 'yes'
  WHERE id = current_setting('test.portal_recipient')::uuid;
 SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response'), 0,

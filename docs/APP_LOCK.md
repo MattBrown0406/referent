@@ -63,3 +63,14 @@ a different face, then Cancel, leaves it locked with the Unlock button; a
 match unlocks with the sheet as it was; turning it on asks for Face ID and
 the cover comes down after. Simulated taps on iOS 26 switches need a press
 of about 0.2 s; quicker ones do not register.
+
+Checked again after the second round (same simulator): an app alert raised
+while locked (an auth link opened then) stays behind the cover and appears
+after Face ID; back after more than the chosen minute with a text field
+focused, no keyboard shows over the cover and typing while locked does not
+reach the field; the Unlock button works on the cover, which is never the
+key window.
+
+Locking ends editing the way tapping elsewhere does, so a field's own
+"on leaving" save runs: a value half typed when the person left more than
+the chosen time ago is saved as it stood.

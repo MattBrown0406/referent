@@ -114,6 +114,7 @@ final class AppLockController: NSObject {
     center.addObserver(self, selector: #selector(willEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
     center.addObserver(self, selector: #selector(didBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
     center.addObserver(self, selector: #selector(keyboardWillShow), name: UIResponder.keyboardWillShowNotification, object: nil)
+    center.addObserver(self, selector: #selector(windowDidBecomeVisible(_:)), name: UIWindow.didBecomeVisibleNotification, object: nil)
     if Self.enabled {
       lock()
       if UIApplication.shared.applicationState == .active { promptIfNeeded() }
@@ -158,6 +159,16 @@ final class AppLockController: NSObject {
     if locked, !authenticating { endEditing() }
   }
 
+  // A window that appears while locked (React Native gives every alert one)
+  // is hidden from VoiceOver too, until the lock opens.
+  @objc private func windowDidBecomeVisible(_ notification: Notification) {
+    guard locked, let cover = window, !cover.isHidden,
+          let appeared = notification.object as? UIWindow, appeared !== cover,
+          appeared.windowScene === cover.windowScene, !appeared.accessibilityElementsHidden else { return }
+    appeared.accessibilityElementsHidden = true
+    hiddenFromVoiceOver.append(Weak(window: appeared))
+  }
+
   @objc private func didBecomeActive() {
     // Face ID's own sheet makes the app inactive and active again; its
     // answer decides, not this.
@@ -188,6 +199,8 @@ final class AppLockController: NSObject {
         // the app switcher; didBecomeActive takes it down on return.
         if UIApplication.shared.applicationState == .active { self.hide() }
       } else {
+        // A field that took focus while Face ID was asking gives it up now.
+        self.endEditing()
         self.show()
       }
     }

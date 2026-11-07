@@ -37,6 +37,11 @@ ALTER TABLE public.notification_outbox ADD CONSTRAINT notification_outbox_kind_c
   CHECK (kind IN ('new_lead', 'assigned_to_me', 'overdue_mine', 'directory_decision', 'directory_submission', 'bed_opened',
                   'placement_response'));
 
+-- The answer throttle and the close/delete drop look these rows up by request.
+CREATE INDEX IF NOT EXISTS notification_outbox_placement_response_idx
+  ON public.notification_outbox ((data ->> 'placement_request_id'), created_at)
+  WHERE kind = 'placement_response';
+
 -- ===========================================================================
 -- 2. Copy and enqueue
 -- ===========================================================================
@@ -141,12 +146,13 @@ BEGIN
     RETURN NULL;
   END IF;
   -- A program editing an answer it already gave: one push per request every
-  -- 15 minutes, however often it saves. A first answer always counts.
+  -- 15 minutes (from the last one sent, or queued), however often it saves.
+  -- A first answer always counts.
   IF OLD.status IN ('responded', 'declined') AND NOT OLD.entered_by_practice
      AND EXISTS (SELECT 1 FROM public.notification_outbox o
-                  WHERE o.user_id = q.created_by AND o.kind = 'placement_response'
-                    AND o.data ->> 'placement_request_id' = q.id::text
-                    AND o.created_at > now() - interval '15 minutes') THEN
+                  WHERE o.kind = 'placement_response' AND o.data ->> 'placement_request_id' = q.id::text
+                    AND o.user_id = q.created_by
+                    AND coalesce(o.sent_at, o.created_at) > now() - interval '15 minutes') THEN
     RETURN NULL;
   END IF;
   PERFORM public.notify_enqueue(q.created_by, 'placement_response', jsonb_build_object('placement_request_id', q.id));
@@ -160,9 +166,10 @@ CREATE TRIGGER placement_request_recipients_answer_notify
   AFTER UPDATE ON public.placement_request_recipients
   FOR EACH ROW EXECUTE FUNCTION public.placement_answer_notify();
 
--- A request closed, cancelled or deleted: a push about it not yet sent (nor
--- claimed by the sender) is dropped, so nobody is sent to compare answers
--- they no longer need.
+-- A request closed, cancelled or deleted: a push about it not yet sent is
+-- dropped, so nobody is sent to compare answers they no longer need. One the
+-- sender claimed is left to it unless its 5-minute claim has lapsed (a send
+-- being retried; push_outbox_claim would pick it up again).
 CREATE OR REPLACE FUNCTION public.placement_request_drop_pushes()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
@@ -170,8 +177,8 @@ SET search_path = public
 AS $$
 BEGIN
   DELETE FROM public.notification_outbox o
-   WHERE o.kind = 'placement_response' AND o.sent_at IS NULL AND o.claimed_at IS NULL
-     AND o.data ->> 'placement_request_id' = OLD.id::text;
+   WHERE o.kind = 'placement_response' AND o.data ->> 'placement_request_id' = OLD.id::text
+     AND o.sent_at IS NULL AND (o.claimed_at IS NULL OR o.claimed_at < now() - interval '5 minutes');
   RETURN NULL;
 END
 $$;

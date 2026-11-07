@@ -202,7 +202,7 @@ check('case-card call/text reads the in-memory contact list, never the server',
   /const contacts = allCaseContacts\.filter\(\(item\) => item\.caseId === card\.caseId && item\.phone\.trim\(\)\)/.test(appSource)
   && !/function cardContactAction[\s\S]*?fetchCase[\s\S]*?function logCardContact/.test(appSource));
 check('hydration seeds contacts through the cache-aware case loader',
-  /const load = await loadCaseList\(userId\);[\s\S]{0,700}setAllCaseContacts\(activeContacts\)/.test(appSource));
+  /const load = await loadCaseList\(userId\);[\s\S]{0,1000}setAllCaseContacts\(activeContacts\)/.test(appSource));
 check('the saved case list falls back only when the server is unreachable',
   /remote = await fetchCaseList\(\);\s*\} catch \(error\) \{\s*if \(!isNetworkError\(error\)\) throw error;/.test(storeSource));
 // The sections are rebuilt when the local day changes (midnight, or a return

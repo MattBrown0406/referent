@@ -38,7 +38,11 @@ for (const text of [
   // VoiceOver: the app's own windows are hidden while locked, restored after.
   'other.accessibilityElementsHidden = true',
   'entry.window?.accessibilityElementsHidden = false',
+  // ...and so is a window that appears while locked (an alert raised then).
+  'UIWindow.didBecomeVisibleNotification',
+  'appeared.accessibilityElementsHidden = true',
 ]) assert.ok(swift.includes(text), `AppLockModule.swift missing: ${text}`);
+assert.ok(/\} else \{\s*\/\/[^\n]*\n\s*self\.endEditing\(\)\s*self\.show\(\)/.test(swift), 'a field that took focus during Face ID gives it up after a cancel');
 assert.ok(/@objc private func willResignActive\(\) \{[\s\S]{0,120}show\(\)/.test(swift), 'the cover goes up on willResignActive, before the snapshot');
 assert.ok(/if Self\.enabled \{\s*lock\(\)/.test(swift), 'a launch with the lock on starts locked and covered');
 assert.ok(/private func lock\(\) \{\s*locked = true\s*endEditing\(\)\s*show\(\)/.test(swift), 'locking ends typing and puts the cover up');
@@ -46,7 +50,7 @@ assert.ok((swift.match(/locked = true/g) || []).length === 1, 'every lock goes t
 assert.ok(swift.includes('#selector(UIResponder.resignFirstResponder)'), 'the field behind the lock gives up the keyboard');
 assert.ok(/@objc private func keyboardWillShow\(\) \{\s*if locked, !authenticating \{ endEditing\(\) \}/.test(swift), 'and a field that takes focus while locked gives it up again, except during Face ID');
 
-// The lock: Face ID or the passcode; time away by uptime; one automatic
+// The lock: Face ID or the passcode; time away by a clock that counts in sleep; one automatic
 // prompt per return; never a lock that nothing can open.
 assert.ok(swift.includes('.deviceOwnerAuthentication,') && !/evaluatePolicy\(\.deviceOwnerAuthenticationWithBiometrics/.test(swift),
   'unlock accepts the passcode as well as Face ID');
