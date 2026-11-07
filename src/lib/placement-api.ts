@@ -112,8 +112,12 @@ export async function placementRequestExists(id: string): Promise<boolean | null
   }
 }
 
-/** The practice's newest requests with their programs (RLS: this workspace only). */
-export async function fetchPlacementRequests(): Promise<PlacementRequestsRead> {
+/**
+ * The practice's newest requests with their programs (RLS: this workspace
+ * only). `alsoId`: one request to include even when it is older than the
+ * newest REQUEST_LIMIT (a push about it was tapped, its answers are open).
+ */
+export async function fetchPlacementRequests(alsoId?: string | null): Promise<PlacementRequestsRead> {
   let requestRows: unknown[] = [];
   try {
     const { data, error, status } = await supabase
@@ -127,6 +131,12 @@ export async function fetchPlacementRequests(): Promise<PlacementRequestsRead> {
       throw placementFailure(error, status, 'Could not load placement requests.');
     }
     requestRows = Array.isArray(data) ? data : [];
+    const wanted = alsoId?.toLowerCase();
+    if (wanted && !requestRows.some((row) => String((row as { id?: unknown }).id).toLowerCase() === wanted)) {
+      const extra = await supabase.from('placement_requests').select(REQUEST_SELECT).eq('id', wanted).maybeSingle();
+      if (extra.error) throw placementFailure(extra.error, extra.status, 'Could not load placement requests.');
+      if (extra.data) requestRows = [...requestRows, extra.data];
+    }
   } catch (error) {
     if (isMissing(error)) return { available: false, requests: [] };
     throw placementFailure(error, undefined, 'Could not load placement requests.');
@@ -319,8 +329,12 @@ const INITIAL: PlacementRequestsState = { status: 'loading', requests: [], error
 export type PlacementRequestsHook = {
   state: PlacementRequestsState;
   seen: PlacementSeen;
-  /** Reads again; resolves to how it went (the comparison says "online only" on 'offline'). */
-  reload: () => Promise<PlacementRequestsState['status'] | 'failed'>;
+  /**
+   * Reads again; resolves to how it went (the comparison says "online only"
+   * on 'offline'). `alsoId`: a request to keep in the list from now on, even
+   * when it is older than the newest ones read.
+   */
+  reload: (alsoId?: string) => Promise<PlacementRequestsState['status'] | 'failed'>;
   /** A request changed by this practitioner (sent, answer logged, cancelled): shown at once. */
   replace: (view: PlacementRequestView) => void;
   /** The practitioner looked at this request's answers. */
@@ -352,16 +366,20 @@ export function usePlacementRequests(userId: string | undefined, refreshKey: num
   stateRef.current = state;
   const seenRef = useRef(seen);
   seenRef.current = seen;
+  // The request whose answers were last opened: every later read keeps it,
+  // so a refresh never drops it from under the open screen.
+  const alsoIdRef = useRef<string | null>(null);
 
-  const load = useCallback(async (): Promise<PlacementRequestsState['status'] | 'failed'> => {
+  const load = useCallback(async (alsoId?: string): Promise<PlacementRequestsState['status'] | 'failed'> => {
     const generation = ++generationRef.current;
     const readScope = scope;
+    if (typeof alsoId === 'string' && alsoId) alsoIdRef.current = alsoId;
     if (!userId) {
       setHeld({ scope: readScope, state: INITIAL });
       return 'failed';
     }
     try {
-      const read = await fetchPlacementRequests();
+      const read = await fetchPlacementRequests(alsoIdRef.current);
       if (generation !== generationRef.current || scopeRef.current !== readScope) return 'failed';
       const next: PlacementRequestsState = read.available
         ? { status: 'ready', requests: read.requests, error: '' }
@@ -393,6 +411,8 @@ export function usePlacementRequests(userId: string | undefined, refreshKey: num
     return () => { active = false; };
   }, [userId]);
 
+  // Another workspace keeps nothing of this one's (before its first read).
+  useEffect(() => { alsoIdRef.current = null; }, [scope]);
   useEffect(() => {
     void load();
   }, [load, refreshKey]);

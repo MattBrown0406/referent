@@ -9,8 +9,11 @@
 --   3. A trigger on placement_request_recipients: an answer entered in the
 --      center portal (not one the practitioner logged) queues a push for
 --      the practitioner who sent the request, while still in that
---      workspace. notify_enqueue folds several answers that arrive before
---      the next send into one push per request.
+--      workspace and while the request is open. notify_enqueue folds
+--      several answers that arrive before the next send into one push per
+--      request; a program editing its answer pushes at most once every 15
+--      minutes per request. Closing, cancelling or deleting the request
+--      drops a push not yet sent.
 --   4. push_dispatch_tick reads referralfit_push_dispatch_url and
 --      referralfit_push_dispatch_secret from Vault (Supabase does not let
 --      the postgres role ALTER DATABASE SET app.* any more); the old
@@ -130,9 +133,20 @@ BEGIN
          IS NOT DISTINCT FROM (OLD.bed_available, OLD.likely_accept, OLD.earliest_admit_on, OLD.daily_rate, OLD.cost_note, OLD.note) THEN
     RETURN NULL;
   END IF;
-  SELECT r.id, r.org_id, r.created_by INTO q FROM public.placement_requests r WHERE r.id = NEW.request_id;
-  IF NOT FOUND OR q.created_by IS NULL THEN RETURN NULL; END IF;
+  SELECT r.id, r.org_id, r.created_by, r.status INTO q FROM public.placement_requests r WHERE r.id = NEW.request_id;
+  IF NOT FOUND OR q.created_by IS NULL OR q.status <> 'open' THEN RETURN NULL; END IF;
+  -- Their own answer (a center account of the practitioner's) needs no push.
+  IF NEW.responded_by IS NOT DISTINCT FROM q.created_by THEN RETURN NULL; END IF;
   IF NOT EXISTS (SELECT 1 FROM public.org_members m WHERE m.org_id = q.org_id AND m.user_id = q.created_by) THEN
+    RETURN NULL;
+  END IF;
+  -- A program editing an answer it already gave: one push per request every
+  -- 15 minutes, however often it saves. A first answer always counts.
+  IF OLD.status IN ('responded', 'declined') AND NOT OLD.entered_by_practice
+     AND EXISTS (SELECT 1 FROM public.notification_outbox o
+                  WHERE o.user_id = q.created_by AND o.kind = 'placement_response'
+                    AND o.data ->> 'placement_request_id' = q.id::text
+                    AND o.created_at > now() - interval '15 minutes') THEN
     RETURN NULL;
   END IF;
   PERFORM public.notify_enqueue(q.created_by, 'placement_response', jsonb_build_object('placement_request_id', q.id));
@@ -145,6 +159,34 @@ DROP TRIGGER IF EXISTS placement_request_recipients_answer_notify ON public.plac
 CREATE TRIGGER placement_request_recipients_answer_notify
   AFTER UPDATE ON public.placement_request_recipients
   FOR EACH ROW EXECUTE FUNCTION public.placement_answer_notify();
+
+-- A request closed, cancelled or deleted: a push about it not yet sent (nor
+-- claimed by the sender) is dropped, so nobody is sent to compare answers
+-- they no longer need.
+CREATE OR REPLACE FUNCTION public.placement_request_drop_pushes()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  DELETE FROM public.notification_outbox o
+   WHERE o.kind = 'placement_response' AND o.sent_at IS NULL AND o.claimed_at IS NULL
+     AND o.data ->> 'placement_request_id' = OLD.id::text;
+  RETURN NULL;
+END
+$$;
+REVOKE ALL ON FUNCTION public.placement_request_drop_pushes() FROM PUBLIC, anon, authenticated, service_role;
+
+DROP TRIGGER IF EXISTS placement_requests_closed_drop_pushes ON public.placement_requests;
+CREATE TRIGGER placement_requests_closed_drop_pushes
+  AFTER UPDATE OF status ON public.placement_requests
+  FOR EACH ROW WHEN (OLD.status = 'open' AND NEW.status IS DISTINCT FROM 'open')
+  EXECUTE FUNCTION public.placement_request_drop_pushes();
+
+DROP TRIGGER IF EXISTS placement_requests_deleted_drop_pushes ON public.placement_requests;
+CREATE TRIGGER placement_requests_deleted_drop_pushes
+  AFTER DELETE ON public.placement_requests
+  FOR EACH ROW EXECUTE FUNCTION public.placement_request_drop_pushes();
 
 -- ===========================================================================
 -- 4. The scheduler's address and secret

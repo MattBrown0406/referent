@@ -111,11 +111,14 @@ export type PreferencesState = {
 
 const BASE_PREFERENCE_COLUMNS = 'push_enabled, new_lead, assigned_to_me, overdue_mine, directory_decision, directory_submission';
 
-// 42703: a column the server does not have yet (bed_opened,
-// placement_response: their migrations are newer than the database). Read
-// and write without it so the other switches keep working; it then reads
-// as off.
-const UNDEFINED_COLUMN = '42703';
+// A column the server does not have yet (bed_opened, placement_response:
+// their migrations are newer than the database). Read and write without it
+// so the other switches keep working (turning push off too); it then reads
+// as off. A select reports it as Postgres's 42703; an upsert never reaches
+// Postgres: PostgREST checks its schema cache and answers PGRST204.
+export function isMissingColumn(error: { code?: string } | null | undefined): boolean {
+  return error?.code === '42703' || error?.code === 'PGRST204';
+}
 
 // The newer columns, newest first: an older server drops one at a time.
 const OPTIONAL_PREFERENCE_COLUMNS = ['placement_response', 'bed_opened'] as const;
@@ -127,7 +130,7 @@ export async function fetchNotificationPreferences(userId: string): Promise<Pref
     .select([BASE_PREFERENCE_COLUMNS, ...optional].join(', '))
     .eq('user_id', userId)
     .maybeSingle();
-  while (error?.code === UNDEFINED_COLUMN && optional.length) {
+  while (isMissingColumn(error) && optional.length) {
     optional = optional.slice(1);
     ({ data, error } = await supabase
       .from('notification_preferences')
@@ -158,7 +161,7 @@ export async function saveNotificationPreferences(userId: string, preferences: N
   let names: readonly (typeof OPTIONAL_PREFERENCE_COLUMNS)[number][] = OPTIONAL_PREFERENCE_COLUMNS;
   const withOptional = () => ({ ...row, ...Object.fromEntries(names.map((name) => [name, optional[name]])) });
   let { error } = await supabase.from('notification_preferences').upsert(withOptional(), { onConflict: 'user_id' });
-  while (error?.code === UNDEFINED_COLUMN && names.length) {
+  while (isMissingColumn(error) && names.length) {
     names = names.slice(1);
     ({ error } = await supabase.from('notification_preferences').upsert(withOptional(), { onConflict: 'user_id' }));
   }

@@ -155,7 +155,8 @@ export default function PlacementCompare({
     setLoading(true);
     setNow(new Date());
     void fetchPlacementPracticeName().then((name) => { if (generationRef.current === generation) setPracticeName(name); });
-    void placementRef.current.reload().then((status) => {
+    // Its own request too: a push can be about one older than the newest read.
+    void placementRef.current.reload(requestId).then((status) => {
       if (generationRef.current !== generation) return;
       setLoading(false);
       setOffline(status === 'offline');
@@ -181,7 +182,7 @@ export default function PlacementCompare({
   async function refresh() {
     const generation = generationRef.current;
     setLoading(true);
-    const status = await placement.reload();
+    const status = await placement.reload(requestId ?? undefined);
     if (generationRef.current !== generation) return;
     setLoading(false);
     setOffline(status === 'offline');

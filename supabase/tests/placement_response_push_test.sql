@@ -5,7 +5,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(15);
+SELECT plan(21);
 
 -- p1 owns practice P and sends the request; p2 is a teammate; c1 is the
 -- center that claimed listing L1 (answers in the portal); L2 is unclaimed
@@ -84,17 +84,26 @@ RESET ROLE;
 SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response'), 1,
   'a changed answer before the send is the same one push');
 
--- After that push went out, a changed answer is news again.
+-- Sent a minute ago: the program editing again within 15 minutes waits.
 UPDATE public.notification_outbox SET sent_at = now() WHERE kind = 'placement_response';
+SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000b8', true);
+SET LOCAL ROLE authenticated;
+SELECT public.respond_to_placement_request(current_setting('test.portal_recipient')::uuid, 'waitlist', 'no', NULL, NULL, NULL, NULL);
+RESET ROLE;
+SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response' AND sent_at IS NULL), 0,
+  'a program editing its answer within 15 minutes of the last push sends nothing more');
+
+-- Later than that, a changed answer is news again.
+UPDATE public.notification_outbox SET created_at = now() - interval '20 minutes' WHERE kind = 'placement_response';
 SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000b8', true);
 SET LOCAL ROLE authenticated;
 SELECT public.respond_to_placement_request(current_setting('test.portal_recipient')::uuid, 'yes', 'maybe', NULL, NULL, NULL, NULL);
 RESET ROLE;
 SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response' AND sent_at IS NULL), 1,
-  'a changed answer after the send queues a new push');
+  'a changed answer after the quiet time queues a new push');
 
 -- The same answer saved again is not news.
-UPDATE public.notification_outbox SET sent_at = now() WHERE kind = 'placement_response';
+UPDATE public.notification_outbox SET sent_at = now(), created_at = now() - interval '20 minutes' WHERE kind = 'placement_response';
 SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000b8', true);
 SET LOCAL ROLE authenticated;
 SELECT public.respond_to_placement_request(current_setting('test.portal_recipient')::uuid, 'yes', 'maybe', NULL, NULL, NULL, NULL);
@@ -111,19 +120,49 @@ SELECT public.respond_to_placement_request(current_setting('test.portal_recipien
 RESET ROLE;
 SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response'), 0,
   'the practitioner who turned it off gets nothing');
-
--- Left the workspace: nothing.
 UPDATE public.notification_preferences SET placement_response = true WHERE user_id = 'b1000000-0000-0000-0000-0000000000b8';
--- (the center account stands in for someone no longer in practice P)
-UPDATE public.placement_requests SET created_by = 'c1000000-0000-0000-0000-0000000000b8'
+
+-- The practitioner answering as the program themselves: no push to them.
+UPDATE public.placement_request_recipients SET responded_by = 'b1000000-0000-0000-0000-0000000000b8', bed_available = 'no'
+ WHERE id = current_setting('test.portal_recipient')::uuid;
+SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response'), 0,
+  'an answer the sender gave themselves sends no push');
+UPDATE public.placement_request_recipients SET responded_by = 'c1000000-0000-0000-0000-0000000000b8'
+ WHERE id = current_setting('test.portal_recipient')::uuid;
+
+-- Left the workspace: nothing. (x1 has a workspace of their own, not P.)
+INSERT INTO auth.users (id, email) VALUES ('a9000000-0000-0000-0000-0000000000b8', 'push-x1@example.test');
+UPDATE public.placement_requests SET created_by = 'a9000000-0000-0000-0000-0000000000b8'
  WHERE id = '91000000-0000-0000-0000-0000000000b8';
-INSERT INTO public.notification_preferences (user_id, push_enabled) VALUES ('c1000000-0000-0000-0000-0000000000b8', true);
+INSERT INTO public.notification_preferences (user_id, push_enabled) VALUES ('a9000000-0000-0000-0000-0000000000b8', true);
 INSERT INTO public.push_tokens (expo_push_token, user_id, platform)
-VALUES ('ExponentPushToken[pushtestc1cccc]', 'c1000000-0000-0000-0000-0000000000b8', 'ios');
-UPDATE public.placement_request_recipients SET bed_available = 'no'
+VALUES ('ExponentPushToken[pushtestx1dddd]', 'a9000000-0000-0000-0000-0000000000b8', 'ios');
+UPDATE public.placement_request_recipients SET bed_available = 'yes'
  WHERE id = current_setting('test.portal_recipient')::uuid;
 SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response'), 0,
   'a sender who left the workspace gets nothing');
+UPDATE public.placement_requests SET created_by = 'b1000000-0000-0000-0000-0000000000b8'
+ WHERE id = '91000000-0000-0000-0000-0000000000b8';
+
+-- Closed before the push went out: it is dropped, and later answers send nothing.
+UPDATE public.placement_request_recipients SET bed_available = 'waitlist'
+ WHERE id = current_setting('test.portal_recipient')::uuid;
+SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response' AND sent_at IS NULL), 1,
+  '(a push is waiting)');
+SELECT set_config('request.jwt.claim.sub', 'b1000000-0000-0000-0000-0000000000b8', true);
+SET LOCAL ROLE authenticated;
+SELECT public.close_placement_request('91000000-0000-0000-0000-0000000000b8');
+RESET ROLE;
+SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response'), 0,
+  'closing the request drops the push not yet sent');
+UPDATE public.placement_request_recipients SET bed_available = 'yes'
+ WHERE id = current_setting('test.portal_recipient')::uuid;
+SELECT is((SELECT count(*)::integer FROM public.notification_outbox WHERE kind = 'placement_response'), 0,
+  'and an answer changed after closing sends nothing');
+SELECT ok(
+  EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'placement_requests_deleted_drop_pushes' AND tgrelid = 'public.placement_requests'::regclass),
+  'deleting a request drops its unsent pushes too'
+);
 
 -- ===========================================================================
 -- Schema and grants

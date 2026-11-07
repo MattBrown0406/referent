@@ -419,6 +419,22 @@ function query(result) {
   const read = await api.fetchPlacementRequests();
   check('requests come back with their programs in rank order', [read.available, read.requests[0].recipients.map((item) => item.rank)], [true, [1, 2]]);
 
+  // A push about a request older than the newest 100: it is read by id too.
+  const older = { ...requestRow, id: 'f0000000-0000-4000-8000-0000000000aa', created_at: '2026-01-01T00:00:00Z' };
+  const asked = [];
+  fake.from = (table) => {
+    if (table !== 'placement_requests') return query({ data: [], error: null, status: 200 });
+    const chain = query({ data: [requestRow], error: null, status: 200 });
+    chain.eq = (column, value) => { asked.push([column, value]); return { maybeSingle: () => Promise.resolve({ data: older, error: null, status: 200 }) }; };
+    return chain;
+  };
+  const withOlder = await api.fetchPlacementRequests('F0000000-0000-4000-8000-0000000000AA');
+  check('a tapped request beyond the newest is read by id and kept', [asked, withOlder.requests.map((item) => item.request.id)],
+    [[['id', 'f0000000-0000-4000-8000-0000000000aa']], [requestRow.id, older.id]]);
+  asked.length = 0;
+  await api.fetchPlacementRequests(requestRow.id);
+  check('one already among the newest is not read twice', asked, []);
+
   fake.rpc = (name, args) => {
     check('create sends the saved match, the ranked ids, their places on the match screen, and no criteria of its own', [name, args.p_match_profile_id, args.p_partner_ids, args.p_ranks, args.p_criteria, args.p_respond_hours, args.p_note],
       ['create_placement_request', 'm1', ['p1', 'p2'], [1, 3], null, 24, 'Prefers a quiet setting']);

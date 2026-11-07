@@ -160,6 +160,9 @@ const pushSource = readFileSync(path.join(repoRoot, 'src/lib/push.ts'), 'utf8');
 assert.ok(pushSource.includes("{ key: 'placement_response', label: 'A program answers my placement request'"), 'the Notify me card lists the new kind');
 assert.ok(pushSource.includes("placement_response: 'placementResponse'") && pushSource.includes('placementResponse: true,'), 'placement_response maps to its preference, on by default like the database');
 assert.ok(pushSource.includes("const OPTIONAL_PREFERENCE_COLUMNS = ['placement_response', 'bed_opened'] as const;"), 'an older server without the column still loads and saves the other switches');
+assert.ok(pushSource.includes("return error?.code === '42703' || error?.code === 'PGRST204';")
+  && (pushSource.match(/while \(isMissingColumn\(error\) && /g) || []).length === 2,
+  'a read (42703) and a save (PostgREST PGRST204) both drop a column the server lacks');
 const pushMigration = readFileSync(path.join(repoRoot, 'supabase/migrations/20261106120000_placement_response_push.sql'), 'utf8');
 assert.ok(/^[\x00-\x7F]*$/.test(pushMigration) && !pushMigration.includes('\\'), 'push migration: ASCII only, no backslashes');
 {
