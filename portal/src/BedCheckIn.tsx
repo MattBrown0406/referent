@@ -1,6 +1,6 @@
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 
-import { bedsLine, bedTokenFrom, stepCount } from './email-rules';
+import { bedsLine, bedTokenFrom, stepCount, tokenForTab } from './email-rules';
 import { signedOutSupabase as supabase } from './supabase';
 
 // /b#<token>: the weekly bed check-in email's page (migration
@@ -42,7 +42,7 @@ function toStatus(row: Row | undefined): Status | null {
 }
 
 export default function BedCheckIn() {
-  const [token] = useState(() => bedTokenFrom(window.location.hash));
+  const [token] = useState(() => tokenForTab('referralfit.bedLink.v1', window.location.hash, bedTokenFrom));
   const [status, setStatus] = useState<Status | null>(null);
   const [form, setForm] = useState({ bedsMale: null as number | null, bedsFemale: null as number | null, contactName: '', contactPhone: '' });
   const [state, setState] = useState<'loading' | 'ready' | 'saving' | 'unavailable' | 'unreachable'>('loading');

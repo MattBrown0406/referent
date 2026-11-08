@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
   ACCEPT_CHOICES,
@@ -36,11 +36,18 @@ const TOKEN_KEY = 'referralfit.answerLink.v1';
 const CLAIM_PAGE = 'https://referralfit.com/programs';
 
 function readToken(): string | null {
+  const hash = window.location.hash.replace(/^#/, '').trim();
   const fromHash = answerLinkTokenFrom(window.location.hash);
   try {
     if (fromHash) {
       window.sessionStorage.setItem(TOKEN_KEY, fromHash);
       return fromHash;
+    }
+    // A link with a token that is cut off or wrong: never fall back to a
+    // request opened earlier in this tab.
+    if (hash) {
+      window.sessionStorage.removeItem(TOKEN_KEY);
+      return null;
     }
     return answerLinkTokenFrom(window.sessionStorage.getItem(TOKEN_KEY) || '');
   } catch {
@@ -58,6 +65,7 @@ export default function AnswerLink() {
   const [problem, setProblem] = useState('');
   const [notice, setNotice] = useState('');
   const [now, setNow] = useState(() => new Date());
+  const prefilledRef = useRef(false);
 
   const load = useCallback(async (): Promise<AnswerLinkView | null> => {
     if (!token) { setState('unavailable'); return null; }
@@ -69,6 +77,10 @@ export default function AnswerLink() {
       }
       const next = answerLinkViewFromJson(data);
       if (!next) { setState('unavailable'); return null; }
+      if (!prefilledRef.current) {
+        prefilledRef.current = true;
+        setForm(formFromRow(next.answer));
+      }
       setView(next);
       setNow(new Date());
       setState('ready');
@@ -82,7 +94,7 @@ export default function AnswerLink() {
   useEffect(() => {
     // Keep the token out of history entries and screenshots of the address bar.
     if (window.location.hash) window.history.replaceState(null, '', window.location.pathname);
-    void load().then((first) => { if (first) setForm(formFromRow(first.answer)); });
+    void load();
   }, [load]);
 
   // The time left keeps moving while the page is open.
@@ -102,9 +114,10 @@ export default function AnswerLink() {
     try {
       const { data, error } = await supabase.rpc('public_placement_answer_respond', { p_token: token, ...checked.payload });
       if (error) {
-        setProblem(error.message || 'The answer was not saved. Check the connection and try again.');
+        if (error.code === 'P0002') { setState('unavailable'); return; }
+        // No code: the request never reached the server (offline, a timeout).
+        setProblem(error.code && error.message ? error.message : 'The answer was not saved. Check the connection and try again.');
         await load();
-        setState('ready');
         return;
       }
       const saved = answerLinkViewFromJson(data);

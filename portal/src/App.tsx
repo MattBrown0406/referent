@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
 
 import Credentials from './Credentials';
@@ -213,6 +213,10 @@ export default function App() {
     }
   });
   const [authMode, setAuthMode] = useState<'signin' | 'signup'>(() => (pendingClaimCode ? 'signup' : 'signin'));
+  // Signed in at some point in this tab (so a sign-out ends the invite), and
+  // whether the invite's code was already put in the field once.
+  const hadSessionRef = useRef(false);
+  const prefilledRef = useRef(false);
   const [claimCode, setClaimCode] = useState('');
   const [listing, setListing] = useState<Listing | null | 'none'>(null);
   const [form, setForm] = useState<ListingForm | null>(null);
@@ -320,9 +324,17 @@ export default function App() {
     setBedHistory((history as BedHistoryRow[] | null) || []);
   }
 
+  // The invite's code belongs to whoever opened the link: forget it on
+  // sign-out (a shared computer), and once it can no longer be used.
+  const forgetClaimCode = useCallback(() => {
+    setPendingClaimCode('');
+    try { window.sessionStorage.removeItem(CLAIM_CODE_STORAGE_KEY); } catch { /* storage unavailable */ }
+  }, []);
+
   useEffect(() => {
-    if (session) { setPassword(''); void loadListing(); }
+    if (session) { hadSessionRef.current = true; setPassword(''); void loadListing(); }
     else {
+      if (hadSessionRef.current) { forgetClaimCode(); prefilledRef.current = false; }
       // Nothing from the previous account (its held edit, its last notice,
       // the email and password it signed in with, a claim code it typed)
       // may show for the next one on a shared browser.
@@ -330,15 +342,20 @@ export default function App() {
       setHeldEdit(null); setNotice(''); setError('');
       setEmail(''); setPassword(''); setClaimCode(''); setBedsForm(toBedsForm(null));
     }
-  }, [session, loadListing]);
+  }, [session, loadListing, forgetClaimCode]);
 
   useEffect(() => {
     if (/^\/claim\/?$/.test(window.location.pathname)) window.history.replaceState(null, '', '/');
   }, []);
 
   useEffect(() => {
-    if (listing === 'none' && pendingClaimCode && !claimCode) setClaimCode(pendingClaimCode);
-  }, [listing, pendingClaimCode, claimCode]);
+    if (listing === 'none' && pendingClaimCode && !prefilledRef.current) {
+      prefilledRef.current = true;
+      setClaimCode(pendingClaimCode);
+    }
+    // An account that already manages a listing cannot use another code.
+    if (listing && listing !== 'none' && pendingClaimCode) forgetClaimCode();
+  }, [listing, pendingClaimCode, forgetClaimCode]);
 
   async function submitAuth(event: React.FormEvent) {
     event.preventDefault();
@@ -369,11 +386,14 @@ export default function App() {
       const { error: claimError } = await supabase.rpc('claim_center_listing', { p_code: claimCode.trim().toLowerCase() });
       if (claimError) throw claimError;
       setClaimCode('');
-      setPendingClaimCode('');
-      try { window.sessionStorage.removeItem(CLAIM_CODE_STORAGE_KEY); } catch { /* storage unavailable */ }
+      forgetClaimCode();
       setNotice('Listing claimed. Keep it accurate — that is what families and interventionists see.');
       await loadListing();
     } catch (claimException) {
+      // A code that is unknown, used or expired will not work later either:
+      // show the search again so the program can ask instead.
+      const code = (claimException as { code?: string }).code;
+      if (code === 'P0002' || code === '22023') forgetClaimCode();
       setError((claimException as Error).message);
     } finally {
       setBusy(false);

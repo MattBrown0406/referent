@@ -194,3 +194,24 @@ export function placeText(row: Pick<TargetRow, 'city' | 'state'>): string {
 export function isMissingSchema(code: string | undefined): boolean {
   return code === 'PGRST202' || code === 'PGRST205' || code === '42P01' || code === '42703' || code === '42883';
 }
+
+/**
+ * A listing's website as a safe link: http(s) only, a bare host gets
+ * https://, anything else (javascript:, data:, mailto:, junk) is no link.
+ */
+export function safeWebsiteHref(value: string | null | undefined): string | null {
+  const raw = (value || '').trim();
+  if (!raw) return null;
+  let candidate = raw;
+  if (!/^https?:\/\//i.test(raw)) {
+    // A scheme other than http(s) (no dot before the colon): refuse it.
+    if (/^[a-z][a-z0-9+.-]*:/i.test(raw) && !/^[^:]*\./.test(raw)) return null;
+    candidate = `https://${raw}`;
+  }
+  try {
+    const url = new URL(candidate);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
