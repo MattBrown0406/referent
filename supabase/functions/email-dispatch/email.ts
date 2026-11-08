@@ -40,6 +40,8 @@ export type RenderedEmail = {
 export const DEFAULT_APP_URL = 'https://app.referralfit.com';
 export const DEFAULT_PORTAL_URL = 'https://portal.referralfit.com';
 export const DEFAULT_FROM = 'ReferralFit <notifications@referralfit.com>';
+// Replies go to Matt (Matt, 2026-11-08); EMAIL_REPLY_TO overrides.
+export const DEFAULT_REPLY_TO = 'matt@freedominterventions.com';
 export const RESEND_URL = 'https://api.resend.com/emails';
 
 const TOKEN_PATTERN = /^[0-9a-f]{64}$/;

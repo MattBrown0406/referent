@@ -103,12 +103,13 @@ Vault settings last (they start the sending).
    ```sh
    supabase functions deploy email-dispatch --project-ref ovfafffvcpaahktvlsdm
    EMAIL_DISPATCH_SECRET="$(openssl rand -hex 32)"
-   supabase secrets set EMAIL_DISPATCH_SECRET="$EMAIL_DISPATCH_SECRET" RESEND_API_KEY="<the Resend key>" \
-     EMAIL_REPLY_TO="<where replies should go>" --project-ref ovfafffvcpaahktvlsdm
+   supabase secrets set EMAIL_DISPATCH_SECRET="$EMAIL_DISPATCH_SECRET" --project-ref ovfafffvcpaahktvlsdm
    ```
 
-   Optional: `EMAIL_FROM` (default `ReferralFit <notifications@referralfit.com>`),
-   `EMAIL_APP_URL`, `EMAIL_PORTAL_URL`. `SUPABASE_URL` and
+   `RESEND_API_KEY` is set the same way (done 2026-11-08). Optional:
+   `EMAIL_REPLY_TO` (default matt@freedominterventions.com), `EMAIL_FROM`
+   (default `ReferralFit <notifications@referralfit.com>`), `EMAIL_APP_URL`,
+   `EMAIL_PORTAL_URL`. `SUPABASE_URL` and
    `SUPABASE_SERVICE_ROLE_KEY` are provided automatically.
 5. **Vault** (SQL editor), with the same `EMAIL_DISPATCH_SECRET` value:
 

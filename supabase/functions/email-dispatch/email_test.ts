@@ -2,6 +2,7 @@ import { assert, assertEquals, assertFalse, assertStringIncludes } from 'jsr:@st
 
 import {
   daysAgo,
+  DEFAULT_REPLY_TO,
   escapeHtml,
   isAuthorized,
   isTransientStatus,
@@ -115,4 +116,8 @@ Deno.test('Resend body: one recipient, both parts, unsubscribe headers, a kind t
 Deno.test('transient statuses', () => {
   for (const status of [429, 408, 500, 502, 503]) assert(isTransientStatus(status), String(status));
   for (const status of [400, 401, 403, 404, 422]) assertFalse(isTransientStatus(status), String(status));
+});
+
+Deno.test('replies go to Matt unless EMAIL_REPLY_TO says otherwise', () => {
+  assertEquals(DEFAULT_REPLY_TO, 'matt@freedominterventions.com');
 });

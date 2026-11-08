@@ -21,6 +21,7 @@ import {
   DEFAULT_APP_URL,
   DEFAULT_FROM,
   DEFAULT_PORTAL_URL,
+  DEFAULT_REPLY_TO,
   isAuthorized,
   isTransientStatus,
   type Links,
@@ -86,7 +87,7 @@ async function sendOne(row: OutboxRow, apiKey: string, from: string, replyTo: st
 async function drain(supabase: ReturnType<typeof serviceClient>): Promise<{ sent: number; failed: number; retrying: number }> {
   const apiKey = requiredEnv('RESEND_API_KEY');
   const from = Deno.env.get('EMAIL_FROM') || DEFAULT_FROM;
-  const replyTo = Deno.env.get('EMAIL_REPLY_TO') || undefined;
+  const replyTo = Deno.env.get('EMAIL_REPLY_TO') || DEFAULT_REPLY_TO;
   const target = links();
   const totals = { sent: 0, failed: 0, retrying: 0 };
   let seen = 0;
