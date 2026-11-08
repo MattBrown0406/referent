@@ -2212,6 +2212,17 @@ export default function App() {
     wait(0);
   }, []);
 
+  // After a change made on the server (an import, a referral logged from the
+  // case card): a refresh already in flight may have read before it, so wait
+  // for that one and read again.
+  const refreshAfterServerChange = useCallback(() => {
+    if (refreshInFlightRef.current) {
+      scheduleCatchUpRefresh();
+      return;
+    }
+    void refreshFromServerRef.current?.('pull').catch(() => undefined);
+  }, [scheduleCatchUpRefresh]);
+
   const refreshFromServer = useCallback(async (trigger: 'foreground' | 'pull'): Promise<'ok' | 'offline'> => {
     const userId = session?.user?.id;
     if (!userId) return 'ok';
@@ -7806,7 +7817,7 @@ export default function App() {
               <ProgramReferralCard
                 key={record.id}
                 caseId={record.id}
-                onLedgerChanged={() => { void refreshFromServerRef.current?.('pull').catch(() => undefined); }}
+                onLedgerChanged={refreshAfterServerChange}
               />
 
               <View style={styles.infoCard}>
@@ -10186,11 +10197,10 @@ export default function App() {
         userId={activeUserId}
         partners={partners}
         directoryEntitled={entitlements.entitlements.directory}
-        isPlatformAdmin={credentialIndex.isPlatformAdmin}
         onClose={() => setShowPartnerImport(false)}
         onImported={(result) => {
           // The new partners come in with the next read of the network.
-          if (result.added || result.linked) void refreshFromServerRef.current?.('pull').catch(() => undefined);
+          if (result.added || result.linked) refreshAfterServerChange();
         }}
       />
       <GlobalDirectoryScreen

@@ -24,6 +24,18 @@
 
 BEGIN;
 
+-- Needs 20261108170000_audit_round1.sql (email_local_now, the zone name):
+-- this fails here, before anything changes, when that is not applied yet.
+DO $$
+BEGIN
+  IF to_regprocedure('public.email_local_now(text, integer)') IS NULL
+     OR NOT EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = 'public' AND table_name = 'email_preferences' AND column_name = 'tz_name') THEN
+    RAISE EXCEPTION 'Apply 20261108170000_audit_round1.sql first, then run this file again.';
+  END IF;
+END
+$$;
+
 -- ===========================================================================
 -- 1. Import partners
 -- ===========================================================================
@@ -42,8 +54,26 @@ AS $$
 $$;
 REVOKE ALL ON FUNCTION public.import_partner_website(text) FROM PUBLIC, anon, authenticated;
 
--- One own-contact row, or NULL when it was skipped (empty or a duplicate).
-CREATE OR REPLACE FUNCTION public.import_partner_row(p_org uuid, p_user uuid, r jsonb)
+-- The keys a partner is known by in its workspace: its email, the last ten
+-- digits of its phone, and its organization with its name (lower case).
+CREATE OR REPLACE FUNCTION public.import_partner_keys(p_email text, p_phone text, p_organization text, p_name text)
+RETURNS text[]
+LANGUAGE sql IMMUTABLE
+SET search_path = public
+AS $$
+  SELECT array_remove(ARRAY[
+    CASE WHEN btrim(coalesce(p_email, '')) <> '' THEN 'e:' || lower(btrim(p_email)) END,
+    CASE WHEN length(regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g')) >= 10
+         THEN 'p:' || right(regexp_replace(p_phone, '[^0-9]', '', 'g'), 10) END,
+    'n:' || lower(btrim(coalesce(p_organization, ''))) || '|' || lower(btrim(coalesce(p_name, '')))
+  ], NULL)
+$$;
+REVOKE ALL ON FUNCTION public.import_partner_keys(text, text, text, text) FROM PUBLIC, anon, authenticated;
+
+-- One own-contact row, or NULL when it was skipped: empty, no known type, or
+-- already one of p_keys (the workspace's partners, import_partner_keys) or
+-- p_added (rows added earlier in this import).
+CREATE OR REPLACE FUNCTION public.import_partner_row(p_org uuid, p_user uuid, r jsonb, p_keys jsonb, p_added jsonb)
 RETURNS uuid
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public
@@ -53,25 +83,24 @@ DECLARE
   v_name text := left(btrim(coalesce(r ->> 'name', '')), 200);
   v_email text := lower(left(btrim(coalesce(r ->> 'email', '')), 254));
   v_phone text := left(btrim(coalesce(r ->> 'phone', '')), 40);
-  v_digits text;
-  v_state text := upper(left(btrim(coalesce(r ->> 'state', '')), 2));
+  v_state text := upper(btrim(coalesce(r ->> 'state', '')));
   v_types text[];
   v_id uuid := gen_random_uuid();
 BEGIN
   IF v_org_name = '' THEN v_org_name := v_name; END IF;
   IF v_name = '' THEN v_name := v_org_name; END IF;
-  SELECT coalesce(array_agg(DISTINCT t), '{}') INTO v_types
-    FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(r -> 'types') = 'array' THEN r -> 'types' ELSE '[]'::jsonb END) t
-   WHERE t IN ('Inpatient', 'IOP / PHP', 'Interventionist', 'Therapist', 'Sober Living', 'Detox');
+  -- Known types only, in the order given (the first is the partner's main type).
+  SELECT coalesce(array_agg(x.t ORDER BY x.o), '{}') INTO v_types
+    FROM (SELECT e.t, min(e.o) AS o
+            FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(r -> 'types') = 'array' THEN r -> 'types' ELSE '[]'::jsonb END)
+                 WITH ORDINALITY AS e(t, o)
+           WHERE e.t IN ('Inpatient', 'IOP / PHP', 'Interventionist', 'Therapist', 'Sober Living', 'Detox')
+           GROUP BY e.t) x;
   IF v_name = '' OR cardinality(v_types) = 0 THEN RETURN NULL; END IF;
-  IF v_email !~ '^[^@ ]+@[^@ ]+[.][^@ ]+$' THEN v_email := ''; END IF;
-  v_digits := right(regexp_replace(v_phone, '[^0-9]', '', 'g'), 10);
+  IF v_email !~ '^[^@[:space:][:cntrl:]]+@[^@[:space:][:cntrl:]]+[.][^@[:space:][:cntrl:]]+$' THEN v_email := ''; END IF;
   IF v_state !~ '^[A-Z]{2}$' THEN v_state := ''; END IF;
-  IF EXISTS (SELECT 1 FROM public.partners p
-              WHERE p.org_id = p_org
-                AND ((v_email <> '' AND lower(p.email) = v_email)
-                  OR (length(v_digits) = 10 AND right(regexp_replace(p.phone, '[^0-9]', '', 'g'), 10) = v_digits)
-                  OR (lower(p.organization) = lower(v_org_name) AND lower(p.name) = lower(v_name)))) THEN
+  IF coalesce(p_keys, '{}'::jsonb) ?| public.import_partner_keys(v_email, v_phone, v_org_name, v_name)
+     OR coalesce(p_added, '{}'::jsonb) ?| public.import_partner_keys(v_email, v_phone, v_org_name, v_name) THEN
     RETURN NULL;
   END IF;
   INSERT INTO public.partners (id, owner_id, org_id, name, organization, types, levels, city, state, regions,
@@ -84,8 +113,12 @@ BEGIN
   RETURN v_id;
 END
 $$;
-REVOKE ALL ON FUNCTION public.import_partner_row(uuid, uuid, jsonb) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.import_partner_row(uuid, uuid, jsonb, jsonb, jsonb) FROM PUBLIC, anon, authenticated;
 
+-- The workspace's partner keys are read once per import into a jsonb set
+-- (a large practice's network is never rescanned per row). In the platform
+-- seed workspace, own contacts are not published to the Directory on
+-- import (referralfit.syncing, which partners_seed_publish skips on).
 CREATE OR REPLACE FUNCTION public.import_partners(p_rows jsonb)
 RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER
@@ -102,11 +135,14 @@ DECLARE
   v_skipped integer := 0;
   v_ids uuid[] := '{}';
   v_directory boolean;
+  v_seed boolean;
+  v_syncing text := coalesce(current_setting('referralfit.syncing', true), '');
+  v_keys jsonb;
+  v_added_keys jsonb := '{}'::jsonb;
 BEGIN
   IF v_user IS NULL OR v_org IS NULL THEN
     RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
   END IF;
-  v_directory := public.is_platform_admin() OR public.org_has_entitlement('directory');
   IF jsonb_typeof(p_rows) IS DISTINCT FROM 'array' THEN
     RAISE EXCEPTION 'Choose at least one contact to add.' USING ERRCODE = '22023';
   END IF;
@@ -116,6 +152,11 @@ BEGIN
   IF jsonb_array_length(p_rows) > 500 THEN
     RAISE EXCEPTION 'Add up to 500 partners at a time.' USING ERRCODE = '22023';
   END IF;
+  v_directory := public.is_platform_admin() OR public.org_has_entitlement('directory');
+  v_seed := public.org_is_platform_seed(v_org);
+  SELECT coalesce(jsonb_object_agg(k.key, true), '{}'::jsonb) INTO v_keys
+    FROM (SELECT DISTINCT unnest(public.import_partner_keys(p.email, p.phone, p.organization, p.name)) AS key
+            FROM public.partners p WHERE p.org_id = v_org) k;
   FOR r IN SELECT value FROM jsonb_array_elements(p_rows) LOOP
     IF jsonb_typeof(r) IS DISTINCT FROM 'object' THEN v_skipped := v_skipped + 1; CONTINUE; END IF;
     v_gid := CASE WHEN coalesce(r ->> 'global_id', '') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -130,10 +171,15 @@ BEGIN
       v_id := public.import_global_partner(v_gid, gen_random_uuid());
       v_linked := v_linked + 1;
     ELSE
-      v_id := public.import_partner_row(v_org, v_user, r);
+      IF v_seed THEN PERFORM set_config('referralfit.syncing', 'on', true); END IF;
+      v_id := public.import_partner_row(v_org, v_user, r, v_keys, v_added_keys);
+      IF v_seed THEN PERFORM set_config('referralfit.syncing', v_syncing, true); END IF;
       IF v_id IS NULL THEN v_skipped := v_skipped + 1; CONTINUE; END IF;
       v_added := v_added + 1;
     END IF;
+    SELECT v_added_keys || coalesce(jsonb_object_agg(k, true), '{}'::jsonb) INTO v_added_keys
+      FROM public.partners p, unnest(public.import_partner_keys(p.email, p.phone, p.organization, p.name)) k
+     WHERE p.id = v_id;
     v_ids := v_ids || v_id;
   END LOOP;
   RETURN jsonb_build_object('added', v_added, 'linked', v_linked, 'skipped', v_skipped, 'ids', to_jsonb(v_ids));
@@ -178,12 +224,18 @@ BEGIN
   IF NOT FOUND THEN RETURN NULL; END IF;
   SELECT public.email_local_now(p.tz_name, p.tz_offset_minutes)::date INTO v_day
     FROM public.email_preferences p WHERE p.user_id = v_case.owner_id;
-  PERFORM set_config('request.jwt.claim.sub', '', true);
-  PERFORM set_config('request.jwt.claims', '', true);
-  INSERT INTO public.referrals (owner_id, org_id, partner_id, direction, referred_on, client_label, outcome, note, case_id)
-  VALUES (v_case.owner_id, NEW.to_org_id, v_partner, 'inbound',
-          coalesce(v_day, public.email_local_now(NULL, NULL)::date), left(coalesce(v_case.title, ''), 120),
-          'Pending', 'Referred through ReferralFit.', NEW.case_id);
+  -- The referral itself never fails because of its history entry: anything
+  -- going wrong here is a warning, and the practice can log it from the case.
+  BEGIN
+    PERFORM set_config('request.jwt.claim.sub', '', true);
+    PERFORM set_config('request.jwt.claims', '', true);
+    INSERT INTO public.referrals (owner_id, org_id, partner_id, direction, referred_on, client_label, outcome, note, case_id)
+    VALUES (v_case.owner_id, NEW.to_org_id, v_partner, 'inbound',
+            coalesce(v_day, public.email_local_now(NULL, NULL)::date), left(coalesce(v_case.title, ''), 120),
+            'Pending', 'Referred through ReferralFit.', NEW.case_id);
+  EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'program referral % not logged in the referral history (%)', NEW.id, SQLSTATE;
+  END;
   PERFORM set_config('request.jwt.claim.sub', v_sub, true);
   PERFORM set_config('request.jwt.claims', v_claims, true);
   RETURN NULL;
@@ -226,7 +278,9 @@ GRANT EXECUTE ON FUNCTION public.case_program_referral(uuid) TO authenticated;
 -- "Add to network and log": the referring program as a partner (from its
 -- Directory listing) when it is not one yet, and the inbound referral on the
 -- case when it is not logged yet. Any member of the case's workspace;
--- running it twice changes nothing. p_referred_on is the device's date for
+-- running it twice changes nothing. Deliberately not gated on the Directory
+-- entitlement: it adds only the program that referred this family to the
+-- practice (program_referrals has no client grants, so it cannot be forged). p_referred_on is the device's date for
 -- the referral (within a day of it; otherwise the server's).
 CREATE OR REPLACE FUNCTION public.log_program_referral(p_referral_id uuid, p_referred_on date)
 RETURNS jsonb
@@ -241,6 +295,7 @@ DECLARE
   v_referral uuid;
   v_added boolean := false;
   v_day date;
+  v_offset interval;
 BEGIN
   IF v_user IS NULL OR v_org IS NULL THEN
     RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
@@ -265,7 +320,12 @@ BEGIN
    WHERE r.org_id = v_org AND r.case_id = v_row.case_id AND r.partner_id = v_partner AND r.direction = 'inbound'
    ORDER BY r.created_at LIMIT 1;
   IF v_referral IS NULL THEN
-    v_day := v_row.created_at::date;
+    -- The referral's date where the member is (their email time zone), unless
+    -- the device's date for it is within a day of that.
+    SELECT public.email_local_now(p.tz_name, p.tz_offset_minutes) - (now() AT TIME ZONE 'UTC') INTO v_offset
+      FROM public.email_preferences p WHERE p.user_id = v_user;
+    v_offset := coalesce(v_offset, public.email_local_now(NULL, NULL) - (now() AT TIME ZONE 'UTC'));
+    v_day := ((v_row.created_at AT TIME ZONE 'UTC') + v_offset)::date;
     IF p_referred_on BETWEEN v_day - 1 AND v_day + 1 THEN v_day := p_referred_on; END IF;
     INSERT INTO public.referrals (owner_id, org_id, partner_id, direction, referred_on, client_label, outcome, note, case_id)
     VALUES (v_user, v_org, v_partner, 'inbound', v_day, left(coalesce(v_row.title, ''), 120), 'Pending',

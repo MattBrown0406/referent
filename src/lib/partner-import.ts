@@ -51,6 +51,8 @@ export type NetworkPartnerLike = {
   organization: string;
   email: string;
   phone: string;
+  website?: string;
+  state?: string;
   globalPartnerId?: string;
 };
 
@@ -107,7 +109,24 @@ const FREE_MAIL = new Set([
   'gmx.com', 'mail.com', 'zoho.com', 'yandex.com', 'cox.net', 'charter.net', 'bellsouth.net', 'earthlink.net',
 ]);
 
-/** A website's or a work email's domain ("www.oaks.org/x" to "oaks.org"); '' for free mail and junk. */
+// Shared hosts: a page or address there says nothing about which program it
+// is (Facebook pages, Psychology Today profiles, site builders, link pages,
+// hosted mail).
+const SHARED_HOSTS = new Set([
+  'facebook.com', 'fb.com', 'm.facebook.com', 'instagram.com', 'linkedin.com', 'twitter.com', 'x.com', 'youtube.com', 'tiktok.com',
+  'psychologytoday.com', 'goodtherapy.org', 'healthgrades.com', 'zocdoc.com', 'yelp.com', 'google.com', 'sites.google.com',
+  'goo.gl', 'g.page', 'maps.app.goo.gl', 'bit.ly', 'linktr.ee', 'linkin.bio', 'carrd.co', 'wixsite.com', 'wix.com',
+  'squarespace.com', 'godaddysites.com', 'weebly.com', 'wordpress.com', 'blogspot.com', 'square.site', 'hushmail.com',
+  'rehabs.com', 'recovery.com', 'addictioncenter.com', 'findtreatment.gov', 'samhsa.gov', 'alignable.com', 'nextdoor.com',
+]);
+
+function sharedHost(domain: string): boolean {
+  if (SHARED_HOSTS.has(domain)) return true;
+  for (const host of SHARED_HOSTS) if (domain.endsWith(`.${host}`)) return true;
+  return false;
+}
+
+/** A website's or a work email's domain ("www.oaks.org/x" to "oaks.org"); '' for free mail, shared hosts and junk. */
 export function domainKey(value: unknown): string {
   const text = clip(value, 300).toLowerCase();
   if (!text) return '';
@@ -115,7 +134,7 @@ export function domainKey(value: unknown): string {
     ? text.split('@').pop() || ''
     : text.replace(/^[a-z][a-z0-9+.-]*:\/\//, '').split(/[/?#:]/)[0];
   const domain = host.replace(/^www\./, '');
-  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(domain) || FREE_MAIL.has(domain)) return '';
+  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(domain) || FREE_MAIL.has(domain) || sharedHost(domain)) return '';
   return domain;
 }
 
@@ -217,36 +236,68 @@ type Field = keyof RawContact | 'first' | 'middle' | 'last';
 
 const norm = (header: string) => header.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 
-// Google Contacts, Outlook, and hand-made sheets.
-function headerField(header: string): Field | null {
+/**
+ * Which field a column fills, and its rank (lower wins when several columns
+ * fill the same field): Google Contacts, Outlook (classic and Outlook.com),
+ * and hand-made sheets. Labels, types, assistants, faxes and countries are
+ * never read.
+ */
+function headerField(header: string): { field: Field; rank: number } | null {
   const h = norm(header);
-  if (!h || /\b(label|type)\b/.test(h) && /\b\d+\b/.test(h)) return null; // "E-mail 1 - Label"
-  if (/^(first name|given name|first)$/.test(h)) return 'first';
-  if (/^(middle name|additional name|middle)$/.test(h)) return 'middle';
-  if (/^(last name|family name|surname|last)$/.test(h)) return 'last';
-  if (/^(name|full name|contact|contact name|display name|person|contact person)$/.test(h)) return 'name';
-  if (/^(organization|organisation|organization name|organization 1 name|company|company name|program|program name|facility|agency|business|business name|practice|center|centre)$/.test(h)) return 'organization';
-  if (/(^| )e ?mail( |$)/.test(h)) return 'email';
-  if (/(^| )(phone|mobile|cell|telephone|tel)( |$)/.test(h) && !/fax/.test(h)) return 'phone';
-  if (/(^| )city( |$)/.test(h)) return 'city';
-  if (/^(state|st|region|province)$|(^| )(state|region)( |$)/.test(h)) return 'state';
-  if (/^(website|web site|web page|webpage|url|site)$|website \d+ value|web page/.test(h)) return 'website';
-  if (/^(type|category|partner type|level of care|kind|job title|title|organization 1 title|organization title)$/.test(h)) return 'hint';
-  if (/^(note|notes|comments)$/.test(h)) return 'note';
+  if (!h) return null;
+  // "E-mail 1 - Label", "E-mail Type", "Phone 1 - Type" (a plain "Type" column is the partner type).
+  if (/\b(label|display name)\b/.test(h) || (/\btype\b/.test(h) && !/^(type|partner type|provider type|program type)$/.test(h))) return null;
+  if (/(assistant|fax|pager|telex|tty|callback|radio|country)/.test(h)) return null;
+  if (/^(first name|given name|first)$/.test(h)) return { field: 'first', rank: 0 };
+  if (/^(middle name|additional name|middle)$/.test(h)) return { field: 'middle', rank: 0 };
+  if (/^(last name|family name|surname|last)$/.test(h)) return { field: 'last', rank: 0 };
+  if (/^(name|full name|contact|contact name|display|person|contact person)$/.test(h)) return { field: 'name', rank: 0 };
+  if (/^(organization|organisation|organization name|organization 1 name|company|company name|program|program name|facility|agency|business|business name|practice|center|centre)$/.test(h)) {
+    return { field: 'organization', rank: 0 };
+  }
+  if (/(^| )e ?mail( |$)/.test(h)) return { field: 'email', rank: /(home|personal|other)/.test(h) ? 2 : /\b[2-9]\b/.test(h) ? 1 : 0 };
+  if (/(^| )(phone|mobile|cell|telephone|tel)( |$)/.test(h)) {
+    return { field: 'phone', rank: /(business|work|company|primary|main)/.test(h) ? 0 : /(mobile|cell)/.test(h) ? 1 : /(home|other|car)/.test(h) ? 3 : 2 };
+  }
+  if (/(^| )city( |$)/.test(h)) return { field: 'city', rank: /(business|work)/.test(h) ? 0 : /home/.test(h) ? 2 : 1 };
+  if (/^(state|st|region|province)$|(^| )(state|region)( |$)/.test(h)) return { field: 'state', rank: /(business|work)/.test(h) ? 0 : /home/.test(h) ? 2 : 1 };
+  if (/^(website|web site|web page|webpage|url|site|business web page|personal web page)$|website \d+ value/.test(h)) {
+    return { field: 'website', rank: /personal/.test(h) ? 1 : 0 };
+  }
+  if (/^(type|category|partner type|provider type|program type|level of care|kind)$/.test(h)) return { field: 'hint', rank: 0 };
+  if (/^(job title|organization 1 title|organization title|role|position)$/.test(h)) return { field: 'hint', rank: 1 };
+  if (h === 'title') return { field: 'hint', rank: 2 }; // Outlook's "Title" is often Dr./Mr.
+  if (/^(note|notes|comments)$/.test(h)) return { field: 'note', rank: 0 };
   return null;
+}
+
+/** Google Contacts joins several values with " ::: "; the first usable one is kept. */
+function firstValue(field: Field, cell: string): string {
+  const parts = cell.split(/\s*:::\s*/).map((part) => part.trim()).filter(Boolean);
+  if (field === 'email') return parts.find((part) => cleanEmail(part)) || '';
+  if (field === 'phone') return parts.find((part) => part.replace(/\D/g, '').length >= 7) || '';
+  if (field === 'website') return parts.find((part) => cleanWebsite(part)) || '';
+  return parts[0] || '';
 }
 
 /** Contacts from a CSV with a header row; rows without a name or organization are dropped. */
 export function contactsFromCsv(text: string): RawContact[] {
   const rows = parseCsv(text);
   if (rows.length < 2) return [];
-  const fields = rows[0].map(headerField);
+  const columns = rows[0].map(headerField);
   const out: RawContact[] = [];
   for (const cells of rows.slice(1)) {
     const value: Partial<Record<Field, string>> = {};
-    fields.forEach((field, index) => {
-      const cell = (cells[index] || '').trim();
-      if (field && cell && !value[field]) value[field] = cell;
+    const rank: Partial<Record<Field, number>> = {};
+    columns.forEach((column, index) => {
+      if (!column) return;
+      const cell = firstValue(column.field, (cells[index] || '').trim());
+      if (!cell) return;
+      const current = rank[column.field];
+      if (current === undefined || column.rank < current) {
+        value[column.field] = cell;
+        rank[column.field] = column.rank;
+      }
     });
     const name = value.name || [value.first, value.middle, value.last].filter(Boolean).join(' ');
     const contact = cleanContact({ ...value, name });
@@ -258,7 +309,20 @@ export function contactsFromCsv(text: string): RawContact[] {
 // ─── Reading a contacts file (vCard) ───────────────────────────────────────
 
 function vcardValue(raw: string): string {
-  return raw.replace(/\\n/gi, ' ').replace(/\\([,;\\])/g, '$1');
+  return raw.replace(/\\n/gi, ' ').replace(/\\(.)/g, '$1');
+}
+
+/** A structured value split on its unescaped separators ("Oaks\\; Intake;Dept" is two parts). */
+function vcardParts(raw: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw[i] === '\\' && i + 1 < raw.length) { current += raw[i] + raw[i + 1]; i += 1; continue; }
+    if (raw[i] === ';') { parts.push(current); current = ''; continue; }
+    current += raw[i];
+  }
+  parts.push(current);
+  return parts;
 }
 
 /** Contacts from a .vcf (Apple Contacts, Google, Outlook; vCard 2.1 to 4.0). */
@@ -293,18 +357,18 @@ export function contactsFromVcard(text: string): RawContact[] {
     switch (name) {
       case 'FN': set('name', value); break;
       case 'N': {
-        const [last = '', first = ''] = value.split(';');
+        const [last = '', first = ''] = vcardParts(value);
         set('last', last); set('first', first);
         break;
       }
-      case 'ORG': set('organization', value.split(';')[0]); break;
+      case 'ORG': set('organization', vcardParts(value)[0] || ''); break;
       case 'TITLE': set('hint', value); break;
       case 'EMAIL': set('email', value, preferred || work); break;
       case 'TEL': set('phone', value, preferred || work); break;
       case 'URL': set('website', value); break;
       case 'NOTE': set('note', value); break;
       case 'ADR': {
-        const parts = value.split(';');
+        const parts = vcardParts(value);
         set('city', parts[3] || '', work); set('state', parts[4] || '', work);
         break;
       }
@@ -329,14 +393,17 @@ type PickedContact = {
   urlAddresses?: { url?: string }[];
 };
 
+// iOS labels arrive localized ("work", "trabajo", "travail") or raw ("_$!<Work>!$_").
+const WORK_LABEL = /work|trabajo|travail|arbeit|lavoro|trabalho|negocio|empresa|oficina|business/i;
+
 function preferredOf<T extends { isPrimary?: boolean; label?: string }>(items: T[] | undefined): T | undefined {
   const list = items || [];
-  return list.find((item) => item.isPrimary) || list.find((item) => /work/i.test(item.label || '')) || list[0];
+  return list.find((item) => item.isPrimary) || list.find((item) => WORK_LABEL.test(item.label || '')) || list[0];
 }
 
 export function contactFromPicker(picked: PickedContact | null | undefined): RawContact | null {
   if (!picked) return null;
-  const address = (picked.addresses || []).find((item) => /work/i.test(item.label || '')) || (picked.addresses || [])[0];
+  const address = (picked.addresses || []).find((item) => WORK_LABEL.test(item.label || '')) || (picked.addresses || [])[0];
   const contact = cleanContact({
     name: picked.name || [picked.firstName, picked.lastName].filter(Boolean).join(' '),
     organization: picked.company,
@@ -359,43 +426,106 @@ export type DirectoryIndex = {
   byOrg: Map<string, ListingLike>;
 };
 
+/**
+ * Listings by website or email domain, phone, and organization name. A key
+ * two listings share (a multi-location operator's domain, a shared intake
+ * line, two "Recovery Center"s) matches neither: a wrong match is worse
+ * than none.
+ */
 export function directoryIndex(listings: ListingLike[]): DirectoryIndex {
-  const index: DirectoryIndex = { byDomain: new Map(), byPhone: new Map(), byOrg: new Map() };
+  const seen = { domain: new Map<string, ListingLike | null>(), phone: new Map<string, ListingLike | null>(), org: new Map<string, ListingLike | null>() };
+  const put = (map: Map<string, ListingLike | null>, key: string, listing: ListingLike) => {
+    if (!key) return;
+    const existing = map.get(key);
+    if (existing === undefined) map.set(key, listing);
+    else if (existing && existing.id !== listing.id) map.set(key, null);
+  };
   for (const listing of listings) {
-    const domain = domainKey(listing.website) || domainKey(listing.email);
-    const phone = phoneKey(listing.phone);
+    const domains = new Set([domainKey(listing.website), domainKey(listing.email)].filter(Boolean));
+    for (const domain of domains) put(seen.domain, domain, listing);
+    put(seen.phone, phoneKey(listing.phone), listing);
     const org = orgKey(listing.organization);
-    if (domain && !index.byDomain.has(domain)) index.byDomain.set(domain, listing);
-    if (phone && !index.byPhone.has(phone)) index.byPhone.set(phone, listing);
-    if (org && org.length >= 4 && !index.byOrg.has(org)) index.byOrg.set(org, listing);
+    if (org.length >= 4) put(seen.org, org, listing);
   }
-  return index;
+  const unique = (map: Map<string, ListingLike | null>) => {
+    const out = new Map<string, ListingLike>();
+    for (const [key, listing] of map) if (listing) out.set(key, listing);
+    return out;
+  };
+  return { byDomain: unique(seen.domain), byPhone: unique(seen.phone), byOrg: unique(seen.org) };
 }
 
-/** The Directory listing a contact most likely is: same website or work-email domain, same phone, or same organization name. */
+/**
+ * The Directory listing a contact most likely is: the same website or work
+ * email domain, the same phone, or the same organization name (and, when
+ * both say, the same state).
+ */
 export function matchListing(contact: RawContact, index: DirectoryIndex): ListingLike | null {
   const domain = domainKey(contact.website) || domainKey(contact.email);
   if (domain && index.byDomain.has(domain)) return index.byDomain.get(domain)!;
   const phone = phoneKey(contact.phone);
   if (phone && index.byPhone.has(phone)) return index.byPhone.get(phone)!;
   const org = orgKey(contact.organization);
-  if (org && index.byOrg.has(org)) return index.byOrg.get(org)!;
+  const byName = org ? index.byOrg.get(org) : undefined;
+  if (byName && (!contact.state || !byName.state || byName.state.toUpperCase() === contact.state)) return byName;
   return null;
 }
 
-/** The network partner a candidate already is, by Directory link, email, phone, or name and organization. */
-export function existingPartner(contact: RawContact, match: ListingLike | null, network: NetworkPartnerLike[]): string | null {
-  const email = contact.email;
-  const phone = phoneKey(contact.phone);
-  const org = (contact.organization || contact.name).toLowerCase();
-  const name = (contact.name || contact.organization).toLowerCase();
+/** The network's partners by every key a duplicate check reads, built once per batch. */
+export type NetworkIndex = {
+  byListing: Map<string, string>;
+  byEmail: Map<string, string>;
+  byPhone: Map<string, string>;
+  byDomain: Map<string, string>;
+  byNames: Map<string, string>;
+  byOrg: Map<string, { id: string; state: string }[]>;
+};
+
+export function networkIndex(network: NetworkPartnerLike[]): NetworkIndex {
+  const index: NetworkIndex = { byListing: new Map(), byEmail: new Map(), byPhone: new Map(), byDomain: new Map(), byNames: new Map(), byOrg: new Map() };
   for (const partner of network) {
-    if (match && partner.globalPartnerId && partner.globalPartnerId.toLowerCase() === match.id.toLowerCase()) return partner.id;
-    if (email && partner.email && partner.email.trim().toLowerCase() === email) return partner.id;
-    if (phone && phoneKey(partner.phone) === phone) return partner.id;
-    if (org && partner.organization.trim().toLowerCase() === org && partner.name.trim().toLowerCase() === name) return partner.id;
+    if (partner.globalPartnerId) index.byListing.set(partner.globalPartnerId.toLowerCase(), partner.id);
+    const email = cleanEmail(partner.email);
+    if (email) index.byEmail.set(email, partner.id);
+    const phone = phoneKey(partner.phone);
+    if (phone) index.byPhone.set(phone, partner.id);
+    const domain = domainKey(partner.website);
+    if (domain) index.byDomain.set(domain, partner.id);
+    index.byNames.set(`${partner.organization.trim().toLowerCase()}|${partner.name.trim().toLowerCase()}`, partner.id);
+    const org = orgKey(partner.organization);
+    if (org.length >= 4) index.byOrg.set(org, [...(index.byOrg.get(org) || []), { id: partner.id, state: stateCode(partner.state) }]);
   }
-  return null;
+  return index;
+}
+
+/**
+ * The network partner a candidate already is: by its Directory link, by the
+ * contact's own email, phone or name and organization, or, for a Directory
+ * match, by the listing's phone, email, website or organization (a program
+ * the practice added by hand before it was linked).
+ */
+export function existingPartner(contact: RawContact, match: ListingLike | null, network: NetworkIndex): string | null {
+  if (match) {
+    const linked = network.byListing.get(match.id.toLowerCase());
+    if (linked) return linked;
+  }
+  const email = contact.email;
+  if (email && network.byEmail.has(email)) return network.byEmail.get(email)!;
+  const phone = phoneKey(contact.phone);
+  if (phone && network.byPhone.has(phone)) return network.byPhone.get(phone)!;
+  const names = `${(contact.organization || contact.name).toLowerCase()}|${(contact.name || contact.organization).toLowerCase()}`;
+  if (network.byNames.has(names)) return network.byNames.get(names)!;
+  if (!match) return null;
+  const listingEmail = cleanEmail(match.email);
+  if (listingEmail && network.byEmail.has(listingEmail)) return network.byEmail.get(listingEmail)!;
+  const listingPhone = phoneKey(match.phone);
+  if (listingPhone && network.byPhone.has(listingPhone)) return network.byPhone.get(listingPhone)!;
+  const listingDomain = domainKey(match.website);
+  if (listingDomain && network.byDomain.has(listingDomain)) return network.byDomain.get(listingDomain)!;
+  const sameOrg = network.byOrg.get(orgKey(match.organization)) || [];
+  const state = stateCode(match.state);
+  const hit = sameOrg.find((partner) => !partner.state || !state || partner.state === state);
+  return hit ? hit.id : null;
 }
 
 function contactKey(contact: RawContact): string {
@@ -420,6 +550,8 @@ export function addCandidates(
 ): { candidates: ImportCandidate[]; added: number; truncated: boolean } {
   const out = existing.slice();
   const seen = new Set(out.map((candidate) => candidate.key));
+  const listingsUsed = new Set(out.filter((candidate) => candidate.useListing && candidate.match).map((candidate) => candidate.match!.id));
+  const known = networkIndex(network);
   let added = 0;
   let truncated = false;
   for (const contact of contacts) {
@@ -428,9 +560,13 @@ export function addCandidates(
     if (out.length >= MAX_IMPORT_ROWS) { truncated = true; break; }
     seen.add(key);
     const match = index ? matchListing(contact, index) : null;
-    const existingPartnerId = existingPartner(contact, match, network);
-    const types = match && listingTypes(match).length ? listingTypes(match) : suggestTypes(contact);
-    out.push({ ...contact, key, types, match, useListing: Boolean(match), existingPartnerId, include: !existingPartnerId });
+    const existingPartnerId = existingPartner(contact, match, known);
+    // A second contact at the same program keeps its own details (the
+    // listing is added once).
+    const useListing = Boolean(match) && !listingsUsed.has(match!.id);
+    if (useListing) listingsUsed.add(match!.id);
+    const types = useListing && listingTypes(match!).length ? listingTypes(match!) : suggestTypes(contact);
+    out.push({ ...contact, key, types, match, useListing, existingPartnerId, include: !existingPartnerId });
     added += 1;
   }
   return { candidates: out, added, truncated };
@@ -444,19 +580,27 @@ export function isReady(candidate: ImportCandidate): boolean {
 }
 
 export function importRows(candidates: ImportCandidate[]): ImportRow[] {
-  return candidates.filter(isReady).map((candidate) => (candidate.useListing && candidate.match
-    ? { global_id: candidate.match.id }
-    : {
+  // A listing is sent once; another row set to the same listing is sent as
+  // the contact itself (typed like the listing when it has no type).
+  const listings = new Set<string>();
+  return candidates.filter(isReady).map((candidate) => {
+    const match = candidate.useListing ? candidate.match : null;
+    if (match && !listings.has(match.id)) {
+      listings.add(match.id);
+      return { global_id: match.id };
+    }
+    return {
         name: candidate.name || candidate.organization,
         organization: candidate.organization || candidate.name,
-        types: candidate.types,
+        types: candidate.types.length || !match ? candidate.types : listingTypes(match),
         email: candidate.email,
         phone: candidate.phone,
         city: candidate.city,
         state: candidate.state,
         website: candidate.website,
         note: candidate.note,
-      }));
+      };
+  });
 }
 
 /** The import's outcome in one line: "Added 3 partners and 2 from the Directory. 1 was already in your network." */

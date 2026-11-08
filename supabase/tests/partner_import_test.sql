@@ -7,7 +7,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(36);
+SELECT plan(44);
 
 -- Actors
 --   p1  owner of practice P (profile listing I1, Cascade Interventions)
@@ -63,7 +63,8 @@ SELECT ok(
 );
 SELECT ok(
   (SELECT bool_and(NOT has_function_privilege('authenticated', f, 'EXECUTE') AND NOT has_function_privilege('anon', f, 'EXECUTE'))
-     FROM unnest(ARRAY['public.import_partner_row(uuid, uuid, jsonb)', 'public.import_partner_website(text)',
+     FROM unnest(ARRAY['public.import_partner_row(uuid, uuid, jsonb, jsonb, jsonb)', 'public.import_partner_website(text)',
+                       'public.import_partner_keys(text, text, text, text)',
                        'public.program_referral_network_partner(uuid, uuid)', 'public.program_referrals_log_inbound()']) AS f),
   'the helpers are not callable by clients'
 );
@@ -71,7 +72,7 @@ SELECT ok(
   (SELECT bool_and(p.prosecdef AND p.proconfig @> ARRAY['search_path=public'])
      FROM pg_proc p
     WHERE p.oid IN ('public.import_partners(jsonb)'::regprocedure, 'public.log_program_referral(uuid, date)'::regprocedure,
-                    'public.case_program_referral(uuid)'::regprocedure, 'public.import_partner_row(uuid, uuid, jsonb)'::regprocedure)),
+                    'public.case_program_referral(uuid)'::regprocedure, 'public.import_partner_row(uuid, uuid, jsonb, jsonb, jsonb)'::regprocedure)),
   'the RPCs are SECURITY DEFINER with a pinned search_path'
 );
 
@@ -137,16 +138,30 @@ SELECT is(
 RESET ROLE;
 SELECT is(public.import_partner_website('https://ok.example/path?a=1'), 'https://ok.example/path?a=1', 'an https website is kept');
 SELECT is(public.import_partner_website('data:text/html,hi'), '', 'any other scheme is dropped');
+SELECT set_config('request.jwt.claim.sub', 'b1000000-0000-0000-0000-0000000000a7', true);
+SET LOCAL ROLE authenticated;
+SELECT public.import_partners(jsonb_build_array(
+  jsonb_build_object('name', 'Order Kept', 'types', jsonb_build_array('Therapist', 'Interventionist', 'Therapist')),
+  jsonb_build_object('name', 'Loose Fields', 'types', jsonb_build_array('Detox'), 'state', 'Texas', 'email', E'a@b.co\nBcc: x@y.z')));
+RESET ROLE;
+SELECT is((SELECT types FROM public.partners WHERE name = 'Order Kept'), ARRAY['Therapist', 'Interventionist'],
+  'types keep the order given (the first is the main type), each once');
+SELECT is((SELECT row(state, email)::text FROM public.partners WHERE name = 'Loose Fields'), row(chr(8212), '')::text,
+  'a state that is not two letters, and an email with a line break, are dropped');
 
 -- ===========================================================================
 -- C. A referral from a program already in the network is logged
 -- ===========================================================================
 
 SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000a7', true);
+SELECT set_config('request.jwt.claims', '{"sub": "c1000000-0000-0000-0000-0000000000a7", "role": "authenticated"}', true);
 SET LOCAL ROLE authenticated;
 SELECT set_config('test.ref1', public.program_refer_family('d9000000-0000-0000-0000-0000000000a7', 'Maria', '(503) 555-0101', '',
   'mother', 'Alex', 'none', '', true)::text, true);
 SELECT is(auth.uid(), 'c1000000-0000-0000-0000-0000000000a7'::uuid, 'the program''s own session is restored after the log');
+SELECT is(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', 'c1000000-0000-0000-0000-0000000000a7',
+  'both claim settings are restored (PostgREST sets the JSON one)');
+SELECT set_config('request.jwt.claims', '', true);
 RESET ROLE;
 SELECT set_config('test.case1', case_id::text, true) FROM public.program_referrals WHERE id = current_setting('test.ref1')::uuid;
 SELECT is(
@@ -247,6 +262,50 @@ SELECT is((SELECT can_log FROM public.case_program_referral(current_setting('tes
 SELECT throws_ok($$ SELECT public.log_program_referral(current_setting('test.ref5')::uuid, current_date) $$, 'P0002',
   'This program is no longer listed in the Directory. Add it to your network by hand.', 'and the RPC says so');
 RESET ROLE;
+
+-- ===========================================================================
+-- F. A history entry that cannot be written never blocks the referral
+-- ===========================================================================
+
+CREATE FUNCTION pg_temp.refuse_referrals() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN RAISE EXCEPTION 'refused for the test'; END
+$f$;
+CREATE TRIGGER zz_refuse BEFORE INSERT ON public.referrals FOR EACH ROW EXECUTE FUNCTION pg_temp.refuse_referrals();
+SELECT set_config('request.jwt.claim.sub', 'c1000000-0000-0000-0000-0000000000a7', true);
+SET LOCAL ROLE authenticated;
+SELECT lives_ok($$ SELECT set_config('test.ref6', public.program_refer_family('d9000000-0000-0000-0000-0000000000a7', 'Iris',
+  '(503) 555-0188', '', 'aunt', 'Leo', 'none', '', true)::text, true) $$, 'the program''s referral still goes through');
+RESET ROLE;
+DROP TRIGGER zz_refuse ON public.referrals;
+SELECT is((SELECT count(*)::integer FROM public.referrals r JOIN public.program_referrals pr ON pr.case_id = r.case_id
+            WHERE pr.id = current_setting('test.ref6')::uuid), 0, 'with no history entry (the case card can log it)');
+
+-- ===========================================================================
+-- G. The platform seed workspace: imported contacts are not published
+-- ===========================================================================
+
+INSERT INTO public.platform_admins (user_id) VALUES ('b1000000-0000-0000-0000-0000000000a7');
+SELECT set_config('request.jwt.claim.sub', 'b1000000-0000-0000-0000-0000000000a7', true);
+SET LOCAL ROLE authenticated;
+SELECT public.import_partners(jsonb_build_array(
+  jsonb_build_object('name', 'Intake', 'organization', 'Seed Import Ranch', 'types', jsonb_build_array('Inpatient'), 'website', 'seedranch.test')));
+RESET ROLE;
+SELECT is((SELECT count(*)::integer FROM public.global_partners WHERE organization = 'Seed Import Ranch'), 0,
+  'a program imported into the seed workspace is not published to the Directory');
+SELECT is(coalesce(current_setting('referralfit.syncing', true), ''), '', 'and the publishing switch is back as it was');
+DELETE FROM public.platform_admins WHERE user_id = 'b1000000-0000-0000-0000-0000000000a7';
+
+-- ===========================================================================
+-- H. Without the Directory, Directory rows are skipped
+-- ===========================================================================
+
+CREATE OR REPLACE FUNCTION public.free_launch_period() RETURNS boolean LANGUAGE sql IMMUTABLE SET search_path = public AS $f$ SELECT false $f$;
+SELECT set_config('request.jwt.claim.sub', 'b2000000-0000-0000-0000-0000000000a7', true);
+SET LOCAL ROLE authenticated;
+SELECT is(public.import_partners(jsonb_build_array(jsonb_build_object('global_id', 'd4000000-0000-0000-0000-0000000000a7'))) ->> 'linked',
+  '0', 'a workspace without the Directory cannot add Directory listings through an import');
+RESET ROLE;
+CREATE OR REPLACE FUNCTION public.free_launch_period() RETURNS boolean LANGUAGE sql IMMUTABLE SET search_path = public AS $f$ SELECT true $f$;
 
 SELECT * FROM finish();
 ROLLBACK;

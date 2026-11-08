@@ -62,7 +62,9 @@ export type PickedFile = { contacts: RawContact[]; fileName: string } | { proble
 /**
  * A .csv or .vcf chosen on the web, read in the browser. Must be called
  * inside the tap (browsers open a file chooser only then): nothing is
- * awaited before the chooser opens. Null when the chooser is closed.
+ * awaited before the chooser opens. Null when the chooser is closed (in a
+ * browser without the 'cancel' event it simply never settles; the sheet does
+ * not wait on it).
  */
 export function pickContactsFile(): Promise<PickedFile> {
   return new Promise((resolve) => {
@@ -83,8 +85,15 @@ export function pickContactsFile(): Promise<PickedFile> {
       const file = input.files?.[0];
       if (!file) { done(null); return; }
       if (file.size > MAX_IMPORT_FILE_BYTES) { done({ problem: 'That file is larger than 5 MB. Export only the contacts you want, then try again.' }); return; }
-      file.text()
-        .then((text) => {
+      file.arrayBuffer()
+        .then((bytes) => {
+          // UTF-8 first; Excel and Outlook often save Windows-1252 (é, ñ).
+          let text: string;
+          try {
+            text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+          } catch {
+            text = new TextDecoder('windows-1252').decode(bytes);
+          }
           const contacts = contactsFromFile(file.name, text);
           done(contacts.length
             ? { contacts, fileName: file.name }

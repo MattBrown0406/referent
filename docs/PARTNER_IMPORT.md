@@ -28,10 +28,17 @@ address book.
 2. **Web: the file is read in the browser.** A .csv (with a header row) or
    a .vcf, up to 5 MB, read with `File.text()`; nothing is uploaded.
 3. **Matching happens on the device.** Each contact is matched to the
-   ReferralFit Directory (same website or work-email domain, same phone, or
-   same organization name; free-mail domains never match) against the
-   listings the app already loads, and checked against the network (same
-   Directory link, email, phone, or name and organization).
+   ReferralFit Directory against the listings the app already loads: the
+   same website or work-email domain, the same phone, or the same
+   organization name (and the same state when both say). A key two listings
+   share (a multi-location operator's domain, a shared intake line) matches
+   neither, and free mail and shared hosts (Facebook pages, Psychology Today
+   profiles, site builders, link pages) never match: a wrong match is worse
+   than none. Each row is checked against the network: the same Directory
+   link, email, phone, or name and organization, and for a Directory match
+   the listing's own phone, email, website or name (a program added by hand
+   before it was linked). A second contact at the same program keeps its
+   own details; the listing is added once.
 4. **Only confirmed rows are sent.** The practitioner reviews every row:
    include or not, its type, and for a Directory match whether to add the
    listing or the contact's own details. `import_partners` receives only
@@ -50,9 +57,18 @@ not be added." and reloads the network. Imported partners get no automatic
 first follow-up (a large import would flood Today); add one from the
 partner's profile.
 
-In a workspace owned by a ReferralFit admin (the platform seed workspace),
-programs added this way are published to the Directory exactly as programs
-added by hand are (`partners_seed_publish`); the sheet says so to admins.
+In the platform seed workspace (owned by a ReferralFit admin), where
+partners added by hand publish to the Directory, contacts imported this way
+are not published (`referralfit.syncing` is on for those inserts, which
+`partners_seed_publish` skips): an import can never create or overwrite a
+Directory listing. A later edit of an imported program in that workspace
+publishes it, as with any partner there.
+
+`import_partners` reads the workspace's partner keys once per call into a
+jsonb set: 500 rows into a 5,000-partner workspace take about 0.2 s locally.
+
+The referring program's history entry never blocks its referral: an error
+writing it is a warning, and the case card offers to log it.
 
 ## Files the web import reads
 
@@ -71,10 +87,27 @@ A "Type" or job-title column suggests the partner type ("Interventionist",
 "LMFT" to Therapist, "Detox", "Sober Living", "IOP" ...); rows with no type
 wait for the practitioner to choose one (or set one for all at once).
 
+## Files from Excel and Outlook
+
+Files are decoded as UTF-8, or as Windows-1252 when they are not valid
+UTF-8 (Excel and Outlook save that way), so accented names read right.
+Google Contacts' joined values ("a ::: b") give their first usable value.
+Outlook's columns are ranked: Job Title over Title, a business phone over
+mobile, home and others, business city and state over home; assistants,
+faxes, countries, labels and types are never read.
+
+## App Store Connect
+
+Picked contacts the practitioner adds are stored in their workspace, so the
+App Privacy answers should list **Contacts** (collected, linked to the user,
+used for app functionality, not for tracking) before the build with the
+contact picker is submitted.
+
 ## Deploy
 
 1. Paste `supabase/migrations/20261108180000_partner_import.sql` in the SQL
-   editor after `20261108170000_audit_round1.sql` (one BEGIN/COMMIT).
+   editor after `20261108170000_audit_round1.sql` (one BEGIN/COMMIT; it
+   stops with a clear message if that one is not applied yet).
 2. Deploy the web app: the Directory tab shows "Import partners" (a file).
 3. The next iPhone build carries the contact picker (`expo-contacts`
    57.0.8, pinned; a native module, so it needs a new build). Older builds

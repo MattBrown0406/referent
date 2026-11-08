@@ -11,6 +11,7 @@ import {
   Alert,
   FlatList,
   Modal,
+  Platform,
   SafeAreaView,
   StyleSheet,
   Switch,
@@ -68,13 +69,11 @@ type Props = {
   partners: NetworkPartnerLike[];
   /** The workspace reads the Directory (matching uses it; without it, contacts are added as they are). */
   directoryEntitled: boolean;
-  /** A ReferralFit admin: programs added to their own workspace are published to the Directory. */
-  isPlatformAdmin: boolean;
   onClose: () => void;
   onImported: (result: ImportResult) => void;
 };
 
-export default function PartnerImportSheet({ visible, userId, partners, directoryEntitled, isPlatformAdmin, onClose, onImported }: Props) {
+export default function PartnerImportSheet({ visible, userId, partners, directoryEntitled, onClose, onImported }: Props) {
   const [candidates, setCandidates] = useState<ImportCandidate[]>([]);
   const [index, setIndex] = useState<DirectoryIndex | null>(null);
   const [directoryState, setDirectoryState] = useState<'idle' | 'loading' | 'ready' | 'unavailable'>('idle');
@@ -83,14 +82,32 @@ export default function PartnerImportSheet({ visible, userId, partners, director
   const pickingRef = useRef(false);
   const candidatesRef = useRef(candidates);
   candidatesRef.current = candidates;
+  // The latest Directory and network, read when a contact is added (a tap
+  // made while the Directory was loading still gets matched).
+  const indexRef = useRef(index);
+  indexRef.current = index;
+  const partnersRef = useRef(partners);
+  partnersRef.current = partners;
+  // iOS presents the contact picker only once this sheet has finished
+  // presenting; before that the picker would silently never appear.
+  const [shown, setShown] = useState(Platform.OS === 'web');
+  // Bumped on every close: a pick or a save finishing afterwards changes nothing.
+  const openingRef = useRef(0);
+  const endPickerOverlayRef = useRef<(() => void) | null>(null);
   const contactsHere = deviceContactsAvailable();
   const filesHere = contactFilesAvailable();
 
-  // A fresh sheet each time it opens, and for each account.
+  // A fresh sheet each time it opens, and for each account. Closing releases
+  // a picker that never answered, so nothing stays blocked.
   useEffect(() => {
-    if (!visible) return;
+    openingRef.current += 1;
+    pickingRef.current = false;
+    endPickerOverlayRef.current?.();
+    endPickerOverlayRef.current = null;
+    if (!visible) { if (Platform.OS !== 'web') setShown(false); return; }
     setCandidates([]);
     setNotice(null);
+    setBusy(false);
   }, [visible, userId]);
 
   // The Directory, once per opening, for matching on the device.
@@ -115,7 +132,7 @@ export default function PartnerImportSheet({ visible, userId, partners, director
       return current.map((candidate, i) => (candidate.match || !rematched[i]?.match ? candidate : {
         ...candidate,
         match: rematched[i].match,
-        useListing: true,
+        useListing: rematched[i].useListing,
         existingPartnerId: candidate.existingPartnerId || rematched[i].existingPartnerId,
         include: candidate.include && !rematched[i].existingPartnerId,
         types: candidate.types.length ? candidate.types : rematched[i].types,
@@ -127,7 +144,7 @@ export default function PartnerImportSheet({ visible, userId, partners, director
   const needType = candidates.filter((candidate) => candidate.include && !candidate.existingPartnerId && !isReady(candidate)).length;
 
   function add(contacts: RawContact[], source: string) {
-    const result = addCandidates(candidatesRef.current, contacts, index, partners);
+    const result = addCandidates(candidatesRef.current, contacts, indexRef.current, partnersRef.current);
     candidatesRef.current = result.candidates;
     setCandidates(result.candidates);
     if (result.truncated) {
@@ -140,32 +157,46 @@ export default function PartnerImportSheet({ visible, userId, partners, director
   }
 
   async function pickContact() {
-    if (pickingRef.current || busy) return;
+    if (pickingRef.current || busy || !shown) return;
     pickingRef.current = true;
+    const opening = openingRef.current;
     // iOS presents the picker over this sheet: nothing else may present meanwhile.
     const endOverlay = beginOverlay();
+    endPickerOverlayRef.current = endOverlay;
     try {
       const contact = await pickDeviceContact();
+      if (opening !== openingRef.current) return;
       if (contact) add([contact], contact.organization || contact.name || 'That contact');
     } catch (error) {
-      Alert.alert('Contacts unavailable', describeError(error));
+      if (opening === openingRef.current) Alert.alert('Contacts unavailable', describeError(error));
     } finally {
       endOverlay();
-      pickingRef.current = false;
+      if (endPickerOverlayRef.current === endOverlay) endPickerOverlayRef.current = null;
+      if (opening === openingRef.current) pickingRef.current = false;
     }
   }
 
   function pickFile() {
-    if (pickingRef.current || busy) return;
-    pickingRef.current = true;
-    // Called inside the tap: the browser opens a file chooser only then.
-    void pickContactsFile()
-      .then((picked) => {
-        if (!picked) return;
-        if ('problem' in picked) { setNotice({ ok: false, text: picked.problem }); return; }
-        add(picked.contacts, picked.fileName);
-      })
-      .finally(() => { pickingRef.current = false; });
+    if (busy) return;
+    const opening = openingRef.current;
+    // Called inside the tap: the browser opens a file chooser only then. Not
+    // guarded by pickingRef: a browser without the 'cancel' event (Safari
+    // before 16.4) never reports a closed chooser, and each tap makes a new
+    // chooser anyway.
+    void pickContactsFile().then((picked) => {
+      if (!picked || opening !== openingRef.current) return;
+      if ('problem' in picked) { setNotice({ ok: false, text: picked.problem }); return; }
+      add(picked.contacts, picked.fileName);
+    });
+  }
+
+  function close() {
+    if (busy) return;
+    if (!candidates.length) { onClose(); return; }
+    Alert.alert('Discard this list?', 'None of these contacts have been added yet.', [
+      { text: 'Keep reviewing', style: 'cancel' },
+      { text: 'Discard', style: 'destructive', onPress: onClose },
+    ]);
   }
 
   function patch(key: string, change: Partial<ImportCandidate>) {
@@ -188,17 +219,19 @@ export default function PartnerImportSheet({ visible, userId, partners, director
 
   async function save() {
     if (busy || !ready.length) return;
+    const opening = openingRef.current;
     setBusy(true);
     setNotice(null);
     try {
       const result = await importPartners(importRows(candidates), userId);
+      onImported(result);
+      if (opening !== openingRef.current) return;
       setCandidates([]);
       setNotice({ ok: true, text: importSummary(result) });
-      onImported(result);
     } catch (error) {
-      setNotice({ ok: false, text: describeError(error) });
+      if (opening === openingRef.current) setNotice({ ok: false, text: describeError(error) });
     } finally {
-      setBusy(false);
+      if (opening === openingRef.current) setBusy(false);
     }
   }
 
@@ -278,7 +311,13 @@ export default function PartnerImportSheet({ visible, userId, partners, director
       </Text>
       <View style={styles.sourceRow}>
         {contactsHere ? (
-          <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void pickContact(); }} style={styles.sourceButton}>
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityState={{ disabled: busy || !shown }}
+            disabled={busy || !shown}
+            onPress={() => { void pickContact(); }}
+            style={[styles.sourceButton, (busy || !shown) && styles.primaryButtonOff]}
+          >
             <Text style={styles.sourceButtonText}>{candidates.length ? 'Pick another contact' : 'Pick a contact'}</Text>
           </TouchableOpacity>
         ) : null}
@@ -291,9 +330,6 @@ export default function PartnerImportSheet({ visible, userId, partners, director
       {directoryState === 'loading' ? <Text style={styles.hint}>Checking the ReferralFit Directory…</Text> : null}
       {directoryState === 'ready' && candidates.length ? (
         <Text style={styles.hint}>Contacts that are on ReferralFit add the Directory listing; switch it off to keep your own details.</Text>
-      ) : null}
-      {isPlatformAdmin ? (
-        <Text style={styles.adminNote}>In a workspace a ReferralFit admin owns, programs added here are also published to the Directory.</Text>
       ) : null}
       {notice ? (
         <View style={[styles.notice, notice.ok && styles.noticeOk]} accessibilityRole="alert">
@@ -317,11 +353,18 @@ export default function PartnerImportSheet({ visible, userId, partners, director
   );
 
   return (
-    <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={onClose}>
+    <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={close} onShow={() => setShown(true)}>
       <SafeAreaView style={styles.page}>
         <View style={styles.header}>
-          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close import" onPress={onClose} style={styles.headerButton}>
-            <Text style={styles.headerButtonText}>{candidates.length ? 'Cancel' : 'Done'}</Text>
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityLabel="Close import"
+            accessibilityState={{ disabled: busy }}
+            disabled={busy}
+            onPress={close}
+            style={styles.headerButton}
+          >
+            <Text style={[styles.headerButtonText, busy && styles.primaryButtonOff]}>{candidates.length ? 'Cancel' : 'Done'}</Text>
           </TouchableOpacity>
           <Text style={styles.headerTitle}>Import partners</Text>
           <View style={styles.headerButton} />
@@ -367,7 +410,6 @@ const styles = StyleSheet.create({
   content: { padding: 18, paddingBottom: 48 },
   intro: { fontSize: 14, lineHeight: 20, color: COLORS.gray },
   hint: { fontSize: 12, lineHeight: 17, color: COLORS.gray, marginTop: 8 },
-  adminNote: { fontSize: 12, lineHeight: 17, color: COLORS.blue, marginTop: 8, fontWeight: '600' },
   label: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, color: COLORS.gray, marginTop: 18, marginBottom: 8 },
   sourceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
   sourceButton: { minHeight: 46, paddingHorizontal: 16, borderRadius: 12, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },

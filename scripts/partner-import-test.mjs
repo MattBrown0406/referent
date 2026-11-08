@@ -166,6 +166,45 @@ check(() => assert.deepEqual(
   ['Added 3 partners and 2 from the Directory. 1 was already in your network or could not be added.', 'Added 1 partner.',
    'Nothing new was added. 2 were already in your network or could not be added.']), 'the outcome line');
 
+// ─── Bookend audit: wrong matches, lost rows, real exports ─────────────────
+{
+  const shared = [
+    { id: 'bbbbbbbb-0000-0000-0000-000000000001', name: 'A', organization: 'Calm Therapy', types: ['Therapist'], city: '', state: 'OR', phone: '', email: '', website: 'https://www.psychologytoday.com/us/therapists/a' },
+    { id: 'bbbbbbbb-0000-0000-0000-000000000002', name: 'Hazelden CA', organization: 'Hazelden Betty Ford', types: ['Inpatient'], city: '', state: 'CA', phone: '', email: '', website: 'https://hazeldenbettyford.org' },
+    { id: 'bbbbbbbb-0000-0000-0000-000000000003', name: 'Hazelden MN', organization: 'Hazelden Betty Ford', types: ['Inpatient'], city: '', state: 'MN', phone: '', email: '', website: 'https://hazeldenbettyford.org/mn' },
+    { id: 'bbbbbbbb-0000-0000-0000-000000000004', name: 'Intake', organization: 'Oaks Treatment', types: ['Inpatient'], city: '', state: 'OR', phone: '541-555-0170', email: '', website: '' },
+  ];
+  const idx = rules.directoryIndex(shared);
+  check(() => assert.equal(rules.matchListing(c({ organization: 'Other', website: 'https://www.psychologytoday.com/us/therapists/b' }), idx), null),
+    'a Psychology Today or Facebook page never matches a listing');
+  check(() => assert.equal(rules.domainKey('https://www.facebook.com/oaksliving'), ''), 'shared hosts are not domains');
+  check(() => assert.equal(rules.matchListing(c({ organization: 'HBF', email: 'x@hazeldenbettyford.org' }), idx), null),
+    'a domain two listings share matches neither');
+  check(() => assert.equal(rules.matchListing(c({ organization: 'Oaks Treatment', state: 'WA' }), idx), null), 'a name-only match needs the same state');
+  check(() => assert.equal(rules.matchListing(c({ organization: 'Oaks Treatment', state: 'OR' }), idx)?.id, shared[3].id), 'and matches when it agrees');
+  const handAdded = [{ id: 'p-oaks', name: 'Admissions', organization: 'Oaks Treatment', email: '', phone: '(541) 555-0170', state: 'OR' }];
+  const jane = rules.addCandidates([], [c({ name: 'Jane', organization: 'Oaks', phone: '541-555-0170' })], idx, handAdded).candidates[0];
+  check(() => assert.deepEqual([jane.match?.id, jane.existingPartnerId], [shared[3].id, 'p-oaks']), 'a program added by hand is found through its listing');
+  const two = rules.addCandidates([], [c({ name: 'Ann', organization: 'Oaks Treatment', state: 'OR', email: 'ann@x.test' }),
+    c({ name: 'Bo', organization: 'Oaks Treatment', state: 'OR', email: 'bo@x.test' })], idx, []).candidates;
+  check(() => assert.deepEqual(two.map((row) => row.useListing), [true, false]), 'a second contact at the same program keeps its own details');
+  const sent = rules.importRows([two[0], { ...two[1], useListing: true }]);
+  check(() => assert.deepEqual([sent.length, 'global_id' in sent[0], sent[1].organization, sent[1].types], [2, true, 'Oaks Treatment', ['Inpatient']]),
+    'a listing is sent once; the other row goes as the contact, never dropped');
+  const googleMulti = 'Name,E-mail 1 - Value,Phone 1 - Value\nPat,bad ::: pat@work.test,+1 503 555 0101 ::: +1 503 555 0102';
+  check(() => assert.deepEqual([rules.contactsFromCsv(googleMulti)[0].email, rules.contactsFromCsv(googleMulti)[0].phone], ['pat@work.test', '+1 503 555 0101']),
+    'Google ":::" values: the first usable one');
+  const outlookClassic = 'First Name,Title,Job Title,Home Phone,Business Phone,Assistant\'s Phone,Business State,Business Country/Region,E-mail Type,E-mail Address\nAl,Dr.,Clinical Director,503-555-0001,503-555-0002,503-555-0003,OR,United States,SMTP,al@x.test';
+  const al = rules.contactsFromCsv(outlookClassic)[0];
+  check(() => assert.deepEqual([al.hint, al.phone, al.state, al.email], ['Clinical Director', '503-555-0002', 'OR', 'al@x.test']),
+    'Outlook: Job Title over Title, Business Phone over Home and Assistant, State not Country, no E-mail Type');
+  const vEsc = 'BEGIN:VCARD\nFN:Kay\nORG:Oaks\\; Pines;Intake\nURL:http\\://oaks.test\nEND:VCARD';
+  const kay = rules.contactsFromVcard(vEsc)[0];
+  check(() => assert.deepEqual([kay.organization, kay.website], ['Oaks; Pines', 'http://oaks.test']), 'vCard: escaped ";" and ":" read right');
+  check(() => assert.equal(rules.contactFromPicker({ name: 'Rosa', emails: [{ email: 'r@casa.test', label: 'casa' }, { email: 'r@oaks.test', label: 'trabajo' }] }).email,
+    'r@oaks.test'), 'a Spanish phone\'s work label is read');
+}
+
 // ─── The case card's referral-history rule ────────────────────────────────
 const base = { id: 'r', fromDisplay: 'Oaks', shareProgress: true, createdAt: '2026-11-08T03:00:00Z' };
 check(() => assert.deepEqual(
@@ -194,7 +233,11 @@ check(() => assert.match(api, /input\.click\(\);\s*\}\);/), 'the web file choose
 check(() => assert.match(sheet, /importPartners\(importRows\(candidates\), userId\)/), 'only reviewed rows are sent');
 check(() => assert.match(sheet, /const endOverlay = beginOverlay\(\);/), 'nothing presents over the iOS picker');
 check(() => assert.match(app, /\|\| showGlobalDirectory \|\| showPartnerImport/), 'the import sheet counts as an open sheet');
-check(() => assert.match(app, /onLedgerChanged=\{\(\) => \{ void refreshFromServerRef\.current\?\.\('pull'\)/), 'the case card reloads the network after logging');
+check(() => assert.match(app, /onLedgerChanged=\{refreshAfterServerChange\}/), 'the case card reloads the network after logging');
+check(() => assert.match(app, /if \(result\.added \|\| result\.linked\) refreshAfterServerChange\(\);/), 'an import reloads the network');
+check(() => assert.match(app, /if \(refreshInFlightRef\.current\) \{\s*scheduleCatchUpRefresh\(\);/), 'a refresh already in flight is followed by another');
+check(() => assert.match(sheet, /onShow=\{\(\) => setShown\(true\)\}/), 'iOS: the picker opens only once the sheet is up');
+check(() => assert.match(sheet, /endPickerOverlayRef\.current\?\.\(\);/), 'closing the sheet releases a picker that never answered');
 check(() => {
   const plugin = appJson.expo.plugins.find((entry) => Array.isArray(entry) && entry[0] === 'expo-contacts');
   assert.ok(plugin && /only the contacts you pick/.test(plugin[1].contactsPermission));
@@ -202,7 +245,7 @@ check(() => {
 check(() => assert.doesNotMatch(migration, /[^\x00-\x7f]/), 'migration: ASCII only');
 check(() => assert.doesNotMatch(migration, /\\/), 'migration: no backslashes');
 check(() => assert.match(migration, /GRANT EXECUTE ON FUNCTION public\.import_partners\(jsonb\) TO authenticated;/));
-check(() => assert.match(migration, /REVOKE ALL ON FUNCTION public\.import_partner_row\(uuid, uuid, jsonb\) FROM PUBLIC, anon, authenticated;/));
+check(() => assert.match(migration, /REVOKE ALL ON FUNCTION public\.import_partner_row\(uuid, uuid, jsonb, jsonb, jsonb\) FROM PUBLIC, anon, authenticated;/));
 check(() => assert.match(migration, /v_directory := public\.is_platform_admin\(\) OR public\.org_has_entitlement\('directory'\);/), 'Directory rows only for a workspace with the Directory');
 check(() => assert.doesNotMatch(matching, /\.(inbound|outbound)\b/), 'matching never reads referral counts');
 

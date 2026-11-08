@@ -114,7 +114,7 @@ export default function ProgramReferralCard({ caseId, onLedgerChanged }: Props) 
           onPress={() => { void log(); }}
           style={[styles.logButton, logging && styles.logButtonBusy]}
         >
-          {logging ? <ActivityIndicator color={COLORS.forest} /> : (
+          {logging ? <ActivityIndicator color={COLORS.forest} accessibilityLabel="Logging the referral" /> : (
             <Text style={styles.logButtonText} numberOfLines={2}>
               {action === 'log' ? 'Log in referral history' : `Add ${referral.fromDisplay} to your network and log`}
             </Text>

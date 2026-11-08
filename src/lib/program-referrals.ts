@@ -59,7 +59,11 @@ export async function fetchCaseProgramReferral(caseId: string): Promise<{ availa
  */
 export async function logProgramReferral(referralId: string, referredOn: string): Promise<{ addedPartner: boolean }> {
   const { data, error, status } = await supabase.rpc('log_program_referral', { p_referral_id: referralId, p_referred_on: referredOn });
-  if (error) throw failure(error, status, 'The referral could not be logged.');
+  if (error) {
+    if (isMissingProgramReferralSchema(error)) throw new Error('Logging this referral needs the latest ReferralFit update on the server.');
+    if ((error as { message?: string }).message === 'Referral not found') throw new Error('This referral is no longer on this case. Pull to refresh.');
+    throw failure(error, status, 'The referral could not be logged.');
+  }
   return { addedPartner: (data as { added_partner?: unknown } | null)?.added_partner === true };
 }
 
