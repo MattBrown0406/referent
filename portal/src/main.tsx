@@ -3,17 +3,27 @@ import { createRoot } from 'react-dom/client';
 
 import AnswerLink from './AnswerLink';
 import App from './App';
+import BedCheckIn from './BedCheckIn';
+import EmailPreferences from './EmailPreferences';
 import Handoff from './Handoff';
 import './styles.css';
 
-// /h is a referral handoff's page (signed out, src/Handoff.tsx); /a is a
-// placement request opened from a practice's answer link (signed out,
-// src/AnswerLink.tsx); everything else is the center portal.
+// Signed-out pages, each reached by a private link: /h a referral handoff
+// (src/Handoff.tsx), /a a placement request opened from a practice's answer
+// link (src/AnswerLink.tsx), /b the weekly bed check-in email's page
+// (src/BedCheckIn.tsx), /u email settings and unsubscribe
+// (src/EmailPreferences.tsx). Everything else is the center portal.
 const isHandoff = /^\/h\/?$/.test(window.location.pathname);
 const isAnswerLink = /^\/a\/?$/.test(window.location.pathname);
+const isBedCheckIn = /^\/b\/?$/.test(window.location.pathname);
+const isEmailPreferences = /^\/u\/?$/.test(window.location.pathname);
 
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    {isHandoff ? <Handoff /> : isAnswerLink ? <AnswerLink /> : <App />}
+    {isHandoff ? <Handoff />
+      : isAnswerLink ? <AnswerLink />
+        : isBedCheckIn ? <BedCheckIn />
+          : isEmailPreferences ? <EmailPreferences />
+            : <App />}
   </React.StrictMode>,
 );
