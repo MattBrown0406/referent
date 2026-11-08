@@ -86,10 +86,25 @@ as an author on the practice's rows. So it is an ordinary lead:
 - urgency "Someone may be in danger right now" carries over, with the
   911/988 line shown on the program's form.
 
-Not done: a received entry in the practice's referral ledger. That table's
-insert path assumes the practice's own signed-in author (its org triggers
-and ledger rules), so the practitioner logs it by hand, as before, if they
-track the program as a partner.
+## In the referral history (migration 20261108180000)
+
+- **The program is already a partner** (a partner in the receiving
+  workspace linked to the program's Directory listing): the referral is
+  logged automatically as an inbound referral on the new lead
+  (`program_referrals_log_inbound`, a trigger on `program_referrals`),
+  written as the lead's owner with the program's claims cleared for the
+  insert, dated the practice's local day, note "Referred through
+  ReferralFit.", outcome Pending. It counts in the partner's "received"
+  total like one logged by hand.
+- **It is not a partner yet:** the case card offers "Add <program> to your
+  network and log" (`log_program_referral`): one tap imports the program's
+  Directory listing as a partner (added by the member who tapped) and logs
+  the inbound referral. If the program is a partner but the referral is not
+  logged (the practice deleted it), the card offers "Log in referral
+  history". Running it twice changes nothing. A program whose listing has
+  left the Directory and is not a partner gets no button.
+- Inbound referrals never change matching or ranking (matching never reads
+  inbound or outbound counts).
 
 ## Milestones (derived, never entered by hand)
 
@@ -120,7 +135,8 @@ rest are counted as "not shared or closed".
 | `program_refer_family(p_to_global_id, p_caller_first_name, p_phone, p_email, p_relationship, p_about_first_name, p_urgency, p_note, p_consent)` | center | The referral and its lead; returns the referral id |
 | `list_program_referrals()` | center | Its referrals, newest first, with milestones and `placed_with` (only while shared) |
 | `program_referral_stats()` | center | Its track record per interventionist |
-| `case_program_referral(p_case_id)` | practice member | The program behind a case, and the sharing switch |
+| `case_program_referral(p_case_id)` | practice member | The program behind a case, the sharing switch, and `in_network` / `logged` / `can_log` for the referral history |
+| `log_program_referral(p_referral_id, p_referred_on)` | practice member | "Add to network and log": the program as a partner if needed, and the inbound referral on the case |
 | `set_program_referral_sharing(p_referral_id, p_share)` | practice member | Turn sharing on or off (written to the case timeline) |
 | `program_referral_settings()` | practice member | Accepting on or off, whether the caller may change it, whether the workspace has a live profile |
 | `set_accepts_program_referrals(p_accepts)` | workspace owner | The switch |

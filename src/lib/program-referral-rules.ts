@@ -8,6 +8,12 @@ export type CaseProgramReferral = {
   fromDisplay: string;
   shareProgress: boolean;
   createdAt: string;
+  /** The program is a partner in this workspace (migration 20261108180000; false on an older server). */
+  inNetwork: boolean;
+  /** An inbound referral from the program is in the referral history on this case. */
+  logged: boolean;
+  /** "Add to network and log" can work (the program is a partner, or its listing is live). */
+  canLog: boolean;
 };
 
 export type ProgramReferralSettings = {
@@ -37,7 +43,27 @@ export function caseProgramReferralFromRow(data: unknown): CaseProgramReferral |
     fromDisplay: typeof row.from_display === 'string' && row.from_display.trim() ? row.from_display.trim() : 'A treatment program',
     shareProgress: row.share_progress !== false,
     createdAt: typeof row.created_at === 'string' ? row.created_at : '',
+    inNetwork: row.in_network === true,
+    logged: row.logged === true,
+    canLog: row.can_log === true,
   };
+}
+
+/**
+ * What the case file offers for the referral history: nothing (an older
+ * server, or already logged), "Log in referral history" (the program is a
+ * partner), or "Add <program> to your network and log" (it is not yet).
+ */
+export function ledgerAction(referral: CaseProgramReferral): 'none' | 'log' | 'add_and_log' {
+  if (referral.logged || !referral.canLog) return 'none';
+  return referral.inNetwork ? 'log' : 'add_and_log';
+}
+
+/** The local date (YYYY-MM-DD) of an ISO time, for the referral's date in the history. */
+export function localDateOf(iso: string, fallback = new Date()): string {
+  const at = iso ? new Date(iso) : fallback;
+  const day = Number.isNaN(at.getTime()) ? fallback : at;
+  return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
 }
 
 export function programReferralSettingsFromRow(data: unknown): ProgramReferralSettings | null {

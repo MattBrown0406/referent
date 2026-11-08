@@ -15,6 +15,7 @@ const expected = {
   expoSecureStore: '57.0.1',
   expoSms: '57.0.1',
   expoMailComposer: '57.0.1',
+  expoContacts: '57.0.8',
 };
 
 assert.equal(
@@ -50,6 +51,8 @@ for (const [packageName, expectedVersion] of [
   // Follow-up outreach: the Messages / Mail compose sheets. Same native cohort.
   ['expo-sms', expected.expoSms],
   ['expo-mail-composer', expected.expoMailComposer],
+  // Partner import: iOS's contact picker only (no address book access).
+  ['expo-contacts', expected.expoContacts],
 ]) {
   assert.equal(
     packageJson.dependencies[packageName],

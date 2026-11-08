@@ -168,6 +168,8 @@ import { latestRequestForMatch, placementTodayItems, requestProgress, type Place
 import LevelOfCareSheet from './src/lib/LevelOfCareSheet';
 import LevelOfCareCard, { AssessedLevelNote } from './src/lib/LevelOfCareCard';
 import ProgramReferralCard from './src/lib/ProgramReferralCard';
+import PartnerImportSheet from './src/lib/PartnerImportSheet';
+import { contactFilesAvailable, deviceContactsAvailable } from './src/lib/partner-import-api';
 import { useCaseAssessments } from './src/lib/level-of-care-api';
 import { levelOfCarePacketLines, reasonNames, type PlacementLevel } from './src/lib/level-of-care';
 import {
@@ -1291,6 +1293,8 @@ export default function App() {
   const [todayStamp, setTodayStamp] = useState(localDateStamp);
   const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
+  // Import partners from the iPhone's contacts or (web) a .csv / .vcf file.
+  const [showPartnerImport, setShowPartnerImport] = useState(false);
   const [directorySubmitBusy, setDirectorySubmitBusy] = useState(false);
   // Incremented after the account joins a different practice workspace, which
   // re-homes its rows server-side; bumping it re-runs the hydration effect.
@@ -4599,7 +4603,7 @@ export default function App() {
   latestCasesRef.current = cases;
   const sheetOpenNow = Boolean(
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
-    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory
+    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory || showPartnerImport
     || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
     || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible
     || placementSheet || placementCompareId || showHandoffs,
@@ -7466,6 +7470,25 @@ export default function App() {
           </View>
           <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
         </TouchableOpacity>
+        {deviceContactsAvailable() || contactFilesAvailable() ? (
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityLabel={deviceContactsAvailable() ? 'Import partners from your contacts' : 'Import partners from a contacts file'}
+            style={styles.globalDirectoryBanner}
+            onPress={() => setShowPartnerImport(true)}
+          >
+            <AppIcon name="person-add-outline" size={20} color={COLORS.forest} />
+            <View style={styles.globalDirectoryCopy}>
+              <Text style={styles.globalDirectoryTitle}>Import partners</Text>
+              <Text style={styles.globalDirectorySubtitle}>
+                {deviceContactsAvailable()
+                  ? 'Pick the contacts you refer with; ReferralFit sees only the ones you pick'
+                  : 'From a spreadsheet (.csv) or a contacts file (.vcf), reviewed before anything is saved'}
+              </Text>
+            </View>
+            <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
+          </TouchableOpacity>
+        ) : null}
         <View style={styles.searchBox}>
           <AppIcon name="search" size={19} color={COLORS.gray} />
           <TextInput value={search} onChangeText={setSearch} placeholder="Name, program, location, specialty" placeholderTextColor="#91A09B" style={styles.searchInput} />
@@ -7780,7 +7803,11 @@ export default function App() {
               {renderSavedCopyNotice(caseFileSource, 'case file')}
 
               {/* Referred by a treatment program: the practice's switch for sharing progress */}
-              <ProgramReferralCard key={record.id} caseId={record.id} />
+              <ProgramReferralCard
+                key={record.id}
+                caseId={record.id}
+                onLedgerChanged={() => { void refreshFromServerRef.current?.('pull').catch(() => undefined); }}
+              />
 
               <View style={styles.infoCard}>
                 <View style={styles.caseSectionHeader}>
@@ -10152,6 +10179,18 @@ export default function App() {
         onOpenCase={(caseId) => {
           setShowBusinessDashboard(false);
           afterSheetCloses(() => openCase(caseId));
+        }}
+      />
+      <PartnerImportSheet
+        visible={showPartnerImport}
+        userId={activeUserId}
+        partners={partners}
+        directoryEntitled={entitlements.entitlements.directory}
+        isPlatformAdmin={credentialIndex.isPlatformAdmin}
+        onClose={() => setShowPartnerImport(false)}
+        onImported={(result) => {
+          // The new partners come in with the next read of the network.
+          if (result.added || result.linked) void refreshFromServerRef.current?.('pull').catch(() => undefined);
         }}
       />
       <GlobalDirectoryScreen
