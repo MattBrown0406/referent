@@ -2216,12 +2216,14 @@ export default function App() {
   // case card): a refresh already in flight may have read before it, so wait
   // for that one and read again.
   const refreshAfterServerChange = useCallback(() => {
-    if (refreshInFlightRef.current) {
-      scheduleCatchUpRefresh();
+    const again = () => { void refreshFromServerRef.current?.('pull').catch(() => undefined); };
+    const running = refreshInFlightRef.current;
+    if (running) {
+      void running.then(again, again);
       return;
     }
-    void refreshFromServerRef.current?.('pull').catch(() => undefined);
-  }, [scheduleCatchUpRefresh]);
+    again();
+  }, []);
 
   const refreshFromServer = useCallback(async (trigger: 'foreground' | 'pull'): Promise<'ok' | 'offline'> => {
     const userId = session?.user?.id;

@@ -55,7 +55,9 @@ $$;
 REVOKE ALL ON FUNCTION public.import_partner_website(text) FROM PUBLIC, anon, authenticated;
 
 -- The keys a partner is known by in its workspace: its email, the last ten
--- digits of its phone, and its organization with its name (lower case).
+-- digits of its phone, and its organization with its name (lower case; a
+-- partner without an organization is its own organization, as an import
+-- makes it).
 CREATE OR REPLACE FUNCTION public.import_partner_keys(p_email text, p_phone text, p_organization text, p_name text)
 RETURNS text[]
 LANGUAGE sql IMMUTABLE
@@ -65,7 +67,8 @@ AS $$
     CASE WHEN btrim(coalesce(p_email, '')) <> '' THEN 'e:' || lower(btrim(p_email)) END,
     CASE WHEN length(regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g')) >= 10
          THEN 'p:' || right(regexp_replace(p_phone, '[^0-9]', '', 'g'), 10) END,
-    'n:' || lower(btrim(coalesce(p_organization, ''))) || '|' || lower(btrim(coalesce(p_name, '')))
+    'n:' || lower(coalesce(nullif(btrim(coalesce(p_organization, '')), ''), btrim(coalesce(p_name, ''))))
+         || '|' || lower(coalesce(nullif(btrim(coalesce(p_name, '')), ''), btrim(coalesce(p_organization, ''))))
   ], NULL)
 $$;
 REVOKE ALL ON FUNCTION public.import_partner_keys(text, text, text, text) FROM PUBLIC, anon, authenticated;
@@ -177,9 +180,14 @@ BEGIN
       IF v_id IS NULL THEN v_skipped := v_skipped + 1; CONTINUE; END IF;
       v_added := v_added + 1;
     END IF;
-    SELECT v_added_keys || coalesce(jsonb_object_agg(k, true), '{}'::jsonb) INTO v_added_keys
-      FROM public.partners p, unnest(public.import_partner_keys(p.email, p.phone, p.organization, p.name)) k
-     WHERE p.id = v_id;
+    -- Only own contacts count against later rows: a listing added above
+    -- carries the program's main line and intake email, which other people
+    -- there may share.
+    IF v_gid IS NULL THEN
+      SELECT v_added_keys || coalesce(jsonb_object_agg(k, true), '{}'::jsonb) INTO v_added_keys
+        FROM public.partners p, unnest(public.import_partner_keys(p.email, p.phone, p.organization, p.name)) k
+       WHERE p.id = v_id;
+    END IF;
     v_ids := v_ids || v_id;
   END LOOP;
   RETURN jsonb_build_object('added', v_added, 'linked', v_linked, 'skipped', v_skipped, 'ids', to_jsonb(v_ids));
@@ -295,7 +303,8 @@ DECLARE
   v_referral uuid;
   v_added boolean := false;
   v_day date;
-  v_offset interval;
+  v_tz text;
+  v_minutes integer;
 BEGIN
   IF v_user IS NULL OR v_org IS NULL THEN
     RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
@@ -320,12 +329,18 @@ BEGIN
    WHERE r.org_id = v_org AND r.case_id = v_row.case_id AND r.partner_id = v_partner AND r.direction = 'inbound'
    ORDER BY r.created_at LIMIT 1;
   IF v_referral IS NULL THEN
-    -- The referral's date where the member is (their email time zone), unless
-    -- the device's date for it is within a day of that.
-    SELECT public.email_local_now(p.tz_name, p.tz_offset_minutes) - (now() AT TIME ZONE 'UTC') INTO v_offset
-      FROM public.email_preferences p WHERE p.user_id = v_user;
-    v_offset := coalesce(v_offset, public.email_local_now(NULL, NULL) - (now() AT TIME ZONE 'UTC'));
-    v_day := ((v_row.created_at AT TIME ZONE 'UTC') + v_offset)::date;
+    -- The referral's date where the member is (their email time zone, as
+    -- email_local_now reads it), unless the device's date for it is within a
+    -- day of that.
+    SELECT p.tz_name, p.tz_offset_minutes INTO v_tz, v_minutes FROM public.email_preferences p WHERE p.user_id = v_user;
+    IF v_tz ~ '^[A-Za-z]+(/[A-Za-z0-9_+-]+){0,2}$' THEN
+      BEGIN
+        v_day := (v_row.created_at AT TIME ZONE v_tz)::date;
+      EXCEPTION WHEN OTHERS THEN
+        v_day := NULL;
+      END;
+    END IF;
+    v_day := coalesce(v_day, ((v_row.created_at AT TIME ZONE 'UTC') + make_interval(mins => coalesce(v_minutes, -420)))::date);
     IF p_referred_on BETWEEN v_day - 1 AND v_day + 1 THEN v_day := p_referred_on; END IF;
     INSERT INTO public.referrals (owner_id, org_id, partner_id, direction, referred_on, client_label, outcome, note, case_id)
     VALUES (v_user, v_org, v_partner, 'inbound', v_day, left(coalesce(v_row.title, ''), 120), 'Pending',

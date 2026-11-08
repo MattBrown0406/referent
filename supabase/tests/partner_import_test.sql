@@ -7,7 +7,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(44);
+SELECT plan(46);
 
 -- Actors
 --   p1  owner of practice P (profile listing I1, Cascade Interventions)
@@ -306,6 +306,23 @@ SELECT is(public.import_partners(jsonb_build_array(jsonb_build_object('global_id
   '0', 'a workspace without the Directory cannot add Directory listings through an import');
 RESET ROLE;
 CREATE OR REPLACE FUNCTION public.free_launch_period() RETURNS boolean LANGUAGE sql IMMUTABLE SET search_path = public AS $f$ SELECT true $f$;
+
+-- ===========================================================================
+-- I. A listing and a person there, in one import
+-- ===========================================================================
+
+UPDATE public.global_partners SET phone = '541-555-0199', email = 'intake@juniper.test' WHERE id = 'd1000000-0000-0000-0000-0000000000a7';
+SELECT set_config('request.jwt.claim.sub', 'b3000000-0000-0000-0000-0000000000a7', true);
+SET LOCAL ROLE authenticated;
+SELECT is(public.import_partners(jsonb_build_array(
+  jsonb_build_object('global_id', 'd1000000-0000-0000-0000-0000000000a7'),
+  jsonb_build_object('name', 'Rae', 'organization', 'Juniper Ridge Recovery', 'types', jsonb_build_array('Inpatient'),
+                     'phone', '541-555-0199', 'email', 'intake@juniper.test'))) - 'ids',
+  '{"added": 1, "linked": 1, "skipped": 0}'::jsonb,
+  'a person sharing the program''s main line is still added after its listing');
+SELECT is(public.import_partners(jsonb_build_array(jsonb_build_object('name', 'Solo Coach', 'types', jsonb_build_array('Interventionist'))))
+            -> 'added', '1'::jsonb, 'a person without an organization is added');
+RESET ROLE;
 
 SELECT * FROM finish();
 ROLLBACK;

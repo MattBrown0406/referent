@@ -43,8 +43,7 @@ assert.match(app, /setLoaded\(true\);\s*\/\/ The saved copy shows its waiting ch
   'the badge and banner count the saved copy\'s waiting changes at once');
 assert.match(app, /if \(skippedServerCopy \|\| changedMeanwhile\(\)\) \{\s*lastServerRefreshAtRef\.current = 0;\s*scheduleCatchUpRefresh\(\);\s*\} else if \(result\.source === 'remote'\) \{/,
   'a server copy left unshown is read again soon, and never marked as fresh');
-assert.ok((app.match(/scheduleCatchUpRefresh\(\);/g) || []).length === 4,
-  'launch, both skips in refreshFromServer, and a server-side change made during a refresh (refreshAfterServerChange) catch up');
+assert.ok((app.match(/scheduleCatchUpRefresh\(\);/g) || []).length === 3, 'launch and both skips in refreshFromServer catch up');
 assert.match(app, /if \(\(mutationActiveRef\.current \|\| refreshInFlightRef\.current\) && waits < 20\)[\s\S]{0,120}catchUpTriesRef\.current \+= 1;\s*void refreshFromServerRef\.current\?\.\('pull'\)/,
   'the catch-up waits for the save to finish');
 assert.match(app, /const scheduleFrom = \(changedMeanwhile\(\) \|\| !caseListLoad\) && latestSnapshotRef\.current\s*\? \{ \.\.\.latestSnapshotRef\.current, cases: latestCasesRef\.current \}/,

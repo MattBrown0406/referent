@@ -183,8 +183,22 @@ check(() => assert.deepEqual(
   check(() => assert.equal(rules.matchListing(c({ organization: 'Oaks Treatment', state: 'WA' }), idx), null), 'a name-only match needs the same state');
   check(() => assert.equal(rules.matchListing(c({ organization: 'Oaks Treatment', state: 'OR' }), idx)?.id, shared[3].id), 'and matches when it agrees');
   const handAdded = [{ id: 'p-oaks', name: 'Admissions', organization: 'Oaks Treatment', email: '', phone: '(541) 555-0170', state: 'OR' }];
-  const jane = rules.addCandidates([], [c({ name: 'Jane', organization: 'Oaks', phone: '541-555-0170' })], idx, handAdded).candidates[0];
-  check(() => assert.deepEqual([jane.match?.id, jane.existingPartnerId], [shared[3].id, 'p-oaks']), 'a program added by hand is found through its listing');
+  const bob = rules.addCandidates([], [c({ name: 'Bob', organization: 'Oaks Treatment', state: 'OR', email: 'bob@oaksmail.test', phone: '541-555-0999' })], idx, handAdded).candidates[0];
+  check(() => assert.deepEqual([bob.match?.id, bob.existingPartnerId, bob.useListing, bob.include, bob.types], [shared[3].id, null, false, true, ['Inpatient']]),
+    'a new person at a program added by hand: not a duplicate, added with their own details (the listing is not added again)');
+  const mainLine = rules.addCandidates([], [c({ name: 'Front desk', organization: 'Oaks', phone: '541-555-0170' })], idx, handAdded).candidates[0];
+  check(() => assert.equal(mainLine.existingPartnerId, 'p-oaks'), 'the same phone as a partner is a duplicate');
+  const linkedNetwork = [{ id: 'p-dana', name: 'Dana Cole', organization: 'Cascade Interventions', email: '', phone: '', globalPartnerId: 'cccccccc-0000-0000-0000-000000000001' }];
+  const danaListing = { id: 'cccccccc-0000-0000-0000-000000000001', name: 'Dana Cole', organization: 'Cascade Interventions', types: ['Interventionist'], city: '', state: 'OR', phone: '', email: 'dana@cascadeint.test', website: '' };
+  const danaRow = rules.addCandidates([], [c({ name: 'Dana', organization: 'Cascade', email: 'dana@cascadeint.test' })], rules.directoryIndex([danaListing]), linkedNetwork).candidates[0];
+  check(() => assert.equal(danaRow.existingPartnerId, 'p-dana'), 'a person whose own listing is already linked is a duplicate');
+  check(() => assert.equal(rules.matchListing(c({ organization: 'Seeded Ranch', state: 'OR' }),
+    rules.directoryIndex([{ id: 'x', name: 'I', organization: 'Seeded Ranch', types: ['Inpatient'], city: '', state: '\u2014', phone: '', email: '', website: '' }]))?.id, 'x'),
+    'a listing without a real state still name-matches');
+  check(() => assert.equal(rules.contactsFromCsv('Display Name,Primary Email\nPat Lee,pat@lee.test').length, 1), 'a Display Name column is a name (Thunderbird)');
+  check(() => assert.equal(rules.contactsFromVcard('BEGIN:VCARD\nFN:Jane\\\nEND:VCARD')[0].name, 'Jane'), 'a trailing backslash is dropped');
+  check(() => assert.equal(rules.addCandidates([], [c({ name: 'Pat Doe' })], null, [{ id: 'p-pat', name: 'Pat Doe', organization: '', email: '', phone: '' }]).candidates[0].existingPartnerId,
+    'p-pat'), 'a partner without an organization is its own organization');
   const two = rules.addCandidates([], [c({ name: 'Ann', organization: 'Oaks Treatment', state: 'OR', email: 'ann@x.test' }),
     c({ name: 'Bo', organization: 'Oaks Treatment', state: 'OR', email: 'bo@x.test' })], idx, []).candidates;
   check(() => assert.deepEqual(two.map((row) => row.useListing), [true, false]), 'a second contact at the same program keeps its own details');
@@ -235,7 +249,7 @@ check(() => assert.match(sheet, /const endOverlay = beginOverlay\(\);/), 'nothin
 check(() => assert.match(app, /\|\| showGlobalDirectory \|\| showPartnerImport/), 'the import sheet counts as an open sheet');
 check(() => assert.match(app, /onLedgerChanged=\{refreshAfterServerChange\}/), 'the case card reloads the network after logging');
 check(() => assert.match(app, /if \(result\.added \|\| result\.linked\) refreshAfterServerChange\(\);/), 'an import reloads the network');
-check(() => assert.match(app, /if \(refreshInFlightRef\.current\) \{\s*scheduleCatchUpRefresh\(\);/), 'a refresh already in flight is followed by another');
+check(() => assert.match(app, /const running = refreshInFlightRef\.current;\s*if \(running\) \{\s*void running\.then\(again, again\);/), 'a refresh already in flight is followed by another');
 check(() => assert.match(sheet, /onShow=\{\(\) => setShown\(true\)\}/), 'iOS: the picker opens only once the sheet is up');
 check(() => assert.match(sheet, /endPickerOverlayRef\.current\?\.\(\);/), 'closing the sheet releases a picker that never answered');
 check(() => {

@@ -246,12 +246,13 @@ function headerField(header: string): { field: Field; rank: number } | null {
   const h = norm(header);
   if (!h) return null;
   // "E-mail 1 - Label", "E-mail Type", "Phone 1 - Type" (a plain "Type" column is the partner type).
-  if (/\b(label|display name)\b/.test(h) || (/\btype\b/.test(h) && !/^(type|partner type|provider type|program type)$/.test(h))) return null;
+  if (/\blabel\b/.test(h) || (/display name/.test(h) && h !== 'display name')
+      || (/\btype\b/.test(h) && !/^(type|partner type|provider type|program type)$/.test(h))) return null;
   if (/(assistant|fax|pager|telex|tty|callback|radio|country)/.test(h)) return null;
   if (/^(first name|given name|first)$/.test(h)) return { field: 'first', rank: 0 };
   if (/^(middle name|additional name|middle)$/.test(h)) return { field: 'middle', rank: 0 };
   if (/^(last name|family name|surname|last)$/.test(h)) return { field: 'last', rank: 0 };
-  if (/^(name|full name|contact|contact name|display|person|contact person)$/.test(h)) return { field: 'name', rank: 0 };
+  if (/^(name|full name|contact|contact name|display|display name|person|contact person)$/.test(h)) return { field: 'name', rank: 0 };
   if (/^(organization|organisation|organization name|organization 1 name|company|company name|program|program name|facility|agency|business|business name|practice|center|centre)$/.test(h)) {
     return { field: 'organization', rank: 0 };
   }
@@ -309,7 +310,7 @@ export function contactsFromCsv(text: string): RawContact[] {
 // ─── Reading a contacts file (vCard) ───────────────────────────────────────
 
 function vcardValue(raw: string): string {
-  return raw.replace(/\\n/gi, ' ').replace(/\\(.)/g, '$1');
+  return raw.replace(/\\n/gi, ' ').replace(/\\(.)/g, '$1').replace(/\\$/, '');
 }
 
 /** A structured value split on its unescaped separators ("Oaks\\; Intake;Dept" is two parts). */
@@ -467,7 +468,8 @@ export function matchListing(contact: RawContact, index: DirectoryIndex): Listin
   if (phone && index.byPhone.has(phone)) return index.byPhone.get(phone)!;
   const org = orgKey(contact.organization);
   const byName = org ? index.byOrg.get(org) : undefined;
-  if (byName && (!contact.state || !byName.state || byName.state.toUpperCase() === contact.state)) return byName;
+  const listingState = byName ? stateCode(byName.state) : '';
+  if (byName && (!contact.state || !listingState || listingState === contact.state)) return byName;
   return null;
 }
 
@@ -491,41 +493,56 @@ export function networkIndex(network: NetworkPartnerLike[]): NetworkIndex {
     if (phone) index.byPhone.set(phone, partner.id);
     const domain = domainKey(partner.website);
     if (domain) index.byDomain.set(domain, partner.id);
-    index.byNames.set(`${partner.organization.trim().toLowerCase()}|${partner.name.trim().toLowerCase()}`, partner.id);
+    // A partner without an organization is its own organization (as an import makes it).
+    const ownName = partner.name.trim() || partner.organization.trim();
+    index.byNames.set(`${(partner.organization.trim() || ownName).toLowerCase()}|${ownName.toLowerCase()}`, partner.id);
     const org = orgKey(partner.organization);
     if (org.length >= 4) index.byOrg.set(org, [...(index.byOrg.get(org) || []), { id: partner.id, state: stateCode(partner.state) }]);
   }
   return index;
 }
 
+const INDIVIDUAL_TYPES = new Set(['Interventionist', 'Therapist']);
+
+/** A listing for one person (an interventionist or therapist), not a program. */
+function individualListing(listing: ListingLike): boolean {
+  return listing.types.length > 0 && listing.types.every((type) => INDIVIDUAL_TYPES.has(type));
+}
+
 /**
- * The network partner a candidate already is: by its Directory link, by the
- * contact's own email, phone or name and organization, or, for a Directory
- * match, by the listing's phone, email, website or organization (a program
- * the practice added by hand before it was linked).
+ * The network partner this contact already is: the same email, phone, or
+ * name and organization; or, for a match to a person's own listing (an
+ * interventionist or therapist), that listing already linked.
  */
 export function existingPartner(contact: RawContact, match: ListingLike | null, network: NetworkIndex): string | null {
-  if (match) {
-    const linked = network.byListing.get(match.id.toLowerCase());
-    if (linked) return linked;
-  }
   const email = contact.email;
   if (email && network.byEmail.has(email)) return network.byEmail.get(email)!;
   const phone = phoneKey(contact.phone);
   if (phone && network.byPhone.has(phone)) return network.byPhone.get(phone)!;
   const names = `${(contact.organization || contact.name).toLowerCase()}|${(contact.name || contact.organization).toLowerCase()}`;
   if (network.byNames.has(names)) return network.byNames.get(names)!;
-  if (!match) return null;
+  if (match && individualListing(match)) {
+    return network.byListing.get(match.id.toLowerCase()) || null;
+  }
+  return null;
+}
+
+/**
+ * The matched program is already in the network: linked to the listing, or
+ * added by hand (the listing's email, phone, website, or name in the same
+ * state). A new person there is added with their own details, not the
+ * listing again.
+ */
+export function programInNetwork(match: ListingLike, network: NetworkIndex): boolean {
+  if (network.byListing.has(match.id.toLowerCase())) return true;
   const listingEmail = cleanEmail(match.email);
-  if (listingEmail && network.byEmail.has(listingEmail)) return network.byEmail.get(listingEmail)!;
+  if (listingEmail && network.byEmail.has(listingEmail)) return true;
   const listingPhone = phoneKey(match.phone);
-  if (listingPhone && network.byPhone.has(listingPhone)) return network.byPhone.get(listingPhone)!;
+  if (listingPhone && network.byPhone.has(listingPhone)) return true;
   const listingDomain = domainKey(match.website);
-  if (listingDomain && network.byDomain.has(listingDomain)) return network.byDomain.get(listingDomain)!;
-  const sameOrg = network.byOrg.get(orgKey(match.organization)) || [];
+  if (listingDomain && network.byDomain.has(listingDomain)) return true;
   const state = stateCode(match.state);
-  const hit = sameOrg.find((partner) => !partner.state || !state || partner.state === state);
-  return hit ? hit.id : null;
+  return (network.byOrg.get(orgKey(match.organization)) || []).some((partner) => !partner.state || !state || partner.state === state);
 }
 
 function contactKey(contact: RawContact): string {
@@ -563,9 +580,11 @@ export function addCandidates(
     const existingPartnerId = existingPartner(contact, match, known);
     // A second contact at the same program keeps its own details (the
     // listing is added once).
-    const useListing = Boolean(match) && !listingsUsed.has(match!.id);
+    // The listing is added once, and never when the program is already a
+    // partner; other contacts there keep their own details.
+    const useListing = Boolean(match) && !listingsUsed.has(match!.id) && !programInNetwork(match!, known);
     if (useListing) listingsUsed.add(match!.id);
-    const types = useListing && listingTypes(match!).length ? listingTypes(match!) : suggestTypes(contact);
+    const types = match && listingTypes(match).length ? listingTypes(match) : suggestTypes(contact);
     out.push({ ...contact, key, types, match, useListing, existingPartnerId, include: !existingPartnerId });
     added += 1;
   }
