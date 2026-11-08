@@ -35,6 +35,7 @@ import { type Entitlement, type EntitlementState } from './entitlements';
 import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySubmissions, type OrgDirectoryProfileState } from './directory';
 import DirectoryReviewQueue from './DirectoryReviewQueue';
 import CredentialReviewQueue from './CredentialReviewQueue';
+import ProgramReferralSettingsCard from './ProgramReferralSettingsCard';
 import { fetchPendingListingCredentials } from './credentials';
 import { prepareForWorkspaceChange } from './store';
 import { deleteOwnAccount } from './account';
@@ -830,6 +831,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 <ActivityIndicator color={COLORS.blue} />
               )}
             </View>
+
+            <ProgramReferralSettingsCard visible={visible} />
 
             {pendingSubmissions !== null ? (
               <View style={styles.card}>
