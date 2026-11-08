@@ -390,10 +390,28 @@ export function practiceNameForMessage(name: string | null | undefined): string 
   return value && value !== 'My Practice' && value !== UNNAMED_PRACTICE ? value : '';
 }
 
+// ─── Answer links (migration 20261108130000) ────────────────────────────────
+
+/**
+ * The center portal's signed-out answer page. The token goes in the
+ * fragment, so it never reaches a server log, a proxy or a Referer header.
+ * Like HANDOFF_PAGE (handoffs.ts).
+ */
+export const PLACEMENT_ANSWER_PAGE = 'https://portal.referralfit.com/a';
+
+/** The link a program answers from, or null for anything but a 64-character hex token. */
+export function placementAnswerLink(token: string | null | undefined): string | null {
+  const value = (token || '').trim();
+  return /^[0-9a-f]{64}$/.test(value) ? `${PLACEMENT_ANSWER_PAGE}#${value}` : null;
+}
+
 /**
  * The request summary a practitioner texts or emails to a program that
  * cannot answer in the portal (channel 'manual'). Built only from the
- * payload: no label, budget or contact details, by construction.
+ * payload: no label, budget or contact details, by construction. With an
+ * answer link (one per program: every message goes to one program), the
+ * program can answer from it itself; without one (an older server, or the
+ * link could not be made) the message asks for a reply, as before.
  */
 export function placementRequestMessage(input: {
   payload: PlacementPayload;
@@ -401,6 +419,7 @@ export function placementRequestMessage(input: {
   practiceName?: string | null;
   senderName?: string | null;
   respondBy: string;
+  answerLink?: string | null;
 }): { text: string; subject: string; body: string } {
   const sender = (input.senderName || '').trim().split(/\s+/)[0] || '';
   const practice = practiceNameForMessage(input.practiceName);
@@ -410,7 +429,10 @@ export function placementRequestMessage(input: {
   const details = placementSummaryLines(input.payload).map((line) => `- ${line.label}: ${line.value}`).join('\n');
   const deadline = deadlineLabel(input.respondBy);
   const ask = `Could you let me know${deadline ? ` by ${deadline}` : ''}: do you have a bed (yes, no or waitlist), would you likely accept, your earliest admit date, and your daily rate or cost? Thank you.`;
-  const body = `${greeting}\n\n${intro}\n${details}\n\n${ask}`;
+  const link = (input.answerLink || '').trim();
+  const valid = link.startsWith(`${PLACEMENT_ANSWER_PAGE}#`) && placementAnswerLink(link.slice(PLACEMENT_ANSWER_PAGE.length + 1)) === link;
+  const answer = valid ? `\n\nAnswer in one tap, no account needed: ${link}` : '';
+  const body = `${greeting}\n\n${intro}\n${details}\n\n${ask}${answer}`;
   return {
     text: body,
     subject: 'Placement request: do you have a bed?',
@@ -753,6 +775,24 @@ export function sentOnStamp(request: Pick<PlacementRequest, 'createdAt'>): strin
 export function canLogAnswer(request: Pick<PlacementRequest, 'status'>, recipient: Pick<PlacementRecipient, 'respondedAt' | 'enteredByPractice'>): boolean {
   if (request.status === 'cancelled') return false;
   return !recipient.respondedAt || recipient.enteredByPractice;
+}
+
+/**
+ * Where a program's answer came from, for the answers screen: the portal,
+ * its answer link (asked by hand, answered by the program itself), or the
+ * practice's own log of a call or a text.
+ */
+export function answerSourceLine(recipient: Pick<PlacementRecipient, 'channel' | 'respondedAt' | 'enteredByPractice'>): string {
+  if (recipient.respondedAt && recipient.enteredByPractice) return 'Logged by your practice';
+  if (recipient.channel === 'portal') return 'Answers in ReferralFit';
+  return recipient.respondedAt ? 'Answered from your link' : 'Answers by phone, text or link';
+}
+
+/** The waiting line for a program that has not answered (nor been logged). */
+export function waitingLine(channel: PlacementChannel, status: RecipientStatus): string {
+  if (status === 'expired') return 'No answer by the deadline. You can still log one if they call back.';
+  if (channel === 'portal') return status === 'viewed' ? 'They opened it and have not answered yet.' : 'Not opened yet.';
+  return status === 'viewed' ? 'They opened your link and have not answered yet.' : 'Waiting for their reply.';
 }
 
 /** A view with one program's row replaced (after a logged answer); the order never moves. */

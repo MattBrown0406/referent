@@ -22,6 +22,7 @@ import { releaseComposeOverlay, sendEmailMessage, sendTextMessage } from './outr
 import {
   cancelPlacementRequest,
   createPlacementRequest,
+  fetchPlacementAnswerLink,
   fetchPlacementChannels,
   fetchPlacementPracticeName,
   newPlacementRequestId,
@@ -379,17 +380,22 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
 
   async function reach(recipientId: string, partner: Partner, how: 'text' | 'email') {
     if (!sent || composingRef.current) return;
-    const message = placementRequestMessage({
-      payload: sent.request.payload,
-      programName: partner.organization || partner.name,
-      practiceName,
-      senderName,
-      respondBy: sent.request.respondBy,
-    });
     composingRef.current = true;
     const generation = generationRef.current;
     let result;
     try {
+      // The program's own answer link, when the server can make one (never
+      // blocks: without it the summary asks for a reply, as before).
+      const answerLink = await fetchPlacementAnswerLink(recipientId);
+      if (generationRef.current !== generation) return;
+      const message = placementRequestMessage({
+        payload: sent.request.payload,
+        programName: partner.organization || partner.name,
+        practiceName,
+        senderName,
+        respondBy: sent.request.respondBy,
+        answerLink,
+      });
       result = how === 'text'
         ? await sendTextMessage(partner.phone, message.text)
         : await sendEmailMessage(partner.email, message.subject, message.body);
@@ -543,7 +549,7 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
         {manual.length ? (
           <>
             <Text style={styles.label}>SEND THE SUMMARY TO THESE</Text>
-            <Text style={styles.hint}>They do not answer in ReferralFit yet. Text or email them the same de-identified summary, then log what they say from the answers screen.</Text>
+            <Text style={styles.hint}>They do not answer in ReferralFit yet. Text or email them the same de-identified summary, with a link they can answer from themselves. If they reply instead, log what they say from the answers screen.</Text>
             {manual.map((recipient) => {
               const option = options.find((item) => item.partner.id.toLowerCase() === recipient.partnerId);
               const partner = option?.partner;

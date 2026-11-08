@@ -752,4 +752,116 @@ function topLevelStatements(sql) {
      '  UPDATE public.placement_request_recipients SET org_id = p_to WHERE org_id = p_from;']);
 }
 
+// ─── (l) Answer links (20261108130000) ──────────────────────────────────────
+// A program asked by hand answers from a link in the text or email: the
+// link's shape, the message with and without one, the app's call (never
+// blocks a text), the answers screen's lines, the portal page's parser, and
+// the migration's paste rules.
+
+{
+  const token = 'ab'.repeat(32);
+  check('a link is the portal\'s /a page with the token in the fragment', rules.placementAnswerLink(token), `https://portal.referralfit.com/a#${token}`);
+  check('the page constant is the portal\'s /a', rules.PLACEMENT_ANSWER_PAGE, 'https://portal.referralfit.com/a');
+  check('anything but 64 lowercase hex characters makes no link',
+    ['', null, undefined, 'ab'.repeat(31), 'AB'.repeat(32), `${token}0`, `${'zz'.repeat(32)}`, `${token} x`].map((value) => rules.placementAnswerLink(value)),
+    [null, null, null, null, null, null, null, null]);
+
+  const base = { payload: fixturePayload, programName: 'Juniper Ridge Recovery', practiceName: 'Cascade Interventions', senderName: 'Matt Brown', respondBy: '2026-11-05T23:00:00Z' };
+  const without = rules.placementRequestMessage(base);
+  const link = rules.placementAnswerLink(token);
+  const withLink = rules.placementRequestMessage({ ...base, answerLink: link });
+  check('without a link the message is exactly as before', rules.placementRequestMessage({ ...base, answerLink: null }), without);
+  check('with a link the text ends with the one-tap line', withLink.text, `${without.text}\n\nAnswer in one tap, no account needed: ${link}`);
+  ok('and the email carries it before the sign-off', withLink.body.startsWith(`${without.text}\n\nAnswer in one tap, no account needed: ${link}`) && withLink.body.endsWith('\n\nMatt\nCascade Interventions'));
+  check('the subject does not change', withLink.subject, without.subject);
+  for (const forged of ['https://example.com/a#' + token, `${link}x`, `https://portal.referralfit.com/h#${token}`, 'javascript:alert(1)', `http://portal.referralfit.com/a#${token}`]) {
+    check(`a link that is not the portal's answer page is left out (${forged.slice(0, 30)})`, rules.placementRequestMessage({ ...base, answerLink: forged }).text, without.text);
+  }
+  ok('the link carries nothing about the client or the request', !link.includes('rivera') && !link.includes('q1') && link.split('#')[1] === token);
+
+  check('the answers screen names where an answer came from', [
+    rules.answerSourceLine({ channel: 'portal', respondedAt: null, enteredByPractice: false }),
+    rules.answerSourceLine({ channel: 'portal', respondedAt: '2026-11-04T15:00:00Z', enteredByPractice: false }),
+    rules.answerSourceLine({ channel: 'portal', respondedAt: '2026-11-04T15:00:00Z', enteredByPractice: true }),
+    rules.answerSourceLine({ channel: 'manual', respondedAt: null, enteredByPractice: false }),
+    rules.answerSourceLine({ channel: 'manual', respondedAt: '2026-11-04T15:00:00Z', enteredByPractice: false }),
+    rules.answerSourceLine({ channel: 'manual', respondedAt: '2026-11-04T15:00:00Z', enteredByPractice: true }),
+  ], ['Answers in ReferralFit', 'Answers in ReferralFit', 'Logged by your practice', 'Answers by phone, text or link', 'Answered from your link', 'Logged by your practice']);
+  check('and what a program that has not answered is doing', [
+    rules.waitingLine('portal', 'sent'), rules.waitingLine('portal', 'viewed'), rules.waitingLine('manual', 'sent'),
+    rules.waitingLine('manual', 'viewed'), rules.waitingLine('manual', 'expired'), rules.waitingLine('portal', 'expired'),
+  ], ['Not opened yet.', 'They opened it and have not answered yet.', 'Waiting for their reply.', 'They opened your link and have not answered yet.',
+      'No answer by the deadline. You can still log one if they call back.', 'No answer by the deadline. You can still log one if they call back.']);
+  ok('a program\'s own link answer cannot be logged over', !rules.canLogAnswer({ status: 'open' }, { respondedAt: '2026-11-04T15:00:00Z', enteredByPractice: false }));
+
+  // The app's call: cached per recipient, never throws, never blocks long.
+  const calls = [];
+  fake.rpc = (name, args) => { calls.push([name, args]); return Promise.resolve({ data: token, error: null, status: 200 }); };
+  check('the app asks the server for the program\'s link', await api.fetchPlacementAnswerLink('R-1'), link);
+  check('with the recipient id, lower-cased', calls, [['placement_answer_link', { p_recipient_id: 'r-1' }]]);
+  check('a second text or email to the same program reuses the link', [await api.fetchPlacementAnswerLink('r-1'), calls.length], [link, 1]);
+  fake.rpc = () => Promise.resolve({ data: null, error: { code: 'PGRST202', message: 'Could not find the function' }, status: 404 });
+  check('an older server: no link, no error', await api.fetchPlacementAnswerLink('r-2'), null);
+  fake.rpc = () => Promise.resolve({ data: null, error: { code: '22023', message: 'This request is closed' }, status: 400 });
+  check('a refusal: no link, no error', await api.fetchPlacementAnswerLink('r-3'), null);
+  fake.rpc = () => Promise.resolve({ data: null, error: { message: 'TypeError: Network request failed' }, status: 0 });
+  check('offline: no link, no error', await api.fetchPlacementAnswerLink('r-4'), null);
+  fake.rpc = () => { throw new Error('boom'); };
+  check('a thrown error: no link', await api.fetchPlacementAnswerLink('r-5'), null);
+  fake.rpc = () => Promise.resolve({ data: 'not-a-token', error: null, status: 200 });
+  check('an answer that is not a token: no link', await api.fetchPlacementAnswerLink('r-6'), null);
+  fake.rpc = () => new Promise(() => {});
+  const started = Date.now();
+  check('a server that never answers: no link, after the timeout', await api.fetchPlacementAnswerLink('r-7', 30), null);
+  ok('and the text is not held up', Date.now() - started < 1000);
+  check('nothing failed is cached', await api.fetchPlacementAnswerLink(''), null);
+  check('the timeout is a few seconds', api.ANSWER_LINK_TIMEOUT_MS, 4000);
+
+  // The portal page's parser (portal/src/placement-rules.ts).
+  check('the page reads the token from the fragment', [portal.answerLinkTokenFrom(`#${token}`), portal.answerLinkTokenFrom(token), portal.answerLinkTokenFrom('#abc'), portal.answerLinkTokenFrom('')], [token, token, null, null]);
+  const served = {
+    program_name: 'Unclaimed Oaks', practice_name: 'Cascade Interventions', payload: JSON.parse(FIXTURE_JSON),
+    sent_at: '2026-11-04T12:00:00Z', respond_by: '2026-11-05T12:00:00Z', request_status: 'open', status: 'viewed', can_respond: true, answer: null,
+  };
+  const parsed = portal.answerLinkViewFromJson(served);
+  check('the page reads the view', [parsed.programName, parsed.practiceName, parsed.status, parsed.canRespond, parsed.answer, parsed.requestStatus],
+    ['Unclaimed Oaks', 'Cascade Interventions', 'viewed', true, null, 'open']);
+  check('and the summary the inbox shows', portal.summaryLines(parsed.payload), portal.summaryLines(portal.payloadFromJson(JSON.parse(FIXTURE_JSON))));
+  check('a link that does not work reads as nothing', [portal.answerLinkViewFromJson(null), portal.answerLinkViewFromJson({}), portal.answerLinkViewFromJson([])], [null, null, null]);
+  const answered = portal.answerLinkViewFromJson({ ...served, status: 'responded', answer: { responded_at: '2026-11-04T15:00:00Z', bed_available: 'waitlist', likely_accept: 'maybe', earliest_admit_on: '2026-11-12', daily_rate: 950, cost_note: '', note: 'Call first' } });
+  check('the program\'s own answer fills the form', portal.formFromRow(answered.answer), { bed: 'waitlist', likely: 'maybe', admitOn: '2026-11-12', dailyRate: '950', costNote: '', note: 'Call first' });
+  check('and reads in one line', portal.answerSummary(answered.answer), 'Bed: Waitlist; likely to accept: Maybe; earliest admit 2026-11-12; $950 a day');
+  check('an answer with an unknown value is not shown as given', portal.answerLinkViewFromJson({ ...served, answer: { responded_at: 'x', bed_available: 'perhaps', likely_accept: 'yes' } }).answer, null);
+  check('unknown statuses read safely', [portal.answerLinkViewFromJson({ ...served, status: 'weird', request_status: 'weird' }).status, portal.answerLinkViewFromJson({ ...served, request_status: 'cancelled' }).requestStatus], ['sent', 'cancelled']);
+
+  // The migration follows the paste rules and stays out of the push code.
+  const links = readFileSync(path.join(repoRoot, 'supabase/migrations/20261108130000_placement_answer_links.sql'), 'utf8');
+  ok('answer links: ASCII only', /^[\x00-\x7F]*$/.test(links));
+  ok('answer links: no backslash anywhere', !links.includes('\\'));
+  const { statements, tail, unterminated } = topLevelStatements(links);
+  ok('answer links: every dollar quote is closed', unterminated === null);
+  check('answer links: nothing after the last statement', tail, '');
+  const longest = Math.max(...statements.map((statement) => statement.length));
+  ok(`answer links: every statement is under 3,700 characters (longest ${longest})`, longest < 3700);
+  check('answer links: one BEGIN/COMMIT around the file', [statements[0].trim().endsWith('BEGIN;'), statements[statements.length - 1].trim().endsWith('COMMIT;')], [true, true]);
+  const created = [...links.matchAll(/CREATE OR REPLACE FUNCTION public\.([a-z_]+)\(/g)].map((match) => match[1]);
+  check('answer links: the functions it makes', [...created].sort(), ['placement_answer_link', 'placement_answer_link_recipient', 'placement_answer_link_view',
+    'placement_recipient_answered_via', 'public_placement_answer_open', 'public_placement_answer_respond']);
+  const revoked = [...links.matchAll(/CREATE OR REPLACE FUNCTION public\.([a-z_]+)\([\s\S]*?\$\$;\s*\n(REVOKE ALL ON FUNCTION public\.\1\([^)]*\) FROM PUBLIC[^;]*;)/g)].map((match) => match[1]);
+  check('answer links: every function is revoked from PUBLIC right after it is made', [...revoked].sort(), [...created].sort());
+  const pinned = [...links.matchAll(/CREATE OR REPLACE FUNCTION public\.([a-z_]+)\([\s\S]*?\nSET search_path = public\n/g)];
+  ok('answer links: every function pins its search_path', pinned.length === created.length);
+  check('answer links: only the two page functions are open to anon',
+    [...links.matchAll(/GRANT EXECUTE ON FUNCTION public\.([a-z_]+)\([^)]*\) TO ([a-z_, ]+);/g)].map((match) => `${match[1]} -> ${match[2]}`).sort(),
+    ['placement_answer_link -> authenticated', 'public_placement_answer_open -> anon, authenticated', 'public_placement_answer_respond -> anon, authenticated']);
+  ok('answer links: the push code and the existing answer functions are not re-created',
+    !/FUNCTION public\.(placement_answer_notify|notify_enqueue|respond_to_placement_request|log_manual_response|list_center_placement_requests)\(/.test(links));
+  ok('answer links: no table or column is dropped', !/DROP (TABLE|COLUMN)/.test(links));
+  ok('answer links: the links table is revoked before its one grant',
+    links.indexOf('REVOKE ALL ON TABLE public.placement_answer_links FROM PUBLIC, anon, authenticated;') > 0
+    && links.indexOf('REVOKE ALL ON TABLE public.placement_answer_links FROM PUBLIC, anon, authenticated;') < links.indexOf('GRANT ALL ON TABLE public.placement_answer_links TO service_role;'));
+  ok('answer links: only the token\'s sha256 is stored', /extensions\.digest\(v_token, 'sha256'\)/.test(links) && !/INSERT INTO public\.placement_answer_links \([^)]*token[^_]/.test(links));
+  ok('answer links: the app never reads the new column (an older server would hide the feature)', !rules.RECIPIENT_COLUMNS.includes('answered_via'));
+}
+
 console.log(`placement requests: ${checks} checks ok`);
