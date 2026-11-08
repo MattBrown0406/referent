@@ -1,11 +1,22 @@
 import { Alert, Linking } from 'react-native';
 
-// The published privacy policy (docs/privacy.html, served by GitHub Pages).
-// App Store Connect's Privacy Policy URL must be this same address.
-export const PRIVACY_POLICY_URL = 'https://mattbrown0406.github.io/referent/privacy.html';
+// ReferralFit's legal and support pages live only on referralfit.com (the
+// website repo, MattBrown0406/referralfit-web). App Store Connect's Privacy
+// Policy URL and Support URL are these same addresses.
+export const PRIVACY_POLICY_URL = 'https://referralfit.com/privacy';
+export const TERMS_OF_USE_URL = 'https://referralfit.com/terms';
+export const SUPPORT_URL = 'https://referralfit.com/support';
+
+function openPage(url: string, name: string): void {
+  Linking.openURL(url).catch(() => {
+    Alert.alert(`Could not open the ${name}`, `Open ${url} in your browser.`);
+  });
+}
 
 export function openPrivacyPolicy(): void {
-  Linking.openURL(PRIVACY_POLICY_URL).catch(() => {
-    Alert.alert('Could not open the privacy policy', `Open ${PRIVACY_POLICY_URL} in your browser.`);
-  });
+  openPage(PRIVACY_POLICY_URL, 'privacy policy');
+}
+
+export function openTermsOfUse(): void {
+  openPage(TERMS_OF_USE_URL, 'terms of use');
 }

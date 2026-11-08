@@ -242,7 +242,7 @@ of the native set and covered by `scripts/native-compat-test.mjs`.
 Before submitting, update App Store Connect → **App Privacy**: names (first
 names of contacts) can be shared with Anthropic for App Functionality when a
 user turns on AI drafts, not linked to tracking. The privacy policy
-(`docs/privacy.html`) has an "AI-drafted follow-ups" section and lists
+(https://referralfit.com/privacy) has an "AI-drafted follow-ups" section and lists
 Anthropic. `APP_REVIEW.md` has a reviewer note: AI drafts are optional and use
 the user's own Anthropic account, so nothing is sold.
 
