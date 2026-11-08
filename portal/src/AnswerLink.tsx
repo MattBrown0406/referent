@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
   ACCEPT_CHOICES,
@@ -36,11 +36,18 @@ const TOKEN_KEY = 'referralfit.answerLink.v1';
 const CLAIM_PAGE = 'https://referralfit.com/programs';
 
 function readToken(): string | null {
+  const hash = window.location.hash.replace(/^#/, '').trim();
   const fromHash = answerLinkTokenFrom(window.location.hash);
   try {
     if (fromHash) {
       window.sessionStorage.setItem(TOKEN_KEY, fromHash);
       return fromHash;
+    }
+    // A link with a token that is cut off or wrong: never fall back to a
+    // request opened earlier in this tab.
+    if (hash) {
+      window.sessionStorage.removeItem(TOKEN_KEY);
+      return null;
     }
     return answerLinkTokenFrom(window.sessionStorage.getItem(TOKEN_KEY) || '');
   } catch {
@@ -58,6 +65,22 @@ export default function AnswerLink() {
   const [problem, setProblem] = useState('');
   const [notice, setNotice] = useState('');
   const [now, setNow] = useState(() => new Date());
+  const prefilledRef = useRef(false);
+  // "Viewed" is the program's own doing: its first tap or key on the page,
+  // never the page load (mail and text scanners open links).
+  const seenRef = useRef(false);
+  const seenTriedAtRef = useRef(0);
+  const markSeen = useCallback(() => {
+    // After a failure, try again on a later tap or key, at most every 5 seconds.
+    if (seenRef.current || !token || Date.now() - seenTriedAtRef.current < 5000) return;
+    seenRef.current = true;
+    seenTriedAtRef.current = Date.now();
+    // supabase-js reports a failure in the result, not by rejecting.
+    void supabase.rpc('public_placement_answer_seen', { p_token: token }).then(
+      ({ error }) => { if (error) seenRef.current = false; },
+      () => { seenRef.current = false; },
+    );
+  }, [token]);
 
   const load = useCallback(async (): Promise<AnswerLinkView | null> => {
     if (!token) { setState('unavailable'); return null; }
@@ -69,6 +92,10 @@ export default function AnswerLink() {
       }
       const next = answerLinkViewFromJson(data);
       if (!next) { setState('unavailable'); return null; }
+      if (!prefilledRef.current) {
+        prefilledRef.current = true;
+        setForm(formFromRow(next.answer));
+      }
       setView(next);
       setNow(new Date());
       setState('ready');
@@ -82,7 +109,7 @@ export default function AnswerLink() {
   useEffect(() => {
     // Keep the token out of history entries and screenshots of the address bar.
     if (window.location.hash) window.history.replaceState(null, '', window.location.pathname);
-    void load().then((first) => { if (first) setForm(formFromRow(first.answer)); });
+    void load();
   }, [load]);
 
   // The time left keeps moving while the page is open.
@@ -102,9 +129,10 @@ export default function AnswerLink() {
     try {
       const { data, error } = await supabase.rpc('public_placement_answer_respond', { p_token: token, ...checked.payload });
       if (error) {
-        setProblem(error.message || 'The answer was not saved. Check the connection and try again.');
+        if (error.code === 'P0002') { setState('unavailable'); return; }
+        // No code: the request never reached the server (offline, a timeout).
+        setProblem(error.code && error.message ? error.message : 'The answer was not saved. Check the connection and try again.');
         await load();
-        setState('ready');
         return;
       }
       const saved = answerLinkViewFromJson(data);
@@ -154,24 +182,26 @@ export default function AnswerLink() {
   const left = view.canRespond ? timeLeft(view.respondBy, now) : '';
   const given = answerSummary(view.answer);
   return (
-    <main className="shell">
+    <main className="shell" onPointerDown={markSeen} onKeyDown={markSeen}>
       <div className="brand"><h1>ReferralFit</h1><span>Placement request</span></div>
       <section className="card placement answer-link">
-        <p className="handoff-eyebrow">FROM {view.practiceName.toUpperCase()}</p>
+        <p className="handoff-eyebrow">{view.payload ? `FROM ${view.practiceName.toUpperCase()}` : 'PLACEMENT REQUEST'}</p>
         <h2 className="handoff-title">Can {view.programName} take this client?</h2>
         <p className="help">{PROGRAM_INTRO}</p>
         <div className="status-row">
           {reason ? <span className="badge archived">Closed</span> : <span className="badge pending">{left || 'Closing'}</span>}
           {view.answer ? <span className="badge active">Answered</span> : null}
         </div>
-        <dl className="summary">
-          {summaryLines(view.payload).map((line) => (
-            <div key={line.label}>
-              <dt>{line.label}</dt>
-              <dd>{line.value}</dd>
-            </div>
-          ))}
-        </dl>
+        {view.payload ? (
+          <dl className="summary">
+            {summaryLines(view.payload).map((line) => (
+              <div key={line.label}>
+                <dt>{line.label}</dt>
+                <dd>{line.value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
         {notice ? <div className="success" role="status">{notice}</div> : null}
         {reason ? (
           <>

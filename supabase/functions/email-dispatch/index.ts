@@ -11,8 +11,10 @@
 //   * the service role holds no table grants: claiming and recording go
 //     through service-role-only RPCs, which fill in the address and counts;
 //   * nothing about a recipient or an email's content is logged here;
-//   * each send carries the outbox id as Resend's Idempotency-Key, so a
-//     retry after an unknown outcome never sends the same email twice.
+//   * each send carries the outbox id (plus a hash of the sender settings)
+//     as Resend's Idempotency-Key, and a retry renders the same body from the
+//     row's prepared data and prepared_at, so a retry after an unknown
+//     outcome never sends the same email twice.
 
 import { createClient } from 'npm:@supabase/supabase-js@2.110.8';
 
@@ -22,11 +24,13 @@ import {
   DEFAULT_FROM,
   DEFAULT_PORTAL_URL,
   DEFAULT_REPLY_TO,
+  classifyResendFailure,
+  idempotencyKey,
   isAuthorized,
-  isTransientStatus,
   type Links,
   oneClickFrom,
   type OutboxRow,
+  preparedAt,
   renderEmail,
   RESEND_URL,
   resendBody,
@@ -56,20 +60,23 @@ function links(): Links {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function sendOne(row: OutboxRow, apiKey: string, from: string, replyTo: string | undefined, target: Links): Promise<SendResult> {
+type SendOutcome = SendResult & { config?: boolean; charge?: boolean };
+
+async function sendOne(row: OutboxRow, apiKey: string, from: string, replyTo: string | undefined, target: Links): Promise<SendOutcome> {
   let email;
   try {
-    email = renderEmail(row, target);
+    email = renderEmail(row, target, preparedAt(row));
   } catch {
     return { id: row.id, error: 'render_failed', retry: false };
   }
   try {
+    const key = await idempotencyKey(row, from, replyTo, target);
     const response = await fetch(Deno.env.get('EMAIL_RESEND_URL_FOR_TESTS') || RESEND_URL, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${apiKey}`,
         'content-type': 'application/json',
-        'idempotency-key': row.id,
+        'idempotency-key': key,
       },
       body: JSON.stringify(resendBody(row, email, from, replyTo)),
     });
@@ -77,14 +84,37 @@ async function sendOne(row: OutboxRow, apiKey: string, from: string, replyTo: st
       const answer = await response.json().catch(() => ({})) as { id?: string };
       return { id: row.id, provider_id: answer.id || '' };
     }
-    await response.body?.cancel().catch(() => undefined);
-    return { id: row.id, error: `resend_${response.status}`, retry: isTransientStatus(response.status) };
+    const failure = await response.json().catch(() => null);
+    const kind = classifyResendFailure(response.status, failure);
+    // A 401/403 refuses the whole account (no attempt is spent while it is
+    // fixed); a 422 about the sender might be this one email, so it spends one.
+    return {
+      id: row.id,
+      error: `resend_${response.status}`,
+      retry: kind !== 'final',
+      config: kind === 'config',
+      charge: kind === 'config' && response.status === 422,
+    };
   } catch {
     return { id: row.id, error: 'network', retry: true };
   }
 }
 
-async function drain(supabase: ReturnType<typeof serviceClient>): Promise<{ sent: number; failed: number; retrying: number }> {
+async function record(supabase: ReturnType<typeof serviceClient>, result: SendResult): Promise<void> {
+  const { error } = await supabase.rpc('email_outbox_record', { p_results: [result] });
+  if (error) throw error;
+}
+
+// A configuration error stopped the run: the row tried waits 15 minutes (so
+// the queue rotates and no single row holds it) and spends its attempt only
+// for a 422 about the sender; the rows not tried go back to waiting without
+// spending one. A bad key delays mail; it never uses up the attempts.
+async function release(supabase: ReturnType<typeof serviceClient>, untried: string[], tried: string, reason: string, charge: boolean): Promise<void> {
+  const { error } = await supabase.rpc('email_outbox_release', { p_ids: untried, p_tried: tried, p_error: reason, p_charge: charge });
+  if (error) console.error('email-dispatch: release failed', error.code || 'unknown');
+}
+
+async function drain(supabase: ReturnType<typeof serviceClient>): Promise<{ sent: number; failed: number; retrying: number; stopped?: string }> {
   const apiKey = requiredEnv('RESEND_API_KEY');
   const from = Deno.env.get('EMAIL_FROM') || DEFAULT_FROM;
   const replyTo = Deno.env.get('EMAIL_REPLY_TO') || DEFAULT_REPLY_TO;
@@ -97,25 +127,37 @@ async function drain(supabase: ReturnType<typeof serviceClient>): Promise<{ sent
     const rows = (Array.isArray(data) ? data : []) as OutboxRow[];
     if (!rows.length) break;
     seen += rows.length;
-    const results: SendResult[] = [];
-    for (const row of rows) {
-      if (results.length) await sleep(SEND_SPACING_MS);
-      const result = await sendOne(row, apiKey, from, replyTo, target);
-      results.push(result);
+    for (let index = 0; index < rows.length; index += 1) {
+      if (index) await sleep(SEND_SPACING_MS);
+      const result = await sendOne(rows[index], apiKey, from, replyTo, target);
+      if (result.config) {
+        // The account or sender is wrong: nothing can go out. Stop, and keep
+        // the claimed rows waiting.
+        console.error('email-dispatch: Resend refused the account or sender', result.error);
+        await release(supabase, rows.slice(index + 1).map((row) => row.id), rows[index].id, result.error || 'config', Boolean(result.charge));
+        return { ...totals, stopped: result.error };
+      }
+      // Recorded one by one, so a crash mid-batch never resends what went out.
+      await record(supabase, { id: result.id, provider_id: result.provider_id, error: result.error, retry: result.retry });
       if (!result.error) totals.sent += 1;
       else if (result.retry) totals.retrying += 1;
       else totals.failed += 1;
     }
-    const { error: recordError } = await supabase.rpc('email_outbox_record', { p_results: results });
-    if (recordError) throw recordError;
     if (rows.length < CLAIM_SIZE) break;
   }
   return totals;
 }
 
 Deno.serve(async (request) => {
-  if (request.method !== 'POST') return jsonResponse({ error: 'method_not_allowed' }, 405);
   const url = new URL(request.url);
+  if (request.method === 'GET') {
+    // A mail client that opens the List-Unsubscribe address in a browser:
+    // send it to the email settings page, which changes nothing on its own.
+    const link = oneClickFrom(url);
+    if (!link) return jsonResponse({ error: 'not_found' }, 404);
+    return new Response(null, { status: 303, headers: { location: `${links().portalUrl}/u#${link.token}:${link.kind}` } });
+  }
+  if (request.method !== 'POST') return jsonResponse({ error: 'method_not_allowed' }, 405);
 
   // RFC 8058 one-click unsubscribe from the mail client: no secret, only
   // this token's owner, only this kind, only off.

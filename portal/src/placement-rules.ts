@@ -265,7 +265,8 @@ export function answerLinkTokenFrom(hash: string): string | null {
 export type AnswerLinkView = {
   programName: string;
   practiceName: string;
-  payload: Payload;
+  /** Null once the request is closed or a week past due: the page shows only its status. */
+  payload: Payload | null;
   sentAt: string;
   respondBy: string;
   requestStatus: CenterRequestRow['request_status'];
@@ -307,7 +308,7 @@ export function answerLinkViewFromJson(value: unknown): AnswerLinkView | null {
   return {
     programName: stringOr(row.program_name).trim() || 'your program',
     practiceName: stringOr(row.practice_name).trim() || 'A ReferralFit practice',
-    payload: payloadFromJson(row.payload),
+    payload: row.payload && typeof row.payload === 'object' && Object.keys(row.payload).length ? payloadFromJson(row.payload) : null,
     sentAt,
     respondBy,
     requestStatus,

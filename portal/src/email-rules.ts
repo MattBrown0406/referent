@@ -79,3 +79,28 @@ export function bedsLine(male: number | null, female: number | null, updatedAt: 
     ? `${counts}, last confirmed ${when}. Practices now see Unconfirmed instead of a number.`
     : `${counts}, confirmed ${when}.`;
 }
+
+/**
+ * A page's token for this tab: from the link's fragment (kept in this tab's
+ * sessionStorage under `key`), else the one kept earlier, so a reload or an
+ * evicted Safari tab still works. A fragment that is present but not a valid
+ * token clears what was kept and returns null (never an older link).
+ */
+export function tokenForTab<T>(key: string, hash: string, parse: (fragment: string) => T | null): T | null {
+  const fragment = hash.replace(/^#/, '').trim();
+  const fromHash = fragment ? parse(`#${fragment}`) : null;
+  try {
+    if (fromHash) {
+      window.sessionStorage.setItem(key, `#${fragment}`);
+      return fromHash;
+    }
+    if (fragment) {
+      window.sessionStorage.removeItem(key);
+      return null;
+    }
+    const kept = window.sessionStorage.getItem(key);
+    return kept ? parse(kept) : null;
+  } catch {
+    return fromHash;
+  }
+}

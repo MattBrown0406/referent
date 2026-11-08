@@ -149,3 +149,46 @@ Deno.test('claim decision email: approved and declined', () => {
 Deno.test('one-click unsubscribe never accepts an account email kind', () => {
   assertEquals(oneClickFrom(new URL(`https://x/?unsubscribe=${TOKEN}&kind=claim_decision`)), null);
 });
+
+Deno.test('Resend failures: retry, configuration, final', async () => {
+  const { classifyResendFailure } = await import('./email.ts');
+  // A key reused with a different body is a failure to look at, never "sent".
+  assertEquals(classifyResendFailure(409, { name: 'invalid_idempotent_request' }), 'final');
+  assertEquals(classifyResendFailure(409, { name: 'concurrent_idempotent_requests' }), 'retry');
+  assertEquals(classifyResendFailure(401, { name: 'missing_api_key' }), 'config');
+  assertEquals(classifyResendFailure(403, { name: 'invalid_api_key' }), 'config');
+  assertEquals(classifyResendFailure(422, { name: 'invalid_from_address' }), 'config');
+  assertEquals(classifyResendFailure(422, { name: 'validation_error', message: 'The example.com domain is not verified' }), 'config');
+  assertEquals(classifyResendFailure(422, { name: 'validation_error', message: 'The `to` domain has no MX record' }), 'final');
+  assertEquals(classifyResendFailure(422, { name: 'validation_error', message: 'Invalid `to` field' }), 'final');
+  assertEquals(classifyResendFailure(429, null), 'retry');
+  assertEquals(classifyResendFailure(503, null), 'retry');
+  assertEquals(classifyResendFailure(400, null), 'final');
+});
+
+Deno.test('a retry renders the same email under the same key; a sender change gets a new key', async () => {
+  const { idempotencyKey, preparedAt } = await import('./email.ts');
+  const prepared = row('bed_reminder', {
+    listing_name: 'Oaks', link_token: LINK, beds_updated_at: '2026-11-01T12:00:00Z', prepared_at: '2026-11-08T15:00:00Z',
+  });
+  assertEquals(preparedAt(prepared).toISOString(), '2026-11-08T15:00:00.000Z');
+  const first = renderEmail(prepared, LINKS, preparedAt(prepared));
+  const later = renderEmail(prepared, LINKS, preparedAt(prepared));
+  assertEquals(first.text, later.text);
+  const key = await idempotencyKey(prepared, 'A <a@x.com>', 'r@x.com', LINKS);
+  assertEquals(key, await idempotencyKey(prepared, 'A <a@x.com>', 'r@x.com', LINKS));
+  assert(key.startsWith(`${prepared.id}-`) && key.length <= 256);
+  assert(key !== await idempotencyKey(prepared, 'B <b@x.com>', 'r@x.com', LINKS));
+  assert(key !== await idempotencyKey({ ...prepared, email: 'new@example.com' }, 'A <a@x.com>', 'r@x.com', LINKS));
+  assert(preparedAt(row('daily_summary', {})).getTime() > Date.now() - 5000, 'an unprepared row renders as of now');
+});
+
+Deno.test('an unknown kind is never rendered as a bed check-in', () => {
+  let threw = false;
+  try {
+    renderEmail({ ...row('bed_reminder', {}), kind: 'something_new' as never }, LINKS, NOW);
+  } catch {
+    threw = true;
+  }
+  assert(threw);
+});

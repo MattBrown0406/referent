@@ -1,4 +1,4 @@
-import { StoreError } from './errors';
+import { friendlyStoreError } from './errors';
 import { supabase } from './supabase';
 
 // Hourly coaching on an interventionist's or therapist's directory profile
@@ -63,9 +63,9 @@ export async function fetchListingCoaching(ids: string[]): Promise<Record<string
   if (!unique.length) return {};
   const out: Record<string, ListingCoaching> = {};
   for (let start = 0; start < unique.length; start += 200) {
-    const { data, error } = await supabase.rpc('fetch_listing_coaching', { p_ids: unique.slice(start, start + 200) });
+    const { data, error, status } = await supabase.rpc('fetch_listing_coaching', { p_ids: unique.slice(start, start + 200) });
     if (isMissingCoaching(error)) return {};
-    if (error) throw new StoreError(error.message || 'Could not load coaching.', false);
+    if (error) throw friendlyStoreError(error, status, 'Could not load coaching.');
     for (const row of (Array.isArray(data) ? data : []) as Row[]) {
       const coaching = mapCoaching(row);
       if (coaching.offered && typeof row.global_partner_id === 'string') out[row.global_partner_id] = coaching;
@@ -76,12 +76,12 @@ export async function fetchListingCoaching(ids: string[]): Promise<Record<string
 
 /** The owner's own profile coaching (including a rate kept while turned off); null on an older server. */
 export async function fetchOwnCoaching(listingId: string): Promise<ListingCoaching | null> {
-  const { data, error } = await supabase.from('global_partners')
+  const { data, error, status } = await supabase.from('global_partners')
     .select('coaching_offered, coaching_hourly_rate, coaching_note')
     .eq('id', listingId)
     .maybeSingle();
   if (isMissingCoaching(error)) return null;
-  if (error) throw new StoreError(error.message || 'Could not load coaching.', false);
+  if (error) throw friendlyStoreError(error, status, 'Could not load coaching.');
   const row = data as Row | null;
   return {
     offered: row?.coaching_offered === true,
@@ -91,13 +91,13 @@ export async function fetchOwnCoaching(listingId: string): Promise<ListingCoachi
 }
 
 export async function saveListingCoaching(listingId: string, offered: boolean, hourlyRate: number | null, note: string): Promise<ListingCoaching> {
-  const { data, error } = await supabase.rpc('set_listing_coaching', {
+  const { data, error, status } = await supabase.rpc('set_listing_coaching', {
     p_global_id: listingId,
     p_offered: offered,
     p_hourly_rate: hourlyRate,
     p_note: note.trim().slice(0, MAX_COACHING_NOTE),
   });
-  if (error) throw new StoreError(error.message || 'Could not save coaching.', false);
+  if (error) throw friendlyStoreError(error, status, 'Could not save coaching.');
   const row = (Array.isArray(data) ? data[0] : data) as Row | undefined;
   return {
     offered: row?.coaching_offered === true,

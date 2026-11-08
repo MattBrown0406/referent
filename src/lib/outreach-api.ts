@@ -190,6 +190,11 @@ function loadMail(): MailModule | null {
 
 async function openUrl(url: string): Promise<boolean> {
   try {
+    // The web opens at once: Safari allows a mail window only during the tap.
+    if (Platform.OS === 'web') {
+      await Linking.openURL(url);
+      return true;
+    }
     if (!(await Linking.canOpenURL(url))) return false;
     await Linking.openURL(url);
     return true;

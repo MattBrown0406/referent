@@ -222,3 +222,11 @@ table.track tbody th small { display: block; color: var(--gray); font-size: 12px
 
 /* Hourly coaching on an interventionist in the Refer a family search. */
 .target-coaching { display: block; font-size: 13px; font-weight: 600; color: var(--green); }
+
+/* Phones: 16px fields so iOS Safari does not zoom in on focus; long
+   referral rows wrap instead of running off the screen. */
+@media (max-width: 520px) {
+  input, textarea, select { font-size: 16px; }
+  .referrals li.referral-row { flex-wrap: wrap; }
+  .referrals li.referral-row .request-side { flex-shrink: 1; align-items: flex-start; }
+}

@@ -20,6 +20,8 @@ import { OfflineError, describeError } from './errors';
 import { formatStamp, type ProgramIntegrity } from './integrity';
 import { releaseComposeOverlay, sendEmailMessage, sendTextMessage } from './outreach-api';
 import {
+  cachedPlacementAnswerLink,
+  prefetchPlacementAnswerLinks,
   cancelPlacementRequest,
   closePlacementRequest,
   fetchPlacementAnswerLink,
@@ -139,8 +141,29 @@ export default function PlacementCompare({
 
   const view = requestId ? placement.state.requests.find((item) => item.request.id === requestId) || null : null;
 
+  // The program whose answer link is being made right now (native only).
+  const [preparingId, setPreparingId] = useState<string | null>(null);
+
+  // Programs asked by hand that can still answer, with a phone or email on
+  // file: make their links now. Web only (a send there cannot wait; on the
+  // iPhone a tap waits with "Preparing..."), since every link made is one
+  // more the server keeps for that program.
+  const manualIds = Platform.OS === 'web' && view && acceptingAnswers(view.request, new Date())
+    ? view.recipients.filter((item) => {
+        if (item.channel !== 'manual' || item.respondedAt) return false;
+        const partner = item.partnerId ? partnersById.get(item.partnerId) : undefined;
+        return Boolean(partner && (partner.phone.trim() || partner.email.trim()));
+      }).map((item) => item.id).join(',')
+    : '';
+  useEffect(() => {
+    if (manualIds) prefetchPlacementAnswerLinks(manualIds.split(','));
+  }, [manualIds]);
+
   useEffect(() => {
     if (!requestId) {
+      // A send waiting on a link must not open Messages or Mail over what
+      // shows next.
+      generationRef.current += 1;
       releaseComposeOverlay();
       placementRef.current.releaseKept();
     }
@@ -266,10 +289,25 @@ export default function PlacementCompare({
   async function reach(recipient: PlacementRecipient, partner: Partner, how: 'text' | 'email') {
     if (!view || composingRef.current) return;
     composingRef.current = true;
+    const generation = generationRef.current;
     let result;
     try {
-      // The program's own answer link when the server can make one; never blocks.
-      const answerLink = await fetchPlacementAnswerLink(recipient.id);
+      // The program's own answer link (made ahead of time when the row showed).
+      // On the web nothing may be awaited before Messages or Mail opens:
+      // Safari allows the clipboard and mail only during the tap, so the web
+      // uses a link already made, or sends without one.
+      let answerLink = cachedPlacementAnswerLink(recipient.id);
+      // The web sends this one without a link; the next tap has it.
+      if (!answerLink && Platform.OS === 'web') prefetchPlacementAnswerLinks([recipient.id]);
+      if (!answerLink && Platform.OS !== 'web') {
+        setPreparingId(recipient.id);
+        try {
+          answerLink = await fetchPlacementAnswerLink(recipient.id);
+        } finally {
+          setPreparingId(null);
+        }
+      }
+      if (generationRef.current !== generation) return;
       const message = placementRequestMessage({
         payload: view.request.payload,
         programName: partner.organization || partner.name,
@@ -325,13 +363,13 @@ export default function PlacementCompare({
         {cost ? <Text style={styles.familyCost}>Family's estimate: {cost}</Text> : null}
         <View style={styles.rowActions}>
           {reachable && partner?.phone.trim() ? (
-            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Text the summary to ${partner.organization}`} onPress={() => { void reach(recipient, partner, 'text'); }} style={styles.secondaryButton}>
-              <Text style={styles.secondaryButtonText}>Text summary</Text>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Text the summary to ${partner.organization}`} accessibilityState={{ busy: preparingId === recipient.id }} onPress={() => { void reach(recipient, partner, 'text'); }} style={styles.secondaryButton}>
+              <Text style={styles.secondaryButtonText}>{preparingId === recipient.id ? 'Preparing…' : 'Text summary'}</Text>
             </TouchableOpacity>
           ) : null}
           {reachable && partner?.email.trim() ? (
-            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Email the summary to ${partner.organization}`} onPress={() => { void reach(recipient, partner, 'email'); }} style={styles.secondaryButton}>
-              <Text style={styles.secondaryButtonText}>Email summary</Text>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Email the summary to ${partner.organization}`} accessibilityState={{ busy: preparingId === recipient.id }} onPress={() => { void reach(recipient, partner, 'email'); }} style={styles.secondaryButton}>
+              <Text style={styles.secondaryButtonText}>{preparingId === recipient.id ? 'Preparing…' : 'Email summary'}</Text>
             </TouchableOpacity>
           ) : null}
           {loggable ? (

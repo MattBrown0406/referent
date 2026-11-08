@@ -264,9 +264,49 @@ export async function closePlacementRequest(id: string): Promise<PlacementReques
 }
 
 // Answer links made while the app runs, by recipient: a program texted and
-// then emailed gets the same link (the server keeps a recipient's five
+// then emailed gets the same link (the server keeps a recipient's 50
 // newest links working; placement_answer_link).
 const answerLinks = new Map<string, string>();
+// Requests in flight, so a prefetch and a tap never ask twice.
+const answerLinkRequests: Record<string, Promise<string | null> | undefined> = Object.create(null);
+// Bumped on sign-out: a request still in flight then never fills the cache.
+let answerLinkEpoch = 0;
+// On the web the links also survive a reload of the tab (sessionStorage), so
+// reloading the page does not make a new link for every program each time.
+const ANSWER_LINKS_STORAGE_KEY = 'referralfit.answerLinks.v1';
+let answerLinksLoaded = false;
+
+function linkStorage(): Storage | null {
+  try {
+    return typeof window !== 'undefined' && window.sessionStorage ? window.sessionStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+function loadStoredAnswerLinks(): void {
+  if (answerLinksLoaded) return;
+  answerLinksLoaded = true;
+  try {
+    const stored = JSON.parse(linkStorage()?.getItem(ANSWER_LINKS_STORAGE_KEY) || '{}') as Record<string, unknown>;
+    for (const [id, link] of Object.entries(stored)) {
+      if (/^[0-9a-f-]{36}$/.test(id) && typeof link === 'string' && placementAnswerLink(link.split('#')[1] || null) === link) {
+        answerLinks.set(id, link);
+      }
+    }
+  } catch {
+    // Unreadable storage: links are made again as needed.
+  }
+}
+
+function rememberAnswerLink(id: string, link: string): void {
+  answerLinks.set(id, link);
+  try {
+    linkStorage()?.setItem(ANSWER_LINKS_STORAGE_KEY, JSON.stringify(Object.fromEntries(answerLinks)));
+  } catch {
+    // Full or blocked storage: the in-memory copy still serves this page.
+  }
+}
 // Making a link must never hold up a text: past this, the message goes
 // without one.
 export const ANSWER_LINK_TIMEOUT_MS = 4000;
@@ -280,23 +320,70 @@ export const ANSWER_LINK_TIMEOUT_MS = 4000;
 export async function fetchPlacementAnswerLink(recipientId: string, timeoutMs: number = ANSWER_LINK_TIMEOUT_MS): Promise<string | null> {
   const id = (recipientId || '').toLowerCase();
   if (!id) return null;
+  loadStoredAnswerLinks();
   const cached = answerLinks.get(id);
   if (cached) return cached;
+  const epoch = answerLinkEpoch;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const call = (async () => {
-      const { data, error } = await supabase.rpc('placement_answer_link', { p_recipient_id: id });
-      return error ? null : placementAnswerLink(typeof data === 'string' ? data : null);
-    })();
+    let call = answerLinkRequests[id];
+    if (!call) {
+      const pending: Promise<string | null> = (async () => {
+        const { data, error } = await supabase.rpc('placement_answer_link', { p_recipient_id: id });
+        const made = error ? null : placementAnswerLink(typeof data === 'string' ? data : null);
+        if (made && epoch === answerLinkEpoch) rememberAnswerLink(id, made);
+        return made;
+      })().catch(() => null).finally(() => {
+        if (answerLinkRequests[id] === pending) answerLinkRequests[id] = undefined;
+      });
+      answerLinkRequests[id] = pending;
+      call = pending;
+    }
     const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); });
     const link = await Promise.race([call, late]);
-    if (link) answerLinks.set(id, link);
+    // Signed out meanwhile: that account's link is not used.
+    if (epoch !== answerLinkEpoch) return null;
+    if (link) rememberAnswerLink(id, link);
     return link;
   } catch {
     return null;
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/** A link already made for this recipient, or null; never waits. */
+export function cachedPlacementAnswerLink(recipientId: string): string | null {
+  loadStoredAnswerLinks();
+  return answerLinks.get((recipientId || '').toLowerCase()) || null;
+}
+
+/**
+ * Make the links for programs asked by hand as soon as their row shows, so a
+ * web tap never waits. It must not: Safari allows the clipboard and mail only
+ * during the tap itself, so a send there uses only a link made ahead of time
+ * (cachedPlacementAnswerLink). Call it only for rows that can be sent: each
+ * link made is one more the server keeps for that program.
+ */
+export function prefetchPlacementAnswerLinks(recipientIds: string[]): void {
+  loadStoredAnswerLinks();
+  for (const recipientId of recipientIds) {
+    const id = (recipientId || '').toLowerCase();
+    if (id && !answerLinks.has(id) && !answerLinkRequests[id]) void fetchPlacementAnswerLink(id);
+  }
+}
+
+/** Sign-out: links made for the previous account are dropped. */
+export function clearPlacementAnswerLinks(): void {
+  answerLinkEpoch += 1;
+  answerLinks.clear();
+  answerLinksLoaded = true;
+  try {
+    linkStorage()?.removeItem(ANSWER_LINKS_STORAGE_KEY);
+  } catch {
+    // Nothing stored.
+  }
+  for (const key of Object.keys(answerLinkRequests)) answerLinkRequests[key] = undefined;
 }
 
 /** A program's answer from a call or a text, logged by the practitioner. */

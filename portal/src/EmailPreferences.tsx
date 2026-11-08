@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 
-import { EMAIL_KIND_LABELS, type EmailKind, kindsFor, preferenceLinkFrom } from './email-rules';
+import { EMAIL_KIND_LABELS, type EmailKind, kindsFor, preferenceLinkFrom, tokenForTab } from './email-rules';
 import { signedOutSupabase as supabase } from './supabase';
 
 // /u#<token>:<kind>: the "Turn off these emails" page every ReferralFit email
@@ -11,7 +11,7 @@ import { signedOutSupabase as supabase } from './supabase';
 type Prefs = Record<EmailKind, boolean>;
 
 export default function EmailPreferences() {
-  const [link] = useState(() => preferenceLinkFrom(window.location.hash));
+  const [link] = useState(() => tokenForTab('referralfit.emailLink.v1', window.location.hash, preferenceLinkFrom));
   const [kinds, setKinds] = useState<EmailKind[]>([]);
   const [prefs, setPrefs] = useState<Prefs | null>(null);
   const [state, setState] = useState<'loading' | 'ready' | 'saving' | 'unavailable' | 'unreachable'>('loading');

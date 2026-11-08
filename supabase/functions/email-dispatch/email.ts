@@ -216,6 +216,11 @@ function content(row: OutboxRow, links: Links, now: Date): Content {
         why: 'You get this because you asked to manage a listing on ReferralFit.',
       };
   }
+  if (row.kind !== 'bed_reminder') {
+    // A kind this function does not know (a newer database): never send it
+    // as a bed check-in; the dispatcher records render_failed instead.
+    throw new Error(`unknown email kind: ${String(row.kind)}`);
+  }
   const listing = plain(data.listing_name) || 'your program';
   const confirmed = daysAgo(data.beds_updated_at, now);
   const status = `Men: ${bedCount(data.beds_male)}. Women: ${bedCount(data.beds_female)}.`
@@ -231,7 +236,7 @@ function content(row: OutboxRow, links: Links, now: Date): Content {
     ],
     button: { label: 'Confirm or update beds', url: `${links.portalUrl}/b#${token}` },
     afterButton: 'The button opens a private page for your program. It works for 14 days.',
-    why: 'You get this because your program claimed its listing on ReferralFit. We send it at most once a week, and only when your beds have not been confirmed in the last 6 days.',
+    why: 'You get this because your program claimed its listing on ReferralFit. We send it only when your beds have not been confirmed in the last 5 days, at most every 5 days.',
     offLabel: 'Turn off bed check-in emails',
   };
 }
@@ -301,6 +306,25 @@ export function renderEmail(row: OutboxRow, links: Links, now = new Date()): Ren
   };
 }
 
+/** When the row was first prepared (its counts and links are from then), or now. */
+export function preparedAt(row: OutboxRow): Date {
+  const raw = (row.data as Record<string, unknown> | null | undefined)?.prepared_at;
+  const at = typeof raw === 'string' ? new Date(raw) : null;
+  return at && !Number.isNaN(at.getTime()) ? at : new Date();
+}
+
+/**
+ * Resend's Idempotency-Key: the outbox id plus a short hash of what the
+ * sender settings put in the body. A retry of the same row with the same
+ * settings replays the first result; after a sender fix it is a new send.
+ */
+export async function idempotencyKey(row: OutboxRow, from: string, replyTo: string | undefined, links: Links): Promise<string> {
+  const basis = [from, replyTo || '', row.email, links.appUrl, links.portalUrl, links.functionUrl].join('\n');
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(basis)));
+  const hex = Array.from(digest.slice(0, 8), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${row.id}-${hex}`;
+}
+
 /** The request body for Resend's POST /emails. */
 export function resendBody(row: OutboxRow, email: RenderedEmail, from: string, replyTo?: string): Record<string, unknown> {
   const body: Record<string, unknown> = {
@@ -319,6 +343,37 @@ export function resendBody(row: OutboxRow, email: RenderedEmail, from: string, r
 /** A failed send worth trying again later: rate limits, server errors, network. */
 export function isTransientStatus(status: number): boolean {
   return status === 429 || status === 408 || status >= 500;
+}
+
+/**
+ * What a failed Resend response means for the email (body = Resend's JSON
+ * error, when it sent one):
+ *   retry  - rate limits, server errors, 409 concurrent_idempotent_requests;
+ *   config - the account or sender is wrong (401/403, an invalid from or
+ *            reply-to, an unverified sending domain): no email can go out,
+ *            so the run stops;
+ *   final  - this email cannot be sent (an invalid recipient, or 409
+ *            invalid_idempotent_request: the key was used with a different
+ *            body, which a retry of the same prepared row never sends, so it
+ *            is recorded as a failure to look at, never as sent).
+ * A retry of a prepared row renders the same body (prepared_at) under a key
+ * that changes with the sender settings (idempotencyKey), so Resend answers
+ * a repeat with the first result instead of a 409.
+ */
+export type FailureKind = 'retry' | 'config' | 'final';
+
+export function classifyResendFailure(status: number, body: unknown): FailureKind {
+  const name = body && typeof body === 'object' && typeof (body as { name?: unknown }).name === 'string'
+    ? (body as { name: string }).name
+    : '';
+  const message = body && typeof body === 'object' && typeof (body as { message?: unknown }).message === 'string'
+    ? (body as { message: string }).message.toLowerCase()
+    : '';
+  if (status === 409) return name === 'concurrent_idempotent_requests' ? 'retry' : 'final';
+  if (status === 401 || status === 403) return 'config';
+  if (status === 422 && (name === 'invalid_from_address' || /\b(from|reply_to|reply-to)\b|domain is not verified/.test(message))) return 'config';
+  if (isTransientStatus(status)) return 'retry';
+  return 'final';
 }
 
 export type SendResult = { id: string; provider_id?: string; error?: string; retry?: boolean };

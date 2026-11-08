@@ -237,11 +237,14 @@ link rides in the message the practitioner sends from their own phone.
   `placement_answer_link(recipient)` for a practice member, only for a
   program asked by hand, on an open request before its deadline. Only its
   sha256 is stored (`placement_answer_links`, no client role can read or
-  write it). Each call makes a new link; a recipient's five newest work,
-  so a program texted and then emailed can use either, and an older one
-  stops. The app keeps the link it made for each program while it runs, so
-  a second text or email to the same program reuses it. Deleting the
-  request deletes its links.
+  write it). Each call makes a new link; a recipient's 50 newest work
+  (5 before audit round 2), so a program texted and then emailed can use
+  either, and only a much older one stops. The app keeps the link it made
+  for each program while it runs, so a second text or email to the same
+  program reuses it. The web app makes a link when the row shows (a send
+  there cannot wait for one), only for a program that can still answer and
+  has a phone or email on file; the iPhone makes it on the tap. Deleting
+  the request deletes its links.
 - **The page:** `https://portal.referralfit.com/a#<token>` (the center
   portal's `src/AnswerLink.tsx`). The token is in the fragment, so it never
   reaches a server log or a Referer header; the page keeps it for that tab

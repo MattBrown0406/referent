@@ -15,6 +15,7 @@ import {
   type ReferralForm,
   type ReferralRow,
   type StatsRow,
+  safeWebsiteHref,
   type TargetRow,
 } from './program-referral-rules';
 import { supabase } from './supabase';
@@ -195,7 +196,7 @@ export default function ProgramReferrals({ onNotice, onError }: Props) {
                         <b>{row.display_name}</b>
                         <small>{[placeText(row), (row.types || []).join(', ')].filter(Boolean).join(' · ')}</small>
                         {coachingLine(coaching[row.global_partner_id]) ? <span className="target-coaching">{coachingLine(coaching[row.global_partner_id])}</span> : null}
-                        {row.website ? <a href={row.website} target="_blank" rel="noreferrer noopener">{row.website.replace(/^https?:\/\//, '')}</a> : null}
+                        {safeWebsiteHref(row.website) ? <a href={safeWebsiteHref(row.website)!} target="_blank" rel="noreferrer noopener">{(row.website || '').replace(/^https?:\/\//, '')}</a> : null}
                       </span>
                       {row.receive_status === 'ready' ? (
                         <button type="button" onClick={() => choose(row)}>Refer</button>

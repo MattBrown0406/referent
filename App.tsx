@@ -162,7 +162,8 @@ import { openCallOrText } from './src/lib/phone-actions';
 import { IS_WEB, useWideWeb, WEB_PAGE, WEB_SHEET, WEB_SHEET_OVERLAY } from './src/lib/web-layout';
 import PlacementCompare, { type CompareChoice } from './src/lib/PlacementCompare';
 import HandoffsSheet from './src/lib/HandoffsSheet';
-import { usePlacementRequests } from './src/lib/placement-api';
+import {
+  clearPlacementAnswerLinks, usePlacementRequests } from './src/lib/placement-api';
 import { latestRequestForMatch, placementTodayItems, requestProgress, type PlacementRequest, type PlacementRequestView } from './src/lib/placement-requests';
 import LevelOfCareSheet from './src/lib/LevelOfCareSheet';
 import LevelOfCareCard, { AssessedLevelNote } from './src/lib/LevelOfCareCard';
@@ -1538,6 +1539,7 @@ export default function App() {
 
   const resetAccountState = useCallback(() => {
     clearUnansweredSendKeys();
+    clearPlacementAnswerLinks();
     setOutreach(null);
     setAssessmentCaseId(null);
     setPlacementSheet(null);
@@ -7773,7 +7775,7 @@ export default function App() {
               {renderSavedCopyNotice(caseFileSource, 'case file')}
 
               {/* Referred by a treatment program: the practice's switch for sharing progress */}
-              <ProgramReferralCard caseId={record.id} />
+              <ProgramReferralCard key={record.id} caseId={record.id} />
 
               <View style={styles.infoCard}>
                 <View style={styles.caseSectionHeader}>
