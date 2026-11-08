@@ -11,9 +11,18 @@
 
 import { timingSafeEqual } from '../_shared/webhooks.ts';
 
-export type EmailKind = 'placement_response' | 'daily_summary' | 'bed_reminder';
+// Emails a person chooses (and can turn off from any of them).
+export type PreferenceKind = 'placement_response' | 'daily_summary' | 'bed_reminder';
+// Account emails a person asked for by acting (a claim request and its
+// answer): no preference, no unsubscribe link (20261108150000).
+export type AccountKind = 'claim_request' | 'claim_decision';
+export type EmailKind = PreferenceKind | AccountKind;
 
-export const EMAIL_KINDS: EmailKind[] = ['placement_response', 'daily_summary', 'bed_reminder'];
+export const EMAIL_KINDS: PreferenceKind[] = ['placement_response', 'daily_summary', 'bed_reminder'];
+
+export function isPreferenceKind(kind: EmailKind): kind is PreferenceKind {
+  return (EMAIL_KINDS as string[]).includes(kind);
+}
 
 export type OutboxRow = {
   id: string;
@@ -54,11 +63,11 @@ export function isAuthorized(headers: Headers, secret: string, serviceRoleKey: s
 }
 
 /** The one-click unsubscribe in a request URL, or null when it is not one. */
-export function oneClickFrom(url: URL): { token: string; kind: EmailKind } | null {
+export function oneClickFrom(url: URL): { token: string; kind: PreferenceKind } | null {
   const token = url.searchParams.get('unsubscribe') || '';
   const kind = url.searchParams.get('kind') || '';
-  if (!TOKEN_PATTERN.test(token) || !EMAIL_KINDS.includes(kind as EmailKind)) return null;
-  return { token, kind: kind as EmailKind };
+  if (!TOKEN_PATTERN.test(token) || !EMAIL_KINDS.includes(kind as PreferenceKind)) return null;
+  return { token, kind: kind as PreferenceKind };
 }
 
 export function escapeHtml(value: string): string {
@@ -117,7 +126,8 @@ type Content = {
   button: { label: string; url: string };
   afterButton?: string;
   why: string;
-  offLabel: string;
+  // The "turn off" link's label; absent for account emails (no unsubscribe).
+  offLabel?: string;
 };
 
 function content(row: OutboxRow, links: Links, now: Date): Content {
@@ -156,6 +166,56 @@ function content(row: OutboxRow, links: Links, now: Date): Content {
       offLabel: 'Turn off the morning summary',
     };
   }
+  if (row.kind === 'claim_request') {
+    const listing = plain(data.listing_name) || 'A program';
+    const place = [plain(data.city, 60), plain(data.state, 4)].filter(Boolean).join(', ');
+    const waiting = count(data.waiting);
+    return {
+      subject: `Claim request: ${listing}`,
+      preheader: 'A program asked to manage its listing.',
+      heading: 'A program asked to manage its listing',
+      paragraphs: [
+        place ? `${listing} (${place}) asked to keep its ReferralFit listing current.` : `${listing} asked to keep its ReferralFit listing current.`,
+        data.email_matches_website === true
+          ? "The requester's email address matches the program's website."
+          : "The requester's email address does not match the program's website. Check before approving, for example by calling the program's main number.",
+        waiting > 1 ? `${waiting} claim requests are waiting.` : '',
+      ].filter(Boolean),
+      button: { label: 'Review in ReferralFit', url: links.appUrl },
+      afterButton: 'In the app: Workspace and settings, Program claim requests.',
+      why: 'You get this because you review claim requests for ReferralFit.',
+    };
+  }
+  if (row.kind === 'claim_decision') {
+    const listing = plain(data.listing_name) || 'your program';
+    const note = plain(data.decision_note, 500);
+    const approved = data.approved === true;
+    return approved
+      ? {
+        subject: `You can now manage ${listing} on ReferralFit`,
+        preheader: 'Your request was approved.',
+        heading: 'Your request was approved',
+        paragraphs: [
+          `You now manage ${listing} in the ReferralFit program portal.`,
+          'Keep your open beds, levels of care, insurance and admissions contacts current, answer placement requests from interventionists, and refer families to them. It is free.',
+          ...(note ? [`Note from ReferralFit: ${note}`] : []),
+        ],
+        button: { label: 'Open the program portal', url: links.portalUrl },
+        why: 'You get this because you asked to manage a listing on ReferralFit. Questions? Reply to this email.',
+      }
+      : {
+        subject: 'About your ReferralFit listing request',
+        preheader: `We could not approve your request to manage ${listing}.`,
+        heading: 'We could not approve your request',
+        paragraphs: [
+          `We could not confirm your request to manage ${listing}.`,
+          ...(note ? [`Note from ReferralFit: ${note}`] : []),
+          'Reply to this email and we will help you get set up.',
+        ],
+        button: { label: 'Open the program portal', url: links.portalUrl },
+        why: 'You get this because you asked to manage a listing on ReferralFit.',
+      };
+  }
   const listing = plain(data.listing_name) || 'your program';
   const confirmed = daysAgo(data.beds_updated_at, now);
   const status = `Men: ${bedCount(data.beds_male)}. Women: ${bedCount(data.beds_female)}.`
@@ -180,7 +240,7 @@ const GREEN = '#1F5A49';
 const INK = '#16352E';
 const SOFT = '#38564F';
 
-function html(c: Content, offUrl: string): string {
+function html(c: Content, offUrl: string | null): string {
   const paragraphs = c.paragraphs
     .map((p) => `<p style="margin:0 0 14px;font-size:16px;line-height:1.55;color:${INK}">${escapeHtml(p)}</p>`)
     .join('');
@@ -208,11 +268,12 @@ function html(c: Content, offUrl: string): string {
     + after
     + `</td></tr>`
     + `<tr><td style="padding:18px 28px 26px;border-top:1px solid #DDE4DF;font-size:13px;line-height:1.5;color:${SOFT}">${escapeHtml(c.why)}<br>`
-    + `<a href="${escapeHtml(offUrl)}" style="color:${GREEN}">${escapeHtml(c.offLabel)}</a> &middot; <a href="https://referralfit.com" style="color:${GREEN}">referralfit.com</a></td></tr>`
+    + (offUrl && c.offLabel ? `<a href="${escapeHtml(offUrl)}" style="color:${GREEN}">${escapeHtml(c.offLabel)}</a> &middot; ` : '')
+    + `<a href="https://referralfit.com" style="color:${GREEN}">referralfit.com</a></td></tr>`
     + `</table></td></tr></table></body></html>`;
 }
 
-function text(c: Content, offUrl: string): string {
+function text(c: Content, offUrl: string | null): string {
   return [
     c.heading,
     '',
@@ -223,21 +284,20 @@ function text(c: Content, offUrl: string): string {
     '',
     '--',
     c.why,
-    `${c.offLabel}: ${offUrl}`,
+    ...(offUrl && c.offLabel ? [`${c.offLabel}: ${offUrl}`] : []),
   ].join('\n');
 }
 
 export function renderEmail(row: OutboxRow, links: Links, now = new Date()): RenderedEmail {
   const c = content(row, links, now);
-  const off = unsubscribeLinks(row, links);
+  const off = isPreferenceKind(row.kind) ? unsubscribeLinks(row, links) : null;
   return {
     subject: plain(c.subject, 160),
-    html: html(c, off.page),
-    text: text(c, off.page),
-    headers: {
-      'List-Unsubscribe': `<${off.oneClick}>`,
-      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
-    },
+    html: html(c, off ? off.page : null),
+    text: text(c, off ? off.page : null),
+    headers: off
+      ? { 'List-Unsubscribe': `<${off.oneClick}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' }
+      : {},
   };
 }
 

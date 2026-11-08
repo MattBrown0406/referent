@@ -207,3 +207,15 @@ table.track th, table.track td { text-align: left; padding: 10px 8px; border-top
 table.track thead th { border-top: 0; color: var(--gray); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; }
 table.track tbody th { font-weight: 600; }
 table.track tbody th small { display: block; color: var(--gray); font-size: 12px; font-weight: 400; }
+
+/* Claiming: find your program and ask (src/ClaimRequest.tsx). */
+.claim-search { margin-bottom: 8px; }
+.claim-results { list-style: none; padding: 0; margin: 12px 0 0; display: grid; gap: 8px; }
+.claim-results li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; }
+.claim-results li.chosen { border-color: var(--blue); background: var(--blue-soft); }
+.claim-results li div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.claim-results small { color: var(--gray); font-size: 13px; overflow-wrap: anywhere; }
+.claim-results button { flex: none; }
+.claim-taken { color: var(--gray); font-size: 13px; white-space: nowrap; }
+.claim-request-form { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
+.claim-request-form h3 { margin: 0 0 4px; font-size: 16px; }

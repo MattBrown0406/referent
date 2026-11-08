@@ -56,6 +56,26 @@ user is that listing's center member or a member of the owning workspace.
    listing; the org-profile paths (create, approval) do set
    `status = 'active'` because the owner is attesting their own practice.
 
+## Program claims (self-serve, 20261108150000)
+
+A program no longer needs ReferralFit to run SQL. In the center portal a
+signed-in account searches for its listing ("Find your program": active
+program listings only, never an interventionist's or therapist's) and asks to
+manage it (`request_program_claim`: its name, role, phone and a note; one
+waiting request per account, five a day). Every platform admin is emailed;
+the request waits in the app under Workspace > Program claim requests
+(`list_program_claim_requests`, admins only), which shows the requester's
+email and whether its domain matches the listing's website
+(`email_matches_website`). Approving (`decide_program_claim_request`) binds
+the account exactly as a claim code does: a `center_members` row,
+`verified_at` stamped if empty, unused codes expired; any other waiting
+request for that listing is declined. The requester is emailed the decision
+and the portal shows it. Admins can also tap "Issue claim code" on a
+program's Directory card in the app; the invite's link
+(`portal.referralfit.com/claim#<code>`) fills the code in. Requests live in
+`program_claim_requests` (not `center_claim_requests`, which is the older
+table for workspaces claiming their own profile).
+
 ## Workspace profiles (self-serve)
 
 `public.upsert_org_directory_profile(p_payload jsonb)` — SECURITY DEFINER,
