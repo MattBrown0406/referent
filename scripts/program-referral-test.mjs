@@ -112,7 +112,7 @@ function ok(label, value) {
 {
   const { caseProgramReferralFromRow, programReferralSettingsFromRow, sharingExplanation, acceptsExplanation, isMissingProgramReferralSchema } = app;
   check('a referral row', caseProgramReferralFromRow([{ id: 'r1', from_display: ' Juniper Ridge Recovery ', share_progress: false, created_at: 't' }]),
-    { id: 'r1', fromDisplay: 'Juniper Ridge Recovery', shareProgress: false, createdAt: 't' });
+    { id: 'r1', fromDisplay: 'Juniper Ridge Recovery', shareProgress: false, createdAt: 't', inNetwork: false, logged: false, canLog: false });
   check('no row means no card', [caseProgramReferralFromRow([]), caseProgramReferralFromRow(null)], [null, null]);
   check('settings', programReferralSettingsFromRow([{ accepts: false, can_change: true, has_profile: true }]),
     { accepts: false, canChange: true, hasProfile: true });
@@ -141,7 +141,7 @@ function ok(label, value) {
   const portalApp = read('portal/src/App.tsx');
   ok('the portal shows referrals after placement requests',
     portalApp.indexOf('<PlacementRequests') > 0 && portalApp.indexOf('<ProgramReferrals') > portalApp.indexOf('<PlacementRequests'));
-  ok('the case file shows the referral card, keyed by case', /<ProgramReferralCard key=\{record\.id\} caseId=\{record\.id\} \/>/.test(read('App.tsx')));
+  ok('the case file shows the referral card, keyed by case', /<ProgramReferralCard\s+key=\{record\.id\}\s+caseId=\{record\.id\}/.test(read('App.tsx')));
   ok('Workspace shows the settings card', /<ProgramReferralSettingsCard visible=\{visible\} \/>/.test(read('src/lib/WorkspaceScreen.tsx')));
   const ui = read('portal/src/ProgramReferrals.tsx');
   for (const name of ['program_referral_targets', 'program_refer_family', 'list_program_referrals', 'program_referral_stats']) {

@@ -58,6 +58,12 @@
           "cameraPermission": false,
           "microphonePermission": false
         }
+      ],
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "ReferralFit uses only the contacts you pick, one at a time, to add them as referral partners. It never reads the rest of your address book."
+        }
       ]
     ],
     "extra": {

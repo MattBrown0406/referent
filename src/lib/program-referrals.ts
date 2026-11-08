@@ -27,6 +27,8 @@ export {
   acceptsExplanation,
   caseProgramReferralFromRow,
   isMissingProgramReferralSchema,
+  ledgerAction,
+  localDateOf,
   programReferralSettingsFromRow,
   sharingExplanation,
   type CaseProgramReferral,
@@ -48,6 +50,21 @@ export async function fetchCaseProgramReferral(caseId: string): Promise<{ availa
     throw failure(error, status, 'The referral could not be loaded.');
   }
   return { available: true, referral: caseProgramReferralFromRow(data) };
+}
+
+/**
+ * "Add to network and log": the referring program becomes a partner (from its
+ * Directory listing) if it is not one, and the referral goes into the
+ * referral history as inbound on this case. Running it twice changes nothing.
+ */
+export async function logProgramReferral(referralId: string, referredOn: string): Promise<{ addedPartner: boolean }> {
+  const { data, error, status } = await supabase.rpc('log_program_referral', { p_referral_id: referralId, p_referred_on: referredOn });
+  if (error) {
+    if (isMissingProgramReferralSchema(error)) throw new Error('Logging this referral needs the latest ReferralFit update on the server.');
+    if ((error as { message?: string }).message === 'Referral not found') throw new Error('This referral is no longer on this case. Pull to refresh.');
+    throw failure(error, status, 'The referral could not be logged.');
+  }
+  return { addedPartner: (data as { added_partner?: unknown } | null)?.added_partner === true };
 }
 
 export async function setProgramReferralSharing(referralId: string, share: boolean): Promise<boolean> {

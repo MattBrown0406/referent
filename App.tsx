@@ -168,6 +168,8 @@ import { latestRequestForMatch, placementTodayItems, requestProgress, type Place
 import LevelOfCareSheet from './src/lib/LevelOfCareSheet';
 import LevelOfCareCard, { AssessedLevelNote } from './src/lib/LevelOfCareCard';
 import ProgramReferralCard from './src/lib/ProgramReferralCard';
+import PartnerImportSheet from './src/lib/PartnerImportSheet';
+import { contactFilesAvailable, deviceContactsAvailable } from './src/lib/partner-import-api';
 import { useCaseAssessments } from './src/lib/level-of-care-api';
 import { levelOfCarePacketLines, reasonNames, type PlacementLevel } from './src/lib/level-of-care';
 import {
@@ -1291,6 +1293,8 @@ export default function App() {
   const [todayStamp, setTodayStamp] = useState(localDateStamp);
   const [entitlements, setEntitlements] = useState<EntitlementState>(NO_ENTITLEMENTS);
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
+  // Import partners from the iPhone's contacts or (web) a .csv / .vcf file.
+  const [showPartnerImport, setShowPartnerImport] = useState(false);
   const [directorySubmitBusy, setDirectorySubmitBusy] = useState(false);
   // Incremented after the account joins a different practice workspace, which
   // re-homes its rows server-side; bumping it re-runs the hydration effect.
@@ -2206,6 +2210,19 @@ export default function App() {
       }, CATCH_UP_REFRESH_MS);
     };
     wait(0);
+  }, []);
+
+  // After a change made on the server (an import, a referral logged from the
+  // case card): a refresh already in flight may have read before it, so wait
+  // for that one and read again.
+  const refreshAfterServerChange = useCallback(() => {
+    const again = () => { void refreshFromServerRef.current?.('pull').catch(() => undefined); };
+    const running = refreshInFlightRef.current;
+    if (running) {
+      void running.then(again, again);
+      return;
+    }
+    again();
   }, []);
 
   const refreshFromServer = useCallback(async (trigger: 'foreground' | 'pull'): Promise<'ok' | 'offline'> => {
@@ -4599,7 +4616,7 @@ export default function App() {
   latestCasesRef.current = cases;
   const sheetOpenNow = Boolean(
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
-    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory
+    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory || showPartnerImport
     || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
     || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible
     || placementSheet || placementCompareId || showHandoffs,
@@ -7288,9 +7305,14 @@ export default function App() {
                 <AppIcon name="document-text" size={16} color={COLORS.forest} />
                 <Text style={styles.packetButtonText}>Send packet</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.assignReferralButton, styles.matchActionFlex]} onPress={() => openMatchedReferral(match.partner.id)}>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel={`Assign and refer ${matchClientLabel.trim() || 'this client'} to ${match.partner.organization}`}
+                style={[styles.assignReferralButton, styles.matchActionFlex]}
+                onPress={() => openMatchedReferral(match.partner.id)}
+              >
                 <AppIcon name="paper-plane" size={16} color={COLORS.white} />
-                <Text style={styles.assignReferralButtonText}>Assign & refer {matchClientLabel.trim() || 'this client'}</Text>
+                <Text style={styles.assignReferralButtonText} numberOfLines={1}>Assign & refer {matchClientLabel.trim() || 'this client'}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -7461,6 +7483,25 @@ export default function App() {
           </View>
           <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
         </TouchableOpacity>
+        {deviceContactsAvailable() || contactFilesAvailable() ? (
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityLabel={deviceContactsAvailable() ? 'Import partners from your contacts' : 'Import partners from a contacts file'}
+            style={styles.globalDirectoryBanner}
+            onPress={() => setShowPartnerImport(true)}
+          >
+            <AppIcon name="person-add-outline" size={20} color={COLORS.forest} />
+            <View style={styles.globalDirectoryCopy}>
+              <Text style={styles.globalDirectoryTitle}>Import partners</Text>
+              <Text style={styles.globalDirectorySubtitle}>
+                {deviceContactsAvailable()
+                  ? 'Pick the contacts you refer with; ReferralFit sees only the ones you pick'
+                  : 'From a spreadsheet (.csv) or a contacts file (.vcf), reviewed before anything is saved'}
+              </Text>
+            </View>
+            <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
+          </TouchableOpacity>
+        ) : null}
         <View style={styles.searchBox}>
           <AppIcon name="search" size={19} color={COLORS.gray} />
           <TextInput value={search} onChangeText={setSearch} placeholder="Name, program, location, specialty" placeholderTextColor="#91A09B" style={styles.searchInput} />
@@ -7775,7 +7816,11 @@ export default function App() {
               {renderSavedCopyNotice(caseFileSource, 'case file')}
 
               {/* Referred by a treatment program: the practice's switch for sharing progress */}
-              <ProgramReferralCard key={record.id} caseId={record.id} />
+              <ProgramReferralCard
+                key={record.id}
+                caseId={record.id}
+                onLedgerChanged={refreshAfterServerChange}
+              />
 
               <View style={styles.infoCard}>
                 <View style={styles.caseSectionHeader}>
@@ -10149,6 +10194,17 @@ export default function App() {
           afterSheetCloses(() => openCase(caseId));
         }}
       />
+      <PartnerImportSheet
+        visible={showPartnerImport}
+        userId={activeUserId}
+        partners={partners}
+        directoryEntitled={entitlements.entitlements.directory}
+        onClose={() => setShowPartnerImport(false)}
+        onImported={(result) => {
+          // The new partners come in with the next read of the network.
+          if (result.added || result.linked) refreshAfterServerChange();
+        }}
+      />
       <GlobalDirectoryScreen
         visible={showGlobalDirectory}
         entitled={entitlements.entitlements.directory}
@@ -10427,8 +10483,9 @@ const styles = StyleSheet.create({
   mustHaveBlock: { marginTop: -4, marginBottom: 12 },
   placementReasonBlock: { marginTop: 4, marginBottom: 16 },
   placementReasonHint: { color: COLORS.gray, fontSize: 11, lineHeight: 16, marginTop: -4, marginBottom: 10 },
-  assignReferralButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: COLORS.forest, borderRadius: 13, marginTop: 13 },
-  assignReferralButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800' },
+  assignReferralButton: { minHeight: 44, minWidth: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: COLORS.forest, borderRadius: 13, marginTop: 13, paddingHorizontal: 12, overflow: 'hidden' },
+  // The client's name can be long: shrink and end with an ellipsis inside the button.
+  assignReferralButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800', flexShrink: 1, minWidth: 0 },
   directoryTitleRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 18 },
   globalDirectoryBanner: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#EFF4FF', borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14, marginBottom: 16 },
   globalDirectoryCopy: { flex: 1 },
@@ -10603,7 +10660,7 @@ const styles = StyleSheet.create({
   // Match Packet
   matchActionRow: { flexDirection: 'row', gap: 8, marginTop: 13 },
   matchActionFlex: { flex: 1, marginTop: 0 },
-  packetButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: COLORS.mint, borderRadius: 13, paddingHorizontal: 13 },
+  packetButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: COLORS.mint, borderRadius: 13, paddingHorizontal: 13, flexShrink: 0 },
   packetButtonText: { color: COLORS.forest, fontSize: 11, fontWeight: '800' },
   savedMatchPacketButton: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 9, backgroundColor: COLORS.mint, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 6, alignSelf: 'flex-start' },
   savedMatchPacketButtonText: { color: COLORS.forest, fontSize: 10, fontWeight: '800' },
