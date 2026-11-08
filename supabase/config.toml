@@ -409,6 +409,10 @@ verify_jwt = false
 [functions.push-dispatch]
 verify_jwt = false
 
+# Its own secret check (EMAIL_DISPATCH_SECRET); one-click unsubscribe is token-checked.
+[functions.email-dispatch]
+verify_jwt = false
+
 [functions.intake]
 verify_jwt = false
 

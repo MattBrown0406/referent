@@ -164,6 +164,27 @@ button.request {
 .handoff-steps li.current .handoff-marker { border-color: var(--blue); color: var(--blue); box-shadow: 0 0 0 4px var(--blue-soft); }
 .handoff-action { width: 100%; min-height: 48px; font-size: 16px; }
 
+/* Email links: /b bed check-in and /u email settings (signed out). */
+.bed-link-foot { margin: 18px 0 0; }
+.pref-ask { padding: 12px 14px; border-radius: 10px; background: var(--blue-soft); margin: 0 0 16px; }
+.pref-ask p.help { margin: 0 0 10px; color: inherit; }
+.pref-list { display: grid; gap: 10px; }
+label.check.pref-row { display: flex; gap: 12px; align-items: flex-start; text-transform: none; letter-spacing: 0; font-size: 15px; color: inherit; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; }
+label.check.pref-row input { margin-top: 3px; width: 18px; height: 18px; flex: none; }
+label.check.pref-row span { display: flex; flex-direction: column; gap: 2px; }
+label.check.pref-row small { color: var(--gray); font-size: 13px; font-weight: 400; line-height: 1.45; }
+.pref-foot { margin: 16px 0 0; }
+/* Answer link (/a): a program answers a placement request from a text or email, on a phone first. */
+.answer-link .handoff-title { font-size: 22px; }
+.answer-link form label.check { min-height: 40px; }
+.answer-link .answer-submit { margin-top: 20px; }
+.answer-link form > .footnote { margin-top: 12px; }
+.answer-claim { text-align: center; margin-top: 18px; }
+.answer-claim a { color: var(--blue); }
+@media (max-width: 520px) {
+  .placement dl.summary div { flex-direction: column; gap: 2px; }
+  .placement dl.summary dt { flex: none; }
+}
 /* Program referrals (a program refers a family to an interventionist). */
 .referrals .search-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .referrals .search-row input { flex: 1 1 220px; width: auto; }

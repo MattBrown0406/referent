@@ -143,7 +143,12 @@ answer: `bed_available` (yes / no / waitlist), `likely_accept` (yes / maybe
 `channel` is `portal` when the program's listing is claimed by a center
 account (and not merged or archived), so it answers in the center portal;
 otherwise `manual`: the practitioner texts or emails the summary from the
-phone's own Messages or Mail and logs the answer by hand.
+phone's own Messages or Mail, with an answer link the program can answer
+from itself (see "Answer links"), or logs the answer by hand.
+
+`answered_via` (20261108130000) says how an answer arrived: `portal`,
+`link` or `practice`; NULL while unanswered. A BEFORE UPDATE trigger
+(`placement_recipient_answered_via`) keeps it right for every writer.
 
 ## Who reads and writes what
 
@@ -156,8 +161,10 @@ phone's own Messages or Mail and logs the answer by hand.
   client identity, rank, other programs, partner or case ids. An answer the
   practitioner logged by hand is the practice's own record: the program sees
   its row as unanswered.
-- **anon** gets nothing. No client writes either table (no write policies;
-  TRUNCATE revoked; production's default ACL emulated in the tests).
+- **anon** reads no table. It can call only the two answer-link functions,
+  each with a link's token (see "Answer links"). No client writes either
+  table (no write policies; TRUNCATE revoked; production's default ACL
+  emulated in the tests).
 
 RPCs (all SECURITY DEFINER, `search_path` pinned):
 
@@ -170,6 +177,8 @@ RPCs (all SECURITY DEFINER, `search_path` pinned):
 | `list_center_placement_requests(p_recipient_id default null)` | center | Its inbox, newest first, with `status` (expired computed) and `can_respond`. |
 | `mark_placement_request_viewed(p_recipient_id)` | center | Opening a request marks it viewed, once. |
 | `respond_to_placement_request(p_recipient_id, ...)` | center | Its own row only, while the request is open and before `respond_by`; editable until then. |
+| `placement_answer_link(p_recipient_id)` | practice | A new answer link for a program asked by hand, on an open request before its deadline; returns the token (only its hash is kept). |
+| `public_placement_answer_open(p_token)` / `public_placement_answer_respond(p_token, ...)` | anon (the program, by link) | Read the request as the center inbox shows it (marks it viewed); answer it with the portal's checks. |
 
 A joiner's requests move with their workspace when they join a practice
 (`org_move_workspace_rows`, plus `org_merge_linked_partner_copies` repointing
@@ -216,6 +225,57 @@ content changes by step; every question is an Alert; the answers screen
 opens only after the send sheet has closed (`afterSheetCloses`); both count
 in `anySheetOpenRef`; Messages and Mail present over them the way the
 follow-up sheet's do and are released when they close.
+
+## Answer links
+
+Migration `20261108130000_placement_answer_links.sql`. A program asked by
+hand (`channel = 'manual'`) can answer the request itself, signed out, from
+a link in the practitioner's text or email. The server sends nothing: the
+link rides in the message the practitioner sends from their own phone.
+
+- **The token:** 256 random bits (64 hex characters), made by
+  `placement_answer_link(recipient)` for a practice member, only for a
+  program asked by hand, on an open request before its deadline. Only its
+  sha256 is stored (`placement_answer_links`, no client role can read or
+  write it). Each call makes a new link; a recipient's five newest work,
+  so a program texted and then emailed can use either, and an older one
+  stops. The app keeps the link it made for each program while it runs, so
+  a second text or email to the same program reuses it. Deleting the
+  request deletes its links.
+- **The page:** `https://portal.referralfit.com/a#<token>` (the center
+  portal's `src/AnswerLink.tsx`). The token is in the fragment, so it never
+  reaches a server log or a Referer header; the page keeps it for that tab
+  only (sessionStorage, so a reload works) and takes it out of the address
+  bar. It calls two functions with the token alone, as anon:
+  - `public_placement_answer_open(token)`: NULL for a link that does not
+    work; else exactly `program_name`, `practice_name` (the center inbox's
+    rule), `payload` (the allow-listed summary), `sent_at`, `respond_by`,
+    `request_status`, `status` (expired computed), `can_respond`, and
+    `answer`: the program's own answer, or null (one the practice logged
+    reads as unanswered, as in the center inbox). Opening marks the row
+    viewed, once; the answers screen then says "They opened your link and
+    have not answered yet."
+  - `public_placement_answer_respond(token, ...)`: the same checks and
+    words as `respond_to_placement_request` (open, before the deadline,
+    `placement_answer_problem`). The answer is the program's own:
+    `entered_by_practice` false, `responded_by` NULL, `answered_via`
+    'link'. It replaces an answer the practice logged by hand, and
+    `log_manual_response` refuses to write over it ("The program already
+    answered in ReferralFit"). The existing trigger
+    (`placement_answer_notify`) queues the practitioner's push exactly as
+    for a portal answer.
+- **Nothing more is reachable:** no rank, no other program, no partner,
+  case, request or recipient id, no label or budget (tested).
+- **The app:** "Text" and "Email" on the send sheet and on the answers
+  screen ask for the program's link (`fetchPlacementAnswerLink`) and add
+  "Answer in one tap, no account needed: <link>" to that program's message
+  (every message goes to one program). Offline, slow (4 seconds), on an
+  older server, or on any refusal, the message goes without the link, as
+  before; making a link never blocks a text. The answers screen reads
+  "Answered from your link" for such an answer.
+- **The page's footer** invites the program to claim its free listing on
+  ReferralFit to answer every request in one place
+  (https://referralfit.com/programs).
 
 ## Offline and older servers
 
@@ -340,15 +400,41 @@ itself: without `public.program_credentials` it stops at once with "Paste
 5. Ship the app build. Nothing else to deploy: no Edge Function, cron or
    secret.
 
+### Answer links (20261108130000)
+
+After `20261106120000_placement_response_push.sql` (production has it):
+
+1. Paste `supabase/migrations/20261108130000_placement_answer_links.sql`
+   into the SQL editor and run it (ASCII only, no backslashes, every
+   statement under 3,700 characters, one BEGIN/COMMIT, safe to re-run).
+2. Record it:
+
+   ```sql
+   INSERT INTO supabase_migrations.schema_migrations (version, name)
+   VALUES ('20261108130000', 'placement_answer_links');
+   ```
+
+3. Verify:
+
+   ```sql
+   SELECT has_table_privilege('anon', 'public.placement_answer_links', 'SELECT') AS anon_reads_links,          -- false
+          has_table_privilege('authenticated', 'public.placement_answer_links', 'SELECT') AS users_read_links, -- false
+          has_function_privilege('anon', 'public.public_placement_answer_open(text)', 'EXECUTE') AS page_opens, -- true
+          has_function_privilege('anon', 'public.placement_answer_link(uuid)', 'EXECUTE') AS anon_makes_links;  -- false
+   SELECT answered_via, count(*) FROM public.placement_request_recipients GROUP BY 1;  -- answers backfilled
+   ```
+
+4. Deploy the center portal (it adds the `/a` page). Until it is live, a
+   link opens the portal's sign-in page, so deploy it **before** the app
+   build or web app that adds links to messages.
+5. The web app and the next iPhone build add the link to the messages.
+   Against a server without the migration they send the message as before.
+
 ## Not in this version
 
-- **No push notification** when a program answers. The outbox would need a
-  new kind (its CHECK, `notification_copy`, `notify_enqueue`, a preference
-  column, the app's settings and tap routing), which is more than this
-  feature should change; answers show on Today and on the saved match
-  instead. A `placement_response` kind is the natural next step.
 - No email or text is sent by the server: programs without a claimed
-  listing get the summary from the practitioner's own Messages or Mail.
+  listing get the summary (and their answer link) from the practitioner's
+  own Messages or Mail.
 - An app that does not send `p_ranks` stores the position among the
   programs asked (1 to 8), not the original result number.
 - The "new answers" marker is per phone (AsyncStorage), not synced across

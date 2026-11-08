@@ -63,6 +63,13 @@ import {
   type PreferencesState,
 } from './push';
 import { WEB_PAGE } from './web-layout';
+import {
+  EMAIL_PREFERENCE_ROWS,
+  type EmailPreferences,
+  type EmailPreferencesState,
+  fetchEmailPreferences,
+  saveEmailPreference,
+} from './email-preferences';
 
 type Props = {
   visible: boolean;
@@ -146,6 +153,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   const [notify, setNotify] = useState<PreferencesState | null>(null);
   const [notifyError, setNotifyError] = useState('');
   const [notifyNote, setNotifyNote] = useState('');
+  // "Email me about..." (server-sent email). null while loading; available
+  // false on a server without the email migration.
+  const [emailPrefs, setEmailPrefs] = useState<EmailPreferencesState | null>(null);
+  const [emailPrefsError, setEmailPrefsError] = useState('');
   // "Lock with Face ID" on this phone (null: no lock here, e.g. the web).
   const [lock, setLock] = useState<AppLockStatus | null>(() => appLockStatus());
   const [lockBusy, setLockBusy] = useState(false);
@@ -169,6 +180,13 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
       setNotifyError('');
     } catch (error) {
       setNotifyError((error as Error).message);
+    }
+    // Email preferences are secondary too.
+    try {
+      setEmailPrefs(await fetchEmailPreferences());
+      setEmailPrefsError('');
+    } catch (error) {
+      setEmailPrefsError((error as Error).message);
     }
     // The profile card is secondary: its failure never blocks the screen.
     setDirectoryProfileError('');
@@ -406,6 +424,21 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
         await saveNotificationPreferences(userId, next);
       } catch (error) {
         setNotify((current) => (current ? { ...current, preferences: notify.preferences } : current));
+        throw error;
+      }
+    }, 'Could not save that choice');
+  }
+
+  function toggleEmail(key: keyof EmailPreferences, value: boolean) {
+    if (!emailPrefs) return;
+    const before = emailPrefs;
+    setEmailPrefs({ ...before, preferences: { ...before.preferences, [key]: value } });
+    void run(async () => {
+      try {
+        const saved = await saveEmailPreference(key, value);
+        setEmailPrefs({ available: true, preferences: saved });
+      } catch (error) {
+        setEmailPrefs(before);
         throw error;
       }
     }, 'Could not save that choice');
@@ -664,6 +697,34 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                         />
                       </View>
                     )) : null}
+                </>
+              )}
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.cardLabel}>Email me about...</Text>
+              {emailPrefs === null ? (
+                emailPrefsError ? <Text style={styles.helpText}>Email settings could not be loaded: {emailPrefsError}</Text> : <ActivityIndicator color={COLORS.blue} />
+              ) : !emailPrefs.available ? (
+                <Text style={styles.helpText}>Email alerts are not available yet. They switch on here once the server update is applied; nothing else is needed from you.</Text>
+              ) : (
+                <>
+                  <Text style={styles.helpText}>Sent to the email you sign in with. Names and case details never appear in email.</Text>
+                  {EMAIL_PREFERENCE_ROWS.map((row) => (
+                    <View key={row.key} style={styles.memberRow}>
+                      <View style={styles.memberInfo}>
+                        <Text style={styles.memberName}>{row.label}</Text>
+                        <Text style={styles.memberRole}>{row.description}</Text>
+                      </View>
+                      <Switch
+                        accessibilityLabel={`Email: ${row.label}`}
+                        value={emailPrefs.preferences[row.key]}
+                        disabled={busy}
+                        onValueChange={(value) => toggleEmail(row.key, value)}
+                        trackColor={{ true: COLORS.blue }}
+                      />
+                    </View>
+                  ))}
                 </>
               )}
             </View>

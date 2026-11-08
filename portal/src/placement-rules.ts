@@ -190,7 +190,10 @@ export type AnswerPayload = {
   p_note: string;
 };
 
-export function formFromRow(row: CenterRequestRow | null): AnswerForm {
+/** The answer fields of a row (or of an answer link's own answer). */
+export type AnswerFields = Pick<CenterRequestRow, 'bed_available' | 'likely_accept' | 'earliest_admit_on' | 'daily_rate' | 'cost_note' | 'note'>;
+
+export function formFromRow(row: AnswerFields | null): AnswerForm {
   return {
     bed: row?.bed_available || '',
     likely: row?.likely_accept || '',
@@ -246,6 +249,84 @@ export function validateAnswer(form: AnswerForm, sentOn: string): { payload: Ans
   const note = form.note.trim();
   if (Array.from(note).length > 300) return { problem: 'Keep the note to 300 characters' };
   return { payload: { p_bed_available: form.bed, p_likely_accept: form.likely, p_earliest_admit_on: admitOn, p_daily_rate: dailyRate, p_cost_note: costNote, p_note: note } };
+}
+
+// ─── Answer links (/a#<token>, signed out) ───────────────────────────────────
+// Migration 20261108130000: a program the practice asked by hand opens the
+// request from a link in the text or email and answers it itself.
+
+/** The token in the page's fragment: 64 lowercase hex characters, else null. */
+export function answerLinkTokenFrom(hash: string): string | null {
+  const token = hash.replace(/^#/, '').trim();
+  return /^[0-9a-f]{64}$/.test(token) ? token : null;
+}
+
+/** public.public_placement_answer_open / _respond, as the page reads it. */
+export type AnswerLinkView = {
+  programName: string;
+  practiceName: string;
+  payload: Payload;
+  sentAt: string;
+  respondBy: string;
+  requestStatus: CenterRequestRow['request_status'];
+  status: CenterStatus;
+  canRespond: boolean;
+  /** The program's own answer, or null (an answer the practice logged reads as none). */
+  answer: (AnswerFields & { responded_at: string }) | null;
+};
+
+const CENTER_STATUSES: CenterStatus[] = ['sent', 'viewed', 'responded', 'declined', 'expired'];
+
+function stringOr(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+/** The server's JSON, or null when it is not a view (a link that does not work). */
+export function answerLinkViewFromJson(value: unknown): AnswerLinkView | null {
+  const row = (Array.isArray(value) ? value[0] : value) as Record<string, unknown> | null | undefined;
+  if (!row || typeof row !== 'object') return null;
+  const sentAt = stringOr(row.sent_at);
+  const respondBy = stringOr(row.respond_by);
+  if (!sentAt || !respondBy) return null;
+  const requestStatus = row.request_status === 'closed' || row.request_status === 'cancelled' ? row.request_status : 'open';
+  const status = CENTER_STATUSES.includes(row.status as CenterStatus) ? (row.status as CenterStatus) : 'sent';
+  const raw = (row.answer && typeof row.answer === 'object' ? row.answer : null) as Record<string, unknown> | null;
+  const bed = BED_CHOICES.find((choice) => choice.value === raw?.bed_available)?.value ?? null;
+  const likely = ACCEPT_CHOICES.find((choice) => choice.value === raw?.likely_accept)?.value ?? null;
+  const answer = raw && typeof raw.responded_at === 'string' && bed && likely
+    ? {
+        responded_at: raw.responded_at,
+        bed_available: bed,
+        likely_accept: likely,
+        earliest_admit_on: typeof raw.earliest_admit_on === 'string' ? raw.earliest_admit_on : null,
+        daily_rate: typeof raw.daily_rate === 'number' ? raw.daily_rate : null,
+        cost_note: stringOr(raw.cost_note) || null,
+        note: stringOr(raw.note) || null,
+      }
+    : null;
+  return {
+    programName: stringOr(row.program_name).trim() || 'your program',
+    practiceName: stringOr(row.practice_name).trim() || 'A ReferralFit practice',
+    payload: payloadFromJson(row.payload),
+    sentAt,
+    respondBy,
+    requestStatus,
+    status,
+    canRespond: row.can_respond === true,
+    answer,
+  };
+}
+
+/** An answer already given, in one line: "Bed: Waitlist; likely to accept: Maybe; earliest admit 2026-11-12; $950 a day". */
+export function answerSummary(answer: AnswerFields | null): string {
+  if (!answer) return '';
+  const parts = [
+    `Bed: ${BED_CHOICES.find((choice) => choice.value === answer.bed_available)?.label || 'not given'}`,
+    `likely to accept: ${ACCEPT_CHOICES.find((choice) => choice.value === answer.likely_accept)?.label || 'not given'}`,
+  ];
+  if (answer.earliest_admit_on) parts.push(`earliest admit ${answer.earliest_admit_on.slice(0, 10)}`);
+  if (answer.daily_rate) parts.push(`$${answer.daily_rate.toLocaleString('en-US')} a day`);
+  return parts.join('; ');
 }
 
 /** PGRST202 / PGRST205 / 42P01 / 42703 / 42883: the server does not have placement requests yet. */

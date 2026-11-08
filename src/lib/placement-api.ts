@@ -13,6 +13,7 @@ import {
   seenMarker,
   sortRecipients,
   viewFromJson,
+  placementAnswerLink,
   type AdmitWindow,
   type AnswerFields,
   type PlacementChannel,
@@ -260,6 +261,42 @@ export async function closePlacementRequest(id: string): Promise<PlacementReques
   const { data, error, status } = await supabase.rpc('close_placement_request', { p_id: id });
   if (error) throw placementFailure(error, status, 'Could not close the request.');
   return viewOrThrow(data, 'Closed');
+}
+
+// Answer links made while the app runs, by recipient: a program texted and
+// then emailed gets the same link (the server keeps a recipient's five
+// newest links working; placement_answer_link).
+const answerLinks = new Map<string, string>();
+// Making a link must never hold up a text: past this, the message goes
+// without one.
+export const ANSWER_LINK_TIMEOUT_MS = 4000;
+
+/**
+ * The answer link for one program asked by hand (migration
+ * 20261108130000), or null: offline, slow, an older server without the
+ * migration, a closed request, or anything else. Never throws; the summary
+ * is sent without a link instead.
+ */
+export async function fetchPlacementAnswerLink(recipientId: string, timeoutMs: number = ANSWER_LINK_TIMEOUT_MS): Promise<string | null> {
+  const id = (recipientId || '').toLowerCase();
+  if (!id) return null;
+  const cached = answerLinks.get(id);
+  if (cached) return cached;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const call = (async () => {
+      const { data, error } = await supabase.rpc('placement_answer_link', { p_recipient_id: id });
+      return error ? null : placementAnswerLink(typeof data === 'string' ? data : null);
+    })();
+    const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); });
+    const link = await Promise.race([call, late]);
+    if (link) answerLinks.set(id, link);
+    return link;
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** A program's answer from a call or a text, logged by the practitioner. */
