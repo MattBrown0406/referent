@@ -150,3 +150,14 @@ Verify:
 SELECT count(*) FROM public.program_referrals;
 SELECT lead_channel, count(*) FROM public.cases WHERE lead_channel IS NOT NULL GROUP BY 1;
 ```
+
+## Notes from the 2026-11-08 audit (20261108170000)
+
+- A practice that joins another moves its program referrals with it
+  (`org_move_workspace_rows`); merging duplicate listings moves them too
+  (`merge_global_partners`).
+- "Entered treatment" counts only the practice's outbound referral records.
+- A program's referral history belongs to the program's listing: an account
+  that later manages the same listing (the earlier account removed, a claim
+  approved) sees the referrals the program made before it. This is intended:
+  the history is the program's, not one person's.

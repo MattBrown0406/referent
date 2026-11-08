@@ -7,7 +7,7 @@ domain:
 | --- | --- | --- | --- |
 | `placement_response` | the practitioner who sent a placement request | a program answers (in the portal or from an answer link), held two minutes so answers arriving together make one email; a program editing its answer emails at most once every 15 minutes per request | on |
 | `daily_summary` | a practice member who turned it on | around 7 AM in their time zone, only on days with something waiting | off |
-| `bed_reminder` | a program's center account | its beds were not confirmed in the last six days; at most once a week, sent at 16:00 UTC (9 AM Pacific) | on |
+| `bed_reminder` | a program's center account | its beds were not confirmed in the last five days (counts read Unconfirmed at seven), at most every five days, sent at 16:00 UTC (9 AM Pacific) | on |
 | `claim_request` | every platform admin | a program asks to manage its listing (`20261108150000`) | always (account email, no unsubscribe) |
 | `claim_decision` | the program that asked | ReferralFit approves or declines its request | always (account email, no unsubscribe) |
 
@@ -171,3 +171,26 @@ means `RESEND_API_KEY` is not set (every email waits until it is).
 - Local end to end: `supabase functions serve email-dispatch` with
   `EMAIL_RESEND_URL_FOR_TESTS` pointing at a stand-in for Resend (never set
   it in production).
+
+## Audit round 1 (2026-11-08, migration 20261108170000)
+
+- **Fixed content.** A row's content (answer counts, the bed check-in's
+  private link, claim details) is worked out the first time it is prepared
+  and stored with it (`prepared: true`), so a retry sends the same email and
+  Resend's idempotency key holds. Resend's `409 invalid_idempotent_request`
+  means an earlier try went out and is recorded as sent.
+- **Results one by one.** The dispatcher records each send right after it.
+- **Account problems.** A 401/403, or an invalid from or domain, stops the
+  run and returns every claimed row to waiting without spending an attempt
+  (`email_outbox_release`); it is logged once per run.
+- **Recipients re-checked at send:** an answer email only to a sender still
+  in the workspace (`not_member`), a claim alert only to a current admin
+  (`not_admin`). A morning summary more than 3 hours late expires
+  (`expired`) instead of going out with old counts. A row that cannot be
+  prepared is marked `prepare_failed` and never blocks the queue.
+- **Time zone.** The app sends the device's zone name on every load of email
+  settings (`set_email_timezone`); the summary uses it, so it stays at 7 AM
+  across daylight saving. The offset remains the fallback.
+- **Folding.** A new answer folds only into an email nobody claimed yet.
+- **One-click GET.** A mail client that opens the List-Unsubscribe address in
+  a browser is redirected to the /u page (which changes nothing).

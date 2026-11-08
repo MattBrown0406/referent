@@ -66,6 +66,14 @@ export default function AnswerLink() {
   const [notice, setNotice] = useState('');
   const [now, setNow] = useState(() => new Date());
   const prefilledRef = useRef(false);
+  // "Viewed" is the program's own doing: its first tap or key on the page,
+  // never the page load (mail and text scanners open links).
+  const seenRef = useRef(false);
+  const markSeen = useCallback(() => {
+    if (seenRef.current || !token) return;
+    seenRef.current = true;
+    void supabase.rpc('public_placement_answer_seen', { p_token: token }).then(() => undefined, () => { seenRef.current = false; });
+  }, [token]);
 
   const load = useCallback(async (): Promise<AnswerLinkView | null> => {
     if (!token) { setState('unavailable'); return null; }
@@ -167,7 +175,7 @@ export default function AnswerLink() {
   const left = view.canRespond ? timeLeft(view.respondBy, now) : '';
   const given = answerSummary(view.answer);
   return (
-    <main className="shell">
+    <main className="shell" onPointerDown={markSeen} onKeyDown={markSeen}>
       <div className="brand"><h1>ReferralFit</h1><span>Placement request</span></div>
       <section className="card placement answer-link">
         <p className="handoff-eyebrow">FROM {view.practiceName.toUpperCase()}</p>

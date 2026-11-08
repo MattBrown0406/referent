@@ -136,4 +136,42 @@ check(() => assert.match(migration, /IF auth\.uid\(\) IS NULL OR NOT public\.is_
 check(() => assert.match(migration, /IF v_admin IS NULL OR NOT public\.is_platform_admin\(\) THEN\s+RAISE EXCEPTION 'Only platform admins can decide claim requests'/));
 check(() => assert.doesNotMatch(migration, /[^\x00-\x7f]/), 'ASCII only');
 
+// ─── Audit round 1 (portal + app) ───────────────────────────────────────────
+const referralRules = require(transpileTo('portal/src/program-referral-rules.ts', 'portal/program-referral-rules.js'));
+check(() => {
+  const href = referralRules.safeWebsiteHref;
+  assert.equal(href('https://example.com/x'), 'https://example.com/x');
+  assert.equal(href('example.com'), 'https://example.com/');
+  assert.equal(href('www.example.com'), 'https://www.example.com/');
+  assert.equal(href('HTTP://Example.com'), 'http://example.com/');
+  for (const bad of ['javascript:alert(1)', 'JavaScript:alert(1)', 'data:text/html,x', 'mailto:a@b.c', '', '   ', null, undefined, 'http://']) {
+    assert.equal(href(bad), null, String(bad));
+  }
+});
+const emailRules = require(transpileTo('portal/src/email-rules.ts', 'portal/email-rules-audit.js'));
+check(() => {
+  const store = new Map();
+  globalThis.window = { sessionStorage: { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: (k) => store.delete(k) } };
+  const T = 'b'.repeat(64);
+  assert.equal(emailRules.tokenForTab('k', `#${T}`, emailRules.bedTokenFrom), T, 'from the link');
+  assert.equal(emailRules.tokenForTab('k', '', emailRules.bedTokenFrom), T, 'a reload keeps it for the tab');
+  assert.equal(emailRules.tokenForTab('k', '#cut-off', emailRules.bedTokenFrom), null, 'a cut-off link never falls back');
+  assert.equal(emailRules.tokenForTab('k', '', emailRules.bedTokenFrom), null, 'and forgets the old one');
+  delete globalThis.window;
+});
+const portalApp2 = read('portal/src/App.tsx');
+check(() => assert.match(portalApp2, /if \(hadSessionRef\.current\) \{ forgetClaimCode\(\); prefilledRef\.current = false; \}/), 'sign-out forgets the invite code');
+check(() => assert.match(portalApp2, /if \(code === 'P0002' \|\| code === '22023'\) forgetClaimCode\(\);/), 'a refused code frees the search');
+const answerPage = read('portal/src/AnswerLink.tsx');
+check(() => assert.match(answerPage, /onPointerDown=\{markSeen\} onKeyDown=\{markSeen\}/), 'viewed on the first interaction');
+check(() => assert.doesNotMatch(answerPage, /public_placement_answer_seen[\s\S]{0,80}useEffect/), 'never on load');
+for (const sheet of ['src/lib/PlacementRequestSheet.tsx', 'src/lib/PlacementCompare.tsx']) {
+  const source = read(sheet);
+  check(() => assert.match(source, /let answerLink = cachedPlacementAnswerLink\([^)]*\);\s*if \(!answerLink && Platform\.OS !== 'web'\) \{/), `${sheet}: the web never waits before sending`);
+  check(() => assert.match(source, /prefetchPlacementAnswerLinks\(/), `${sheet}: links are made ahead of time`);
+}
+for (const mod of ['src/lib/email-preferences.ts', 'src/lib/coaching.ts', 'src/lib/claim-requests.ts']) {
+  check(() => assert.doesNotMatch(read(mod), /new StoreError\(error\.message/), `${mod}: no raw server errors`);
+}
+
 console.log(`claim-test: ${checks} checks passed`);

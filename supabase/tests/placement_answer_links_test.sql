@@ -5,7 +5,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(54);
+SELECT plan(57);
 
 -- Actors
 --   p1  owner of practice P, sends the requests (push on, one device)
@@ -180,12 +180,16 @@ SELECT ok(
 SELECT is(
   (SELECT ARRAY[v ->> 'status', v ->> 'can_respond', coalesce(v ->> 'answer', 'none'), v ->> 'request_status']
      FROM (SELECT current_setting('test.view')::jsonb AS v) s),
-  ARRAY['viewed', 'true', 'none', 'open'],
-  'opened: viewed, can answer, no answer yet'
+  ARRAY['sent', 'true', 'none', 'open'],
+  'opened: still sent (opening reads only), can answer, no answer yet'
 );
+SET LOCAL ROLE anon;
+SELECT is(public.public_placement_answer_seen(current_setting('test.t2')), true, 'the program''s first tap marks it seen');
+SELECT is(public.public_placement_answer_seen(current_setting('test.t2')), false, 'once');
+RESET ROLE;
 SELECT ok(
   (SELECT status = 'viewed' AND viewed_at IS NOT NULL FROM public.placement_request_recipients WHERE id = current_setting('test.oaks')::uuid),
-  'opening marks the program''s row viewed'
+  'the program''s row reads viewed after its first interaction, never on page load (20261108170000)'
 );
 
 -- ===========================================================================
@@ -267,7 +271,7 @@ SELECT set_config('test.pview', public.public_placement_answer_open(current_sett
 RESET ROLE;
 SELECT is(
   (SELECT ARRAY[v ->> 'status', coalesce(v ->> 'answer', 'none')] FROM (SELECT current_setting('test.pview')::jsonb AS v) s),
-  ARRAY['viewed', 'none'],
+  ARRAY['sent', 'none'],
   'the program does not see the answer the practice logged: it reads unanswered'
 );
 SET LOCAL ROLE anon;
@@ -323,6 +327,11 @@ SELECT is(
   (SELECT ARRAY[v ->> 'request_status', v ->> 'can_respond'] FROM (SELECT public.public_placement_answer_open(current_setting('test.t_r2')) AS v) s),
   ARRAY['cancelled', 'false'],
   'the page says the request is closed'
+);
+SELECT is(
+  (SELECT (v -> 'payload') = '{}'::jsonb AND v ->> 'practice_name' = '' FROM (SELECT public.public_placement_answer_open(current_setting('test.t_r2')) AS v) s),
+  true,
+  'a closed request shows only its status: no summary, no practice name (20261108170000)'
 );
 SELECT throws_ok(
   $$ SELECT public.public_placement_answer_respond(current_setting('test.t_r2'), 'yes', 'yes', NULL, NULL, NULL, NULL) $$,
