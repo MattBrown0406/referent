@@ -11,8 +11,10 @@
 //   * the service role holds no table grants: claiming and recording go
 //     through service-role-only RPCs, which fill in the address and counts;
 //   * nothing about a recipient or an email's content is logged here;
-//   * each send carries the outbox id as Resend's Idempotency-Key, so a
-//     retry after an unknown outcome never sends the same email twice.
+//   * each send carries the outbox id (plus a hash of the sender settings)
+//     as Resend's Idempotency-Key, and a retry renders the same body from the
+//     row's prepared data and prepared_at, so a retry after an unknown
+//     outcome never sends the same email twice.
 
 import { createClient } from 'npm:@supabase/supabase-js@2.110.8';
 
@@ -23,10 +25,12 @@ import {
   DEFAULT_PORTAL_URL,
   DEFAULT_REPLY_TO,
   classifyResendFailure,
+  idempotencyKey,
   isAuthorized,
   type Links,
   oneClickFrom,
   type OutboxRow,
+  preparedAt,
   renderEmail,
   RESEND_URL,
   resendBody,
@@ -61,17 +65,18 @@ type SendOutcome = SendResult & { config?: boolean };
 async function sendOne(row: OutboxRow, apiKey: string, from: string, replyTo: string | undefined, target: Links): Promise<SendOutcome> {
   let email;
   try {
-    email = renderEmail(row, target);
+    email = renderEmail(row, target, preparedAt(row));
   } catch {
     return { id: row.id, error: 'render_failed', retry: false };
   }
   try {
+    const key = await idempotencyKey(row, from, replyTo, target);
     const response = await fetch(Deno.env.get('EMAIL_RESEND_URL_FOR_TESTS') || RESEND_URL, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${apiKey}`,
         'content-type': 'application/json',
-        'idempotency-key': row.id,
+        'idempotency-key': key,
       },
       body: JSON.stringify(resendBody(row, email, from, replyTo)),
     });
@@ -81,7 +86,6 @@ async function sendOne(row: OutboxRow, apiKey: string, from: string, replyTo: st
     }
     const failure = await response.json().catch(() => null);
     const kind = classifyResendFailure(response.status, failure);
-    if (kind === 'sent') return { id: row.id, provider_id: '' };
     return { id: row.id, error: `resend_${response.status}`, retry: kind !== 'final', config: kind === 'config' };
   } catch {
     return { id: row.id, error: 'network', retry: true };
@@ -93,11 +97,12 @@ async function record(supabase: ReturnType<typeof serviceClient>, result: SendRe
   if (error) throw error;
 }
 
-// Rows claimed but not tried (a configuration error stopped the run): back
-// to waiting, without spending an attempt.
-async function release(supabase: ReturnType<typeof serviceClient>, ids: string[]): Promise<void> {
-  if (!ids.length) return;
-  const { error } = await supabase.rpc('email_outbox_release', { p_ids: ids });
+// A configuration error stopped the run: the row tried keeps its attempt and
+// waits 15 minutes (so one row that only looks like a configuration problem
+// cannot hold the queue forever); the rows not tried go back to waiting
+// without spending one.
+async function release(supabase: ReturnType<typeof serviceClient>, untried: string[], tried: string, reason: string): Promise<void> {
+  const { error } = await supabase.rpc('email_outbox_release', { p_ids: untried, p_tried: tried, p_error: reason });
   if (error) console.error('email-dispatch: release failed', error.code || 'unknown');
 }
 
@@ -118,10 +123,10 @@ async function drain(supabase: ReturnType<typeof serviceClient>): Promise<{ sent
       if (index) await sleep(SEND_SPACING_MS);
       const result = await sendOne(rows[index], apiKey, from, replyTo, target);
       if (result.config) {
-        // The account or sender is wrong: nothing can go out. Keep this and
-        // every claimed row waiting, without spending their attempts.
+        // The account or sender is wrong: nothing can go out. Stop, and keep
+        // the claimed rows waiting.
         console.error('email-dispatch: Resend refused the account or sender', result.error);
-        await release(supabase, rows.slice(index).map((row) => row.id));
+        await release(supabase, rows.slice(index + 1).map((row) => row.id), rows[index].id, result.error || 'config');
         return { ...totals, stopped: result.error };
       }
       // Recorded one by one, so a crash mid-batch never resends what went out.

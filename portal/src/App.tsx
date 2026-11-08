@@ -392,8 +392,9 @@ export default function App() {
     } catch (claimException) {
       // A code that is unknown, used or expired will not work later either:
       // show the search again so the program can ask instead.
+      // Only the code the link brought: a typo in the field keeps it.
       const code = (claimException as { code?: string }).code;
-      if (code === 'P0002' || code === '22023') forgetClaimCode();
+      if ((code === 'P0002' || code === '22023') && claimCode.trim().toLowerCase() === pendingClaimCode) forgetClaimCode();
       setError((claimException as Error).message);
     } finally {
       setBusy(false);

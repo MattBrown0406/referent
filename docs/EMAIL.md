@@ -176,13 +176,24 @@ means `RESEND_API_KEY` is not set (every email waits until it is).
 
 - **Fixed content.** A row's content (answer counts, the bed check-in's
   private link, claim details) is worked out the first time it is prepared
-  and stored with it (`prepared: true`), so a retry sends the same email and
-  Resend's idempotency key holds. Resend's `409 invalid_idempotent_request`
-  means an earlier try went out and is recorded as sent.
+  and stored with it (`prepared: true`, `prepared_at`), and a retry renders
+  from that data as of `prepared_at`, so it sends the same email. The
+  Idempotency-Key is the outbox id plus a short hash of the sender settings
+  and the address (`idempotencyKey`), so Resend replays a repeat's first
+  result, and a send after a sender fix is a new send. A `409
+  invalid_idempotent_request` (a key reused with a different body) is
+  recorded as a failure (`resend_409`), never as sent.
 - **Results one by one.** The dispatcher records each send right after it.
-- **Account problems.** A 401/403, or an invalid from or domain, stops the
-  run and returns every claimed row to waiting without spending an attempt
-  (`email_outbox_release`); it is logged once per run.
+- **Account problems.** A 401/403, an invalid from or reply-to, or an
+  unverified sending domain stops the run (logged once per run). The row
+  tried keeps its attempt and waits 15 minutes; the claimed rows not tried go
+  back to waiting without spending one (`email_outbox_release(untried,
+  tried, error)`). So a bad key delays mail (each row has 5 attempts, at
+  least 15 minutes apart while the problem lasts) and one row that only
+  looks like an account problem cannot hold the queue.
+- **Bed check-in link.** Its token leaves the outbox row once the row is sent
+  or has failed for good (`email_outbox_record`); the link itself is stored
+  hashed.
 - **Recipients re-checked at send:** an answer email only to a sender still
   in the workspace (`not_member`), a claim alert only to a current admin
   (`not_admin`). A morning summary more than 3 hours late expires
@@ -190,7 +201,9 @@ means `RESEND_API_KEY` is not set (every email waits until it is).
   prepared is marked `prepare_failed` and never blocks the queue.
 - **Time zone.** The app sends the device's zone name on every load of email
   settings (`set_email_timezone`); the summary uses it, so it stays at 7 AM
-  across daylight saving. The offset remains the fallback.
+  across daylight saving. The offset remains the fallback. The server's zone
+  list (slow to scan) is read only when a member's zone name changes, and
+  the hourly summary job never reads it (`email_local_now`).
 - **Folding.** A new answer folds only into an email nobody claimed yet.
 - **One-click GET.** A mail client that opens the List-Unsubscribe address in
   a browser is redirected to the /u page (which changes nothing).

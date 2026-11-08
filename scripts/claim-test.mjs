@@ -161,15 +161,25 @@ check(() => {
 });
 const portalApp2 = read('portal/src/App.tsx');
 check(() => assert.match(portalApp2, /if \(hadSessionRef\.current\) \{ forgetClaimCode\(\); prefilledRef\.current = false; \}/), 'sign-out forgets the invite code');
-check(() => assert.match(portalApp2, /if \(code === 'P0002' \|\| code === '22023'\) forgetClaimCode\(\);/), 'a refused code frees the search');
+check(() => assert.match(portalApp2, /if \(\(code === 'P0002' \|\| code === '22023'\) && claimCode\.trim\(\)\.toLowerCase\(\) === pendingClaimCode\) forgetClaimCode\(\);/),
+  'a refused code frees the search, but a typo keeps the code the link brought');
 const answerPage = read('portal/src/AnswerLink.tsx');
 check(() => assert.match(answerPage, /onPointerDown=\{markSeen\} onKeyDown=\{markSeen\}/), 'viewed on the first interaction');
 check(() => assert.doesNotMatch(answerPage, /public_placement_answer_seen[\s\S]{0,80}useEffect/), 'never on load');
+check(() => assert.match(answerPage, /\(\{ error \}\) => \{ if \(error\) seenRef\.current = false; \}/), 'a failed "seen" is tried again on the next tap');
 for (const sheet of ['src/lib/PlacementRequestSheet.tsx', 'src/lib/PlacementCompare.tsx']) {
   const source = read(sheet);
-  check(() => assert.match(source, /let answerLink = cachedPlacementAnswerLink\([^)]*\);\s*if \(!answerLink && Platform\.OS !== 'web'\) \{/), `${sheet}: the web never waits before sending`);
-  check(() => assert.match(source, /prefetchPlacementAnswerLinks\(/), `${sheet}: links are made ahead of time`);
+  check(() => assert.match(source, /let answerLink = cachedPlacementAnswerLink\([^)]*\);[^\n]*\n[^\n]*\n\s*if \(!answerLink && Platform\.OS === 'web'\) prefetchPlacementAnswerLinks\(\[[^\]]+\]\);\s*if \(!answerLink && Platform\.OS !== 'web'\) \{/),
+    `${sheet}: the web never waits before sending, and a miss makes the link for the next tap`);
+  check(() => assert.match(source, /Platform\.OS (?:!==|===) 'web'[^\n]*acceptingAnswers\(/), `${sheet}: links are made ahead only on the web, while answers are accepted`);
+  check(() => assert.match(source, /phone\.trim\(\) \|\| [a-z.]*email\.trim\(\)/), `${sheet}: only for programs that can be texted or emailed`);
 }
+const placementApi = read('src/lib/placement-api.ts');
+check(() => assert.match(placementApi, /if \(epoch !== answerLinkEpoch\) return null;/), 'a link still in flight at sign-out is not used');
+check(() => assert.match(placementApi, /answerLinkEpoch \+= 1;/), 'sign-out bumps the epoch');
+check(() => assert.match(read('src/lib/outreach-api.ts'), /if \(Platform\.OS === 'web'\) \{\s*await Linking\.openURL\(url\);/), 'the web opens Mail without a check first');
+const round1 = read('supabase/migrations/20261108170000_audit_round1.sql');
+check(() => assert.match(round1, /ORDER BY k\.created_at DESC, k\.token_hash LIMIT 50\);/), 'a program keeps its 50 newest links');
 for (const mod of ['src/lib/email-preferences.ts', 'src/lib/coaching.ts', 'src/lib/claim-requests.ts']) {
   check(() => assert.doesNotMatch(read(mod), /new StoreError\(error\.message/), `${mod}: no raw server errors`);
 }

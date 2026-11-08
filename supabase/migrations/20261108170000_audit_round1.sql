@@ -29,6 +29,16 @@
 --      an attempt (a Resend account problem).
 --   9. Helper functions from 20261108150000 are no longer executable by
 --      clients (they never needed to be).
+--  10. Answer links: a program keeps its 50 newest links working (was 5).
+--      The web app makes a link ahead of the tap, so a few reloads must not
+--      retire the one the program was actually sent.
+--  11. Round 2 of the audit: the time zone list is read only when a member's
+--      zone changes (never per member per hour); a closed link sends no
+--      payload at all (null), so the page shows no made-up details; a
+--      prepared row records when (prepared_at) so a retry renders the same
+--      email; a sent or failed bed check-in drops its link token from the
+--      outbox; and a configuration stop charges the one row it tried (it
+--      waits 15 minutes) so no single row can hold the queue forever.
 --
 -- Transit-safe: ASCII only, no backslashes, every statement under 3,700
 -- characters.
@@ -213,19 +223,25 @@ AS $$
 DECLARE
   v_user uuid := auth.uid();
   v_name text := nullif(btrim(coalesce(p_tz_name, '')), '');
+  v_pref public.email_preferences%ROWTYPE;
+  v_offset integer;
 BEGIN
   IF v_user IS NULL THEN
     RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
   END IF;
-  IF v_name IS NOT NULL AND (length(v_name) > 64 OR NOT EXISTS (SELECT 1 FROM pg_timezone_names z WHERE z.name = v_name)) THEN
+  v_pref := public.email_preferences_row(v_user);
+  -- The zone list is read only for a name not stored yet (it is slow to scan).
+  IF v_name IS NOT NULL AND v_name IS DISTINCT FROM v_pref.tz_name
+     AND (length(v_name) > 64 OR NOT EXISTS (SELECT 1 FROM pg_timezone_names z WHERE z.name = v_name)) THEN
     v_name := NULL;
   END IF;
-  PERFORM public.email_preferences_row(v_user);
-  UPDATE public.email_preferences p
-     SET tz_name = coalesce(v_name, p.tz_name),
-         tz_offset_minutes = CASE WHEN p_tz_offset_minutes BETWEEN -840 AND 840 THEN p_tz_offset_minutes ELSE p.tz_offset_minutes END,
-         updated_at = now()
-   WHERE p.user_id = v_user;
+  v_name := coalesce(v_name, v_pref.tz_name);
+  v_offset := CASE WHEN p_tz_offset_minutes BETWEEN -840 AND 840 THEN p_tz_offset_minutes ELSE v_pref.tz_offset_minutes END;
+  IF v_name IS DISTINCT FROM v_pref.tz_name OR v_offset IS DISTINCT FROM v_pref.tz_offset_minutes THEN
+    UPDATE public.email_preferences p
+       SET tz_name = v_name, tz_offset_minutes = v_offset, updated_at = now()
+     WHERE p.user_id = v_user;
+  END IF;
   RETURN true;
 END
 $$;
@@ -233,14 +249,24 @@ REVOKE ALL ON FUNCTION public.set_email_timezone(text, integer) FROM PUBLIC, ano
 GRANT EXECUTE ON FUNCTION public.set_email_timezone(text, integer) TO authenticated;
 
 -- A member's local time now: their zone when known, else the stored offset.
+-- Names were checked against the zone list when saved (set_email_timezone);
+-- scanning that list here would cost a scan per member every hour. The
+-- pattern keeps out POSIX strings such as 'UTC+5' (their sign is reversed).
 CREATE OR REPLACE FUNCTION public.email_local_now(p_tz_name text, p_tz_offset_minutes integer)
 RETURNS timestamp
-LANGUAGE sql STABLE
+LANGUAGE plpgsql STABLE
 SET search_path = public
 AS $$
-  SELECT CASE WHEN p_tz_name IS NOT NULL AND EXISTS (SELECT 1 FROM pg_timezone_names z WHERE z.name = p_tz_name)
-              THEN now() AT TIME ZONE p_tz_name
-              ELSE (now() AT TIME ZONE 'UTC') + make_interval(mins => coalesce(p_tz_offset_minutes, -420)) END
+BEGIN
+  IF p_tz_name ~ '^[A-Za-z]+(/[A-Za-z0-9_+-]+){0,2}$' THEN
+    BEGIN
+      RETURN now() AT TIME ZONE p_tz_name;
+    EXCEPTION WHEN OTHERS THEN
+      NULL;
+    END;
+  END IF;
+  RETURN (now() AT TIME ZONE 'UTC') + make_interval(mins => coalesce(p_tz_offset_minutes, -420));
+END
 $$;
 REVOKE ALL ON FUNCTION public.email_local_now(text, integer) FROM PUBLIC, anon, authenticated, service_role;
 
@@ -353,9 +379,10 @@ BEGIN
     FROM public.placement_request_recipients r
     JOIN public.placement_requests q ON q.id = r.request_id
    WHERE r.id = v_id;
-  -- Closed, cancelled, or a week past the deadline: the status only.
+  -- Closed, cancelled, or a week past the deadline: the status only (a null
+  -- payload, so the page shows no request details).
   IF NOT coalesce(v_live, false) THEN
-    v_view := v_view || jsonb_build_object('payload', '{}'::jsonb, 'practice_name', '');
+    v_view := v_view || jsonb_build_object('payload', NULL::jsonb, 'practice_name', '');
   END IF;
   RETURN v_view;
 END
@@ -472,7 +499,7 @@ BEGIN
   ELSIF o.kind IN ('claim_request', 'claim_decision') THEN
     v_data := v_data || coalesce(public.email_claim_details(o.kind, o.data), '{}'::jsonb);
   END IF;
-  RETURN v_data || jsonb_build_object('prepared', true);
+  RETURN v_data || jsonb_build_object('prepared', true, 'prepared_at', now());
 END
 $$;
 REVOKE ALL ON FUNCTION public.email_prepare_data(public.email_outbox) FROM PUBLIC, anon, authenticated, service_role;
@@ -547,9 +574,11 @@ $$;
 REVOKE ALL ON FUNCTION public.email_outbox_claim(integer) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.email_outbox_claim(integer) TO service_role;
 
--- Claimed rows the dispatcher did not try (Resend refused the account or the
--- sender): back to waiting, without spending an attempt.
-CREATE OR REPLACE FUNCTION public.email_outbox_release(p_ids uuid[])
+-- Resend refused the account or the sender. The row that was tried keeps the
+-- attempt it spent and waits 15 minutes (so a row that only looks like a
+-- configuration problem cannot hold the queue forever); the claimed rows not
+-- tried go back to waiting without spending one.
+CREATE OR REPLACE FUNCTION public.email_outbox_release(p_ids uuid[], p_tried uuid, p_error text)
 RETURNS integer
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public
@@ -558,13 +587,48 @@ DECLARE
   v_count integer;
 BEGIN
   UPDATE public.email_outbox o SET claimed_at = NULL, attempts = greatest(o.attempts - 1, 0)
-   WHERE o.id = ANY (coalesce(p_ids, '{}'::uuid[])) AND o.sent_at IS NULL AND o.error IS NULL;
+   WHERE o.id = ANY (coalesce(p_ids, '{}'::uuid[])) AND o.id IS DISTINCT FROM p_tried
+     AND o.claimed_at IS NOT NULL AND o.sent_at IS NULL AND o.error IS NULL;
   GET DIAGNOSTICS v_count = ROW_COUNT;
+  UPDATE public.email_outbox o
+     SET claimed_at = NULL, not_before = now() + interval '15 minutes', last_error = left(coalesce(p_error, 'config'), 300)
+   WHERE o.id = p_tried AND o.sent_at IS NULL AND o.error IS NULL;
   RETURN v_count;
 END
 $$;
-REVOKE ALL ON FUNCTION public.email_outbox_release(uuid[]) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.email_outbox_release(uuid[]) TO service_role;
+REVOKE ALL ON FUNCTION public.email_outbox_release(uuid[], uuid, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.email_outbox_release(uuid[], uuid, text) TO service_role;
+
+-- Same as 20261108120000; a bed check-in's link token leaves the outbox once
+-- the row is sent or has failed for good (the link itself is stored hashed).
+CREATE OR REPLACE FUNCTION public.email_outbox_record(p_results jsonb)
+RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  r jsonb;
+  v_count integer := 0;
+BEGIN
+  FOR r IN SELECT value FROM jsonb_array_elements(coalesce(p_results, '[]'::jsonb)) LOOP
+    IF coalesce(r ->> 'error', '') = '' THEN
+      UPDATE public.email_outbox o SET sent_at = now(), provider_id = left(r ->> 'provider_id', 200), last_error = NULL,
+             data = o.data - 'link_token'
+       WHERE o.id = (r ->> 'id')::uuid AND o.sent_at IS NULL;
+    ELSIF coalesce((r ->> 'retry')::boolean, false) THEN
+      UPDATE public.email_outbox o SET last_error = left(r ->> 'error', 300)
+       WHERE o.id = (r ->> 'id')::uuid AND o.sent_at IS NULL;
+    ELSE
+      UPDATE public.email_outbox o SET error = left(r ->> 'error', 300), data = o.data - 'link_token'
+       WHERE o.id = (r ->> 'id')::uuid AND o.sent_at IS NULL;
+    END IF;
+    v_count := v_count + 1;
+  END LOOP;
+  RETURN v_count;
+END
+$$;
+REVOKE ALL ON FUNCTION public.email_outbox_record(jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.email_outbox_record(jsonb) TO service_role;
 
 -- ===========================================================================
 -- 9. Helpers that clients never call
@@ -573,5 +637,52 @@ GRANT EXECUTE ON FUNCTION public.email_outbox_release(uuid[]) TO service_role;
 REVOKE ALL ON FUNCTION public.listing_is_program(text[]) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.website_host(text) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.email_matches_website(text, text) FROM PUBLIC, anon, authenticated;
+
+-- ===========================================================================
+-- 10. Answer links: the 50 newest per program stay working
+-- ===========================================================================
+-- Same as 20261108130000 with LIMIT 50 instead of 5.
+CREATE OR REPLACE FUNCTION public.placement_answer_link(p_recipient_id uuid)
+RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_user uuid := auth.uid();
+  r public.placement_request_recipients%ROWTYPE;
+  q public.placement_requests%ROWTYPE;
+  v_token text;
+BEGIN
+  IF v_user IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
+  END IF;
+  SELECT * INTO r FROM public.placement_request_recipients x
+   WHERE x.id = p_recipient_id AND x.org_id = public.current_org_id();
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'That program is not on this request' USING ERRCODE = 'P0002';
+  END IF;
+  IF r.channel <> 'manual' THEN
+    RAISE EXCEPTION 'This program answers in ReferralFit' USING ERRCODE = '22023';
+  END IF;
+  SELECT * INTO q FROM public.placement_requests WHERE id = r.request_id;
+  IF q.status <> 'open' THEN
+    RAISE EXCEPTION 'This request is closed' USING ERRCODE = '22023';
+  END IF;
+  IF now() > q.respond_by THEN
+    RAISE EXCEPTION 'The time to answer this request has passed' USING ERRCODE = '22023';
+  END IF;
+  v_token := pg_catalog.encode(extensions.gen_random_bytes(32), 'hex');
+  INSERT INTO public.placement_answer_links (token_hash, recipient_id, created_by)
+  VALUES (extensions.digest(v_token, 'sha256'), r.id, v_user);
+  DELETE FROM public.placement_answer_links l
+   WHERE l.recipient_id = r.id
+     AND l.token_hash NOT IN (SELECT k.token_hash FROM public.placement_answer_links k
+                               WHERE k.recipient_id = r.id
+                               ORDER BY k.created_at DESC, k.token_hash LIMIT 50);
+  RETURN v_token;
+END
+$$;
+REVOKE ALL ON FUNCTION public.placement_answer_link(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.placement_answer_link(uuid) TO authenticated;
 
 COMMIT;

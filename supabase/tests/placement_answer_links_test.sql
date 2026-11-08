@@ -294,20 +294,20 @@ SELECT is((SELECT answered_via FROM public.placement_request_recipients WHERE id
   'an answer from the center portal reads portal');
 
 -- ===========================================================================
--- E. Newest five links; closed and expired requests
+-- E. Newest 50 links; closed and expired requests
 -- ===========================================================================
 
 SELECT set_config('request.jwt.claim.sub', 'b1000000-0000-0000-0000-0000000000c9', true);
 SET LOCAL ROLE authenticated;
 SELECT set_config('test.r3a', public.placement_answer_link(current_setting('test.r3')::uuid), true);
-SELECT public.placement_answer_link(current_setting('test.r3')::uuid) FROM generate_series(1, 4);
+SELECT public.placement_answer_link(current_setting('test.r3')::uuid) FROM generate_series(1, 49);
 SELECT set_config('test.r3f', public.placement_answer_link(current_setting('test.r3')::uuid), true);
 RESET ROLE;
 SELECT set_config('request.jwt.claim.sub', '', true);
-SELECT is((SELECT count(*)::integer FROM public.placement_answer_links WHERE recipient_id = current_setting('test.r3')::uuid), 5,
-  'a program keeps its five newest links');
+SELECT is((SELECT count(*)::integer FROM public.placement_answer_links WHERE recipient_id = current_setting('test.r3')::uuid), 50,
+  'a program keeps its 50 newest links (audit round 2: the web app makes links ahead of the tap)');
 SET LOCAL ROLE anon;
-SELECT is(public.public_placement_answer_open(current_setting('test.r3a')), NULL::jsonb, 'the sixth link retires the oldest');
+SELECT is(public.public_placement_answer_open(current_setting('test.r3a')), NULL::jsonb, 'the 51st link retires the oldest');
 SELECT ok(public.public_placement_answer_open(current_setting('test.r3f')) IS NOT NULL, 'the newest works');
 RESET ROLE;
 
@@ -329,7 +329,7 @@ SELECT is(
   'the page says the request is closed'
 );
 SELECT is(
-  (SELECT (v -> 'payload') = '{}'::jsonb AND v ->> 'practice_name' = '' FROM (SELECT public.public_placement_answer_open(current_setting('test.t_r2')) AS v) s),
+  (SELECT jsonb_typeof(v -> 'payload') = 'null' AND v ->> 'practice_name' = '' FROM (SELECT public.public_placement_answer_open(current_setting('test.t_r2')) AS v) s),
   true,
   'a closed request shows only its status: no summary, no practice name (20261108170000)'
 );
@@ -375,7 +375,7 @@ SELECT set_config('request.jwt.claim.sub', '', true);
 SELECT ok(
   (SELECT count(*) FROM public.placement_answer_links l
      JOIN public.placement_request_recipients r ON r.id = l.recipient_id
-    WHERE r.request_id = '93000000-0000-0000-0000-0000000000c9') = 5,
+    WHERE r.request_id = '93000000-0000-0000-0000-0000000000c9') = 50,
   'the links are there before the request is deleted'
 );
 DELETE FROM public.placement_requests WHERE id = '93000000-0000-0000-0000-0000000000c9';

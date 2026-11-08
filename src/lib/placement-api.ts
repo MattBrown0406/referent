@@ -264,11 +264,13 @@ export async function closePlacementRequest(id: string): Promise<PlacementReques
 }
 
 // Answer links made while the app runs, by recipient: a program texted and
-// then emailed gets the same link (the server keeps a recipient's five
+// then emailed gets the same link (the server keeps a recipient's 50
 // newest links working; placement_answer_link).
 const answerLinks = new Map<string, string>();
 // Requests in flight, so a prefetch and a tap never ask twice.
-const answerLinkRequests: Record<string, Promise<string | null> | undefined> = {};
+const answerLinkRequests: Record<string, Promise<string | null> | undefined> = Object.create(null);
+// Bumped on sign-out: a request still in flight then never fills the cache.
+let answerLinkEpoch = 0;
 // Making a link must never hold up a text: past this, the message goes
 // without one.
 export const ANSWER_LINK_TIMEOUT_MS = 4000;
@@ -284,20 +286,26 @@ export async function fetchPlacementAnswerLink(recipientId: string, timeoutMs: n
   if (!id) return null;
   const cached = answerLinks.get(id);
   if (cached) return cached;
+  const epoch = answerLinkEpoch;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     let call = answerLinkRequests[id];
     if (!call) {
-      call = (async () => {
+      const pending: Promise<string | null> = (async () => {
         const { data, error } = await supabase.rpc('placement_answer_link', { p_recipient_id: id });
         const made = error ? null : placementAnswerLink(typeof data === 'string' ? data : null);
-        if (made) answerLinks.set(id, made);
+        if (made && epoch === answerLinkEpoch) answerLinks.set(id, made);
         return made;
-      })().catch(() => null).finally(() => { answerLinkRequests[id] = undefined; });
-      answerLinkRequests[id] = call;
+      })().catch(() => null).finally(() => {
+        if (answerLinkRequests[id] === pending) answerLinkRequests[id] = undefined;
+      });
+      answerLinkRequests[id] = pending;
+      call = pending;
     }
     const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); });
     const link = await Promise.race([call, late]);
+    // Signed out meanwhile: that account's link is not used.
+    if (epoch !== answerLinkEpoch) return null;
     if (link) answerLinks.set(id, link);
     return link;
   } catch {
@@ -314,9 +322,10 @@ export function cachedPlacementAnswerLink(recipientId: string): string | null {
 
 /**
  * Make the links for programs asked by hand as soon as their row shows, so a
- * tap never waits. On the web it must not: Safari allows the clipboard and
- * mail only during the tap itself, so a send there uses only a link made
- * ahead of time (answerLinkForSend).
+ * web tap never waits. It must not: Safari allows the clipboard and mail only
+ * during the tap itself, so a send there uses only a link made ahead of time
+ * (cachedPlacementAnswerLink). Call it only for rows that can be sent: each
+ * link made is one more the server keeps for that program.
  */
 export function prefetchPlacementAnswerLinks(recipientIds: string[]): void {
   for (const recipientId of recipientIds) {
@@ -327,6 +336,7 @@ export function prefetchPlacementAnswerLinks(recipientIds: string[]): void {
 
 /** Sign-out: links made for the previous account are dropped. */
 export function clearPlacementAnswerLinks(): void {
+  answerLinkEpoch += 1;
   answerLinks.clear();
   for (const key of Object.keys(answerLinkRequests)) answerLinkRequests[key] = undefined;
 }

@@ -161,9 +161,18 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
   // The program whose answer link is being made right now (native only).
   const [preparingId, setPreparingId] = useState<string | null>(null);
 
-  // Programs asked by hand: make their answer links now, so a tap never waits.
+  // Programs asked by hand with a phone or email on file: make their answer
+  // links now, so a web tap never waits (web only; see PlacementCompare).
   useEffect(() => {
-    if (sent) prefetchPlacementAnswerLinks(sent.recipients.filter((item) => item.channel === 'manual').map((item) => item.id));
+    if (!sent || Platform.OS !== 'web' || !acceptingAnswers(sent.request, new Date())) return;
+    const reachable = new Set(options
+      .filter((item) => item.partner.phone.trim() || item.partner.email.trim())
+      .map((item) => item.partner.id.toLowerCase()));
+    prefetchPlacementAnswerLinks(sent.recipients
+      .filter((item) => item.channel === 'manual' && item.partnerId && reachable.has(item.partnerId))
+      .map((item) => item.id));
+    // Once per sent request; the options it reads are fixed by then.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sent]);
   // The server kept an earlier request under this id as first written: the
   // practitioner is told, and offered Cancel before sending a new one.
@@ -398,6 +407,8 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
       // Safari allows the clipboard and mail only during the tap, so the web
       // uses a link already made, or sends without one.
       let answerLink = cachedPlacementAnswerLink(recipientId);
+      // The web sends this one without a link; the next tap has it.
+      if (!answerLink && Platform.OS === 'web') prefetchPlacementAnswerLinks([recipientId]);
       if (!answerLink && Platform.OS !== 'web') {
         setPreparingId(recipientId);
         try {

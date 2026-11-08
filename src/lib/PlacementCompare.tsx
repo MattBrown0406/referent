@@ -144,8 +144,17 @@ export default function PlacementCompare({
   // The program whose answer link is being made right now (native only).
   const [preparingId, setPreparingId] = useState<string | null>(null);
 
-  // Programs asked by hand that can still answer: make their links now.
-  const manualIds = view ? view.recipients.filter((item) => item.channel === 'manual' && !item.respondedAt).map((item) => item.id).join(',') : '';
+  // Programs asked by hand that can still answer, with a phone or email on
+  // file: make their links now. Web only (a send there cannot wait; on the
+  // iPhone a tap waits with "Preparing..."), since every link made is one
+  // more the server keeps for that program.
+  const manualIds = Platform.OS === 'web' && view && acceptingAnswers(view.request, new Date())
+    ? view.recipients.filter((item) => {
+        if (item.channel !== 'manual' || item.respondedAt) return false;
+        const partner = item.partnerId ? partnersById.get(item.partnerId) : undefined;
+        return Boolean(partner && (partner.phone.trim() || partner.email.trim()));
+      }).map((item) => item.id).join(',')
+    : '';
   useEffect(() => {
     if (manualIds) prefetchPlacementAnswerLinks(manualIds.split(','));
   }, [manualIds]);
@@ -288,6 +297,8 @@ export default function PlacementCompare({
       // Safari allows the clipboard and mail only during the tap, so the web
       // uses a link already made, or sends without one.
       let answerLink = cachedPlacementAnswerLink(recipient.id);
+      // The web sends this one without a link; the next tap has it.
+      if (!answerLink && Platform.OS === 'web') prefetchPlacementAnswerLinks([recipient.id]);
       if (!answerLink && Platform.OS !== 'web') {
         setPreparingId(recipient.id);
         try {

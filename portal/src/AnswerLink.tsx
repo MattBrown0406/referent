@@ -72,7 +72,11 @@ export default function AnswerLink() {
   const markSeen = useCallback(() => {
     if (seenRef.current || !token) return;
     seenRef.current = true;
-    void supabase.rpc('public_placement_answer_seen', { p_token: token }).then(() => undefined, () => { seenRef.current = false; });
+    // supabase-js reports a failure in the result, not by rejecting.
+    void supabase.rpc('public_placement_answer_seen', { p_token: token }).then(
+      ({ error }) => { if (error) seenRef.current = false; },
+      () => { seenRef.current = false; },
+    );
   }, [token]);
 
   const load = useCallback(async (): Promise<AnswerLinkView | null> => {
@@ -178,21 +182,23 @@ export default function AnswerLink() {
     <main className="shell" onPointerDown={markSeen} onKeyDown={markSeen}>
       <div className="brand"><h1>ReferralFit</h1><span>Placement request</span></div>
       <section className="card placement answer-link">
-        <p className="handoff-eyebrow">FROM {view.practiceName.toUpperCase()}</p>
+        <p className="handoff-eyebrow">{view.payload ? `FROM ${view.practiceName.toUpperCase()}` : 'PLACEMENT REQUEST'}</p>
         <h2 className="handoff-title">Can {view.programName} take this client?</h2>
         <p className="help">{PROGRAM_INTRO}</p>
         <div className="status-row">
           {reason ? <span className="badge archived">Closed</span> : <span className="badge pending">{left || 'Closing'}</span>}
           {view.answer ? <span className="badge active">Answered</span> : null}
         </div>
-        <dl className="summary">
-          {summaryLines(view.payload).map((line) => (
-            <div key={line.label}>
-              <dt>{line.label}</dt>
-              <dd>{line.value}</dd>
-            </div>
-          ))}
-        </dl>
+        {view.payload ? (
+          <dl className="summary">
+            {summaryLines(view.payload).map((line) => (
+              <div key={line.label}>
+                <dt>{line.label}</dt>
+                <dd>{line.value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
         {notice ? <div className="success" role="status">{notice}</div> : null}
         {reason ? (
           <>

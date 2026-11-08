@@ -828,6 +828,9 @@ function topLevelStatements(sql) {
     ['Unclaimed Oaks', 'Cascade Interventions', 'viewed', true, null, 'open']);
   check('and the summary the inbox shows', portal.summaryLines(parsed.payload), portal.summaryLines(portal.payloadFromJson(JSON.parse(FIXTURE_JSON))));
   check('a link that does not work reads as nothing', [portal.answerLinkViewFromJson(null), portal.answerLinkViewFromJson({}), portal.answerLinkViewFromJson([])], [null, null, null]);
+  check('a closed request shows no details (audit round 2: never made-up defaults)',
+    [portal.answerLinkViewFromJson({ ...served, payload: null, practice_name: '', request_status: 'closed' }).payload,
+     portal.answerLinkViewFromJson({ ...served, payload: {} }).payload], [null, null]);
   const answered = portal.answerLinkViewFromJson({ ...served, status: 'responded', answer: { responded_at: '2026-11-04T15:00:00Z', bed_available: 'waitlist', likely_accept: 'maybe', earliest_admit_on: '2026-11-12', daily_rate: 950, cost_note: '', note: 'Call first' } });
   check('the program\'s own answer fills the form', portal.formFromRow(answered.answer), { bed: 'waitlist', likely: 'maybe', admitOn: '2026-11-12', dailyRate: '950', costNote: '', note: 'Call first' });
   check('and reads in one line', portal.answerSummary(answered.answer), 'Bed: Waitlist; likely to accept: Maybe; earliest admit 2026-11-12; $950 a day');
