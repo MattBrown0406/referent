@@ -29,7 +29,7 @@ import {
   type Workspace,
 } from './org';
 import { INTAKE_LINK_ENABLED, intakeLinkUrl, intakeShareMessage } from './intake-link';
-import { openPrivacyPolicy } from './privacy';
+import { openPrivacyPolicy, openTermsOfUse } from './privacy';
 import { SUPABASE_URL, supabase } from './supabase';
 import { type Entitlement, type EntitlementState } from './entitlements';
 import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySubmissions, type OrgDirectoryProfileState } from './directory';
@@ -918,9 +918,14 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
               <Text style={[styles.helpText, styles.helpTextSpaced]}>
                 The only shared space is the Directory: your own profile if you build one, and one of your partners only when you choose to submit it and ReferralFit approves it. Benchmarks use anonymized totals and never identify a practice.
               </Text>
-              <TouchableOpacity accessibilityRole="link" accessibilityLabel="Privacy policy" accessibilityHint="Opens the ReferralFit privacy policy in your browser" onPress={openPrivacyPolicy} style={styles.linkButton}>
-                <Text style={styles.linkButtonText}>Privacy policy</Text>
-              </TouchableOpacity>
+              <View style={styles.legalLinks}>
+                <TouchableOpacity accessibilityRole="link" accessibilityLabel="Privacy policy" accessibilityHint="Opens the ReferralFit privacy policy in your browser" onPress={openPrivacyPolicy} style={styles.linkButton}>
+                  <Text style={styles.linkButtonText}>Privacy policy</Text>
+                </TouchableOpacity>
+                <TouchableOpacity accessibilityRole="link" accessibilityLabel="Terms of use" accessibilityHint="Opens the ReferralFit terms of use in your browser" onPress={openTermsOfUse} style={styles.linkButton}>
+                  <Text style={styles.linkButtonText}>Terms of use</Text>
+                </TouchableOpacity>
+              </View>
             </View>
 
             <View style={styles.card}>
@@ -1097,6 +1102,7 @@ const styles = StyleSheet.create({
   dangerButtonText: { color: COLORS.coral, fontWeight: '700' },
   helpText: { fontSize: 14, color: COLORS.gray, lineHeight: 20 },
   linkText: { fontSize: 13, color: COLORS.blue, backgroundColor: COLORS.blueSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 10 },
+  legalLinks: { flexDirection: 'row', flexWrap: 'wrap', columnGap: 20 },
   linkButton: { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center' },
   linkButtonText: { fontSize: 15, fontWeight: '600', color: COLORS.blue, textDecorationLine: 'underline' },
   targetRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },

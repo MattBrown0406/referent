@@ -718,6 +718,14 @@ export default function App() {
           </form>
         </>
       ) : null}
+
+      <p className="footnote legal-links">
+        <a href="https://referralfit.com/privacy" target="_blank" rel="noopener noreferrer">Privacy Policy</a>
+        {' · '}
+        <a href="https://referralfit.com/terms" target="_blank" rel="noopener noreferrer">Terms of Use</a>
+        {' · '}
+        <a href="https://referralfit.com/support" target="_blank" rel="noopener noreferrer">Support</a>
+      </p>
     </div>
   );
 }

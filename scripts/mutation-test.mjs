@@ -220,10 +220,13 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   const privacy = await readFile(new URL('../src/lib/privacy.ts', import.meta.url), 'utf8');
   const intake = await readFile(new URL('../src/lib/intake-link.ts', import.meta.url), 'utf8');
   const dashboard = await readFile(new URL('../src/lib/BusinessDashboard.tsx', import.meta.url), 'utf8');
-  assert.match(privacy, /PRIVACY_POLICY_URL = 'https:\/\/mattbrown0406\.github\.io\/referent\/privacy\.html'/);
-  assert.match(privacy, /Linking\.openURL\(PRIVACY_POLICY_URL\)/);
+  assert.match(privacy, /PRIVACY_POLICY_URL = 'https:\/\/referralfit\.com\/privacy'/, 'the privacy policy lives on referralfit.com');
+  assert.match(privacy, /TERMS_OF_USE_URL = 'https:\/\/referralfit\.com\/terms'/, 'the terms live on referralfit.com');
+  assert.doesNotMatch(privacy, /github\.io|freedominterventions\.com/, 'no legal page anywhere but referralfit.com');
+  assert.match(privacy, /Linking\.openURL\(url\)/);
   for (const [name, text] of [['WorkspaceScreen', workspace], ['LoginScreen', login]]) {
     assert.match(text, /accessibilityLabel="Privacy policy"[^>]*onPress=\{openPrivacyPolicy\}/, `${name} links the privacy policy`);
+    assert.match(text, /accessibilityLabel="Terms of use"[^>]*onPress=\{openTermsOfUse\}/, `${name} links the terms of use`);
   }
   assert.doesNotMatch(workspace, /ReferralFit staff do not have access/, 'no claim the operator cannot back up');
   assert.match(workspace, /is private to your workspace/);

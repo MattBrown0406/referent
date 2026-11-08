@@ -4,6 +4,33 @@ How ReferralFit gets through App Review, and what to paste into App Store
 Connect. Written after the 2026-09-16 rejection of 1.0.2 (2) under
 Guideline 2.1 (demo account) and 2.1(b) (business model).
 
+## Links (privacy, terms, support)
+
+referralfit.com is the only home for ReferralFit's legal and support pages
+(website repo `MattBrown0406/referralfit-web`). Use these everywhere:
+
+| Where | URL |
+| --- | --- |
+| App Store Connect → App Information → Privacy Policy URL | `https://referralfit.com/privacy` |
+| App Store Connect → version → Support URL | `https://referralfit.com/support` |
+| App Store Connect → version → Marketing URL | `https://referralfit.com` |
+| Description footer | Privacy Policy, Terms of Use (EULA) and Support at the three URLs below |
+| The app (`src/lib/privacy.ts`: sign-in screen and Workspace) | `https://referralfit.com/privacy`, `https://referralfit.com/terms` |
+
+Description footer:
+
+```
+Privacy Policy: https://referralfit.com/privacy
+Terms of Use (EULA): https://referralfit.com/terms
+Support: https://referralfit.com/support
+```
+
+The old copies redirect there: `mattbrown0406.github.io/referent/privacy.html`
+and `support.html` (`docs/`, kept as redirects because app versions before
+1.2.0 open the GitHub privacy page; delete them and turn GitHub Pages off once
+no one runs those versions) and `freedominterventions.com/referralfit/privacy`
+and `/terms`.
+
 ## 1. Demo account (Guideline 2.1)
 
 The rejected submission listed `reviewer2apple.com` — not a valid address and

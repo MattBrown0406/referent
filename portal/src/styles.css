@@ -77,6 +77,8 @@ button:disabled { opacity: 0.5; cursor: default; }
 .stat b { color: var(--ink); }
 
 .footnote { color: var(--gray); font-size: 13px; line-height: 1.5; }
+.legal-links { margin-top: 24px; text-align: center; }
+.legal-links a { color: inherit; }
 
 /* Per-carrier network status (In-network / Out-of-network) under the carriers field. */
 .networks { margin-top: 4px; }

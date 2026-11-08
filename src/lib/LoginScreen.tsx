@@ -23,7 +23,7 @@ import {
   passwordProblem,
 } from './auth-flows';
 import { currentWebOrigin, recordAuthFlowStart } from './auth-link-guard';
-import { openPrivacyPolicy } from './privacy';
+import { openPrivacyPolicy, openTermsOfUse } from './privacy';
 import { supabase } from './supabase';
 
 const COLORS = {
@@ -379,9 +379,14 @@ export default function LoginScreen({ onSignedIn }: Props) {
             <Text style={styles.footnote}>Free for your practice. Create an account in a minute. Your practice's data is private to your workspace — other practices can never see it, and it is not sold or shared with advertisers. {Platform.OS === 'web'
               ? 'You stay signed in in this browser until you sign out, so sign out when you finish on a shared computer.'
               : 'Your session stays on this device in secure storage.'}</Text>
-            <TouchableOpacity accessibilityRole="link" accessibilityLabel="Privacy policy" accessibilityHint="Opens the ReferralFit privacy policy in your browser" onPress={openPrivacyPolicy} style={styles.privacyLink}>
-              <Text style={styles.privacyLinkText}>Privacy policy</Text>
-            </TouchableOpacity>
+            <View style={styles.legalLinks}>
+              <TouchableOpacity accessibilityRole="link" accessibilityLabel="Privacy policy" accessibilityHint="Opens the ReferralFit privacy policy in your browser" onPress={openPrivacyPolicy} style={styles.privacyLink}>
+                <Text style={styles.privacyLinkText}>Privacy policy</Text>
+              </TouchableOpacity>
+              <TouchableOpacity accessibilityRole="link" accessibilityLabel="Terms of use" accessibilityHint="Opens the ReferralFit terms of use in your browser" onPress={openTermsOfUse} style={styles.privacyLink}>
+                <Text style={styles.privacyLinkText}>Terms of use</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -435,6 +440,7 @@ const styles = StyleSheet.create({
   noticeTitle: { textAlign: 'center', fontSize: 18, fontWeight: '800', color: COLORS.ink, marginBottom: 8 },
   noticeBody: { textAlign: 'center', fontSize: 13, lineHeight: 19, color: COLORS.inkSoft, marginBottom: 16 },
   footnote: { marginTop: 16, textAlign: 'center', fontSize: 10, lineHeight: 15, color: COLORS.gray },
+  legalLinks: { flexDirection: 'row', justifyContent: 'center', flexWrap: 'wrap' },
   privacyLink: { alignSelf: 'center', minHeight: 44, justifyContent: 'center', paddingHorizontal: 8 },
   privacyLinkText: { textAlign: 'center', fontSize: 11, lineHeight: 15, fontWeight: '700', color: COLORS.forest, textDecorationLine: 'underline' },
 });

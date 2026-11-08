@@ -697,10 +697,8 @@ function query(result, seen) {
   ok('the match shows the assessed level, still editable', /<AssessedLevelNote assessment=\{matchAssessment\} matchLevel=\{matchType as ReferralMatch\['levelOfCare'\]\} \/>/.test(app) && /onChange=\{setMatchType\}/.test(app));
   ok('the card hides on a server without the feature', /if \(!entry \|\| entry\.status === 'unavailable'\) return null;/.test(card));
   for (const text of [L.EMERGENCY_FLAG.text, ...L.FLAG_RULES.map((rule) => rule.text)]) ok('safety text is plain ASCII punctuation', /^[\x20-\x7E]+$/.test(text));
-  const privacy = readFileSync(path.join(repoRoot, 'docs/privacy.html'), 'utf8');
-  ok('the privacy policy describes assessment ratings with case files',
-    privacy.indexOf('<strong>Level-of-care assessments.</strong>') > privacy.indexOf('<strong>Case files.</strong>')
-    && /clinical-adjacent information about a client/.test(privacy) && /never added to placement requests/.test(privacy));
+  // The privacy policy's level-of-care section lives on referralfit.com now
+  // (referralfit-web tests/legal.test.tsx checks it).
   const docs = readFileSync(path.join(repoRoot, 'docs/LEVEL_OF_CARE.md'), 'utf8');
   ok('the docs carry the licensing note and the deploy steps', /## Licensing/.test(docs) && /none of them is used here/.test(docs)
     && docs.includes("VALUES ('20261104150000', 'level_of_care');"));
