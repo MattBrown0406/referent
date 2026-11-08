@@ -5,7 +5,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(30);
+SELECT plan(33);
 
 INSERT INTO auth.users (id, email)
 VALUES
@@ -123,6 +123,12 @@ SELECT public.set_email_timezone('America/New_York', -300);
 RESET ROLE;
 SELECT ok((SELECT updated_at < now() - interval '23 hours' FROM public.email_preferences WHERE user_id = 'b2000000-0000-0000-0000-0000000000f1'),
   'an app load with the same zone writes nothing');
+SELECT set_config('request.jwt.claim.sub', 'b2000000-0000-0000-0000-0000000000f1', true);
+SET LOCAL ROLE authenticated;
+SELECT public.set_email_timezone('EST5EDT', -300);
+RESET ROLE;
+SELECT is((SELECT tz_name FROM public.email_preferences WHERE user_id = 'b2000000-0000-0000-0000-0000000000f1'), 'America/New_York',
+  'a legacy zone name the summary would not read is not stored');
 
 -- Something waiting for the member: a follow-up past due on the moved case.
 SELECT set_config('request.jwt.claim.sub', 'b2000000-0000-0000-0000-0000000000f1', true);
@@ -170,7 +176,7 @@ DELETE FROM public.email_outbox;
 SELECT public.email_enqueue('c3000000-0000-0000-0000-0000000000f1', 'bed_reminder', jsonb_build_object('global_partner_id', 'd5000000-0000-0000-0000-0000000000f1'));
 SET LOCAL ROLE service_role;
 CREATE TEMP TABLE first_try ON COMMIT DROP AS SELECT * FROM public.email_outbox_claim(10);
-SELECT is(public.email_outbox_release(ARRAY(SELECT id FROM first_try), NULL, NULL), 1, 'released without trying');
+SELECT is(public.email_outbox_release(ARRAY(SELECT id FROM first_try), NULL, NULL, false), 1, 'released without trying');
 RESET ROLE;
 SELECT is((SELECT claimed_at IS NULL AND attempts = 0 FROM public.email_outbox), true, 'back to waiting, no attempt spent');
 SET LOCAL ROLE service_role;
@@ -182,17 +188,31 @@ SELECT is((SELECT count(*)::integer FROM public.listing_bed_links WHERE user_id 
   'and mints no second link');
 SELECT ok((SELECT (data ->> 'prepared_at') IS NOT NULL FROM public.email_outbox), 'a prepared row records when, so a retry renders the same email');
 SET LOCAL ROLE service_role;
-SELECT is(public.email_outbox_release(ARRAY(SELECT id FROM second_try), (SELECT id FROM second_try), 'resend_401'), 0,
+SELECT is(public.email_outbox_release(ARRAY(SELECT id FROM second_try), (SELECT id FROM second_try), 'resend_401', false), 0,
   'the row tried is not handed back as untried');
 RESET ROLE;
-SELECT is((SELECT attempts = 1 AND claimed_at IS NULL AND not_before > now() + interval '14 minutes' AND last_error = 'resend_401'
+SELECT is((SELECT attempts = 0 AND claimed_at IS NULL AND not_before > now() + interval '14 minutes' AND last_error = 'resend_401'
              FROM public.email_outbox), true,
-  'a configuration stop charges the row tried and holds it 15 minutes (it cannot block the queue forever)');
+  'an account refusal holds the row tried 15 minutes and spends no attempt (mail waits for the key, never lost)');
+UPDATE public.email_outbox SET not_before = now() - interval '1 second';
+SET LOCAL ROLE service_role;
+CREATE TEMP TABLE third_try ON COMMIT DROP AS SELECT * FROM public.email_outbox_claim(10);
+SELECT public.email_outbox_release('{}'::uuid[], (SELECT id FROM third_try), 'resend_422', true);
+RESET ROLE;
+SELECT is((SELECT attempts FROM public.email_outbox), 1, 'a sender refusal (422) that may be about this email spends the attempt');
 SET LOCAL ROLE service_role;
 SELECT public.email_outbox_record(jsonb_build_array(jsonb_build_object('id', (SELECT id FROM second_try), 'provider_id', 'x')));
 RESET ROLE;
 SELECT is((SELECT sent_at IS NOT NULL AND NOT (data ? 'link_token') FROM public.email_outbox), true,
   'a sent bed check-in drops its link token from the outbox');
+DELETE FROM public.email_outbox;
+INSERT INTO public.email_outbox (user_id, kind, data, attempts)
+VALUES ('c3000000-0000-0000-0000-0000000000f1', 'bed_reminder', '{"prepared": true, "link_token": "secret"}', 5);
+SET LOCAL ROLE service_role;
+SELECT public.email_outbox_claim(10);
+RESET ROLE;
+SELECT is((SELECT error = 'too_many_attempts' AND NOT (data ? 'link_token') FROM public.email_outbox), true,
+  'a row that runs out of attempts drops its link token too');
 
 DELETE FROM public.email_outbox;
 INSERT INTO public.email_outbox (user_id, kind, data, created_at, not_before)

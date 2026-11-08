@@ -37,8 +37,9 @@
 --      payload at all (null), so the page shows no made-up details; a
 --      prepared row records when (prepared_at) so a retry renders the same
 --      email; a sent or failed bed check-in drops its link token from the
---      outbox; and a configuration stop charges the one row it tried (it
---      waits 15 minutes) so no single row can hold the queue forever.
+--      outbox; and a configuration stop holds the one row it tried for 15
+--      minutes (so no single row can hold the queue), spending its attempt
+--      only for a 422 about the sender, never for an account refusal.
 --
 -- Transit-safe: ASCII only, no backslashes, every statement under 3,700
 -- characters.
@@ -231,8 +232,10 @@ BEGIN
   END IF;
   v_pref := public.email_preferences_row(v_user);
   -- The zone list is read only for a name not stored yet (it is slow to scan).
+  -- Same pattern as email_local_now, so a stored name is always one it uses.
   IF v_name IS NOT NULL AND v_name IS DISTINCT FROM v_pref.tz_name
-     AND (length(v_name) > 64 OR NOT EXISTS (SELECT 1 FROM pg_timezone_names z WHERE z.name = v_name)) THEN
+     AND (length(v_name) > 64 OR v_name !~ '^[A-Za-z]+(/[A-Za-z0-9_+-]+){0,2}$'
+          OR NOT EXISTS (SELECT 1 FROM pg_timezone_names z WHERE z.name = v_name)) THEN
     v_name := NULL;
   END IF;
   v_name := coalesce(v_name, v_pref.tz_name);
@@ -521,7 +524,7 @@ BEGIN
   SELECT u.email INTO v_email FROM auth.users u WHERE u.id = o.user_id;
   v_fail := CASE WHEN coalesce(btrim(v_email), '') = '' THEN 'no_email' ELSE public.email_prepare_problem(o) END;
   IF v_fail IS NOT NULL THEN
-    UPDATE public.email_outbox x SET error = v_fail WHERE x.id = p_id;
+    UPDATE public.email_outbox x SET error = v_fail, data = x.data - 'link_token' WHERE x.id = p_id;
     RETURN;
   END IF;
   IF coalesce((o.data ->> 'prepared')::boolean, false) THEN
@@ -546,7 +549,7 @@ DECLARE
   v_ids uuid[];
   v_id uuid;
 BEGIN
-  UPDATE public.email_outbox o SET error = 'too_many_attempts'
+  UPDATE public.email_outbox o SET error = 'too_many_attempts', data = o.data - 'link_token'
    WHERE o.sent_at IS NULL AND o.error IS NULL AND o.attempts >= 5;
   WITH picked AS (
     SELECT o.id AS pid FROM public.email_outbox o
@@ -566,7 +569,8 @@ BEGIN
     BEGIN
       RETURN QUERY SELECT * FROM public.email_outbox_prepare(v_id);
     EXCEPTION WHEN OTHERS THEN
-      UPDATE public.email_outbox x SET error = 'prepare_failed', last_error = left(SQLERRM, 300) WHERE x.id = v_id;
+      UPDATE public.email_outbox x SET error = 'prepare_failed', last_error = left(SQLERRM, 300), data = x.data - 'link_token'
+       WHERE x.id = v_id;
     END;
   END LOOP;
 END
@@ -574,11 +578,13 @@ $$;
 REVOKE ALL ON FUNCTION public.email_outbox_claim(integer) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.email_outbox_claim(integer) TO service_role;
 
--- Resend refused the account or the sender. The row that was tried keeps the
--- attempt it spent and waits 15 minutes (so a row that only looks like a
--- configuration problem cannot hold the queue forever); the claimed rows not
+-- Resend refused the account or the sender. The row that was tried waits 15
+-- minutes, so the queue rotates and no single row can hold it; it keeps the
+-- attempt it spent only when p_charge (a 422 about the sender, which might
+-- really be about this one email), never for a 401/403 (the whole account:
+-- mail waits until the key is fixed, however long). The claimed rows not
 -- tried go back to waiting without spending one.
-CREATE OR REPLACE FUNCTION public.email_outbox_release(p_ids uuid[], p_tried uuid, p_error text)
+CREATE OR REPLACE FUNCTION public.email_outbox_release(p_ids uuid[], p_tried uuid, p_error text, p_charge boolean)
 RETURNS integer
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public
@@ -591,13 +597,14 @@ BEGIN
      AND o.claimed_at IS NOT NULL AND o.sent_at IS NULL AND o.error IS NULL;
   GET DIAGNOSTICS v_count = ROW_COUNT;
   UPDATE public.email_outbox o
-     SET claimed_at = NULL, not_before = now() + interval '15 minutes', last_error = left(coalesce(p_error, 'config'), 300)
+     SET claimed_at = NULL, not_before = now() + interval '15 minutes', last_error = left(coalesce(p_error, 'config'), 300),
+         attempts = CASE WHEN coalesce(p_charge, true) THEN o.attempts ELSE greatest(o.attempts - 1, 0) END
    WHERE o.id = p_tried AND o.sent_at IS NULL AND o.error IS NULL;
   RETURN v_count;
 END
 $$;
-REVOKE ALL ON FUNCTION public.email_outbox_release(uuid[], uuid, text) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.email_outbox_release(uuid[], uuid, text) TO service_role;
+REVOKE ALL ON FUNCTION public.email_outbox_release(uuid[], uuid, text, boolean) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.email_outbox_release(uuid[], uuid, text, boolean) TO service_role;
 
 -- Same as 20261108120000; a bed check-in's link token leaves the outbox once
 -- the row is sent or has failed for good (the link itself is stored hashed).

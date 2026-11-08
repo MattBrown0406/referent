@@ -186,13 +186,15 @@ means `RESEND_API_KEY` is not set (every email waits until it is).
 - **Results one by one.** The dispatcher records each send right after it.
 - **Account problems.** A 401/403, an invalid from or reply-to, or an
   unverified sending domain stops the run (logged once per run). The row
-  tried keeps its attempt and waits 15 minutes; the claimed rows not tried go
-  back to waiting without spending one (`email_outbox_release(untried,
-  tried, error)`). So a bad key delays mail (each row has 5 attempts, at
-  least 15 minutes apart while the problem lasts) and one row that only
-  looks like an account problem cannot hold the queue.
+  tried waits 15 minutes, so the queue rotates and no single row holds it;
+  the claimed rows not tried go back to waiting without spending an attempt
+  (`email_outbox_release(untried, tried, error, charge)`). A 401/403 (the
+  whole account) never spends the tried row's attempt, so a bad or revoked
+  key delays mail however long it lasts and loses none; a 422 about the
+  sender, which might be about that one email, spends it (5 in all).
 - **Bed check-in link.** Its token leaves the outbox row once the row is sent
-  or has failed for good (`email_outbox_record`); the link itself is stored
+  or has failed for good (recorded failures, `too_many_attempts`,
+  `prepare_failed`, and the send-time checks); the link itself is stored
   hashed.
 - **Recipients re-checked at send:** an answer email only to a sender still
   in the workspace (`not_member`), a claim alert only to a current admin
@@ -203,7 +205,9 @@ means `RESEND_API_KEY` is not set (every email waits until it is).
   settings (`set_email_timezone`); the summary uses it, so it stays at 7 AM
   across daylight saving. The offset remains the fallback. The server's zone
   list (slow to scan) is read only when a member's zone name changes, and
-  the hourly summary job never reads it (`email_local_now`).
+  the hourly summary job never reads it (`email_local_now`). Legacy names
+  such as `EST5EDT` are not stored (the summary would not read them); the
+  offset is used instead.
 - **Folding.** A new answer folds only into an email nobody claimed yet.
 - **One-click GET.** A mail client that opens the List-Unsubscribe address in
   a browser is redirected to the /u page (which changes nothing).

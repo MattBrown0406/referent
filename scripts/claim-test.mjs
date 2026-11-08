@@ -177,6 +177,8 @@ for (const sheet of ['src/lib/PlacementRequestSheet.tsx', 'src/lib/PlacementComp
 const placementApi = read('src/lib/placement-api.ts');
 check(() => assert.match(placementApi, /if \(epoch !== answerLinkEpoch\) return null;/), 'a link still in flight at sign-out is not used');
 check(() => assert.match(placementApi, /answerLinkEpoch \+= 1;/), 'sign-out bumps the epoch');
+check(() => assert.match(placementApi, /linkStorage\(\)\?\.removeItem\(ANSWER_LINKS_STORAGE_KEY\)/), 'sign-out drops the links kept for the tab');
+check(() => assert.match(placementApi, /placementAnswerLink\(link\.split\('#'\)\[1\] \|\| null\) === link/), 'only well-formed links are read back');
 check(() => assert.match(read('src/lib/outreach-api.ts'), /if \(Platform\.OS === 'web'\) \{\s*await Linking\.openURL\(url\);/), 'the web opens Mail without a check first');
 const round1 = read('supabase/migrations/20261108170000_audit_round1.sql');
 check(() => assert.match(round1, /ORDER BY k\.created_at DESC, k\.token_hash LIMIT 50\);/), 'a program keeps its 50 newest links');

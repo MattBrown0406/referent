@@ -60,7 +60,7 @@ function links(): Links {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-type SendOutcome = SendResult & { config?: boolean };
+type SendOutcome = SendResult & { config?: boolean; charge?: boolean };
 
 async function sendOne(row: OutboxRow, apiKey: string, from: string, replyTo: string | undefined, target: Links): Promise<SendOutcome> {
   let email;
@@ -86,7 +86,15 @@ async function sendOne(row: OutboxRow, apiKey: string, from: string, replyTo: st
     }
     const failure = await response.json().catch(() => null);
     const kind = classifyResendFailure(response.status, failure);
-    return { id: row.id, error: `resend_${response.status}`, retry: kind !== 'final', config: kind === 'config' };
+    // A 401/403 refuses the whole account (no attempt is spent while it is
+    // fixed); a 422 about the sender might be this one email, so it spends one.
+    return {
+      id: row.id,
+      error: `resend_${response.status}`,
+      retry: kind !== 'final',
+      config: kind === 'config',
+      charge: kind === 'config' && response.status === 422,
+    };
   } catch {
     return { id: row.id, error: 'network', retry: true };
   }
@@ -97,12 +105,12 @@ async function record(supabase: ReturnType<typeof serviceClient>, result: SendRe
   if (error) throw error;
 }
 
-// A configuration error stopped the run: the row tried keeps its attempt and
-// waits 15 minutes (so one row that only looks like a configuration problem
-// cannot hold the queue forever); the rows not tried go back to waiting
-// without spending one.
-async function release(supabase: ReturnType<typeof serviceClient>, untried: string[], tried: string, reason: string): Promise<void> {
-  const { error } = await supabase.rpc('email_outbox_release', { p_ids: untried, p_tried: tried, p_error: reason });
+// A configuration error stopped the run: the row tried waits 15 minutes (so
+// the queue rotates and no single row holds it) and spends its attempt only
+// for a 422 about the sender; the rows not tried go back to waiting without
+// spending one. A bad key delays mail; it never uses up the attempts.
+async function release(supabase: ReturnType<typeof serviceClient>, untried: string[], tried: string, reason: string, charge: boolean): Promise<void> {
+  const { error } = await supabase.rpc('email_outbox_release', { p_ids: untried, p_tried: tried, p_error: reason, p_charge: charge });
   if (error) console.error('email-dispatch: release failed', error.code || 'unknown');
 }
 
@@ -126,7 +134,7 @@ async function drain(supabase: ReturnType<typeof serviceClient>): Promise<{ sent
         // The account or sender is wrong: nothing can go out. Stop, and keep
         // the claimed rows waiting.
         console.error('email-dispatch: Resend refused the account or sender', result.error);
-        await release(supabase, rows.slice(index + 1).map((row) => row.id), rows[index].id, result.error || 'config');
+        await release(supabase, rows.slice(index + 1).map((row) => row.id), rows[index].id, result.error || 'config', Boolean(result.charge));
         return { ...totals, stopped: result.error };
       }
       // Recorded one by one, so a crash mid-batch never resends what went out.

@@ -69,9 +69,12 @@ export default function AnswerLink() {
   // "Viewed" is the program's own doing: its first tap or key on the page,
   // never the page load (mail and text scanners open links).
   const seenRef = useRef(false);
+  const seenTriedAtRef = useRef(0);
   const markSeen = useCallback(() => {
-    if (seenRef.current || !token) return;
+    // After a failure, try again on a later tap or key, at most every 5 seconds.
+    if (seenRef.current || !token || Date.now() - seenTriedAtRef.current < 5000) return;
     seenRef.current = true;
+    seenTriedAtRef.current = Date.now();
     // supabase-js reports a failure in the result, not by rejecting.
     void supabase.rpc('public_placement_answer_seen', { p_token: token }).then(
       ({ error }) => { if (error) seenRef.current = false; },
