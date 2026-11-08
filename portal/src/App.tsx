@@ -5,6 +5,8 @@ import Credentials from './Credentials';
 import PlacementRequests from './PlacementRequests';
 import ProgramReferrals from './ProgramReferrals';
 import { supabase } from './supabase';
+import ClaimRequest from './ClaimRequest';
+import { CLAIM_CODE_STORAGE_KEY, claimCodeFromLocation } from './claim-rules';
 
 // ReferralFit for Programs — the treatment-center side of the platform.
 // A center account claims its directory listing with an admin-issued code,
@@ -199,7 +201,18 @@ export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
+  // A claim code from ReferralFit's invite link (/claim#<code>), kept for
+  // this tab while the program creates its account or signs in.
+  const [pendingClaimCode, setPendingClaimCode] = useState<string>(() => {
+    const fromLink = claimCodeFromLocation(window.location.pathname, window.location.hash);
+    try {
+      if (fromLink) window.sessionStorage.setItem(CLAIM_CODE_STORAGE_KEY, fromLink);
+      return fromLink || window.sessionStorage.getItem(CLAIM_CODE_STORAGE_KEY) || '';
+    } catch {
+      return fromLink || '';
+    }
+  });
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>(() => (pendingClaimCode ? 'signup' : 'signin'));
   const [claimCode, setClaimCode] = useState('');
   const [listing, setListing] = useState<Listing | null | 'none'>(null);
   const [form, setForm] = useState<ListingForm | null>(null);
@@ -319,6 +332,14 @@ export default function App() {
     }
   }, [session, loadListing]);
 
+  useEffect(() => {
+    if (/^\/claim\/?$/.test(window.location.pathname)) window.history.replaceState(null, '', '/');
+  }, []);
+
+  useEffect(() => {
+    if (listing === 'none' && pendingClaimCode && !claimCode) setClaimCode(pendingClaimCode);
+  }, [listing, pendingClaimCode, claimCode]);
+
   async function submitAuth(event: React.FormEvent) {
     event.preventDefault();
     setBusy(true);
@@ -348,6 +369,8 @@ export default function App() {
       const { error: claimError } = await supabase.rpc('claim_center_listing', { p_code: claimCode.trim().toLowerCase() });
       if (claimError) throw claimError;
       setClaimCode('');
+      setPendingClaimCode('');
+      try { window.sessionStorage.removeItem(CLAIM_CODE_STORAGE_KEY); } catch { /* storage unavailable */ }
       setNotice('Listing claimed. Keep it accurate — that is what families and interventionists see.');
       await loadListing();
     } catch (claimException) {
@@ -490,6 +513,9 @@ export default function App() {
 
       {!session ? (
         <form className="card" onSubmit={submitAuth}>
+          {pendingClaimCode ? (
+            <div className="success">Your claim code is ready. Create your program account (or sign in), then tap Claim listing.</div>
+          ) : null}
           <h2>{authMode === 'signin' ? 'Sign in' : 'Create your program account'}</h2>
           <p className="help">
             Manage your program's listing in the ReferralFit directory — the placement
@@ -507,20 +533,22 @@ export default function App() {
           </div>
         </form>
       ) : listing === 'none' ? (
-        <form className="card" onSubmit={submitClaim}>
-          <h2>Claim your listing</h2>
-          <p className="help">
-            Enter the claim code from your ReferralFit contact. Claiming lets you keep
-            your program's levels of care, insurance panels, and admissions contacts
-            accurate. Verification and placement in the directory remain independent —
-            listings are never ranked by payment.
-          </p>
-          <label>Claim code</label>
-          <input value={claimCode} onChange={(e) => setClaimCode(e.target.value)} required autoComplete="off" />
-          <div className="actions">
-            <button type="submit" disabled={busy || !claimCode.trim()}>Claim listing</button>
-          </div>
-        </form>
+        <>
+          {pendingClaimCode ? null : <ClaimRequest onError={setError} onNotice={setNotice} />}
+          <form className="card" onSubmit={submitClaim}>
+            <h2>{pendingClaimCode ? 'Claim your listing' : 'Have a claim code?'}</h2>
+            <p className="help">
+              {pendingClaimCode
+                ? 'Your claim code from ReferralFit is filled in. Claiming lets you keep your program\'s open beds, levels of care, insurance panels and admissions contacts accurate, and answer placement requests. It is free, and listings are never ranked by payment.'
+                : 'If ReferralFit sent you a code, enter it here instead of searching.'}
+            </p>
+            <label>Claim code</label>
+            <input value={claimCode} onChange={(e) => setClaimCode(e.target.value)} required autoComplete="off" />
+            <div className="actions">
+              <button type="submit" disabled={busy || !claimCode.trim()}>Claim listing</button>
+            </div>
+          </form>
+        </>
       ) : listing && form ? (
         <>
           <div className="card">

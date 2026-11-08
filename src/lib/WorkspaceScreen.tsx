@@ -35,6 +35,8 @@ import { type Entitlement, type EntitlementState } from './entitlements';
 import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySubmissions, type OrgDirectoryProfileState } from './directory';
 import DirectoryReviewQueue from './DirectoryReviewQueue';
 import CredentialReviewQueue from './CredentialReviewQueue';
+import ClaimRequestQueue from './ClaimRequestQueue';
+import { fetchProgramClaimRequests } from './claim-requests';
 import ProgramReferralSettingsCard from './ProgramReferralSettingsCard';
 import { fetchPendingListingCredentials } from './credentials';
 import { prepareForWorkspaceChange } from './store';
@@ -147,6 +149,10 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
   // (null hides the card: not an admin, or the server has no credentials yet).
   const [pendingCredentials, setPendingCredentials] = useState<number | null>(null);
   const [credentialReviewOpen, setCredentialReviewOpen] = useState(false);
+  // Programs asking to manage their listing (null hides the card: not an
+  // admin, or the server has no claim requests yet).
+  const [pendingClaims, setPendingClaims] = useState<number | null>(null);
+  const [claimReviewOpen, setClaimReviewOpen] = useState(false);
   // "Notify me about..." (server-sent push). null while loading; available
   // false when the server does not have push yet, in which case the card
   // explains instead of offering switches.
@@ -210,11 +216,17 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
     } catch {
       setPendingCredentials(null);
     }
+    try {
+      const claims = admin ? await fetchProgramClaimRequests() : null;
+      setPendingClaims(claims ? claims.length : null);
+    } catch {
+      setPendingClaims(null);
+    }
   }, [userId]);
 
   useEffect(() => {
     if (visible) void load();
-    else { setReviewOpen(false); setCredentialReviewOpen(false); }
+    else { setReviewOpen(false); setCredentialReviewOpen(false); setClaimReviewOpen(false); }
   }, [visible, load]);
 
   // The screen stays mounted while hidden, and the lock can change outside
@@ -512,6 +524,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
           <DirectoryReviewQueue onBack={() => setReviewOpen(false)} onCountChange={setPendingSubmissions} />
         ) : credentialReviewOpen && pendingCredentials !== null ? (
           <CredentialReviewQueue onBack={() => setCredentialReviewOpen(false)} onCountChange={setPendingCredentials} />
+        ) : claimReviewOpen && pendingClaims !== null ? (
+          <ClaimRequestQueue onBack={() => setClaimReviewOpen(false)} onCountChange={setPendingClaims} />
         ) : (
         <>
         <View style={styles.header}>
@@ -833,6 +847,25 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
             </View>
 
             <ProgramReferralSettingsCard visible={visible} />
+
+            {pendingClaims !== null ? (
+              <View style={styles.card}>
+                <Text style={styles.cardLabel}>Program claim requests</Text>
+                <View style={styles.memberRow}>
+                  <View style={styles.memberInfo}>
+                    <Text style={styles.memberName}>{pendingClaims === 0 ? 'Nothing waiting' : `${pendingClaims} waiting for you`}</Text>
+                    <Text style={styles.memberRole}>Programs asking to manage their directory listing. Approve or decline; they get an email either way.</Text>
+                  </View>
+                  <View style={pendingClaims > 0 ? styles.planBadgeActive : styles.planBadge}>
+                    <Text accessibilityLabel={`${pendingClaims} pending`} style={pendingClaims > 0 ? styles.planBadgeActiveText : styles.planBadgeText}>{pendingClaims}</Text>
+                  </View>
+                </View>
+                <TouchableOpacity accessibilityRole="button" onPress={() => setClaimReviewOpen(true)} style={styles.primaryButton}>
+                  <Text style={styles.primaryButtonText}>Review claim requests</Text>
+                </TouchableOpacity>
+                <Text style={styles.helpText}>To invite a program yourself, open its listing in the Directory and tap Issue claim code. Only ReferralFit platform admins see this card.</Text>
+              </View>
+            ) : null}
 
             {pendingSubmissions !== null ? (
               <View style={styles.card}>

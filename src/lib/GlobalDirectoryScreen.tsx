@@ -5,6 +5,7 @@ import {
   Modal,
   SafeAreaView,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -31,6 +32,8 @@ import CredentialsCard, { ShieldChip } from './CredentialsCard';
 import { localTodayStamp, programIntegrity, type ProgramCredential } from './integrity';
 import type { Partner } from '../data';
 import { WEB_PAGE } from './web-layout';
+import * as Clipboard from 'expo-clipboard';
+import { claimExpiryDate, claimInviteMessage, issueClaimCode, type ClaimCode } from './claim-requests';
 
 type Props = {
   visible: boolean;
@@ -135,6 +138,10 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
   // set_listing_beds re-checks on the server.
   const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
   const [editingBedsId, setEditingBedsId] = useState<string | null>(null);
+  // Claim codes issued in this session, by listing (admins only).
+  const [claimCodes, setClaimCodes] = useState<Record<string, ClaimCode>>({});
+  const [issuingId, setIssuingId] = useState<string | null>(null);
+  const [claimCopiedId, setClaimCopiedId] = useState<string | null>(null);
   // Program Integrity Watch: each listing's credentials, for the shield chip
   // (display only; the search order never reads it). null hides the chips:
   // not loaded, offline, or a server without the credentials migration.
@@ -252,6 +259,34 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
 
   // After an admin confirms beds, the card shows the new line without a
   // round trip; the next search re-reads it from the server anyway.
+  // Issue a claim code for a program listing and keep it on screen to copy
+  // or share. A new code replaces any unused older one for that listing.
+  function issueCode(listingId: string) {
+    if (issuingId) return;
+    setIssuingId(listingId);
+    issueClaimCode(listingId)
+      .then((code) => setClaimCodes((current) => ({ ...current, [listingId]: code })))
+      .catch((error) => Alert.alert('Could not issue a claim code', (error as Error).message))
+      .finally(() => setIssuingId(null));
+  }
+
+  function copyInvite(listingId: string, programName: string) {
+    const code = claimCodes[listingId];
+    if (!code) return;
+    Clipboard.setStringAsync(claimInviteMessage(programName, code))
+      .then(() => {
+        setClaimCopiedId(listingId);
+        setTimeout(() => setClaimCopiedId((current) => (current === listingId ? null : current)), 2500);
+      })
+      .catch(() => Alert.alert('Could not copy', 'Copy the code from the screen instead.'));
+  }
+
+  function shareInvite(listingId: string, programName: string) {
+    const code = claimCodes[listingId];
+    if (!code) return;
+    Share.share({ message: claimInviteMessage(programName, code) }).catch(() => undefined);
+  }
+
   function applyBeds(listingId: string, beds: ListingBeds) {
     setListings((current) => (current ? current.map((listing) => (listing.id === listingId ? { ...listing, beds } : listing)) : current));
   }
@@ -464,6 +499,37 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                         </TouchableOpacity>
                       )
                     ) : null}
+                    {isPlatformAdmin && !listing.claimed && !isIndividualProfessional(listing.types) ? (
+                      claimCodes[listing.id] ? (
+                        <View style={styles.claimBox}>
+                          <Text style={styles.claimLabel}>Claim code (ReferralFit admin)</Text>
+                          <Text selectable style={styles.claimCode}>{claimCodes[listing.id].code}</Text>
+                          <Text style={styles.claimHelp}>
+                            {claimExpiryDate(claimCodes[listing.id].expiresAt) ? `Works until ${claimExpiryDate(claimCodes[listing.id].expiresAt)}. ` : ''}
+                            Send the invite: its link opens the program portal with the code filled in.
+                          </Text>
+                          <View style={styles.claimButtons}>
+                            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Copy the claim invite for ${listing.organization || listing.name}`} onPress={() => copyInvite(listing.id, listing.organization || listing.name)} style={styles.bedsButton}>
+                              <Text style={styles.bedsButtonText}>{claimCopiedId === listing.id ? 'Copied' : 'Copy invite'}</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Share the claim invite for ${listing.organization || listing.name}`} onPress={() => shareInvite(listing.id, listing.organization || listing.name)} style={styles.bedsButton}>
+                              <Text style={styles.bedsButtonText}>Share invite</Text>
+                            </TouchableOpacity>
+                          </View>
+                        </View>
+                      ) : (
+                        <TouchableOpacity
+                          accessibilityRole="button"
+                          accessibilityLabel={`Issue a claim code for ${listing.organization || listing.name}`}
+                          accessibilityState={{ busy: issuingId === listing.id }}
+                          disabled={Boolean(issuingId)}
+                          onPress={() => issueCode(listing.id)}
+                          style={styles.bedsButton}
+                        >
+                          {issuingId === listing.id ? <ActivityIndicator color={COLORS.blue} /> : <Text style={styles.bedsButtonText}>Issue claim code (ReferralFit admin)</Text>}
+                        </TouchableOpacity>
+                      )
+                    ) : null}
                     {isPlatformAdmin && credentials ? (
                       editingCredentialsId === listing.id ? (
                         <>
@@ -596,6 +662,11 @@ const styles = StyleSheet.create({
   cadence: { fontSize: 12, color: COLORS.gray },
   bedsButton: { alignSelf: 'flex-start', backgroundColor: COLORS.blueSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 },
   bedsButtonText: { color: COLORS.blue, fontWeight: '600', fontSize: 13 },
+  claimBox: { marginTop: 8, padding: 12, borderRadius: 10, backgroundColor: COLORS.blueSoft, gap: 6 },
+  claimLabel: { fontSize: 12, fontWeight: '700', color: COLORS.blue, textTransform: 'uppercase', letterSpacing: 0.4 },
+  claimCode: { fontSize: 22, fontWeight: '800', color: COLORS.ink, letterSpacing: 1 },
+  claimHelp: { fontSize: 13, color: COLORS.gray, lineHeight: 18 },
+  claimButtons: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   importedBadge: { alignSelf: 'flex-start', backgroundColor: COLORS.greenSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 },
   importedText: { color: COLORS.green, fontWeight: '600', fontSize: 14 },
   addButton: { backgroundColor: COLORS.blue, borderRadius: 10, paddingVertical: 10, alignItems: 'center' },

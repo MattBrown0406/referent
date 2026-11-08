@@ -121,3 +121,31 @@ Deno.test('transient statuses', () => {
 Deno.test('replies go to Matt unless EMAIL_REPLY_TO says otherwise', () => {
   assertEquals(DEFAULT_REPLY_TO, 'matt@freedominterventions.com');
 });
+
+Deno.test('claim request email to ReferralFit: the listing, the match, no unsubscribe', () => {
+  const email = renderEmail(row('claim_request', { listing_name: 'Juniper Ridge Recovery', city: 'Bend', state: 'OR', email_matches_website: false, waiting: 2 }), LINKS, NOW);
+  assertEquals(email.subject, 'Claim request: Juniper Ridge Recovery');
+  assertStringIncludes(email.text, 'Juniper Ridge Recovery (Bend, OR) asked to keep its ReferralFit listing current.');
+  assertStringIncludes(email.text, 'does not match the program');
+  assertStringIncludes(email.text, '2 claim requests are waiting.');
+  assertEquals(email.headers, {});
+  assertFalse(email.text.includes('/u#'));
+  const match = renderEmail(row('claim_request', { listing_name: 'X', email_matches_website: true, waiting: 1 }), LINKS, NOW);
+  assertStringIncludes(match.text, "matches the program's website");
+  assertFalse(match.text.includes('waiting.'));
+});
+
+Deno.test('claim decision email: approved and declined', () => {
+  const yes = renderEmail(row('claim_decision', { listing_name: 'Juniper Ridge Recovery', approved: true, decision_note: '' }), LINKS, NOW);
+  assertEquals(yes.subject, 'You can now manage Juniper Ridge Recovery on ReferralFit');
+  assertStringIncludes(yes.text, 'Open the program portal: https://portal.referralfit.com');
+  assertEquals(yes.headers, {});
+  const no = renderEmail(row('claim_decision', { listing_name: 'Juniper Ridge Recovery', approved: false, decision_note: 'Email us from your program address.' }), LINKS, NOW);
+  assertEquals(no.subject, 'About your ReferralFit listing request');
+  assertStringIncludes(no.text, 'Note from ReferralFit: Email us from your program address.');
+  assertStringIncludes(no.text, 'Reply to this email');
+});
+
+Deno.test('one-click unsubscribe never accepts an account email kind', () => {
+  assertEquals(oneClickFrom(new URL(`https://x/?unsubscribe=${TOKEN}&kind=claim_decision`)), null);
+});

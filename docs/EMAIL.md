@@ -8,6 +8,8 @@ domain:
 | `placement_response` | the practitioner who sent a placement request | a program answers (in the portal or from an answer link), held two minutes so answers arriving together make one email; a program editing its answer emails at most once every 15 minutes per request | on |
 | `daily_summary` | a practice member who turned it on | around 7 AM in their time zone, only on days with something waiting | off |
 | `bed_reminder` | a program's center account | its beds were not confirmed in the last six days; at most once a week, sent at 16:00 UTC (9 AM Pacific) | on |
+| `claim_request` | every platform admin | a program asks to manage its listing (`20261108150000`) | always (account email, no unsubscribe) |
+| `claim_decision` | the program that asked | ReferralFit approves or declines its request | always (account email, no unsubscribe) |
 
 Migration: `supabase/migrations/20261108120000_email_alerts.sql`.
 Function: `supabase/functions/email-dispatch` (Resend).

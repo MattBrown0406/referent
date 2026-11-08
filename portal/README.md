@@ -8,10 +8,17 @@ never buys ranking (see the anti-patient-brokering stance in the main README).
 
 ## Flow
 
-1. A platform admin creates the listing in `global_partners` and issues a
-   claim code: `SELECT * FROM public.create_center_claim_code('<listing id>');`
-2. The center creates an account here and redeems the code
-   (`claim_center_listing`), binding the account to the listing.
+1. A program gets access one of two ways (migration 20261108150000):
+   - **It asks.** It creates an account here, searches for its listing under
+     "Find your program" and sends a request. ReferralFit is emailed and
+     approves or declines in the app (Workspace > Program claim requests);
+     the program is emailed either way.
+   - **ReferralFit invites it.** A platform admin taps "Issue claim code" on the
+     listing's Directory card in the app and sends the invite. Its link,
+     `https://portal.referralfit.com/claim#<code>`, opens this portal with the
+     code filled in; the program creates an account and taps Claim listing
+     (`claim_center_listing`).
+2. Either way the account is bound to the listing (`center_members`).
 3. The center edits its listing; edits go live immediately. Status and
    `verified_at` are admin-only (enforced by a database trigger).
 4. The portal shows how many practices have added the listing to their
