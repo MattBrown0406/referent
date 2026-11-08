@@ -32,10 +32,15 @@ filter), `src/lib/ListingBedsEditor.tsx` (admin editor), `portal/src/App.tsx`
 - **On-call admissions contact** (`admissions_contact_name`,
   `admissions_contact_phone`), optional, set with the counts.
 
+A claimed program whose beds were not confirmed in six days gets a weekly
+check-in email with a private link to confirm or update them (`EMAIL.md`).
+
 ## Who can set it
 
 `set_listing_beds(p_global_id, p_beds_male, p_beds_female, p_contact_name,
-p_contact_phone)` is the only write path.
+p_contact_phone)` is the only write path. (Since 20261108120000 its write is
+`apply_listing_beds`, shared with the check-in email's link page, which
+records the center account the email was sent to.)
 
 | Caller | Result |
 | --- | --- |

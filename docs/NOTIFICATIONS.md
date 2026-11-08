@@ -14,6 +14,9 @@ ReferralFit has two kinds of notification:
 Migration: `supabase/migrations/20261001140000_team_basics.sql` (also covers
 assignees and who-did-what; see `TEAM_BASICS.md`).
 
+Email alerts (a program answered, the morning summary, the weekly bed
+check-in) are separate: see `EMAIL.md`.
+
 ## No private detail in a push, ever
 
 A push notification is handled by Apple, Google, and Expo before it reaches
