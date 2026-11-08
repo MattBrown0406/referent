@@ -267,6 +267,8 @@ export async function closePlacementRequest(id: string): Promise<PlacementReques
 // then emailed gets the same link (the server keeps a recipient's five
 // newest links working; placement_answer_link).
 const answerLinks = new Map<string, string>();
+// Requests in flight, so a prefetch and a tap never ask twice.
+const answerLinkRequests = new Map<string, Promise<string | null>>();
 // Making a link must never hold up a text: past this, the message goes
 // without one.
 export const ANSWER_LINK_TIMEOUT_MS = 4000;
@@ -284,10 +286,16 @@ export async function fetchPlacementAnswerLink(recipientId: string, timeoutMs: n
   if (cached) return cached;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const call = (async () => {
-      const { data, error } = await supabase.rpc('placement_answer_link', { p_recipient_id: id });
-      return error ? null : placementAnswerLink(typeof data === 'string' ? data : null);
-    })();
+    let call = answerLinkRequests.get(id);
+    if (!call) {
+      call = (async () => {
+        const { data, error } = await supabase.rpc('placement_answer_link', { p_recipient_id: id });
+        const made = error ? null : placementAnswerLink(typeof data === 'string' ? data : null);
+        if (made) answerLinks.set(id, made);
+        return made;
+      })().catch(() => null).finally(() => answerLinkRequests.delete(id));
+      answerLinkRequests.set(id, call);
+    }
     const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); });
     const link = await Promise.race([call, late]);
     if (link) answerLinks.set(id, link);
@@ -297,6 +305,30 @@ export async function fetchPlacementAnswerLink(recipientId: string, timeoutMs: n
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/** A link already made for this recipient, or null; never waits. */
+export function cachedPlacementAnswerLink(recipientId: string): string | null {
+  return answerLinks.get((recipientId || '').toLowerCase()) || null;
+}
+
+/**
+ * Make the links for programs asked by hand as soon as their row shows, so a
+ * tap never waits. On the web it must not: Safari allows the clipboard and
+ * mail only during the tap itself, so a send there uses only a link made
+ * ahead of time (answerLinkForSend).
+ */
+export function prefetchPlacementAnswerLinks(recipientIds: string[]): void {
+  for (const recipientId of recipientIds) {
+    const id = (recipientId || '').toLowerCase();
+    if (id && !answerLinks.has(id) && !answerLinkRequests.has(id)) void fetchPlacementAnswerLink(id);
+  }
+}
+
+/** Sign-out: links made for the previous account are dropped. */
+export function clearPlacementAnswerLinks(): void {
+  answerLinks.clear();
+  answerLinkRequests.clear();
 }
 
 /** A program's answer from a call or a text, logged by the practitioner. */

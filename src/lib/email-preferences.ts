@@ -1,4 +1,4 @@
-import { StoreError } from './errors';
+import { friendlyStoreError } from './errors';
 import { supabase } from './supabase';
 
 // Workspace > "Email me about...": the answer email and the morning summary
@@ -62,15 +62,35 @@ export function emailPreferenceArgs(key: keyof EmailPreferences, value: boolean,
   };
 }
 
+/** The device's time zone name ("America/Los_Angeles"), or '' when unknown. */
+export function deviceTimeZoneName(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Keep the morning summary at 7 AM where the member is, across daylight
+ * saving and travel: the server stores the zone name (and the current
+ * offset as a fallback). Best effort; an older server simply lacks it.
+ */
+export function syncEmailTimeZone(now = new Date()): void {
+  void supabase.rpc('set_email_timezone', { p_tz_name: deviceTimeZoneName() || null, p_tz_offset_minutes: emailTzOffsetMinutes(now) })
+    .then(() => undefined, () => undefined);
+}
+
 export async function fetchEmailPreferences(): Promise<EmailPreferencesState> {
-  const { data, error } = await supabase.rpc('get_email_preferences');
+  const { data, error, status } = await supabase.rpc('get_email_preferences');
   if (isMissingEmailFeature(error)) return { available: false, preferences: DEFAULT_EMAIL_PREFERENCES };
-  if (error) throw new StoreError(error.message || 'Could not load email settings.', false);
+  if (error) throw friendlyStoreError(error, status, 'Could not load email settings.');
+  syncEmailTimeZone();
   return { available: true, preferences: mapEmailPreferences((Array.isArray(data) ? data[0] : data) as Row | null) };
 }
 
 export async function saveEmailPreference(key: keyof EmailPreferences, value: boolean): Promise<EmailPreferences> {
-  const { data, error } = await supabase.rpc('set_email_preferences', emailPreferenceArgs(key, value));
-  if (error) throw new StoreError(error.message || 'Could not save that choice.', false);
+  const { data, error, status } = await supabase.rpc('set_email_preferences', emailPreferenceArgs(key, value));
+  if (error) throw friendlyStoreError(error, status, 'Could not save that choice.');
   return mapEmailPreferences((Array.isArray(data) ? data[0] : data) as Row | null);
 }

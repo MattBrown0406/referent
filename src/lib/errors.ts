@@ -195,6 +195,18 @@ export function asOfflineError(error: unknown): unknown {
   return new OfflineError(undefined, { timedOut: isTimeoutError(error), cause: error });
 }
 
+// A Supabase failure as something to show: offline or unreachable reads as
+// an OfflineError ("You are offline..."), never as "FetchError: Network
+// request failed"; anything else keeps the server's own message, else the
+// fallback.
+export function friendlyStoreError(error: unknown, status: number | undefined, fallback: string): Error {
+  const annotated = withHttpStatus(error, status);
+  const offline = asOfflineError(annotated);
+  if (offline instanceof Error && offline !== annotated) return offline;
+  const message = (error as { message?: unknown } | null)?.message;
+  return new StoreError(typeof message === 'string' && message ? message : fallback, false);
+}
+
 // ─── Human-readable text ────────────────────────────────────────────────────
 
 const MAX_DESCRIPTION_LENGTH = 300;

@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Modal,
+  Platform,
   SafeAreaView,
   ScrollView,
   Share,
@@ -46,6 +47,10 @@ type Props = {
   onClose: () => void;
   onImported: (partner: Partner, globalId: string, initiatingUserId: string) => void;
 };
+
+// The web can share only where the browser has a share sheet (Safari,
+// mobile browsers); elsewhere "Copy invite" is the way.
+const canShare = Platform.OS !== 'web' || (typeof navigator !== 'undefined' && typeof (navigator as { share?: unknown }).share === 'function');
 
 const COLORS = {
   ink: '#101828',
@@ -210,6 +215,14 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
   // Hourly coaching for the interventionists and therapists on screen, read
   // once per listing as pages arrive. Decoration only: a failure shows none.
   const coachingAskedRef = useRef(new Set<string>());
+
+  // A different account: nothing admin-only (the role, codes issued) carries over.
+  useEffect(() => {
+    setIsPlatformAdmin(false);
+    setClaimCodes({});
+    setCoaching({});
+    coachingAskedRef.current = new Set();
+  }, [userId]);
   useEffect(() => {
     if (!listings) return;
     const ids = listings
@@ -292,7 +305,9 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
     const code = claimCodes[listingId];
     if (!code) return;
     Clipboard.setStringAsync(claimInviteMessage(programName, code))
-      .then(() => {
+      .then((copied) => {
+        // On the web the copy can be refused (no permission): say so.
+        if (copied === false) { Alert.alert('Could not copy', 'Copy the code from the screen instead.'); return; }
         setClaimCopiedId(listingId);
         setTimeout(() => setClaimCopiedId((current) => (current === listingId ? null : current)), 2500);
       })
@@ -531,9 +546,11 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                             <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Copy the claim invite for ${listing.organization || listing.name}`} onPress={() => copyInvite(listing.id, listing.organization || listing.name)} style={styles.bedsButton}>
                               <Text style={styles.bedsButtonText}>{claimCopiedId === listing.id ? 'Copied' : 'Copy invite'}</Text>
                             </TouchableOpacity>
-                            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Share the claim invite for ${listing.organization || listing.name}`} onPress={() => shareInvite(listing.id, listing.organization || listing.name)} style={styles.bedsButton}>
-                              <Text style={styles.bedsButtonText}>Share invite</Text>
-                            </TouchableOpacity>
+                            {canShare ? (
+                              <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Share the claim invite for ${listing.organization || listing.name}`} onPress={() => shareInvite(listing.id, listing.organization || listing.name)} style={styles.bedsButton}>
+                                <Text style={styles.bedsButtonText}>Share invite</Text>
+                              </TouchableOpacity>
+                            ) : null}
                           </View>
                         </View>
                       ) : (

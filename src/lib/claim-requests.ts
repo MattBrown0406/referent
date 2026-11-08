@@ -1,4 +1,4 @@
-import { StoreError } from './errors';
+import { friendlyStoreError, StoreError } from './errors';
 import { supabase } from './supabase';
 
 // How a program comes to manage its directory listing, from ReferralFit's
@@ -60,23 +60,23 @@ export function isMissingClaimRequests(error: { code?: string } | null | undefin
 
 /** Waiting requests, oldest first; null on a server without the feature. */
 export async function fetchProgramClaimRequests(): Promise<ProgramClaimRequest[] | null> {
-  const { data, error } = await supabase.rpc('list_program_claim_requests');
+  const { data, error, status } = await supabase.rpc('list_program_claim_requests');
   if (isMissingClaimRequests(error)) return null;
-  if (error) throw new StoreError(error.message || 'Could not load claim requests.', false);
+  if (error) throw friendlyStoreError(error, status, 'Could not load claim requests.');
   return (Array.isArray(data) ? data : []).map((row) => mapClaimRequest(row as Row));
 }
 
 export async function decideProgramClaimRequest(id: string, approve: boolean, note: string): Promise<'approved' | 'declined'> {
-  const { data, error } = await supabase.rpc('decide_program_claim_request', { p_id: id, p_approve: approve, p_note: note.trim() });
-  if (error) throw new StoreError(error.message || 'Could not save the decision.', false);
+  const { data, error, status } = await supabase.rpc('decide_program_claim_request', { p_id: id, p_approve: approve, p_note: note.trim() });
+  if (error) throw friendlyStoreError(error, status, 'Could not save the decision.');
   return data === 'approved' ? 'approved' : 'declined';
 }
 
 export type ClaimCode = { code: string; expiresAt: string };
 
 export async function issueClaimCode(globalPartnerId: string): Promise<ClaimCode> {
-  const { data, error } = await supabase.rpc('create_center_claim_code', { p_global_partner_id: globalPartnerId });
-  if (error) throw new StoreError(error.message || 'Could not issue a claim code.', false);
+  const { data, error, status } = await supabase.rpc('create_center_claim_code', { p_global_partner_id: globalPartnerId });
+  if (error) throw friendlyStoreError(error, status, 'Could not issue a claim code.');
   const row = (Array.isArray(data) ? data[0] : data) as Row | undefined;
   const code = text(row?.code);
   if (!/^[0-9a-z]{8,32}$/.test(code)) throw new StoreError('The server did not return a claim code.', false);

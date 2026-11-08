@@ -20,9 +20,11 @@ import { OfflineError, describeError } from './errors';
 import type { ProgramIntegrity } from './integrity';
 import { releaseComposeOverlay, sendEmailMessage, sendTextMessage } from './outreach-api';
 import {
+  cachedPlacementAnswerLink,
   cancelPlacementRequest,
   createPlacementRequest,
   fetchPlacementAnswerLink,
+  prefetchPlacementAnswerLinks,
   fetchPlacementChannels,
   fetchPlacementPracticeName,
   newPlacementRequestId,
@@ -156,6 +158,13 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
   const [sendNotice, setSendNotice] = useState('');
   const [sent, setSent] = useState<PlacementRequestView | null>(null);
   const [outreach, setOutreach] = useState<Record<string, Outreach>>({});
+  // The program whose answer link is being made right now (native only).
+  const [preparingId, setPreparingId] = useState<string | null>(null);
+
+  // Programs asked by hand: make their answer links now, so a tap never waits.
+  useEffect(() => {
+    if (sent) prefetchPlacementAnswerLinks(sent.recipients.filter((item) => item.channel === 'manual').map((item) => item.id));
+  }, [sent]);
   // The server kept an earlier request under this id as first written: the
   // practitioner is told, and offered Cancel before sending a new one.
   const [conflict, setConflict] = useState<{ requestId: string; cancelling: boolean } | null>(null);
@@ -384,9 +393,19 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
     const generation = generationRef.current;
     let result;
     try {
-      // The program's own answer link, when the server can make one (never
-      // blocks: without it the summary asks for a reply, as before).
-      const answerLink = await fetchPlacementAnswerLink(recipientId);
+      // The program's own answer link (made ahead of time when the row showed).
+      // On the web nothing may be awaited before Messages or Mail opens:
+      // Safari allows the clipboard and mail only during the tap, so the web
+      // uses a link already made, or sends without one.
+      let answerLink = cachedPlacementAnswerLink(recipientId);
+      if (!answerLink && Platform.OS !== 'web') {
+        setPreparingId(recipientId);
+        try {
+          answerLink = await fetchPlacementAnswerLink(recipientId);
+        } finally {
+          setPreparingId(null);
+        }
+      }
       if (generationRef.current !== generation) return;
       const message = placementRequestMessage({
         payload: sent.request.payload,
@@ -561,13 +580,13 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
                     <Text style={styles.optionLine}>{done === 'texted' ? 'Texted' : done === 'emailed' ? 'Emailed' : done === 'opened' ? 'Opened to send' : partner && (partner.phone.trim() || partner.email.trim()) ? 'Not sent yet' : 'No phone or email on file: call them'}</Text>
                   </View>
                   {partner?.phone.trim() ? (
-                    <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Text the summary to ${recipient.programName}`} onPress={() => { void reach(recipient.id, partner, 'text'); }} style={styles.smallButton}>
-                      <Text style={styles.smallButtonText}>Text</Text>
+                    <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Text the summary to ${recipient.programName}`} accessibilityState={{ busy: preparingId === recipient.id }} onPress={() => { void reach(recipient.id, partner, 'text'); }} style={styles.smallButton}>
+                      <Text style={styles.smallButtonText}>{preparingId === recipient.id ? 'Preparing…' : 'Text'}</Text>
                     </TouchableOpacity>
                   ) : null}
                   {partner?.email.trim() ? (
-                    <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Email the summary to ${recipient.programName}`} onPress={() => { void reach(recipient.id, partner, 'email'); }} style={styles.smallButton}>
-                      <Text style={styles.smallButtonText}>Email</Text>
+                    <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Email the summary to ${recipient.programName}`} accessibilityState={{ busy: preparingId === recipient.id }} onPress={() => { void reach(recipient.id, partner, 'email'); }} style={styles.smallButton}>
+                      <Text style={styles.smallButtonText}>{preparingId === recipient.id ? 'Preparing…' : 'Email'}</Text>
                     </TouchableOpacity>
                   ) : null}
                 </View>
