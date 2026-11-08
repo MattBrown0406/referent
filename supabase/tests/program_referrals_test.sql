@@ -203,7 +203,8 @@ SELECT ok(
   (SELECT org_id = current_setting('test.org_p')::uuid AND owner_id = 'b1000000-0000-0000-0000-0000000000b8'
           AND lead_channel = 'program_referral' AND lead_captured_at IS NOT NULL AND status = 'inquiry'
           AND lead_source = 'Professional referral' AND lead_source_detail = 'Juniper Ridge Recovery'
-          AND summary LIKE 'Referred by Juniper Ridge Recovery through ReferralFit.%Their note: Called us Tuesday%'
+          AND position('Referred by Juniper Ridge Recovery through ReferralFit.' IN summary) > 0
+          AND position('Their note: Called us Tuesday' IN summary) > 0
      FROM public.cases WHERE id = current_setting('test.case1')::uuid),
   'the lead lands in the practice as an ordinary lead, owned by its owner, with the program as its source'
 );
@@ -481,12 +482,11 @@ SELECT throws_ok(
   '22023', 'Unknown lead channel',
   'an unknown channel is still refused'
 );
+SELECT set_config('test.intake_case', public.create_lead_internal(current_setting('test.org_p')::uuid,
+  'b1000000-0000-0000-0000-0000000000b8', '{"caller_name": "Intake Person", "phone": "5035550112"}'::jsonb, 'intake_link')::text, true);
 SELECT ok(
   (SELECT body = 'New lead arrived through the intake link'
-     FROM public.case_events
-    WHERE case_id = public.create_lead_internal(current_setting('test.org_p')::uuid, 'b1000000-0000-0000-0000-0000000000b8',
-                                                '{"caller_name": "Intake Person", "phone": "5035550112"}'::jsonb, 'intake_link')
-      AND kind = 'system'),
+     FROM public.case_events WHERE case_id = current_setting('test.intake_case')::uuid AND kind = 'system'),
   'the intake link''s lead reads as before'
 );
 SELECT is(

@@ -166,6 +166,7 @@ import { usePlacementRequests } from './src/lib/placement-api';
 import { latestRequestForMatch, placementTodayItems, requestProgress, type PlacementRequest, type PlacementRequestView } from './src/lib/placement-requests';
 import LevelOfCareSheet from './src/lib/LevelOfCareSheet';
 import LevelOfCareCard, { AssessedLevelNote } from './src/lib/LevelOfCareCard';
+import ProgramReferralCard from './src/lib/ProgramReferralCard';
 import { useCaseAssessments } from './src/lib/level-of-care-api';
 import { levelOfCarePacketLines, reasonNames, type PlacementLevel } from './src/lib/level-of-care';
 import {
@@ -7770,6 +7771,9 @@ export default function App() {
                 <Text style={styles.profileName}>Opened {shortDate(localDayOf(record.createdAt))} · active {relativeActivity(record.updatedAt)}</Text>
               </View>
               {renderSavedCopyNotice(caseFileSource, 'case file')}
+
+              {/* Referred by a treatment program: the practice's switch for sharing progress */}
+              <ProgramReferralCard caseId={record.id} />
 
               <View style={styles.infoCard}>
                 <View style={styles.caseSectionHeader}>

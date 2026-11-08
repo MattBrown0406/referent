@@ -163,3 +163,26 @@ button.request {
 .handoff-steps li.done .handoff-marker { background: var(--green); border-color: var(--green); color: #fff; }
 .handoff-steps li.current .handoff-marker { border-color: var(--blue); color: var(--blue); box-shadow: 0 0 0 4px var(--blue-soft); }
 .handoff-action { width: 100%; min-height: 48px; font-size: 16px; }
+
+/* Program referrals (a program refers a family to an interventionist). */
+.referrals .search-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.referrals .search-row input { flex: 1 1 220px; width: auto; }
+.referrals .search-row input.state { flex: 0 0 76px; text-transform: uppercase; }
+.referrals .targets { list-style: none; margin: 14px 0 0; padding: 0; }
+.referrals .targets li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.target-main { display: flex; flex-direction: column; gap: 3px; flex: 1 1 220px; font-size: 15px; }
+.target-main small { color: var(--gray); font-size: 13px; }
+.target-main a { color: var(--blue); font-size: 13px; overflow-wrap: anywhere; }
+.referrals label.check { display: flex; margin: 14px 0 0; align-items: flex-start; line-height: 1.45; }
+.referrals label.check input { margin-top: 3px; }
+.referrals label.check.consent { padding: 10px 12px; border-radius: 8px; background: var(--blue-soft); }
+.referrals p.safety { margin: 8px 0 0; padding: 10px 12px; border-radius: 8px; background: var(--coral-soft); color: var(--coral); font-size: 14px; font-weight: 600; }
+.referrals .requests { list-style: none; margin: 0; padding: 0; }
+.referrals li.referral-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+.referrals li.referral-row .request-side .badge { text-align: right; }
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+table.track { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 560px; }
+table.track th, table.track td { text-align: left; padding: 10px 8px; border-top: 1px solid var(--line); vertical-align: top; }
+table.track thead th { border-top: 0; color: var(--gray); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; }
+table.track tbody th { font-weight: 600; }
+table.track tbody th small { display: block; color: var(--gray); font-size: 12px; font-weight: 400; }

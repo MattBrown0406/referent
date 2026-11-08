@@ -3,6 +3,7 @@ import type { Session } from '@supabase/supabase-js';
 
 import Credentials from './Credentials';
 import PlacementRequests from './PlacementRequests';
+import ProgramReferrals from './ProgramReferrals';
 import { supabase } from './supabase';
 
 // ReferralFit for Programs — the treatment-center side of the platform.
@@ -539,6 +540,7 @@ export default function App() {
             </p>
           </div>
           <PlacementRequests onNotice={setNotice} onError={setError} />
+          <ProgramReferrals onNotice={setNotice} onError={setError} />
           {carriesBeds(listing.types) ? (
             <form className="card beds" onSubmit={saveBeds}>
               <h2>Beds available today</h2>
