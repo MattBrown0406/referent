@@ -216,6 +216,11 @@ function content(row: OutboxRow, links: Links, now: Date): Content {
         why: 'You get this because you asked to manage a listing on ReferralFit.',
       };
   }
+  if (row.kind !== 'bed_reminder') {
+    // A kind this function does not know (a newer database): never send it
+    // as a bed check-in; the dispatcher records render_failed instead.
+    throw new Error(`unknown email kind: ${String(row.kind)}`);
+  }
   const listing = plain(data.listing_name) || 'your program';
   const confirmed = daysAgo(data.beds_updated_at, now);
   const status = `Men: ${bedCount(data.beds_male)}. Women: ${bedCount(data.beds_female)}.`
@@ -231,7 +236,7 @@ function content(row: OutboxRow, links: Links, now: Date): Content {
     ],
     button: { label: 'Confirm or update beds', url: `${links.portalUrl}/b#${token}` },
     afterButton: 'The button opens a private page for your program. It works for 14 days.',
-    why: 'You get this because your program claimed its listing on ReferralFit. We send it at most once a week, and only when your beds have not been confirmed in the last 6 days.',
+    why: 'You get this because your program claimed its listing on ReferralFit. We send it only when your beds have not been confirmed in the last 5 days, at most every 5 days.',
     offLabel: 'Turn off bed check-in emails',
   };
 }
@@ -319,6 +324,32 @@ export function resendBody(row: OutboxRow, email: RenderedEmail, from: string, r
 /** A failed send worth trying again later: rate limits, server errors, network. */
 export function isTransientStatus(status: number): boolean {
   return status === 429 || status === 408 || status >= 500;
+}
+
+/**
+ * What a failed Resend response means for the email (body = Resend's JSON
+ * error, when it sent one):
+ *   sent   - 409 invalid_idempotent_request: this key was already used, so
+ *            an earlier try went out (the body differs only in details);
+ *   retry  - rate limits, server errors, 409 concurrent_idempotent_requests;
+ *   config - the account or sender is wrong (401/403, an invalid from or
+ *            domain): no email can go out, so stop and keep them all waiting;
+ *   final  - this email cannot be sent (for example an invalid recipient).
+ */
+export type FailureKind = 'sent' | 'retry' | 'config' | 'final';
+
+export function classifyResendFailure(status: number, body: unknown): FailureKind {
+  const name = body && typeof body === 'object' && typeof (body as { name?: unknown }).name === 'string'
+    ? (body as { name: string }).name
+    : '';
+  const message = body && typeof body === 'object' && typeof (body as { message?: unknown }).message === 'string'
+    ? (body as { message: string }).message.toLowerCase()
+    : '';
+  if (status === 409) return name === 'invalid_idempotent_request' ? 'sent' : 'retry';
+  if (status === 401 || status === 403) return 'config';
+  if (status === 422 && (name === 'invalid_from_address' || /\b(from|domain|reply_to|reply-to)\b/.test(message))) return 'config';
+  if (isTransientStatus(status)) return 'retry';
+  return 'final';
 }
 
 export type SendResult = { id: string; provider_id?: string; error?: string; retry?: boolean };

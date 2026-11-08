@@ -149,3 +149,27 @@ Deno.test('claim decision email: approved and declined', () => {
 Deno.test('one-click unsubscribe never accepts an account email kind', () => {
   assertEquals(oneClickFrom(new URL(`https://x/?unsubscribe=${TOKEN}&kind=claim_decision`)), null);
 });
+
+Deno.test('Resend failures: already sent, retry, configuration, final', async () => {
+  const { classifyResendFailure } = await import('./email.ts');
+  assertEquals(classifyResendFailure(409, { name: 'invalid_idempotent_request' }), 'sent');
+  assertEquals(classifyResendFailure(409, { name: 'concurrent_idempotent_requests' }), 'retry');
+  assertEquals(classifyResendFailure(401, { name: 'missing_api_key' }), 'config');
+  assertEquals(classifyResendFailure(403, { name: 'invalid_api_key' }), 'config');
+  assertEquals(classifyResendFailure(422, { name: 'invalid_from_address' }), 'config');
+  assertEquals(classifyResendFailure(422, { name: 'validation_error', message: 'The domain is not verified' }), 'config');
+  assertEquals(classifyResendFailure(422, { name: 'validation_error', message: 'Invalid `to` field' }), 'final');
+  assertEquals(classifyResendFailure(429, null), 'retry');
+  assertEquals(classifyResendFailure(503, null), 'retry');
+  assertEquals(classifyResendFailure(400, null), 'final');
+});
+
+Deno.test('an unknown kind is never rendered as a bed check-in', () => {
+  let threw = false;
+  try {
+    renderEmail({ ...row('bed_reminder', {}), kind: 'something_new' as never }, LINKS, NOW);
+  } catch {
+    threw = true;
+  }
+  assert(threw);
+});
