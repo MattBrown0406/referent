@@ -22,6 +22,7 @@ import { releaseComposeOverlay, sendEmailMessage, sendTextMessage } from './outr
 import {
   cancelPlacementRequest,
   closePlacementRequest,
+  fetchPlacementAnswerLink,
   fetchPlacementPracticeName,
   logManualAnswer,
   type PlacementRequestsHook,
@@ -32,6 +33,7 @@ import {
   COMPARE_SORTS,
   STATUS_LABELS,
   acceptingAnswers,
+  answerSourceLine,
   canLogAnswer,
   draftFromRecipient,
   effectiveRecipientStatus,
@@ -45,6 +47,7 @@ import {
   requestStatusLine,
   sentOnStamp,
   sortRecipients,
+  waitingLine,
   withRecipient,
   type AcceptAnswer,
   type AnswerDraft,
@@ -262,16 +265,19 @@ export default function PlacementCompare({
 
   async function reach(recipient: PlacementRecipient, partner: Partner, how: 'text' | 'email') {
     if (!view || composingRef.current) return;
-    const message = placementRequestMessage({
-      payload: view.request.payload,
-      programName: partner.organization || partner.name,
-      practiceName,
-      senderName,
-      respondBy: view.request.respondBy,
-    });
     composingRef.current = true;
     let result;
     try {
+      // The program's own answer link when the server can make one; never blocks.
+      const answerLink = await fetchPlacementAnswerLink(recipient.id);
+      const message = placementRequestMessage({
+        payload: view.request.payload,
+        programName: partner.organization || partner.name,
+        practiceName,
+        senderName,
+        respondBy: view.request.respondBy,
+        answerLink,
+      });
       result = how === 'text' ? await sendTextMessage(partner.phone, message.text) : await sendEmailMessage(partner.email, message.subject, message.body);
     } finally {
       composingRef.current = false;
@@ -297,7 +303,7 @@ export default function PlacementCompare({
           <View style={styles.rankBadge}><Text style={styles.rankText}>{recipient.rank}</Text></View>
           <View style={styles.flex}>
             <Text style={styles.programName} numberOfLines={2}>{partner?.organization || recipient.programName}</Text>
-            <Text style={styles.rowMeta}>{recipient.channel === 'portal' ? (recipient.enteredByPractice ? 'Logged by your practice' : 'Answers in ReferralFit') : answered ? 'Logged by your practice' : 'Answers by phone or text'}</Text>
+            <Text style={styles.rowMeta}>{answerSourceLine(recipient)}</Text>
           </View>
           <View style={[styles.statusPill, { backgroundColor: tone.background }]}><Text style={[styles.statusText, { color: tone.color }]}>{STATUS_LABELS[status]}</Text></View>
         </View>
@@ -314,7 +320,7 @@ export default function PlacementCompare({
             {recipient.note ? <Text style={styles.programNote}>“{recipient.note}”</Text> : null}
           </View>
         ) : (
-          <Text style={styles.waiting}>{status === 'expired' ? 'No answer by the deadline. You can still log one if they call back.' : recipient.channel === 'portal' ? (status === 'viewed' ? 'They opened it and have not answered yet.' : 'Not opened yet.') : 'Waiting for their reply.'}</Text>
+          <Text style={styles.waiting}>{waitingLine(recipient.channel, status)}</Text>
         )}
         {cost ? <Text style={styles.familyCost}>Family's estimate: {cost}</Text> : null}
         <View style={styles.rowActions}>
