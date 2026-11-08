@@ -219,3 +219,6 @@ table.track tbody th small { display: block; color: var(--gray); font-size: 12px
 .claim-taken { color: var(--gray); font-size: 13px; white-space: nowrap; }
 .claim-request-form { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
 .claim-request-form h3 { margin: 0 0 4px; font-size: 16px; }
+
+/* Hourly coaching on an interventionist in the Refer a family search. */
+.target-coaching { display: block; font-size: 13px; font-weight: 600; color: var(--green); }

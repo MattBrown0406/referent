@@ -36,6 +36,8 @@ import { fetchIsPlatformAdmin, fetchOrgDirectoryProfile, fetchPendingDirectorySu
 import DirectoryReviewQueue from './DirectoryReviewQueue';
 import CredentialReviewQueue from './CredentialReviewQueue';
 import ClaimRequestQueue from './ClaimRequestQueue';
+import CoachingCard from './CoachingCard';
+import { isIndividualProfessional } from './directory-submission';
 import { fetchProgramClaimRequests } from './claim-requests';
 import ProgramReferralSettingsCard from './ProgramReferralSettingsCard';
 import { fetchPendingListingCredentials } from './credentials';
@@ -816,6 +818,9 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                   <Text style={styles.helpText}>
                     This is your practice's own listing. Your edits publish immediately and keep it verified; other practices see it in the Directory and can add you to their network.
                   </Text>
+                  {isIndividualProfessional(directoryProfile.profile.types) ? (
+                    <CoachingCard listingId={directoryProfile.profile.id} canEdit={directoryProfile.canEdit} />
+                  ) : null}
                 </>
               ) : directoryProfile?.pendingClaim ? (
                 <>
