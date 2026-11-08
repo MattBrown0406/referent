@@ -110,5 +110,7 @@ contact picker is submitted.
    stops with a clear message if that one is not applied yet).
 2. Deploy the web app: the Directory tab shows "Import partners" (a file).
 3. The next iPhone build carries the contact picker (`expo-contacts`
-   57.0.8, pinned; a native module, so it needs a new build). Older builds
-   show no Contacts option.
+   57.0.2, pinned: the version expo 57.0.8 bundles; 57.0.8's prebuilt
+   binary needs a newer expo-modules-core and crashed the app at launch in
+   the simulator check). It is a native module, so it needs a new build.
+   Older builds show no Contacts option.

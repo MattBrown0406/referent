@@ -15,7 +15,9 @@ const expected = {
   expoSecureStore: '57.0.1',
   expoSms: '57.0.1',
   expoMailComposer: '57.0.1',
-  expoContacts: '57.0.8',
+  // The version expo 57.0.8 bundles (bundledNativeModules.json). Later 57.0.x
+  // prebuilds link symbols expo-modules-core 57.0.7 lacks (a launch crash).
+  expoContacts: '57.0.2',
 };
 
 assert.equal(
@@ -64,6 +66,16 @@ for (const [packageName, expectedVersion] of [
     expectedVersion,
     `${packageName} lockfile version must match the known-compatible native pin.`,
   );
+}
+
+// Every prebuilt Expo module must be the version this expo release bundles:
+// a newer prebuild can reference expo-modules-core symbols the pinned core
+// does not have, and iOS kills the app at launch (expo-contacts 57.0.8 did).
+const bundled = JSON.parse(await readFile(new URL('../node_modules/expo/bundledNativeModules.json', import.meta.url), 'utf8'));
+for (const name of ['expo-contacts']) {
+  const range = bundled[name] || '';
+  const base = range.replace(/^[~^]/, '');
+  assert.equal(packageJson.dependencies[name], base, `${name} must be the version expo bundles (${range}), not a later prebuild`);
 }
 
 console.log(

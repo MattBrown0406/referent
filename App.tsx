@@ -9299,7 +9299,7 @@ export default function App() {
             <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
               <View style={styles.prePromptIcon}><AppIcon name="notifications-outline" size={24} color={COLORS.forest} /></View>
               <Text style={styles.prePromptTitle}>Stay ahead of cold relationships</Text>
-              <Text style={styles.prePromptText}>ReferralFit can send a 7 AM briefing and a nudge when a partner passes their stay-in-touch cadence. Everything is scheduled on this device — no data leaves your phone.</Text>
+              <Text style={styles.prePromptText}>ReferralFit can send a 7 AM briefing, a nudge when a partner passes their stay-in-touch cadence, and an alert when a new lead or a program's answer comes in. Alerts never show a client's name or case details.</Text>
               <TouchableOpacity style={styles.primaryButton} onPress={enable}><Text style={styles.primaryButtonText}>Enable notifications</Text></TouchableOpacity>
               <TouchableOpacity onPress={dismiss} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Not now</Text></TouchableOpacity>
             </ScrollView>
