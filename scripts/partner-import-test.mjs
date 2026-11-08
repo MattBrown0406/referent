@@ -199,6 +199,14 @@ check(() => assert.deepEqual(
   check(() => assert.equal(rules.contactsFromVcard('BEGIN:VCARD\nFN:Jane\\\nEND:VCARD')[0].name, 'Jane'), 'a trailing backslash is dropped');
   check(() => assert.equal(rules.addCandidates([], [c({ name: 'Pat Doe' })], null, [{ id: 'p-pat', name: 'Pat Doe', organization: '', email: '', phone: '' }]).candidates[0].existingPartnerId,
     'p-pat'), 'a partner without an organization is its own organization');
+  const oaksCard = rules.addCandidates([], [c({ organization: 'Oaks Treatment', website: 'oakstreatment.com', phone: '541-555-0888', state: 'OR' })], idx, handAdded).candidates[0];
+  check(() => assert.equal(oaksCard.existingPartnerId, 'p-oaks'), 'a company-only card for a program already there is a duplicate');
+  const twice = rules.addCandidates([], [c({ name: 'Dana Cole', organization: 'Cascade Interventions', email: 'dana@cascadeint.test' }),
+    c({ name: 'Dana Cole', organization: 'Cascade Interventions', phone: '503-555-0400' })], rules.directoryIndex([danaListing]), []);
+  check(() => assert.deepEqual([twice.candidates.length, twice.candidates[0].useListing], [1, true]), 'one person on two rows of a file is one row');
+  const programTwice = rules.addCandidates([], [c({ name: 'Ann', organization: 'Oaks Treatment', state: 'OR', email: 'ann@y.test' }),
+    c({ organization: 'Oaks Treatment', state: 'OR', phone: '541-555-0777' })], idx, []);
+  check(() => assert.equal(programTwice.candidates.length, 1), 'a company-only card for a program already on the list is the same program');
   const two = rules.addCandidates([], [c({ name: 'Ann', organization: 'Oaks Treatment', state: 'OR', email: 'ann@x.test' }),
     c({ name: 'Bo', organization: 'Oaks Treatment', state: 'OR', email: 'bo@x.test' })], idx, []).candidates;
   check(() => assert.deepEqual(two.map((row) => row.useListing), [true, false]), 'a second contact at the same program keeps its own details');

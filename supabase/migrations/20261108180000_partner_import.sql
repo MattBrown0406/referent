@@ -55,10 +55,13 @@ $$;
 REVOKE ALL ON FUNCTION public.import_partner_website(text) FROM PUBLIC, anon, authenticated;
 
 -- The keys a partner is known by in its workspace: its email, the last ten
--- digits of its phone, and its organization with its name (lower case; a
--- partner without an organization is its own organization, as an import
--- makes it).
-CREATE OR REPLACE FUNCTION public.import_partner_keys(p_email text, p_phone text, p_organization text, p_name text)
+-- digits of its phone, its organization with its name, and its organization
+-- alone (lower case; a partner without an organization is its own
+-- organization, as an import makes it). p_as_row: the keys of an incoming
+-- row, which carry the organization alone only for a company-only card (no
+-- person on it), so a new person at a program already there is not a
+-- duplicate but the program itself is.
+CREATE OR REPLACE FUNCTION public.import_partner_keys(p_email text, p_phone text, p_organization text, p_name text, p_as_row boolean)
 RETURNS text[]
 LANGUAGE sql IMMUTABLE
 SET search_path = public
@@ -67,11 +70,13 @@ AS $$
     CASE WHEN btrim(coalesce(p_email, '')) <> '' THEN 'e:' || lower(btrim(p_email)) END,
     CASE WHEN length(regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g')) >= 10
          THEN 'p:' || right(regexp_replace(p_phone, '[^0-9]', '', 'g'), 10) END,
-    'n:' || lower(coalesce(nullif(btrim(coalesce(p_organization, '')), ''), btrim(coalesce(p_name, ''))))
-         || '|' || lower(coalesce(nullif(btrim(coalesce(p_name, '')), ''), btrim(coalesce(p_organization, ''))))
+    'n:' || o.org || '|' || o.person,
+    CASE WHEN NOT coalesce(p_as_row, false) OR o.person = o.org THEN 'o:' || o.org END
   ], NULL)
+  FROM (SELECT lower(coalesce(nullif(btrim(coalesce(p_organization, '')), ''), btrim(coalesce(p_name, '')))) AS org,
+               lower(coalesce(nullif(btrim(coalesce(p_name, '')), ''), btrim(coalesce(p_organization, '')))) AS person) o
 $$;
-REVOKE ALL ON FUNCTION public.import_partner_keys(text, text, text, text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.import_partner_keys(text, text, text, text, boolean) FROM PUBLIC, anon, authenticated;
 
 -- One own-contact row, or NULL when it was skipped: empty, no known type, or
 -- already one of p_keys (the workspace's partners, import_partner_keys) or
@@ -102,8 +107,8 @@ BEGIN
   IF v_name = '' OR cardinality(v_types) = 0 THEN RETURN NULL; END IF;
   IF v_email !~ '^[^@[:space:][:cntrl:]]+@[^@[:space:][:cntrl:]]+[.][^@[:space:][:cntrl:]]+$' THEN v_email := ''; END IF;
   IF v_state !~ '^[A-Z]{2}$' THEN v_state := ''; END IF;
-  IF coalesce(p_keys, '{}'::jsonb) ?| public.import_partner_keys(v_email, v_phone, v_org_name, v_name)
-     OR coalesce(p_added, '{}'::jsonb) ?| public.import_partner_keys(v_email, v_phone, v_org_name, v_name) THEN
+  IF coalesce(p_keys, '{}'::jsonb) ?| public.import_partner_keys(v_email, v_phone, v_org_name, v_name, true)
+     OR coalesce(p_added, '{}'::jsonb) ?| public.import_partner_keys(v_email, v_phone, v_org_name, v_name, true) THEN
     RETURN NULL;
   END IF;
   INSERT INTO public.partners (id, owner_id, org_id, name, organization, types, levels, city, state, regions,
@@ -158,7 +163,7 @@ BEGIN
   v_directory := public.is_platform_admin() OR public.org_has_entitlement('directory');
   v_seed := public.org_is_platform_seed(v_org);
   SELECT coalesce(jsonb_object_agg(k.key, true), '{}'::jsonb) INTO v_keys
-    FROM (SELECT DISTINCT unnest(public.import_partner_keys(p.email, p.phone, p.organization, p.name)) AS key
+    FROM (SELECT DISTINCT unnest(public.import_partner_keys(p.email, p.phone, p.organization, p.name, false)) AS key
             FROM public.partners p WHERE p.org_id = v_org) k;
   FOR r IN SELECT value FROM jsonb_array_elements(p_rows) LOOP
     IF jsonb_typeof(r) IS DISTINCT FROM 'object' THEN v_skipped := v_skipped + 1; CONTINUE; END IF;
@@ -180,14 +185,13 @@ BEGIN
       IF v_id IS NULL THEN v_skipped := v_skipped + 1; CONTINUE; END IF;
       v_added := v_added + 1;
     END IF;
-    -- Only own contacts count against later rows: a listing added above
-    -- carries the program's main line and intake email, which other people
-    -- there may share.
-    IF v_gid IS NULL THEN
-      SELECT v_added_keys || coalesce(jsonb_object_agg(k, true), '{}'::jsonb) INTO v_added_keys
-        FROM public.partners p, unnest(public.import_partner_keys(p.email, p.phone, p.organization, p.name)) k
-       WHERE p.id = v_id;
-    END IF;
+    -- Later rows are checked against an own contact's keys, and only a
+    -- listing's names (its main line and intake email may be shared).
+    SELECT v_added_keys || coalesce(jsonb_object_agg(k, true), '{}'::jsonb) INTO v_added_keys
+      FROM public.partners p,
+           unnest(public.import_partner_keys(CASE WHEN v_gid IS NULL THEN p.email END, CASE WHEN v_gid IS NULL THEN p.phone END,
+                                             p.organization, p.name, false)) k
+     WHERE p.id = v_id;
     v_ids := v_ids || v_id;
   END LOOP;
   RETURN jsonb_build_object('added', v_added, 'linked', v_linked, 'skipped', v_skipped, 'ids', to_jsonb(v_ids));

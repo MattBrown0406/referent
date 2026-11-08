@@ -7,7 +7,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(46);
+SELECT plan(48);
 
 -- Actors
 --   p1  owner of practice P (profile listing I1, Cascade Interventions)
@@ -64,7 +64,7 @@ SELECT ok(
 SELECT ok(
   (SELECT bool_and(NOT has_function_privilege('authenticated', f, 'EXECUTE') AND NOT has_function_privilege('anon', f, 'EXECUTE'))
      FROM unnest(ARRAY['public.import_partner_row(uuid, uuid, jsonb, jsonb, jsonb)', 'public.import_partner_website(text)',
-                       'public.import_partner_keys(text, text, text, text)',
+                       'public.import_partner_keys(text, text, text, text, boolean)',
                        'public.program_referral_network_partner(uuid, uuid)', 'public.program_referrals_log_inbound()']) AS f),
   'the helpers are not callable by clients'
 );
@@ -322,6 +322,14 @@ SELECT is(public.import_partners(jsonb_build_array(
   'a person sharing the program''s main line is still added after its listing');
 SELECT is(public.import_partners(jsonb_build_array(jsonb_build_object('name', 'Solo Coach', 'types', jsonb_build_array('Interventionist'))))
             -> 'added', '1'::jsonb, 'a person without an organization is added');
+SELECT is(public.import_partners(jsonb_build_array(
+  jsonb_build_object('organization', 'Juniper Ridge Recovery', 'types', jsonb_build_array('Inpatient'), 'phone', '541-555-0123'),
+  jsonb_build_object('name', 'Juniper Ridge Recovery', 'organization', 'Juniper Ridge Recovery', 'types', jsonb_build_array('Inpatient'))))
+            -> 'skipped', '2'::jsonb, 'a company-only card for a program already there is a duplicate');
+SELECT is(public.import_partners(jsonb_build_array(
+  jsonb_build_object('global_id', 'd3000000-0000-0000-0000-0000000000a7'),
+  jsonb_build_object('name', 'Intake', 'organization', 'Willow Detox', 'types', jsonb_build_array('Detox'), 'phone', '541-555-0124'))) - 'ids',
+  '{"added": 0, "linked": 1, "skipped": 1}'::jsonb, 'the listing''s own names are not added a second time in the same import');
 RESET ROLE;
 
 SELECT * FROM finish();

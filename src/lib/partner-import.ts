@@ -509,10 +509,36 @@ function individualListing(listing: ListingLike): boolean {
   return listing.types.length > 0 && listing.types.every((type) => INDIVIDUAL_TYPES.has(type));
 }
 
+/** A card with no person on it (no name, or the name is the company): the program itself. */
+export function companyOnly(contact: Pick<RawContact, 'name' | 'organization'>): boolean {
+  const name = contact.name.trim().toLowerCase();
+  return !name || name === contact.organization.trim().toLowerCase();
+}
+
+/**
+ * The matched program's partner when it is already in the network: linked
+ * to the listing, or added by hand (the listing's email, phone, website, or
+ * name in the same state).
+ */
+export function programInNetwork(match: ListingLike, network: NetworkIndex): string | null {
+  const linked = network.byListing.get(match.id.toLowerCase());
+  if (linked) return linked;
+  const listingEmail = cleanEmail(match.email);
+  if (listingEmail && network.byEmail.has(listingEmail)) return network.byEmail.get(listingEmail)!;
+  const listingPhone = phoneKey(match.phone);
+  if (listingPhone && network.byPhone.has(listingPhone)) return network.byPhone.get(listingPhone)!;
+  const listingDomain = domainKey(match.website);
+  if (listingDomain && network.byDomain.has(listingDomain)) return network.byDomain.get(listingDomain)!;
+  const state = stateCode(match.state);
+  const hit = (network.byOrg.get(orgKey(match.organization)) || []).find((partner) => !partner.state || !state || partner.state === state);
+  return hit ? hit.id : null;
+}
+
 /**
  * The network partner this contact already is: the same email, phone, or
- * name and organization; or, for a match to a person's own listing (an
- * interventionist or therapist), that listing already linked.
+ * name and organization; a company-only card for a program already there;
+ * or a match to a person's own listing (an interventionist or therapist)
+ * already linked. A new person at a program already there is not one.
  */
 export function existingPartner(contact: RawContact, match: ListingLike | null, network: NetworkIndex): string | null {
   const email = contact.email;
@@ -521,28 +547,15 @@ export function existingPartner(contact: RawContact, match: ListingLike | null, 
   if (phone && network.byPhone.has(phone)) return network.byPhone.get(phone)!;
   const names = `${(contact.organization || contact.name).toLowerCase()}|${(contact.name || contact.organization).toLowerCase()}`;
   if (network.byNames.has(names)) return network.byNames.get(names)!;
-  if (match && individualListing(match)) {
-    return network.byListing.get(match.id.toLowerCase()) || null;
+  const program = companyOnly(contact);
+  if (program) {
+    const state = contact.state;
+    const sameOrg = (network.byOrg.get(orgKey(contact.organization || contact.name)) || [])
+      .find((partner) => !partner.state || !state || partner.state === state);
+    if (sameOrg) return sameOrg.id;
   }
+  if (match && (program || individualListing(match))) return programInNetwork(match, network);
   return null;
-}
-
-/**
- * The matched program is already in the network: linked to the listing, or
- * added by hand (the listing's email, phone, website, or name in the same
- * state). A new person there is added with their own details, not the
- * listing again.
- */
-export function programInNetwork(match: ListingLike, network: NetworkIndex): boolean {
-  if (network.byListing.has(match.id.toLowerCase())) return true;
-  const listingEmail = cleanEmail(match.email);
-  if (listingEmail && network.byEmail.has(listingEmail)) return true;
-  const listingPhone = phoneKey(match.phone);
-  if (listingPhone && network.byPhone.has(listingPhone)) return true;
-  const listingDomain = domainKey(match.website);
-  if (listingDomain && network.byDomain.has(listingDomain)) return true;
-  const state = stateCode(match.state);
-  return (network.byOrg.get(orgKey(match.organization)) || []).some((partner) => !partner.state || !state || partner.state === state);
 }
 
 function contactKey(contact: RawContact): string {
@@ -582,6 +595,8 @@ export function addCandidates(
     // listing is added once).
     // The listing is added once, and never when the program is already a
     // partner; other contacts there keep their own details.
+    // The program itself, or the person a listing is, already on this list.
+    if (match && listingsUsed.has(match.id) && (companyOnly(contact) || individualListing(match))) continue;
     const useListing = Boolean(match) && !listingsUsed.has(match!.id) && !programInNetwork(match!, known);
     if (useListing) listingsUsed.add(match!.id);
     const types = match && listingTypes(match).length ? listingTypes(match) : suggestTypes(contact);
