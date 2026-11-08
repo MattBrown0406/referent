@@ -268,7 +268,7 @@ export async function closePlacementRequest(id: string): Promise<PlacementReques
 // newest links working; placement_answer_link).
 const answerLinks = new Map<string, string>();
 // Requests in flight, so a prefetch and a tap never ask twice.
-const answerLinkRequests = new Map<string, Promise<string | null>>();
+const answerLinkRequests: Record<string, Promise<string | null> | undefined> = {};
 // Making a link must never hold up a text: past this, the message goes
 // without one.
 export const ANSWER_LINK_TIMEOUT_MS = 4000;
@@ -286,15 +286,15 @@ export async function fetchPlacementAnswerLink(recipientId: string, timeoutMs: n
   if (cached) return cached;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    let call = answerLinkRequests.get(id);
+    let call = answerLinkRequests[id];
     if (!call) {
       call = (async () => {
         const { data, error } = await supabase.rpc('placement_answer_link', { p_recipient_id: id });
         const made = error ? null : placementAnswerLink(typeof data === 'string' ? data : null);
         if (made) answerLinks.set(id, made);
         return made;
-      })().catch(() => null).finally(() => answerLinkRequests.delete(id));
-      answerLinkRequests.set(id, call);
+      })().catch(() => null).finally(() => { answerLinkRequests[id] = undefined; });
+      answerLinkRequests[id] = call;
     }
     const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); });
     const link = await Promise.race([call, late]);
@@ -321,14 +321,14 @@ export function cachedPlacementAnswerLink(recipientId: string): string | null {
 export function prefetchPlacementAnswerLinks(recipientIds: string[]): void {
   for (const recipientId of recipientIds) {
     const id = (recipientId || '').toLowerCase();
-    if (id && !answerLinks.has(id) && !answerLinkRequests.has(id)) void fetchPlacementAnswerLink(id);
+    if (id && !answerLinks.has(id) && !answerLinkRequests[id]) void fetchPlacementAnswerLink(id);
   }
 }
 
 /** Sign-out: links made for the previous account are dropped. */
 export function clearPlacementAnswerLinks(): void {
   answerLinks.clear();
-  answerLinkRequests.clear();
+  for (const key of Object.keys(answerLinkRequests)) answerLinkRequests[key] = undefined;
 }
 
 /** A program's answer from a call or a text, logged by the practitioner. */
