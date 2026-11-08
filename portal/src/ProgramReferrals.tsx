@@ -18,6 +18,7 @@ import {
   type TargetRow,
 } from './program-referral-rules';
 import { supabase } from './supabase';
+import { type Coaching, coachingById, coachingLine } from './coaching-rules';
 
 // "Refer a family": a program refers a family that asked for help to an
 // interventionist on ReferralFit (migration 20261108140000). The referral is
@@ -43,6 +44,7 @@ export default function ProgramReferrals({ onNotice, onError }: Props) {
   const [query, setQuery] = useState('');
   const [state, setState] = useState('');
   const [results, setResults] = useState<TargetRow[] | null>(null);
+  const [coaching, setCoaching] = useState<Record<string, Coaching>>({});
   const [target, setTarget] = useState<TargetRow | null>(null);
   const [form, setForm] = useState<ReferralForm>(emptyReferralForm());
   const [problem, setProblem] = useState('');
@@ -82,7 +84,14 @@ export default function ProgramReferrals({ onNotice, onError }: Props) {
     try {
       const { data, error } = await supabase.rpc('program_referral_targets', { p_query: query.trim(), p_state: state.trim() || null });
       if (error) throw error;
-      setResults((Array.isArray(data) ? data : []) as TargetRow[]);
+      const rows = (Array.isArray(data) ? data : []) as TargetRow[];
+      setResults(rows);
+      // Hourly coaching, when the server has it; decoration only.
+      const ids = rows.map((row) => row.global_partner_id);
+      if (ids.length) {
+        const { data: coachingRows } = await supabase.rpc('fetch_listing_coaching', { p_ids: ids });
+        setCoaching(coachingById(coachingRows));
+      }
     } catch (searchError) {
       setProblem((searchError as Error).message);
     } finally {
@@ -185,6 +194,7 @@ export default function ProgramReferrals({ onNotice, onError }: Props) {
                       <span className="target-main">
                         <b>{row.display_name}</b>
                         <small>{[placeText(row), (row.types || []).join(', ')].filter(Boolean).join(' · ')}</small>
+                        {coachingLine(coaching[row.global_partner_id]) ? <span className="target-coaching">{coachingLine(coaching[row.global_partner_id])}</span> : null}
                         {row.website ? <a href={row.website} target="_blank" rel="noreferrer noopener">{row.website.replace(/^https?:\/\//, '')}</a> : null}
                       </span>
                       {row.receive_status === 'ready' ? (

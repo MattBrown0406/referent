@@ -56,6 +56,18 @@ user is that listing's center member or a member of the owning workspace.
    listing; the org-profile paths (create, approval) do set
    `status = 'active'` because the owner is attesting their own practice.
 
+## Hourly coaching on a profile (20261108160000)
+
+An interventionist's or therapist's profile can say it offers hourly
+coaching, with the rate (whole dollars, $1 to $5,000) and a short note
+(200 characters). The workspace owner sets it under Workspace > Your
+directory profile (`set_listing_coaching`, owner or platform admin, never a
+program listing); clients hold no UPDATE grant on the three columns. It
+shows on the listing's Directory card ("Hourly coaching: $150/hour · note")
+and in the center portal's Refer a family search (`fetch_listing_coaching`,
+active listings, any signed-in reader). Turning it off keeps the last rate
+for next time. It never touches verification, matching or ranking.
+
 ## Program claims (self-serve, 20261108150000)
 
 A program no longer needs ReferralFit to run SQL. In the center portal a

@@ -34,6 +34,7 @@ import type { Partner } from '../data';
 import { WEB_PAGE } from './web-layout';
 import * as Clipboard from 'expo-clipboard';
 import { claimExpiryDate, claimInviteMessage, issueClaimCode, type ClaimCode } from './claim-requests';
+import { coachingLine, fetchListingCoaching, type ListingCoaching } from './coaching';
 
 type Props = {
   visible: boolean;
@@ -138,6 +139,8 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
   // set_listing_beds re-checks on the server.
   const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
   const [editingBedsId, setEditingBedsId] = useState<string | null>(null);
+  // Hourly coaching of the interventionists and therapists on screen, by listing.
+  const [coaching, setCoaching] = useState<Record<string, ListingCoaching>>({});
   // Claim codes issued in this session, by listing (admins only).
   const [claimCodes, setClaimCodes] = useState<Record<string, ClaimCode>>({});
   const [issuingId, setIssuingId] = useState<string | null>(null);
@@ -203,6 +206,21 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
 
   const filtered = useMemo(() => listings || [], [listings]);
   const today = localTodayStamp();
+
+  // Hourly coaching for the interventionists and therapists on screen, read
+  // once per listing as pages arrive. Decoration only: a failure shows none.
+  const coachingAskedRef = useRef(new Set<string>());
+  useEffect(() => {
+    if (!listings) return;
+    const ids = listings
+      .filter((listing) => isIndividualProfessional(listing.types) && !coachingAskedRef.current.has(listing.id))
+      .map((listing) => listing.id);
+    if (!ids.length) return;
+    ids.forEach((id) => coachingAskedRef.current.add(id));
+    fetchListingCoaching(ids)
+      .then((next) => setCoaching((current) => ({ ...current, ...next })))
+      .catch(() => { ids.forEach((id) => coachingAskedRef.current.delete(id)); });
+  }, [listings]);
 
   function loadMore() {
     if (loadingMore || !hasMore || listings === null) return;
@@ -460,6 +478,7 @@ export default function GlobalDirectoryScreen({ visible, entitled, entitlementKn
                         {listing.description ? (
                           <Text style={styles.cardDescription} numberOfLines={3}>{listing.description}</Text>
                         ) : null}
+                        {coachingLine(coaching[listing.id]) ? <Text style={styles.coaching}>{coachingLine(coaching[listing.id])}</Text> : null}
                         {usage ? <Text style={styles.usage}>{usage}</Text> : null}
                         {listing.verifiedAt ? (
                           listing.verifiedCurrent
@@ -662,6 +681,7 @@ const styles = StyleSheet.create({
   cadence: { fontSize: 12, color: COLORS.gray },
   bedsButton: { alignSelf: 'flex-start', backgroundColor: COLORS.blueSoft, borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 },
   bedsButtonText: { color: COLORS.blue, fontWeight: '600', fontSize: 13 },
+  coaching: { fontSize: 13, fontWeight: '600', color: COLORS.ink, marginTop: 4 },
   claimBox: { marginTop: 8, padding: 12, borderRadius: 10, backgroundColor: COLORS.blueSoft, gap: 6 },
   claimLabel: { fontSize: 12, fontWeight: '700', color: COLORS.blue, textTransform: 'uppercase', letterSpacing: 0.4 },
   claimCode: { fontSize: 22, fontWeight: '800', color: COLORS.ink, letterSpacing: 1 },
