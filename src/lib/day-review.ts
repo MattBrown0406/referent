@@ -813,8 +813,10 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
   const target = row.kind === 'new_lead' ? phoneKey(row.phone) || cleanEmail(row.email) || comparable(row.callerName)
     : row.kind === 'new_partner' ? orgKey(row.candidate?.organization || row.found.organization) || comparable(row.found.personName)
       : `${row.caseId || ''}|${row.partnerId || ''}`;
-  // A follow-up is also its due date: "Call Ana back" on the 10th and on the 13th are two.
-  const base = `${row.found.kind}|${target}${row.kind === 'follow_up' ? `|d:${row.dueOn}` : ''}`;
+  // A follow-up is also the date the notes gave it ("Call Ana back" on the
+  // 10th and on the 13th are two), never one typed in or defaulted to
+  // tomorrow, which would not match when the notes are read again.
+  const base = `${row.found.kind}|${target}${row.kind === 'follow_up' ? `|d:${row.found.dueDate}` : ''}`;
   const out = [`${base}|t:${comparable(row.text)}`, `${base}|s:${comparable(row.found.summary)}`];
   if (row.found.evidence) out.push(`${base}|q:${comparable(row.found.evidence)}`);
   // Whatever it is matched to now: a lead saved earlier is a case today, so

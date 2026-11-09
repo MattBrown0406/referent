@@ -505,6 +505,9 @@ check(() => {
   const due = (dueDate) => build(found({ kind: 'follow_up', personName: 'Ana Rivera', summary: 'Call Ana back.', regarding: 'family', dueDate }))[0];
   const [secondCall] = rules.markSavedBefore([due('2026-11-13')], new Set(rules.laterSignatures(due('2026-11-10'))));
   assert.equal(secondCall.include, true, 'the same follow-up on another day is another follow-up');
+  const tenth = due('2026-11-10');
+  const [edited] = rules.markSavedBefore([due('2026-11-10')], new Set(rules.laterSignatures({ ...tenth, dueOn: '2026-11-12' })));
+  assert.equal(edited.include, false, 'a follow-up saved with its date changed is still known when the notes give the old date again');
   assert.equal(rules.signatureHash('abc'), rules.signatureHash('abc'));
   assert.notEqual(rules.signatureHash('abc'), rules.signatureHash('abd'));
 }, 'saved leads are matched by who called');
