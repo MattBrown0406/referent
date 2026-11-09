@@ -573,12 +573,13 @@ export default function DayReviewSheet({
         if (result.saved) {
           any = true;
           savedCountRef.current += 1;
-          const signatures = rowSignatures(row, true);
+          const signatures = laterSignatures(row);
           for (const signature of signatures) savedSignaturesRef.current.add(signature);
-          // Kept with each recording it came from, for when that recording is read again.
-          for (const id of recorderReadRef.current?.rowIds.get(row.key) ?? []) {
-            fromRecordings[id] = [...(fromRecordings[id] ?? []), ...laterSignatures(row).map(signatureHash)];
-          }
+          // Kept with each recording it came from (every one in this read when
+          // its quote is in none), for when that recording is read again.
+          const read = recorderReadRef.current;
+          const from = read?.rowIds.get(row.key)?.length ? read.rowIds.get(row.key)! : read?.blocks.map((block) => block.id) ?? [];
+          for (const id of from) fromRecordings[id] = [...(fromRecordings[id] ?? []), ...signatures.map(signatureHash)];
         }
         if (opening !== openingRef.current) break;
       }

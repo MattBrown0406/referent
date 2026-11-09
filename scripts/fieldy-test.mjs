@@ -315,7 +315,8 @@ check(() => {
   assert.match(sheet, /function finish\(hold = false\) \{\s*if \(!hold && phase !== 'finding' && phase !== 'saving'\) settleRecordings\(saved, rows\);/, 'closing the review settles what was set aside');
   assert.match(sheet, /if \(phase === 'finding' && \(!notes\.trim\(\) \|\| recorderText\)\) \{ finish\(\); return; \}/, 'a slow read can be stopped; typed or pasted notes are not thrown away without asking');
   assert.match(sheet, /if \(unmatchedUndecided\(results, current\)\) return \[\];/, 'an undecided item from no one recording holds them all, on Approve as on close');
-  assert.match(sheet, /laterSignatures\(row\)\.map\(signatureHash\)/, 'what is kept for a later review is never a quote alone');
+  assert.match(sheet, /const signatures = laterSignatures\(row\);/, 'what is kept, in this review or a later one, is never a quote or a phone alone');
+  assert.doesNotMatch(read('src/lib/day-review.ts'), /new_lead\|caller\|/, 'a phone alone never makes an item "saved"');
   assert.match(sheet, /\/\/ Kept before the review runs, so a retry after a failed one is still these recordings\./);
   assert.match(sheet, /\.concat\(skipped\);/, 'one with nothing found, or skipped, is done on reading');
   assert.match(sheet, /function markAllReviewed\(\)/, 'the practitioner can be done with them');

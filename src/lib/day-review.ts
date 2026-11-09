@@ -813,7 +813,8 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
   const target = row.kind === 'new_lead' ? phoneKey(row.phone) || cleanEmail(row.email) || comparable(row.callerName)
     : row.kind === 'new_partner' ? orgKey(row.candidate?.organization || row.found.organization) || comparable(row.found.personName)
       : `${row.caseId || ''}|${row.partnerId || ''}`;
-  const base = `${row.found.kind}|${target}`;
+  // A follow-up is also its due date: "Call Ana back" on the 10th and on the 13th are two.
+  const base = `${row.found.kind}|${target}${row.kind === 'follow_up' ? `|d:${row.dueOn}` : ''}`;
   const out = [`${base}|t:${comparable(row.text)}`, `${base}|s:${comparable(row.found.summary)}`];
   if (row.found.evidence) out.push(`${base}|q:${comparable(row.found.evidence)}`);
   // Whatever it is matched to now: a lead saved earlier is a case today, so
@@ -848,20 +849,15 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
     ].filter(Boolean);
     for (const key of keys) out.push(`new_lead|any|q:${quote}|${key}`);
   }
-  // A caller is known by a phone or email, whatever the quote: read again
-  // in a later review with other words, still that caller.
-  if (row.found.kind === 'new_lead' && row.found.verified) {
-    const contacts = [phoneKey(row.found.phone) && `p:${phoneKey(row.found.phone)}`, cleanEmail(row.found.email) && `e:${cleanEmail(row.found.email)}`,
-      ...(saved ? [phoneKey(row.phone) && `p:${phoneKey(row.phone)}`, cleanEmail(row.email) && `e:${cleanEmail(row.email)}`] : [])];
-    for (const contact of new Set(contacts.filter(Boolean))) out.push(`new_lead|caller|${contact}`);
-  }
   return out;
 }
 
 /**
- * What a saved row is known by in a later review of the same recording:
- * its text, its summary, and a lead's caller, never its quote alone (two
- * items often quote one sentence; the one not saved must come back).
+ * What a saved row is known by when the same notes or recording are read
+ * again: its text or its summary with its target (and a follow-up's due
+ * date), and a lead's quote with its caller; never a quote alone (two
+ * items often quote one sentence; the one not saved must come back) nor a
+ * phone alone (a caller calling again about something new is shown).
  */
 export function laterSignatures(row: ReviewRow): string[] {
   return rowSignatures(row, true).filter((signature) => !signature.includes('|q:') || signature.startsWith('new_lead|any|'));

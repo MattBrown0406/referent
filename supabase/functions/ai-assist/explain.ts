@@ -74,7 +74,7 @@ Rules:
 - Never say a program is the best choice, and never promise results, admission, a bed or a cost.
 - No clinical judgments or diagnoses. Do not name or guess at anyone in the family; say "your loved one".
 - Write names, places and abbreviations exactly as the facts write them: do not spell out an abbreviation (EMDR, CA) or add a name the facts do not give.
-- The intro: one or two sentences, from the intro fact.`;
+- The intro: one or two sentences, from the intro fact only. Do not name the programs in it.`;
 
 export function buildExplainPrompt(request: ExplainRequest): string {
   const facts = JSON.stringify(request, null, 2);
@@ -132,7 +132,7 @@ const UNSAID_PHRASES = [
   'don t have to pay', 'won t have to pay', 'we charge', 'charge a fee', 'our fee', 'our fees', 'placement fee', 'placement fees', 'we bill',
   'we take a fee', 'we take a cut', 'we take a share', 'we take money', 'we take a percentage', 'no self pay', 'no private pay',
   'have to self pay', 'have to private pay', 'not self pay', 'not private pay', 'best choice', 'best program', 'best option',
-  'best fit', 'best place', 'to us', 'for us', 'we get',
+  'best fit', 'best place', 'to us', 'for us', 'we get a fee', 'we get money', 'we get a cut', 'we get a share', 'we get something',
 ];
 // Everyday phrases with one of the words above, set aside before the word
 // check (never before the phrase check, which refuses "not pay out of
@@ -156,10 +156,12 @@ function addsWords(text: string, facts: string): string | null {
   if (phrase) return phrase;
   const priced = new Set([...facts.matchAll(/\$\s?\d[\d,]*(?:\.\d+)?/g)].map((match) => dollars(match[0])));
   // Never in a sentence about us ("a fee of $4,500 goes to us").
+  // A sentence ends at a mark followed by a space or the end ("$4,500.00" does not end one).
   const aboutUs = (at: number) => {
-    const start = Math.max(text.lastIndexOf('.', at), text.lastIndexOf('!', at), text.lastIndexOf('?', at)) + 1;
-    const ends = ['.', '!', '?'].map((mark) => text.indexOf(mark, at)).filter((index) => index >= 0);
-    return /\b(?:we|us|our|i|me|my)\b/i.test(text.slice(start, ends.length ? Math.min(...ends) : text.length));
+    const ends = [...text.matchAll(/[.!?](?=\s|$)/g)].map((match) => match.index ?? 0);
+    const start = Math.max(-1, ...ends.filter((index) => index < at)) + 1;
+    const end = ends.find((index) => index >= at) ?? text.length;
+    return /\b(?:we|us|our|i|me|my)\b/i.test(text.slice(start, end));
   };
   let rest = ` ${comparable(text.replace(PRICED_FEE, (whole, amount: string, at: number) => (priced.has(dollars(amount)) && !aboutUs(at) ? ` ${amount}` : whole)))} `;
   for (const item of EVERYDAY_PHRASES) rest = rest.split(` ${item} `).join(' ');
@@ -277,18 +279,12 @@ export function parseExplainOutput(raw: string, request: ExplainRequest): Explai
   const list = Array.isArray(answer.programs) ? answer.programs : [];
   if (!intro || intro.length > EXPLAIN_LIMITS.outIntro) throw new AssistOutputError('The rewrite’s introduction did not fit.');
   const names = request.programs.map((program) => comparable(program.name));
-  // The introduction may name the programs it introduces, in their order;
-  // its own fact's "fit … best, in order" never lets it call one the best.
-  const introNames = `${request.intro}\n${request.programs.map((program) => program.name).join('\n')}`;
-  const introWords = ` ${comparable(intro)} `;
-  const mentioned = names.map((name) => introWords.indexOf(` ${name} `)).filter((at) => at >= 0);
-  // Its fact's "best" describes the list ("fit … best, in order"), never one program it names.
-  const introFacts = mentioned.length ? request.intro.replace(/\bbest\b/gi, ' ') : request.intro;
-  if (addsNumbers(intro, request.intro) || addsWords(intro, introFacts) || addsNames(intro, introNames, names)) {
+  // The introduction comes from its own fact and names no program (whole or
+  // shortened): its fact's "fit … best, in order" describes the list, so it
+  // can never rank one or change the order.
+  if (addsNumbers(intro, request.intro) || addsWords(intro, request.intro) || addsNames(intro, request.intro, names)
+    || names.some((name) => ` ${comparable(intro)} `.includes(` ${name.split(' ')[0]} `))) {
     throw new AssistOutputError('The rewrite added to the facts.');
-  }
-  if (mentioned.some((at, index) => index > 0 && at < mentioned[index - 1])) {
-    throw new AssistOutputError('The rewrite changed the order.');
   }
   if (list.length !== request.programs.length) throw new AssistOutputError('The rewrite left out or added a program.');
   const programs = list.map((raw, index) => {

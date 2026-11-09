@@ -498,7 +498,13 @@ check(() => {
   // A caller read again with other words is still that caller.
   const [kevinOther] = rules.markSavedBefore(build({ ...kevin, evidence: 'Kevin rang about his wife again and left his number' }),
     new Set(rules.laterSignatures(kevinRow).map(rules.signatureHash)));
-  assert.equal(kevinOther.include, false, 'a lead read again with another quote, same phone, is not offered again');
+  assert.equal(kevinOther.include, false, 'a lead read again with another quote but the same summary and phone is not offered again');
+  const [news] = rules.markSavedBefore(build({ ...kevin, personName: 'Tom', summary: 'Tom called about his daughter Emma.', evidence: 'Tom called from the same number about his daughter Emma' }),
+    new Set(rules.laterSignatures(kevinRow).map(rules.signatureHash)));
+  assert.equal(news.include, true, 'someone else calling from the same phone about something new is shown, never taken as saved');
+  const due = (dueDate) => build(found({ kind: 'follow_up', personName: 'Ana Rivera', summary: 'Call Ana back.', regarding: 'family', dueDate }))[0];
+  const [secondCall] = rules.markSavedBefore([due('2026-11-13')], new Set(rules.laterSignatures(due('2026-11-10'))));
+  assert.equal(secondCall.include, true, 'the same follow-up on another day is another follow-up');
   assert.equal(rules.signatureHash('abc'), rules.signatureHash('abc'));
   assert.notEqual(rules.signatureHash('abc'), rules.signatureHash('abd'));
 }, 'saved leads are matched by who called');

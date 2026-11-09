@@ -135,9 +135,11 @@ Deno.test('rankings, outcomes, beds, money ties and outside names are refused; p
     assertThrows(() => parseExplainOutput(first(claim), request()), AssistOutputError, undefined, claim);
   }
   assertThrows(() => parseExplainOutput(answer({ intro: 'Here are two programs; the strongest match comes first.' }), request()), AssistOutputError);
-  const named = parseExplainOutput(answer({ intro: 'Juniper Ridge Recovery and Cedar House fit your loved one, in order. Here we take you through both.' }), request());
-  assertStringIncludes(named.intro, 'Juniper Ridge Recovery', 'the introduction may name its programs');
+  const warm = parseExplainOutput(answer({ intro: 'We get it: this is hard. Here we take you through two programs that fit your loved one best, in order.' }), request());
+  assertStringIncludes(warm.intro, 'take you through', 'the introduction from its fact, warmly worded, passes');
   for (const intro of [
+    'Juniper Ridge Recovery and Cedar House fit your loved one, in order.', 'Juniper Ridge is the best one for your loved one.',
+    'Cedar fits best, then Juniper Ridge.', 'Cedar House comes first for your loved one.',
     'Juniper Ridge Recovery is the best program for your loved one, and Cedar House comes next.',
     'Juniper Ridge Recovery is the best choice; Cedar House is also good.',
     'Cedar House fits your loved one\'s needs best, then Juniper Ridge Recovery.',
@@ -199,7 +201,8 @@ Deno.test('claims in ordinary words are refused; faithful wording about cost and
     assertEquals(parseExplainOutput(first(text), request()).programs[0].text, text);
   }
   const cash = (text: string) => answer({ programs: [{ rank: 1, text: `${base}` }, { rank: 2, text }] });
-  for (const claim of ['Cedar House has a fee of $4,500 that goes to us.', 'We get a fee of $4,500 for it from Cedar House.']) {
+  for (const claim of ['Cedar House has a fee of $4,500 that goes to us.', 'We get a fee of $4,500 for it from Cedar House.',
+    'Cedar House has a fee of $4,500.00 a month, and we keep part of it.']) {
     assertThrows(() => parseExplainOutput(cash(claim), request()), AssistOutputError, undefined, claim);
   }
   for (const text of ['Cedar House has a monthly fee of $4,500, within your $6,000 budget.', 'If your family pays privately, Cedar House costs $4,500 a month, paid out of pocket.',
