@@ -196,11 +196,47 @@ release.
 | Calling the function, saving | `src/lib/day-review-api.ts` |
 | The sheet | `src/lib/DayReviewSheet.tsx`, opened from Today, "Review notes" (iPhone, where AI keys live) |
 
-What the function checks in the model's answer: a phone number or email not
-in the notes is dropped; a quote not found word for word (ignoring case and
-punctuation) marks the row unverified, and it starts switched off; due dates
-outside yesterday to a year out are cleared; a missed promise is due today;
-anything urgent comes first.
+What the function checks in the model's answer: a phone number or email
+that is not one written in the notes is dropped (each number and address is
+read on its own, so digits from two numbers never join); a quote shorter than
+four words, or not found word for word (ignoring case and punctuation), marks
+the row unverified, and it starts switched off; due dates outside yesterday
+to a year out are cleared; a missed promise is due today; a referral whose
+direction the notes do not make clear is left for the practitioner; anything
+urgent comes first. Notes are capped at 12,000 characters and 20 items, so
+the answer comes back inside the function's deadline (no SDK retry); text in
+the notes that looks like the `<notes>` tags is changed.
+
+How rows are placed (all on the phone, `src/lib/day-review.ts`):
+
+- **A new lead** becomes a note on a case only when the caller's phone or
+  email is on exactly one open case. A name alone, or several cases, keeps
+  the lead and says "Possibly already a case", with a switch between New lead
+  and Note on a case. A closed or lost case never takes the note.
+- **The same caller twice** in one review is one lead; the second item goes
+  on the case the first creates, and so does a follow-up or note about a
+  caller who is new today. Those rows save only after the lead (leads save
+  first) and wait if the lead is switched off.
+- **Matched by name only** (a case or a partner): the row is picked but asks
+  "Yes, this case" before it can be saved. Organization names match on
+  distinctive whole words ("Juniper Ridge" / "Juniper Ridge Recovery"), never
+  on words like Recovery or Center alone.
+- **A follow-up** goes on one place, its case or else its partner. With
+  several possible cases it waits for a choice or "Not linked". It is a
+  repeat when the same task is open there at any date, or when it is a call
+  and a call is already open there for about the same day.
+- **A referral** asks which way it went when the notes do not say; its client
+  label is initials ("AR / L"), since the referral history stays
+  de-identified. A referral sent to a program with a license concern waits
+  for "Refer anyway", and that is noted on the referral.
+- **A new partner** that may already be in the network ("Cascade Detox" for
+  "Cascade Recovery Center") offers that partner; tapping it makes the row a
+  note on it. The summary is never stored on the partner record.
+
+Saving uses ids chosen when the review is built, so a retry writes the same
+records (a follow-up or referral already there counts as saved). A new
+partner whose note fails is saved, with a message. Items saved in this
+review are switched off if the same notes are read again.
 
 Saving: a new lead goes through `create_lead` with the summary as the case
 summary; a case note is a case event (a call, meeting, text or email stamps

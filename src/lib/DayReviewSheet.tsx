@@ -23,21 +23,33 @@ import {
 } from 'react-native';
 
 import type { Partner, Referral } from '../data';
-import type { CaseContact, CaseRecord } from './cases';
+import { newUuid, type CaseContact, type CaseRecord } from './cases';
 import {
   addDays,
   buildRows,
+  caseLabel,
+  choosePartner,
+  chooseCase,
   comparable,
   countLine,
   destination,
   KIND_LABEL,
+  kindChoices,
+  leadFor,
+  markSavedBefore,
   rowProblem,
   rowReady,
+  rowSignatures,
+  saveOrder,
+  switchKind,
+  withPendingLeads,
   type ReviewRow,
+  type RowContext,
   type Workspace,
 } from './day-review';
-import { requestDayReview, ReviewUnavailableError, saveReviewRow } from './day-review-api';
+import { requestDayReview, ReviewUnavailableError, saveReviewRow, type SaveResult } from './day-review-api';
 import { fetchGlobalDirectory } from './directory';
+import { licenseConcernAlert, licenseOverrideNote, type LicenseConcern } from './integrity';
 import { aiKeysSupported, getAnthropicKey } from './outreach-api';
 import { directoryIndex, IMPORT_TYPES, type DirectoryIndex, type ImportType } from './partner-import';
 import type { FollowUp } from './store';
@@ -57,6 +69,8 @@ const COLORS = {
   blue: '#2F5D8A',
   bluePale: '#EAF1F8',
   gray: '#73827D',
+  // Small print on white or cream: darker than gray, for contrast.
+  muted: '#55645F',
   line: '#DDE4DF',
 };
 
@@ -70,6 +84,10 @@ type Props = {
   referrals: Referral[];
   /** The workspace reads the Directory (new partners are matched to it). */
   directoryEntitled: boolean;
+  /** The practice's lead response target, for a new lead's first call (as the New lead form). */
+  leadResponseMinutes: number;
+  /** A program's license problem, if any (App.tsx licenseConcernFor), checked before a referral is saved. */
+  licenseConcernFor: (partnerId: string) => LicenseConcern | null;
   onClose: () => void;
   /** Something was saved: the app reloads. */
   onSaved: () => void;
@@ -82,33 +100,67 @@ function localDay(date = new Date()): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-export default function DayReviewSheet({ visible, userId, cases, contacts, partners, followUps, referrals, directoryEntitled, onClose, onSaved }: Props) {
+// A new lead's first call is due within the practice's response target,
+// today; past midnight it is due today with no time (as the New lead form).
+function leadDueTime(minutes: number, now = new Date()): string | null {
+  const due = new Date(now.getTime() + Math.max(0, minutes) * 60000);
+  if (due.getDate() !== now.getDate()) return null;
+  return `${String(due.getHours()).padStart(2, '0')}:${String(due.getMinutes()).padStart(2, '0')}`;
+}
+
+const SWITCH_LABEL: Partial<Record<ReviewRow['kind'], string>> = {
+  new_lead: 'New lead',
+  case_note: 'Note on a case',
+  new_partner: 'New partner',
+  partner_note: 'Note on a partner',
+};
+
+export default function DayReviewSheet({
+  visible, userId, cases, contacts, partners, followUps, referrals, directoryEntitled, leadResponseMinutes, licenseConcernFor, onClose, onSaved,
+}: Props) {
   const [phase, setPhase] = useState<Phase>('paste');
   const [notes, setNotes] = useState('');
   const [rows, setRows] = useState<ReviewRow[]>([]);
   const [today, setToday] = useState(localDay());
   const [keyState, setKeyState] = useState<'checking' | 'ready' | 'missing'>('checking');
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
-  const [saved, setSaved] = useState<Record<string, string>>({}); // row key -> '' saved, else the reason
+  const [saved, setSaved] = useState<Record<string, SaveResult>>({});
   const [picker, setPicker] = useState<{ key: string; what: 'case' | 'partner'; query: string } | null>(null);
   const [index, setIndex] = useState<DirectoryIndex | null>(null);
-  // Bumped on every close: a review or save finishing afterwards changes nothing.
+  // Bumped on every open and close: a review or save finishing afterwards changes nothing.
   const openingRef = useRef(0);
+  // Set synchronously, so a second tap on Approve cannot start a second save.
+  const savingRef = useRef(false);
+  // What this opening has saved, so reading the same notes again does not offer it twice.
+  const savedSignaturesRef = useRef<Set<string>>(new Set());
+  const savedCountRef = useRef(0);
 
   const workspace: Workspace = useMemo(() => ({
     cases, contacts, partners, followUps, referrals, directory: index,
   }), [cases, contacts, partners, followUps, referrals, index]);
+  // The review is built after the network call: from the workspace as it is
+  // then, not as it was when Find was tapped.
+  const workspaceRef = useRef(workspace);
+  workspaceRef.current = workspace;
 
-  // A fresh sheet each time it opens, and for each account.
-  useEffect(() => {
-    openingRef.current += 1;
-    if (!visible) return;
+  function clearReview() {
     setPhase('paste');
     setNotes('');
     setRows([]);
     setSaved({});
     setPicker(null);
     setMessage(null);
+    savedSignaturesRef.current = new Set();
+    savedCountRef.current = 0;
+    savingRef.current = false;
+  }
+
+  // A fresh sheet each time it opens, and for each account; nothing from a
+  // closed review is kept in memory.
+  useEffect(() => {
+    openingRef.current += 1;
+    clearReview();
+    if (!visible) return;
     setToday(localDay());
     setKeyState('checking');
     const opening = openingRef.current;
@@ -127,19 +179,40 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
     return () => { live = false; };
   }, [visible, directoryEntitled, userId]);
 
-  const pending = rows.filter((row) => saved[row.key] !== '');
-  const ready = pending.filter(rowReady);
-  const waiting = pending.filter((row) => row.include && !rowReady(row)).length;
+  // The workspace with this review's new leads in it: a follow-up about a
+  // caller who is new today can go on the case the lead will create.
+  const view = useMemo(() => withPendingLeads(workspace, rows), [workspace, rows]);
+  const context: RowContext = { rows, licenseConcern: (partnerId) => Boolean(licenseConcernFor(partnerId)) };
+  const isSaved = (row: ReviewRow) => saved[row.key]?.saved === true;
+  const pending = rows.filter((row) => !isSaved(row));
+  const ready = pending.filter((row) => rowReady(row, context));
+  const waiting = pending.filter((row) => row.include && !rowReady(row, context)).length;
   const busy = phase === 'finding' || phase === 'saving';
+  const locked = phase === 'saving' || phase === 'done';
+
+  function finish() {
+    openingRef.current += 1;
+    clearReview();
+    onClose();
+  }
 
   function close() {
     if (busy) return;
-    const unsaved = phase === 'review' ? pending.some((row) => row.include) : notes.trim().length > 0 && phase === 'paste';
-    if (!unsaved) { onClose(); return; }
-    Alert.alert('Discard this review?', 'Nothing from these notes has been saved yet.', [
-      { text: 'Keep reviewing', style: 'cancel' },
-      { text: 'Discard', style: 'destructive', onPress: onClose },
-    ]);
+    const unsaved = phase === 'review'
+      ? pending.some((row) => row.include)
+      : phase === 'paste' && notes.trim().length > 0;
+    if (!unsaved) { finish(); return; }
+    const kept = savedCountRef.current;
+    Alert.alert(
+      'Discard this review?',
+      kept
+        ? `${kept} ${kept === 1 ? 'item you approved stays' : 'items you approved stay'} saved. Nothing else from these notes is saved.`
+        : 'Nothing from these notes has been saved yet.',
+      [
+        { text: 'Keep reviewing', style: 'cancel' },
+        { text: 'Discard', style: 'destructive', onPress: finish },
+      ],
+    );
   }
 
   async function pasteFromClipboard() {
@@ -169,8 +242,10 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
       }
       const { items } = await requestDayReview(text, day, key);
       if (opening !== openingRef.current) return;
-      setRows(buildRows(items, workspace, day));
+      const built = markSavedBefore(buildRows(items, workspaceRef.current, day, newUuid), savedSignaturesRef.current);
+      setRows(built);
       setSaved({});
+      setPicker(null);
       setPhase('review');
       if (!items.length) setMessage({ ok: true, text: 'Nothing in these notes needs to go into ReferralFit.' });
     } catch (error) {
@@ -181,45 +256,20 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
     }
   }
 
+  // An edit to a row clears the reason its last save failed.
+  function updateRow(key: string, change: (row: ReviewRow) => ReviewRow) {
+    if (locked) return;
+    setRows((current) => current.map((row) => (row.key === key ? change(row) : row)));
+    setSaved((current) => {
+      if (!current[key] || current[key].saved) return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }
+
   function patch(key: string, change: Partial<ReviewRow>) {
-    setRows((current) => current.map((row) => (row.key === key ? { ...row, ...change } : row)));
-  }
-
-  async function approve() {
-    if (busy || !ready.length) return;
-    const opening = openingRef.current;
-    setPhase('saving');
-    setMessage(null);
-    const results: Record<string, string> = { ...saved };
-    let any = false;
-    // One at a time, in order: a lead before the follow-up written about it.
-    for (const row of ready) {
-      const problem = await saveReviewRow(row, userId, today);
-      results[row.key] = problem;
-      if (!problem) any = true;
-      if (opening !== openingRef.current) break;
-    }
-    if (any) onSaved();
-    if (opening !== openingRef.current) return;
-    setSaved(results);
-    const failed = ready.filter((row) => results[row.key]);
-    const savedKinds = ready.filter((row) => results[row.key] === '').map((row) => row.kind);
-    if (failed.length) {
-      setPhase('review');
-      setMessage({ ok: false, text: `${failed.length} could not be saved. See the rows below. Saved: ${countLine(savedKinds)}` });
-    } else if (rows.some((row) => results[row.key] !== '' && row.include)) {
-      setPhase('review');
-      setMessage({ ok: true, text: `Saved: ${countLine(savedKinds)} The rest still need a choice.` });
-    } else {
-      setPhase('done');
-      setMessage({ ok: true, text: `Saved: ${countLine(savedKinds)}` });
-    }
-  }
-
-  // ─── Rows ───────────────────────────────────────────────────────────────
-
-  function caseTitle(id: string): string {
-    return cases.find((record) => record.id === id)?.title || 'A case';
+    updateRow(key, (row) => ({ ...row, ...change }));
   }
 
   function partnerLabel(id: string): string {
@@ -227,22 +277,81 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
     return partner ? partner.organization || partner.name : 'A partner';
   }
 
+  function licenseNoteFor(row: ReviewRow): string {
+    if (row.kind !== 'referral' || row.direction !== 'sent' || !row.partnerId) return '';
+    const concern = licenseConcernFor(row.partnerId);
+    return concern ? licenseOverrideNote(partnerLabel(row.partnerId), concern, 'refer') : '';
+  }
+
+  async function approve() {
+    if (savingRef.current || busy || !ready.length) return;
+    savingRef.current = true;
+    const opening = openingRef.current;
+    setPhase('saving');
+    setMessage(null);
+    const results: Record<string, SaveResult> = { ...saved };
+    const order = saveOrder(ready);
+    const dueTime = leadDueTime(leadResponseMinutes);
+    let any = false;
+    try {
+      // One at a time: new leads first, then what may go on their cases.
+      for (const row of order) {
+        const lead = leadFor(row, rows);
+        if (lead && !results[lead.key]?.saved) {
+          results[row.key] = { saved: false, message: 'This saves once the new lead above is saved.' };
+          continue;
+        }
+        const result = await saveReviewRow(row, userId, { today, leadDueTime: dueTime, licenseNote: licenseNoteFor(row) });
+        results[row.key] = result;
+        if (result.saved) {
+          any = true;
+          savedCountRef.current += 1;
+          for (const signature of rowSignatures(row)) savedSignaturesRef.current.add(signature);
+        }
+        if (opening !== openingRef.current) break;
+      }
+    } finally {
+      savingRef.current = false;
+    }
+    if (any) onSaved();
+    if (opening !== openingRef.current) return;
+    setSaved(results);
+    const failed = order.filter((row) => !results[row.key]?.saved);
+    const savedKinds = order.filter((row) => results[row.key]?.saved).map((row) => row.kind);
+    const notesToAct = order.filter((row) => results[row.key]?.saved && results[row.key].message).length;
+    const extra = notesToAct ? ` ${notesToAct} ${notesToAct === 1 ? 'needs' : 'need'} a step by hand; see the row.` : '';
+    if (failed.length) {
+      setPhase('review');
+      setMessage({ ok: false, text: `${failed.length} could not be saved; see the rows. Saved: ${countLine(savedKinds)}${extra}` });
+    } else if (rows.some((row) => !results[row.key]?.saved && row.include)) {
+      setPhase('review');
+      setMessage({ ok: true, text: `Saved: ${countLine(savedKinds)} The rest still need a choice.${extra}` });
+    } else {
+      setPhase('done');
+      setMessage({ ok: true, text: `Saved: ${countLine(savedKinds)}${extra}` });
+    }
+  }
+
+  // ─── Rows ───────────────────────────────────────────────────────────────
+
   function renderChoices(row: ReviewRow, what: 'case' | 'partner') {
     const ids = what === 'case' ? row.caseChoices : row.partnerChoices;
     const chosen = what === 'case' ? row.caseId : row.partnerId;
+    const unsure = what === 'case' ? row.caseUnsure : row.partnerUnsure;
     const open = picker?.key === row.key && picker.what === what;
     const query = open ? comparable(picker!.query) : '';
     const searched = open && query
       ? (what === 'case'
-        ? cases.filter((record) => comparable(record.title).includes(query)).map((record) => record.id)
+        ? view.cases.filter((record) => record.id !== row.ids.caseId && comparable(record.title).includes(query)).map((record) => record.id)
         : partners.filter((partner) => comparable(`${partner.organization} ${partner.name}`).includes(query)).map((partner) => partner.id)
       ).slice(0, 8)
       : [];
     const shown = [...new Set([...(chosen ? [chosen] : []), ...ids, ...searched])];
-    const label = what === 'case' ? caseTitle : partnerLabel;
+    const label = (id: string) => (what === 'case' ? caseLabel(view, id) : partnerLabel(id));
+    const noun = what === 'case' ? 'case' : 'partner';
     return (
       <View style={styles.choices}>
-        <Text style={styles.label}>{what === 'case' ? 'CASE' : 'PARTNER'}</Text>
+        <Text style={styles.label}>{row.kind === 'new_partner' ? 'ALREADY IN YOUR NETWORK?' : what === 'case' ? 'CASE' : 'PARTNER'}</Text>
         <View style={styles.pillRow}>
           {shown.map((id) => {
             const on = id === chosen;
@@ -251,9 +360,10 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
                 key={id}
                 accessibilityRole="button"
                 accessibilityState={{ selected: on }}
-                onPress={() => patch(row.key, what === 'case'
-                  ? { caseId: on ? null : id, clientLabel: !on && row.kind === 'referral' && !row.clientLabel ? caseTitle(id) : row.clientLabel, unsure: false }
-                  : { partnerId: on ? null : id, unsure: false })}
+                accessibilityLabel={`${on ? 'Chosen' : 'Choose'} ${noun}: ${label(id)}`}
+                onPress={() => updateRow(row.key, (current) => (what === 'case'
+                  ? chooseCase(current, on ? null : id, view)
+                  : choosePartner(current, on ? null : id)))}
                 style={[styles.pill, on && styles.pillOn]}
               >
                 <Text style={[styles.pillText, on && styles.pillTextOn]} numberOfLines={1}>{label(id)}</Text>
@@ -262,18 +372,33 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
           })}
           <TouchableOpacity
             accessibilityRole="button"
+            accessibilityLabel={open ? `Done finding a ${noun}` : `Find another ${noun}`}
             onPress={() => setPicker(open ? null : { key: row.key, what, query: '' })}
             style={styles.pill}
           >
-            <Text style={styles.pillText}>{open ? 'Done' : 'Find another'}</Text>
+            <Text style={styles.pillText}>{open ? 'Done' : `Find another ${noun}`}</Text>
           </TouchableOpacity>
         </View>
+        {chosen && unsure ? (
+          <View style={styles.confirmRow}>
+            <Text style={[styles.hint, styles.flex]}>Matched by name only. Is this the right {noun}?</Text>
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel={`Yes, ${label(chosen)} is the right ${noun}`}
+              onPress={() => patch(row.key, what === 'case' ? { caseUnsure: false } : { partnerUnsure: false })}
+              style={styles.confirmButton}
+            >
+              <Text style={styles.confirmButtonText}>Yes, this {noun}</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
         {open ? (
           <TextInput
             value={picker!.query}
             onChangeText={(value) => setPicker({ key: row.key, what, query: value })}
             placeholder={what === 'case' ? 'Search cases' : 'Search partners'}
             placeholderTextColor={COLORS.gray}
+            accessibilityLabel={what === 'case' ? 'Search cases' : 'Search partners'}
             autoFocus
             style={styles.input}
           />
@@ -282,23 +407,73 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
     );
   }
 
+  function renderKindSwitch(row: ReviewRow) {
+    const kinds = kindChoices(row);
+    if (!kinds.length) return null;
+    return (
+      <View style={styles.pillRow}>
+        {kinds.map((kind) => {
+          const on = row.kind === kind;
+          return (
+            <TouchableOpacity
+              key={kind}
+              accessibilityRole="button"
+              accessibilityState={{ selected: on }}
+              accessibilityLabel={`Save as: ${SWITCH_LABEL[kind] || KIND_LABEL[kind]}`}
+              onPress={() => updateRow(row.key, (current) => switchKind(current, kind))}
+              style={[styles.pill, on && styles.pillOn]}
+            >
+              <Text style={[styles.pillText, on && styles.pillTextOn]}>{SWITCH_LABEL[kind] || KIND_LABEL[kind]}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    );
+  }
+
+  function renderLicense(row: ReviewRow) {
+    if (row.kind !== 'referral' || row.direction !== 'sent' || !row.partnerId) return null;
+    const concern = licenseConcernFor(row.partnerId);
+    if (!concern) return null;
+    const prompt = licenseConcernAlert(partnerLabel(row.partnerId), concern, 'refer');
+    const confirmed = row.licenseConfirmed === row.partnerId;
+    return (
+      <View style={styles.urgent} accessibilityRole="alert">
+        <Text style={styles.urgentText}>{prompt.message}</Text>
+        {confirmed ? (
+          <Text style={styles.urgentText}>You chose to go ahead. That is noted on the referral.</Text>
+        ) : (
+          <TouchableOpacity accessibilityRole="button" onPress={() => patch(row.key, { licenseConfirmed: row.partnerId })} style={styles.confirmButton}>
+            <Text style={styles.confirmButtonText}>{prompt.proceed}</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    );
+  }
+
   function renderRow(row: ReviewRow) {
     const result = saved[row.key];
-    const done = result === '';
-    const problem = rowProblem(row);
+    const done = result?.saved === true;
+    const readOnly = done || locked;
+    const problem = rowProblem(row, context);
     const found = row.found;
+    const edit = !readOnly && row.include;
+    const showCase = row.kind === 'case_note' || row.kind === 'follow_up' || row.kind === 'referral';
+    const showPartner = row.kind === 'partner_note' || row.kind === 'referral' || row.kind === 'follow_up'
+      || (row.kind === 'new_partner' && row.partnerChoices.length > 0);
     return (
       <View key={row.key} style={[styles.row, (!row.include || done) && styles.rowOff]}>
         <View style={styles.rowTop}>
           <View style={styles.flex}>
             <Text style={styles.kind}>{KIND_LABEL[row.kind].toUpperCase()}{found.urgent ? ' · URGENT' : ''}</Text>
-            <Text style={styles.destination}>{destination(row, workspace)}</Text>
+            <Text style={styles.destination}>{destination(row, view)}</Text>
           </View>
-          {done ? <Text style={styles.savedTag}>Saved</Text> : (
+          {done ? <Text style={styles.savedTag}>Saved</Text> : readOnly ? (
+            <Text style={styles.offTag}>{row.include ? '' : 'Skipped'}</Text>
+          ) : (
             <Switch
               accessibilityLabel={`Include this ${KIND_LABEL[row.kind].toLowerCase()}`}
               value={row.include}
-              disabled={busy}
               onValueChange={(include) => patch(row.key, { include })}
               trackColor={{ true: COLORS.forest }}
             />
@@ -311,23 +486,24 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
           </View>
         ) : null}
 
-        {done ? <Text style={styles.body}>{row.text}</Text> : (
+        {edit ? renderKindSwitch(row) : null}
+
+        {readOnly ? <Text style={styles.body}>{row.text}</Text> : (
           <TextInput
             value={row.text}
             onChangeText={(value) => patch(row.key, { text: value })}
             multiline
-            editable={!busy}
             accessibilityLabel={row.kind === 'follow_up' ? 'Task' : 'Note'}
             style={[styles.input, styles.inputMultiline]}
           />
         )}
 
-        {!done && row.include && row.kind === 'new_lead' ? (
+        {edit && row.kind === 'new_lead' ? (
           <View style={styles.fields}>
             <Text style={styles.fieldLabel}>CALLER</Text>
             <TextInput value={row.callerName} onChangeText={(value) => patch(row.key, { callerName: value })} placeholder="Caller's name" placeholderTextColor={COLORS.gray} accessibilityLabel="Caller's name" style={styles.input} />
             <Text style={styles.fieldLabel}>PHONE</Text>
-            <TextInput value={row.phone} onChangeText={(value) => patch(row.key, { phone: value })} placeholder="Required" placeholderTextColor={COLORS.gray} keyboardType="phone-pad" accessibilityLabel="Phone" style={styles.input} />
+            <TextInput value={row.phone} onChangeText={(value) => patch(row.key, { phone: value })} placeholder="Required" placeholderTextColor={COLORS.gray} keyboardType="phone-pad" maxLength={40} accessibilityLabel="Phone" style={styles.input} />
             <Text style={styles.fieldLabel}>EMAIL</Text>
             <TextInput value={row.email} onChangeText={(value) => patch(row.key, { email: value })} placeholder="Optional" placeholderTextColor={COLORS.gray} keyboardType="email-address" autoCapitalize="none" accessibilityLabel="Email" style={styles.input} />
             <View style={styles.fieldRow}>
@@ -343,10 +519,40 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
           </View>
         ) : null}
 
-        {!done && row.include && (row.kind === 'case_note' || (row.kind === 'follow_up' && (row.caseId || row.caseChoices.length)) || row.kind === 'referral') ? renderChoices(row, 'case') : null}
-        {!done && row.include && (row.kind === 'partner_note' || row.kind === 'referral' || (row.kind === 'follow_up' && !row.caseId)) ? renderChoices(row, 'partner') : null}
+        {edit && row.kind === 'referral' ? (
+          <View style={styles.choices}>
+            <Text style={styles.label}>WHICH WAY</Text>
+            <View style={styles.pillRow}>
+              {([['sent', 'You referred them'], ['received', 'Referred to you']] as const).map(([direction, text]) => {
+                const on = row.direction === direction;
+                return (
+                  <TouchableOpacity key={direction} accessibilityRole="button" accessibilityState={{ selected: on }} onPress={() => patch(row.key, { direction })} style={[styles.pill, on && styles.pillOn]}>
+                    <Text style={[styles.pillText, on && styles.pillTextOn]}>{text}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+        ) : null}
 
-        {!done && row.include && row.kind === 'follow_up' ? (
+        {edit && showCase ? renderChoices(row, 'case') : null}
+        {edit && showPartner ? renderChoices(row, 'partner') : null}
+
+        {edit && row.kind === 'follow_up' && (row.caseChoices.length > 0 || row.partnerChoices.length > 0) ? (
+          <View style={styles.pillRow}>
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityState={{ selected: row.noLink }}
+              accessibilityLabel="Not linked to a case or partner"
+              onPress={() => patch(row.key, row.noLink ? { noLink: false } : { noLink: true, caseId: null, partnerId: null, caseUnsure: false, partnerUnsure: false })}
+              style={[styles.pill, row.noLink && styles.pillOn]}
+            >
+              <Text style={[styles.pillText, row.noLink && styles.pillTextOn]}>Not linked</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
+
+        {edit && row.kind === 'follow_up' ? (
           <View style={styles.choices}>
             <Text style={styles.label}>DUE</Text>
             <View style={styles.pillRow}>
@@ -354,24 +560,27 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
                 const on = row.dueOn === day;
                 const label = day === today ? 'Today' : day === addDays(today, 1) ? 'Tomorrow' : day;
                 return (
-                  <TouchableOpacity key={day} accessibilityRole="button" accessibilityState={{ selected: on }} onPress={() => patch(row.key, { dueOn: day })} style={[styles.pill, on && styles.pillOn]}>
+                  <TouchableOpacity key={day} accessibilityRole="button" accessibilityState={{ selected: on }} accessibilityLabel={`Due ${label}`} onPress={() => patch(row.key, { dueOn: day })} style={[styles.pill, on && styles.pillOn]}>
                     <Text style={[styles.pillText, on && styles.pillTextOn]}>{label}</Text>
                   </TouchableOpacity>
                 );
               })}
             </View>
-            <TextInput value={row.dueOn} onChangeText={(value) => patch(row.key, { dueOn: value.trim() })} placeholder="YYYY-MM-DD" placeholderTextColor={COLORS.gray} style={styles.input} />
+            <TextInput value={row.dueOn} onChangeText={(value) => patch(row.key, { dueOn: value.trim() })} placeholder="YYYY-MM-DD" placeholderTextColor={COLORS.gray} accessibilityLabel="Due date, year month day" maxLength={10} style={styles.input} />
           </View>
         ) : null}
 
-        {!done && row.include && row.kind === 'referral' ? (
+        {edit && row.kind === 'referral' ? (
           <View style={styles.choices}>
-            <Text style={styles.label}>{found.direction === 'received' ? 'REFERRED TO YOU' : 'YOU REFERRED'} · CLIENT LABEL</Text>
-            <TextInput value={row.clientLabel} onChangeText={(value) => patch(row.key, { clientLabel: value })} placeholder="Initials or a private label" placeholderTextColor={COLORS.gray} style={styles.input} />
+            <Text style={styles.label}>CLIENT LABEL</Text>
+            <TextInput value={row.clientLabel} onChangeText={(value) => patch(row.key, { clientLabel: value })} placeholder="Initials or a private label" placeholderTextColor={COLORS.gray} accessibilityLabel="Client label, initials or a private label" maxLength={120} style={styles.input} />
+            <Text style={styles.hint}>The referral history stays de-identified: use initials or a private label, not a name.</Text>
           </View>
         ) : null}
 
-        {!done && row.include && row.kind === 'new_partner' && row.candidate ? (
+        {edit ? renderLicense(row) : null}
+
+        {edit && row.kind === 'new_partner' && row.candidate ? (
           <View style={styles.choices}>
             <Text style={styles.body}>{[row.candidate.organization, row.candidate.name !== row.candidate.organization ? row.candidate.name : '', row.candidate.phone, row.candidate.email].filter(Boolean).join(' · ')}</Text>
             {row.candidate.useListing && row.candidate.match ? null : (
@@ -383,7 +592,9 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
                       key={type}
                       accessibilityRole="button"
                       accessibilityState={{ selected: on }}
-                      onPress={() => patch(row.key, { candidate: { ...row.candidate!, types: on ? row.candidate!.types.filter((item) => item !== type) : [...row.candidate!.types, type] } })}
+                      onPress={() => updateRow(row.key, (current) => (current.candidate
+                        ? { ...current, candidate: { ...current.candidate, types: on ? current.candidate.types.filter((item) => item !== type) : [...current.candidate.types, type] } }
+                        : current))}
                       style={[styles.pill, on && styles.pillOn]}
                     >
                       <Text style={[styles.pillText, on && styles.pillTextOn]}>{type}</Text>
@@ -397,9 +608,8 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
 
         {found.evidence ? <Text style={styles.quote}>“{found.evidence}”</Text> : null}
         {row.hint && !done ? <Text style={styles.hint}>{row.hint}</Text> : null}
-        {row.unsure && !done && row.include ? <Text style={styles.hint}>Matched by name only. Check it.</Text> : null}
-        {result ? <Text style={styles.problem}>{result}</Text> : null}
-        {!done && row.include && problem && !result ? <Text style={styles.problem}>{problem}</Text> : null}
+        {result?.message ? <Text style={result.saved ? styles.hint : styles.problem}>{result.message}</Text> : null}
+        {!readOnly && row.include && problem && !result ? <Text style={styles.problem}>{problem}</Text> : null}
       </View>
     );
   }
@@ -427,7 +637,7 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
           <Text style={styles.secondaryButtonText}>Paste</Text>
         </TouchableOpacity>
         {notes ? (
-          <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => setNotes('')} style={styles.secondaryButton}>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Clear the notes" disabled={busy} onPress={() => setNotes('')} style={styles.secondaryButton}>
             <Text style={styles.secondaryButtonText}>Clear</Text>
           </TouchableOpacity>
         ) : null}
@@ -452,33 +662,33 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
       <SafeAreaView style={styles.page}>
         <View style={styles.header}>
-          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close review" disabled={busy} onPress={close} style={styles.headerButton}>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel={phase === 'done' ? 'Done' : 'Close review'} disabled={busy} onPress={close} style={styles.headerButton}>
             <Text style={[styles.headerButtonText, busy && styles.off]}>{phase === 'done' ? 'Done' : 'Cancel'}</Text>
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>Review notes</Text>
+          <Text style={styles.headerTitle} accessibilityRole="header">Review notes</Text>
           <View style={styles.headerButton} />
         </View>
         <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+          <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
             {phase === 'paste' || phase === 'finding' ? pasteScreen : null}
-            {message ? (
-              <View style={[styles.notice, message.ok && styles.noticeOk]} accessibilityRole="alert">
-                <Text style={[styles.noticeText, message.ok && styles.noticeTextOk]}>{message.text}</Text>
-              </View>
-            ) : null}
             {phase === 'review' || phase === 'saving' || phase === 'done' ? (
-              <>
+              <View pointerEvents={locked ? 'none' : 'auto'}>
                 {rows.length ? <Text style={styles.label}>FROM YOUR NOTES · {countLine(rows.map((row) => row.kind)).replace(/\.$/, '').toUpperCase()}</Text> : null}
                 {rows.map(renderRow)}
-                {phase !== 'done' ? (
-                  <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { setPhase('paste'); setMessage(null); }} style={styles.secondaryButton}>
+                {phase === 'review' ? (
+                  <TouchableOpacity accessibilityRole="button" onPress={() => { setPhase('paste'); setMessage(null); setPicker(null); }} style={styles.secondaryButton}>
                     <Text style={styles.secondaryButtonText}>Back to the notes</Text>
                   </TouchableOpacity>
                 ) : null}
-              </>
+              </View>
             ) : null}
           </ScrollView>
           <View style={styles.footer}>
+            {message ? (
+              <View style={[styles.notice, styles.footerNotice, message.ok && styles.noticeOk]} accessibilityRole="alert" accessibilityLiveRegion="polite">
+                <Text style={[styles.noticeText, message.ok && styles.noticeTextOk]}>{message.text}</Text>
+              </View>
+            ) : null}
             {phase === 'paste' || phase === 'finding' ? (
               <TouchableOpacity
                 accessibilityRole="button"
@@ -489,13 +699,13 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
               >
                 {phase === 'finding' ? (
                   <View style={styles.busyRow}>
-                    <ActivityIndicator color={COLORS.white} />
+                    <ActivityIndicator color={COLORS.white} accessibilityLabel="Reading your notes" />
                     <Text style={styles.primaryButtonText}>Reading your notes…</Text>
                   </View>
                 ) : <Text style={styles.primaryButtonText}>Find what's in it</Text>}
               </TouchableOpacity>
             ) : phase === 'done' ? (
-              <TouchableOpacity accessibilityRole="button" onPress={onClose} style={styles.primaryButton}>
+              <TouchableOpacity accessibilityRole="button" onPress={finish} style={styles.primaryButton}>
                 <Text style={styles.primaryButtonText}>Done</Text>
               </TouchableOpacity>
             ) : (
@@ -508,7 +718,7 @@ export default function DayReviewSheet({ visible, userId, cases, contacts, partn
                   onPress={() => { void approve(); }}
                   style={[styles.primaryButton, (busy || !ready.length) && styles.off]}
                 >
-                  {phase === 'saving' ? <ActivityIndicator color={COLORS.white} /> : (
+                  {phase === 'saving' ? <ActivityIndicator color={COLORS.white} accessibilityLabel="Saving" /> : (
                     <Text style={styles.primaryButtonText}>{!ready.length ? 'Nothing ready to save' : ready.length === pending.filter((row) => row.include).length ? `Approve all (${ready.length})` : `Approve ${ready.length}`}</Text>
                   )}
                 </TouchableOpacity>
@@ -529,9 +739,9 @@ const styles = StyleSheet.create({
   headerButton: { minWidth: 64, minHeight: 44, justifyContent: 'center', paddingHorizontal: 6 },
   headerButtonText: { fontSize: 15, fontWeight: '700', color: COLORS.inkSoft },
   content: { padding: 18, paddingBottom: 48 },
-  intro: { fontSize: 14, lineHeight: 20, color: COLORS.gray },
-  hint: { fontSize: 12, lineHeight: 17, color: COLORS.gray, marginTop: 4 },
-  label: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, color: COLORS.gray, marginTop: 14, marginBottom: 8 },
+  intro: { fontSize: 14, lineHeight: 20, color: COLORS.muted },
+  hint: { fontSize: 12, lineHeight: 17, color: COLORS.muted, marginTop: 4 },
+  label: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, color: COLORS.muted, marginTop: 14, marginBottom: 8 },
   sourceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
   notice: { backgroundColor: COLORS.coralPale, borderRadius: 12, padding: 12, marginTop: 12 },
   noticeOk: { backgroundColor: COLORS.mintPale },
@@ -541,7 +751,7 @@ const styles = StyleSheet.create({
   inputMultiline: { minHeight: 64, textAlignVertical: 'top' },
   notesInput: { minHeight: 220, marginTop: 12, textAlignVertical: 'top' },
   fields: { gap: 6 },
-  fieldLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 0.8, color: COLORS.gray, marginTop: 4 },
+  fieldLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 0.8, color: COLORS.muted, marginTop: 4 },
   fieldRow: { flexDirection: 'row', gap: 8 },
   row: { backgroundColor: COLORS.white, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, padding: 14, marginBottom: 10, gap: 8 },
   rowOff: { opacity: 0.6 },
@@ -550,9 +760,13 @@ const styles = StyleSheet.create({
   destination: { fontSize: 13, color: COLORS.inkSoft, marginTop: 3 },
   body: { fontSize: 15, lineHeight: 21, color: COLORS.ink },
   savedTag: { fontSize: 13, fontWeight: '800', color: COLORS.forest },
+  offTag: { fontSize: 13, fontWeight: '700', color: COLORS.muted },
+  confirmRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  confirmButton: { minHeight: 40, paddingHorizontal: 14, borderRadius: 999, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', alignSelf: 'flex-start' },
+  confirmButtonText: { color: COLORS.white, fontSize: 13, fontWeight: '800' },
   urgent: { backgroundColor: COLORS.coralPale, borderRadius: 10, padding: 10 },
   urgentText: { fontSize: 13, lineHeight: 18, color: COLORS.coralText, fontWeight: '700' },
-  quote: { fontSize: 12, lineHeight: 17, color: COLORS.gray, fontStyle: 'italic' },
+  quote: { fontSize: 12, lineHeight: 17, color: COLORS.muted, fontStyle: 'italic' },
   problem: { fontSize: 12, fontWeight: '700', color: COLORS.coralText },
   choices: { gap: 6 },
   pillRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
@@ -561,7 +775,8 @@ const styles = StyleSheet.create({
   pillText: { fontSize: 13, fontWeight: '700', color: COLORS.inkSoft },
   pillTextOn: { color: COLORS.white },
   footer: { padding: 14, gap: 8, borderTopWidth: 1, borderTopColor: COLORS.line, backgroundColor: COLORS.white },
-  footerHint: { fontSize: 12, color: COLORS.gray, textAlign: 'center' },
+  footerHint: { fontSize: 12, color: COLORS.muted, textAlign: 'center' },
+  footerNotice: { marginTop: 0 },
   primaryButton: { minHeight: 52, borderRadius: 14, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
   primaryButtonText: { color: COLORS.white, fontSize: 16, fontWeight: '800' },
   busyRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },

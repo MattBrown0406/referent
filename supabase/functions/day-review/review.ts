@@ -10,9 +10,9 @@
 // partner itself, and nothing is saved until the practitioner approves it.
 //
 // Because the model can be wrong, its output is checked against the notes:
-// a phone number or email address that is not in the notes is dropped, a
-// quote that is not in the notes is marked unverified, and dates outside a
-// sane window are cleared.
+// a phone number or email address that is not written in the notes is
+// dropped, a quote that is not in the notes (or too short to show anything)
+// is marked unverified, and dates outside a sane window are cleared.
 
 export const REVIEW_KINDS = ['new_lead', 'case_note', 'partner_note', 'follow_up', 'referral', 'new_partner'] as const;
 export type ReviewKind = (typeof REVIEW_KINDS)[number];
@@ -60,17 +60,22 @@ export type FoundItem = {
 export class ReviewRequestError extends Error {}
 export class ReviewOutputError extends Error {}
 
+// Sized so a full answer comes back well inside the function's deadline
+// (index.ts REVIEW_DEADLINE_MS): longer notes are pasted in parts.
 export const LIMITS = {
   textMin: 20,
-  textMax: 20_000,
-  items: 30,
-  summary: 240,
+  textMax: 12_000,
+  items: 20,
+  summary: 200,
   name: 80,
   relationship: 40,
   organization: 120,
   phone: 40,
   email: 254,
-  evidence: 300,
+  evidence: 200,
+  // A quote shorter than this proves nothing ("call", "Friday").
+  quoteMinWords: 4,
+  quoteMinChars: 20,
 } as const;
 
 // Each practitioner brings their own Anthropic API key, exactly as for AI
@@ -93,6 +98,15 @@ export function clean(value: unknown, max: number): string {
     .trim()
     .slice(0, max)
     .trim();
+}
+
+// Shortens text that is already clean at the last whole word within `max`,
+// so a quote never ends mid-word ("Her son Ja").
+export function clipWords(value: string, max: number): string {
+  if (value.length <= max) return value;
+  const cut = value.slice(0, max + 1);
+  const space = cut.lastIndexOf(' ');
+  return (space > max / 2 ? cut.slice(0, space) : value.slice(0, max)).trim();
 }
 
 // The notes keep their line breaks (a day's summary is a list) but nothing
@@ -159,18 +173,25 @@ Also:
 - missed: true for a follow_up the notes show someone asked for or was promised with no sign it was done (a call back that was requested). Its due_date is today.
 - urgent: true on any item where someone may be in immediate danger (an overdose, a threat of suicide or violence). This does not replace emergency services; it only puts the item first.
 - channel: how the conversation happened (call, meeting, text, email), or unknown.
-- due_date: only for follow_ups with a stated or clearly implied date. Resolve words like "tomorrow" or "Friday" against today's date. Use "" when no date is given.
+- due_date: only for follow_ups with a stated or clearly implied date. Resolve words like "tomorrow" or "Friday" against the date the notes themselves give for that conversation when they give one, otherwise against today's date. Use "" when no date is given.
+- direction: for a referral, "sent" or "received" only when the notes make it clear; "" when they do not.
 - phone and email: only exactly as written in the notes. Never guess or complete them; use "" when absent.
-- evidence: copy the exact words from the notes that support the item, up to about 30 words. Do not paraphrase.
-- summary: one plain, factual sentence of at most 25 words. Past tense for notes, an instruction for follow-ups. No clinical judgments, no diagnoses, no recommendations of programs.
+- evidence: copy the exact words from the notes that support the item, at least 4 and at most about 20 words. Do not paraphrase.
+- summary: one plain, factual sentence of at most 20 words. Past tense for notes, an instruction for follow-ups. No clinical judgments, no diagnoses, no recommendations of programs.
 
-Leave out personal or unrelated conversations. Never describe referrals as owed, traded or exchanged. Use "" for any text field that does not apply. List at most ${LIMITS.items} items; if there is nothing to record, return an empty list.`;
+Leave out personal or unrelated conversations. Never describe referrals as owed, traded or exchanged. Use "" for any text field that does not apply. List at most ${LIMITS.items} items, the most important first; if there is nothing to record, return an empty list.`;
+
+// Text in the notes that looks like the tags around them ("</notes>") is
+// changed so the notes cannot appear to end early.
+function fenced(text: string): string {
+  return text.replace(/<\s*\/?\s*notes\s*>/gi, '(notes)');
+}
 
 export function buildUserPrompt(request: ReviewRequest): string {
   return `Today is ${request.weekday}, ${request.today}.
 
 <notes>
-${request.text}
+${fenced(request.text)}
 </notes>`;
 }
 
@@ -228,19 +249,55 @@ function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback
   return typeof value === 'string' && (allowed as readonly string[]).includes(value) ? value as T : fallback;
 }
 
-// A phone number survives only when its last ten digits are in the notes.
-function phoneFromNotes(value: unknown, notesDigits: string): string {
-  const phone = clean(value, LIMITS.phone);
-  const digits = phone.replace(/\D/g, '');
-  if (digits.length < 10) return '';
-  return notesDigits.includes(digits.slice(-10)) ? phone : '';
+// The phone numbers written in the notes, by their last ten digits: US
+// numbers in the usual shapes ((503) 555-0142, 503.555.0142, +1 503 555 0142)
+// and international ones written with a +. Each is read on its own, within
+// one line, so digits from two numbers near each other never join into one
+// that is not there.
+const US_PHONE = /(?<!\d)(?:\+?1[ .-]?)?\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}(?!\d)/g;
+const PLUS_PHONE = /(?<!\d)\+\d{1,3}(?:[ .-]?\d{1,4}){2,5}(?!\d)/g;
+
+export function notesPhones(text: string): Set<string> {
+  const found = new Set<string>();
+  for (const pattern of [US_PHONE, PLUS_PHONE]) {
+    for (const match of text.matchAll(pattern)) {
+      const digits = match[0].replace(/\D/g, '');
+      if (digits.length >= 10 && digits.length <= 15) found.add(digits.slice(-10));
+    }
+  }
+  return found;
 }
 
-// An email address survives only when it is in the notes.
-function emailFromNotes(value: unknown, notesLower: string): string {
-  const email = clean(value, LIMITS.email).toLowerCase();
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return '';
-  return notesLower.includes(email) ? email : '';
+// The email addresses written in the notes, lower case.
+export function notesEmails(text: string): Set<string> {
+  const found = new Set<string>();
+  for (const match of text.matchAll(/[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}/gi)) {
+    found.add(match[0].toLowerCase());
+  }
+  return found;
+}
+
+// A phone number survives only when it is one of the numbers in the notes.
+function phoneFromNotes(value: unknown, phones: Set<string>): string {
+  const phone = clean(value, LIMITS.phone);
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length < 10 || digits.length > 15) return '';
+  return phones.has(digits.slice(-10)) ? phone : '';
+}
+
+// An email address survives only when it is one of the addresses in the notes.
+function emailFromNotes(value: unknown, emails: Set<string>): string {
+  const email = clean(value, LIMITS.email).toLowerCase().replace(/^mailto:/, '');
+  return emails.has(email) ? email : '';
+}
+
+// A quote counts only when it is long enough to show something and appears
+// in the notes word for word (ignoring case, punctuation and line breaks).
+function quoteInNotes(evidence: string, notesComparable: string): boolean {
+  const quote = comparable(evidence);
+  if (!quote) return false;
+  if (quote.split(' ').length < LIMITS.quoteMinWords && quote.length < LIMITS.quoteMinChars) return false;
+  return notesComparable.includes(` ${quote} `);
 }
 
 // A due date from yesterday to a year out; anything else is cleared.
@@ -272,8 +329,8 @@ export function parseReviewOutput(raw: string, request: ReviewRequest): FoundIte
   }
   const list = record(parsed).items;
   if (!Array.isArray(list)) throw new ReviewOutputError('The review came back unreadable.');
-  const notesDigits = request.text.replace(/\D/g, '');
-  const notesLower = request.text.toLowerCase();
+  const phones = notesPhones(request.text);
+  const emails = notesEmails(request.text);
   const notesComparable = ` ${comparable(request.text)} `;
   const items: FoundItem[] = [];
   for (const entry of list) {
@@ -281,30 +338,31 @@ export function parseReviewOutput(raw: string, request: ReviewRequest): FoundIte
     const input = record(entry);
     const kind = oneOf(input.kind, REVIEW_KINDS, 'case_note');
     if (!(REVIEW_KINDS as readonly unknown[]).includes(input.kind)) continue;
-    const evidence = clean(input.evidence, LIMITS.evidence);
-    const quote = comparable(evidence);
+    // Checked in full, then shortened for the screen.
+    const fullEvidence = clean(input.evidence, LIMITS.evidence * 4);
     const item: FoundItem = {
       kind,
-      summary: clean(input.summary, LIMITS.summary),
+      summary: clipWords(clean(input.summary, LIMITS.summary * 2), LIMITS.summary),
       channel: oneOf(input.channel, CHANNELS, 'unknown'),
       personName: clean(input.person_name, LIMITS.name),
       aboutFirstName: clean(input.about_first_name, LIMITS.name),
       aboutRelationship: clean(input.about_relationship, LIMITS.relationship),
       organization: clean(input.organization, LIMITS.organization),
-      phone: phoneFromNotes(input.phone, notesDigits),
-      email: emailFromNotes(input.email, notesLower),
+      phone: phoneFromNotes(input.phone, phones),
+      email: emailFromNotes(input.email, emails),
       dueDate: kind === 'follow_up' ? dueDateWithin(input.due_date, request.today) : '',
       direction: kind === 'referral' ? oneOf(input.direction, DIRECTIONS, '') : '',
       partnerType: oneOf(input.partner_type, PARTNER_TYPES, ''),
       regarding: oneOf(input.regarding, REGARDING, 'none'),
       urgent: input.urgent === true,
       missed: kind === 'follow_up' && input.missed === true,
-      evidence,
-      verified: quote.length >= 3 && notesComparable.includes(` ${quote} `),
+      evidence: clipWords(fullEvidence, LIMITS.evidence),
+      verified: quoteInNotes(fullEvidence, notesComparable),
     };
     // A promise nobody kept is due now.
     if (item.missed && !item.dueDate) item.dueDate = request.today;
-    if (item.kind === 'referral' && !item.direction) item.direction = 'sent';
+    // A referral whose direction the notes do not make clear stays '': the
+    // practitioner says which way it went before it can be saved.
     if (usable(item)) items.push(item);
   }
   // Anything urgent first; otherwise the order of the notes.

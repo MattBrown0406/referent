@@ -1549,6 +1549,8 @@ export default function App() {
   const resetAccountState = useCallback(() => {
     clearUnansweredSendKeys();
     clearPlacementAnswerLinks();
+    // A review open for the account that signed out closes (it is cleared as it closes).
+    setShowDayReview(false);
     setOutreach(null);
     setAssessmentCaseId(null);
     setPlacementSheet(null);
@@ -10223,6 +10225,8 @@ export default function App() {
         followUps={followUps}
         referrals={referrals}
         directoryEntitled={entitlements.entitlements.directory}
+        leadResponseMinutes={leadSettings.leadResponseTargetMinutes}
+        licenseConcernFor={(partnerId) => integrityByPartner.get(partnerId)?.licenseConcern ?? null}
         onClose={() => setShowDayReview(false)}
         onSaved={() => refreshAfterServerChange()}
       />

@@ -3,7 +3,7 @@
 // makes (create_lead, case events, partner touches, follow-ups, referrals,
 // import_partners). The rules live in day-review.ts. See docs/DAY_REVIEW.md.
 
-import { createLead, newUuid } from './cases';
+import { createLead } from './cases';
 import {
   caseEventWrite,
   followUpWrite,
@@ -91,57 +91,107 @@ export async function requestDayReview(notes: string, today: string, apiKey: str
   return { items: readFoundItems(data.items), remaining: typeof data.remaining === 'number' ? data.remaining : null };
 }
 
+export type SaveResult = {
+  /** The row is in ReferralFit (or queued to send when back online, as every write in the app is). */
+  saved: boolean;
+  /** Why it was not saved; or, when saved, what still needs doing by hand. */
+  message: string;
+};
+
+const SAVED: SaveResult = { saved: true, message: '' };
+
+// A follow-up or referral is a plain insert under the row's own id. When a
+// save is tried again after a failure that happened after the row landed,
+// the second insert is refused as a duplicate; the row is there, so it is
+// saved.
+async function alreadyThere(table: 'follow_ups' | 'referrals', id: string): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.from(table).select('id').eq('id', id).maybeSingle();
+    return !error && Boolean(data);
+  } catch {
+    return false;
+  }
+}
+
+export type SaveOptions = {
+  today: string;
+  /** A new lead's first call: the time it is due today (HH:MM), from the practice's lead response target. */
+  leadDueTime: string | null;
+  /** A referral sent despite a license concern: the line kept on it (integrity.ts licenseOverrideNote). */
+  licenseNote?: string;
+};
+
 /**
- * Saves one approved row. Resolves with '' when saved (or queued to send
- * when back online, as every write in the app is), or with the reason it
- * could not be.
+ * Saves one approved row under the ids it was given when the review was
+ * built, so trying again writes the same records, never second copies.
  */
-export async function saveReviewRow(row: ReviewRow, userId: string, today: string): Promise<string> {
+export async function saveReviewRow(row: ReviewRow, userId: string, options: SaveOptions): Promise<SaveResult> {
   const now = new Date().toISOString();
+  const { today } = options;
   try {
     switch (row.kind) {
       case 'new_lead': {
-        const lead = leadWrite(row);
+        // create_lead treats a repeat of a lead that already landed as success.
         await createLead({
-          caseId: newUuid(),
-          contactId: newUuid(),
-          followUpId: newUuid(),
-          ...lead,
+          caseId: row.ids.caseId,
+          contactId: row.ids.contactId,
+          followUpId: row.ids.followUpId,
+          ...leadWrite(row),
           dueOn: today,
-          dueTime: null,
+          dueTime: options.leadDueTime,
         }, userId);
-        return '';
+        return SAVED;
       }
       case 'case_note':
-        await logContactActivity(caseEventWrite(row, newUuid(), now), null, userId);
-        return '';
+        // log_contact_activity upserts by id: a repeat changes nothing.
+        await logContactActivity(caseEventWrite(row, now), null, userId);
+        return SAVED;
       case 'partner_note':
-        await logContactActivity(null, partnerTouchWrite(row, newUuid(), now), userId);
-        return '';
-      case 'follow_up':
-        await createFollowUp(followUpWrite(row, newUuid()), userId);
-        return '';
-      case 'referral':
-        await createReferral(referralWrite(row, newUuid(), today), userId);
-        return '';
+        await logContactActivity(null, partnerTouchWrite(row, now), userId);
+        return SAVED;
+      case 'follow_up': {
+        const write = followUpWrite(row);
+        try {
+          await createFollowUp(write, userId);
+        } catch (error) {
+          if (await alreadyThere('follow_ups', write.id)) return SAVED;
+          throw error;
+        }
+        return SAVED;
+      }
+      case 'referral': {
+        const write = referralWrite(row, today, options.licenseNote);
+        try {
+          await createReferral(write, userId);
+        } catch (error) {
+          if (await alreadyThere('referrals', write.id)) return SAVED;
+          throw error;
+        }
+        return SAVED;
+      }
       case 'new_partner': {
         const importRow = newPartnerWrite(row);
-        if (!importRow) return 'Nothing to add.';
+        if (!importRow) return { saved: false, message: 'Nothing to add.' };
         const result = await importPartners([importRow], userId);
-        if (!result.added && !result.linked) return 'Already in your network.';
-        // What was said about them is the new partner's first touch.
         const partnerId = result.ids?.[0];
-        if (partnerId && row.text.trim()) {
+        if (!result.added && !result.linked && !partnerId) {
+          return { saved: true, message: 'Already in your network: nothing was added.' };
+        }
+        // What was said about them is the new partner's first touch. The
+        // partner is in either way: a failed note is saved with a message,
+        // so a second tap never imports the partner again.
+        if (!partnerId) return { saved: true, message: 'The partner was added. Add the note from the partner.' };
+        if (row.text.trim()) {
           try {
-            await logContactActivity(null, partnerTouchWrite({ ...row, partnerId }, newUuid(), now), userId);
+            await logContactActivity(null, partnerTouchWrite(row, now, partnerId), userId);
           } catch {
-            return 'The partner was added, but the note could not be saved. Add it from the partner.';
+            return { saved: true, message: 'The partner was added, but the note could not be saved. Add it from the partner.' };
           }
         }
-        return '';
+        return SAVED;
       }
     }
   } catch (error) {
-    return describeError(error);
+    return { saved: false, message: describeError(error) };
   }
 }

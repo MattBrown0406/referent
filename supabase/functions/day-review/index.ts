@@ -37,8 +37,9 @@ import {
 const MODEL = 'claude-opus-5-5';
 
 // The phone stops waiting after about a minute (DAY_REVIEW_CLIENT_TIMEOUT_MS
-// in src/lib/day-review-api.ts); the Anthropic call, retries included, ends
-// inside this budget so the answer always reaches the app.
+// in src/lib/day-review-api.ts); the Anthropic call ends inside this budget
+// so the answer always reaches the app. There is no SDK retry: a second try
+// could not finish in what is left, and the practitioner can tap again.
 const REVIEW_DEADLINE_MS = 52_000;
 
 const CORS_HEADERS = {
@@ -146,7 +147,7 @@ Deno.serve(async (request) => {
     }
   }
 
-  const anthropic = new Anthropic({ apiKey, timeout: 50_000, maxRetries: 1 });
+  const anthropic = new Anthropic({ apiKey, timeout: REVIEW_DEADLINE_MS, maxRetries: 0 });
   let response;
   const deadline = AbortSignal.timeout(REVIEW_DEADLINE_MS);
   try {

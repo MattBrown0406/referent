@@ -52,6 +52,14 @@ export type FoundItem = {
 
 const CHANNELS = ['call', 'meeting', 'text', 'email', 'unknown'] as const;
 
+/** A real calendar date written YYYY-MM-DD (not 2026-02-30). */
+export function validDay(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return date.toISOString().slice(0, 10) === value;
+}
+
 const text = (value: unknown, max: number): string =>
   (typeof value === 'string' ? value : '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
 
@@ -76,7 +84,7 @@ export function readFoundItems(value: unknown): FoundItem[] {
       organization: text(item.organization, 120),
       phone: text(item.phone, 40),
       email: cleanEmail(item.email),
-      dueDate: /^\d{4}-\d{2}-\d{2}$/.test(String(item.dueDate || '')) ? String(item.dueDate) : '',
+      dueDate: validDay(String(item.dueDate || '')) ? String(item.dueDate) : '',
       direction: item.direction === 'received' ? 'received' : item.direction === 'sent' ? 'sent' : '',
       partnerType,
       regarding: item.regarding === 'family' || item.regarding === 'professional' ? item.regarding : 'none',
@@ -93,7 +101,7 @@ export function readFoundItems(value: unknown): FoundItem[] {
 
 export type CaseLike = { id: string; title: string; status: string; updatedAt: string };
 export type ContactLike = { caseId: string; name: string; phone: string; email: string };
-export type FollowUpLike = { caseId?: string; partnerId?: string; title: string; dueOn: string; status: string };
+export type FollowUpLike = { caseId?: string; partnerId?: string; title: string; dueOn: string; status: string; kind?: string };
 export type ReferralLike = { partnerId: string; direction: 'Inbound' | 'Outbound'; date: string; caseId?: string };
 
 export type Workspace = {
@@ -107,6 +115,10 @@ export type Workspace = {
 
 const CLOSED = new Set(['closed', 'lost']);
 
+// A new lead in this review that is not saved yet: rows below it can be
+// about it. Its case exists only in the review until the lead is saved.
+export const PENDING_STATUS = 'pending';
+
 // ─── Names ─────────────────────────────────────────────────────────────────
 
 /** Letters and digits only, lower case, accents dropped. */
@@ -114,16 +126,63 @@ export function comparable(value: string): string {
   return value.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
-// Words that say nothing about who a person is.
-const FILLER = new Set(['the', 'family', 'mr', 'mrs', 'ms', 'dr', 'and', 'of', 'her', 'his', 'their', 'mom', 'dad', 'son', 'daughter', 'wife', 'husband']);
+// Words that say nothing about who a person is: titles, and how someone is
+// related to the person a case is about.
+const FILLER = new Set([
+  'the', 'family', 'mr', 'mrs', 'ms', 'dr', 'and', 'of', 'her', 'his', 'their', 'self',
+  'mom', 'dad', 'mother', 'father', 'parent', 'son', 'daughter', 'wife', 'husband', 'partner', 'spouse',
+  'brother', 'sister', 'sibling', 'grandson', 'granddaughter', 'grandmother', 'grandfather', 'grandma', 'grandpa',
+  'aunt', 'uncle', 'niece', 'nephew', 'cousin', 'friend', 'boyfriend', 'girlfriend', 'fiance', 'fiancee',
+  'stepson', 'stepdaughter', 'stepmom', 'stepdad', 'member',
+]);
 
 function nameWords(value: string): string[] {
   return comparable(value).split(' ').filter((word) => word.length >= 2 && !FILLER.has(word));
 }
 
+/**
+ * Initials for the referral history, which stays de-identified (README,
+ * "Privacy note"): "Ana Rivera — son Luis" becomes "AR / L". The
+ * practitioner can change it.
+ */
+export function labelInitials(title: string): string {
+  return title
+    .split(/\s[—–-]\s|\s*[—–]\s*/)
+    .map((part) => nameWords(part).map((word) => word[0].toUpperCase()).join(''))
+    .filter(Boolean)
+    .join(' / ')
+    .slice(0, 20);
+}
+
 // ─── Matching cases ────────────────────────────────────────────────────────
 
 export type Matches = { ids: string[]; sure: boolean };
+
+function rankCases(ids: Iterable<string>, workspace: Workspace): string[] {
+  const known = new Map(workspace.cases.map((record) => [record.id, record]));
+  return [...new Set(ids)].filter((id) => known.has(id)).sort((a, b) => {
+    const left = known.get(a)!;
+    const right = known.get(b)!;
+    const open = Number(CLOSED.has(left.status)) - Number(CLOSED.has(right.status));
+    return open || right.updatedAt.localeCompare(left.updatedAt);
+  });
+}
+
+function isOpenCase(workspace: Workspace, id: string): boolean {
+  const record = workspace.cases.find((item) => item.id === id);
+  return Boolean(record && !CLOSED.has(record.status));
+}
+
+/** The cases with a contact who has this phone number or email address. */
+export function casesByContact(item: Pick<FoundItem, 'phone' | 'email'>, workspace: Workspace): string[] {
+  const phone = phoneKey(item.phone);
+  const email = cleanEmail(item.email);
+  if (!phone && !email) return [];
+  const ids = workspace.contacts
+    .filter((contact) => (phone && phoneKey(contact.phone) === phone) || (email && cleanEmail(contact.email) === email))
+    .map((contact) => contact.caseId);
+  return rankCases(ids, workspace);
+}
 
 /**
  * The cases an item is about. Sure: the same phone or email as a contact on
@@ -131,15 +190,11 @@ export type Matches = { ids: string[]; sure: boolean };
  * same first name as a contact, or a name word in the case title.
  */
 export function matchCases(item: Pick<FoundItem, 'personName' | 'aboutFirstName' | 'phone' | 'email'>, workspace: Workspace): Matches {
-  const strong = new Set<string>();
+  const strong = new Set<string>(casesByContact(item, workspace));
   const likely = new Set<string>();
-  const phone = phoneKey(item.phone);
-  const email = cleanEmail(item.email);
   const person = nameWords(item.personName);
   const about = nameWords(item.aboutFirstName);
   for (const contact of workspace.contacts) {
-    if (phone && phoneKey(contact.phone) === phone) strong.add(contact.caseId);
-    if (email && cleanEmail(contact.email) === email) strong.add(contact.caseId);
     const words = nameWords(contact.name);
     if (!person.length || !words.length) continue;
     if (person.length >= 2 && words[0] === person[0] && words[words.length - 1] === person[person.length - 1]) strong.add(contact.caseId);
@@ -150,26 +205,43 @@ export function matchCases(item: Pick<FoundItem, 'personName' | 'aboutFirstName'
     const title = new Set(nameWords(record.title));
     if (about.some((word) => title.has(word)) || (person.length && person.every((word) => title.has(word)))) likely.add(record.id);
   }
-  const known = new Map(workspace.cases.map((record) => [record.id, record]));
-  const rank = (ids: Set<string>) => [...ids].filter((id) => known.has(id)).sort((a, b) => {
-    const left = known.get(a)!;
-    const right = known.get(b)!;
-    const open = Number(CLOSED.has(left.status)) - Number(CLOSED.has(right.status));
-    return open || right.updatedAt.localeCompare(left.updatedAt);
-  });
-  const sure = rank(strong);
+  const sure = rankCases(strong, workspace);
   if (sure.length) return { ids: sure.slice(0, 6), sure: sure.length === 1 };
-  // A likely match on both the person and who it's about narrows it down.
-  const ids = rank(likely);
-  return { ids: ids.slice(0, 6), sure: false };
+  return { ids: rankCases(likely, workspace).slice(0, 6), sure: false };
 }
 
 // ─── Matching partners ─────────────────────────────────────────────────────
 
+// Words in many program names that say nothing about which program it is.
+const GENERIC_ORG = new Set([
+  'and', 'of', 'at', 'for', 'new', 'recovery', 'center', 'centers', 'centre', 'treatment', 'house', 'home', 'homes',
+  'health', 'healthcare', 'behavioral', 'mental', 'services', 'service', 'wellness', 'sober', 'living', 'detox',
+  'inpatient', 'outpatient', 'residential', 'program', 'programs', 'institute', 'clinic', 'family', 'families',
+  'intervention', 'interventions', 'counseling', 'therapy', 'therapist', 'care', 'addiction', 'rehab',
+  'rehabilitation', 'foundation', 'associates', 'partners', 'network', 'solutions', 'academy', 'campus', 'iop', 'php',
+]);
+
+function distinctiveWords(value: string): Set<string> {
+  return new Set(orgKey(value).split(' ').filter((word) => word.length >= 3 && !GENERIC_ORG.has(word)));
+}
+
+/**
+ * Two organization names that may be the same program: they share two
+ * distinctive words, or every distinctive word of one is in the other
+ * ("Juniper Ridge" and "Juniper Ridge Recovery"), never just "Recovery".
+ */
+export function similarOrganization(a: string, b: string): boolean {
+  const left = distinctiveWords(a);
+  const right = distinctiveWords(b);
+  if (!left.size || !right.size) return false;
+  let shared = 0;
+  for (const word of left) if (right.has(word)) shared += 1;
+  return shared >= 2 || (shared >= 1 && shared === Math.min(left.size, right.size));
+}
+
 /**
  * The partners an item is about. Sure: the same phone, email, organization
- * or person's full name. Likely: one organization name inside the other
- * ("Juniper Ridge" and "Juniper Ridge Recovery").
+ * or person's full name. Likely: a similar organization name.
  */
 export function matchPartners(item: Pick<FoundItem, 'personName' | 'organization' | 'phone' | 'email'>, workspace: Workspace): Matches {
   const strong = new Set<string>();
@@ -183,16 +255,22 @@ export function matchPartners(item: Pick<FoundItem, 'personName' | 'organization
     if (email && cleanEmail(partner.email) === email) strong.add(partner.id);
     const partnerOrg = orgKey(partner.organization);
     if (org.length >= 4 && partnerOrg === org) strong.add(partner.id);
-    else if (org.length >= 5 && partnerOrg.length >= 5 && (partnerOrg.includes(org) || org.includes(partnerOrg))) likely.add(partner.id);
+    else if (org && partnerOrg && similarOrganization(item.organization, partner.organization)) likely.add(partner.id);
     if (person.includes(' ') && comparable(partner.name) === person) strong.add(partner.id);
   }
   const sure = [...strong];
   if (sure.length) return { ids: sure.slice(0, 6), sure: sure.length === 1 };
-  const ids = [...likely];
-  return { ids: ids.slice(0, 6), sure: false };
+  return { ids: [...likely].slice(0, 6), sure: false };
 }
 
 // ─── Review rows ───────────────────────────────────────────────────────────
+
+/**
+ * Ids chosen when the row is built and kept for its whole life, so saving
+ * it again after a failure (or a half-finished save) writes the same
+ * records instead of second copies.
+ */
+export type RowIds = { caseId: string; contactId: string; followUpId: string; write: string };
 
 export type ReviewRow = {
   key: string;
@@ -211,15 +289,27 @@ export type ReviewRow = {
   partnerId: string | null;
   caseChoices: string[];
   partnerChoices: string[];
-  /** The match was likely, not certain: shown so the practitioner checks it. */
-  unsure: boolean;
+  /** Matched by name only: the practitioner confirms before it can be saved. */
+  caseUnsure: boolean;
+  partnerUnsure: boolean;
+  /** A new lead that may already be one of these open cases (by name, or several). */
+  possibleCases: string[];
+  /** A follow-up the practitioner chose to keep off any case or partner. */
+  noLink: boolean;
   dueOn: string;
   clientLabel: string;
+  /** The client label as last filled in automatically, so a case change can replace it. */
+  autoLabel: string;
+  /** A referral: which way it went ('' until the practitioner says, when the notes did not). */
+  direction: 'sent' | 'received' | '';
+  /** The partner whose license concern the practitioner looked at and went ahead with. */
+  licenseConfirmed: string | null;
   /** A new partner, ready for import_partners. */
   candidate: ImportCandidate | null;
   include: boolean;
   /** Why the row looks the way it does ("Already a case: ..."). */
   hint: string;
+  ids: RowIds;
 };
 
 export function addDays(day: string, days: number): string {
@@ -229,18 +319,31 @@ export function addDays(day: string, days: number): string {
   return date.toISOString().slice(0, 10);
 }
 
-const STOP = new Set(['the', 'a', 'an', 'to', 'for', 'and', 'of', 'at', 'on', 'with', 'about', 'call', 'back']);
+const STOP = new Set(['the', 'a', 'an', 'to', 'for', 'and', 'of', 'at', 'on', 'with', 'about', 'call', 'back', 'her', 'his', 'him', 'them', 'their', 'from', 'by']);
 
-/** Two task titles that say the same thing ("Call Tom back" / "Call back Tom about the bed"). */
-export function sameTask(a: string, b: string): boolean {
-  const words = (value: string) => new Set(comparable(value).split(' ').filter((word) => word.length >= 3 && !STOP.has(word)));
+/**
+ * Two task titles that say the same thing: at least two words in common,
+ * leaving out names ("Send the Rivera packet to Dana" / "Send Dana the
+ * placement packet"), and most of the shorter one.
+ */
+export function sameTask(a: string, b: string, names: string[] = []): boolean {
+  const skip = new Set(names.flatMap((value) => comparable(value).split(' ')));
+  const words = (value: string) => new Set(comparable(value).split(' ').filter((word) => word.length >= 3 && !STOP.has(word) && !skip.has(word)));
   const left = words(a);
   const right = words(b);
   if (!left.size || !right.size) return false;
   let shared = 0;
   for (const word of left) if (right.has(word)) shared += 1;
-  return shared / Math.min(left.size, right.size) >= 0.6;
+  return shared >= 2 && shared / Math.min(left.size, right.size) >= 0.6;
 }
+
+/** A task that is a phone call: "Call Tom back", "Return Sarah's call". */
+export function callTask(title: string): boolean {
+  const words = comparable(title);
+  return /^(call|phone|ring|return)\b/.test(words) || /\bcall (\w+ )?back\b/.test(words);
+}
+
+const CALL_KINDS = new Set(['first_call', 'promised_call']);
 
 function caseTitle(workspace: Workspace, caseId: string | null): string {
   return (caseId && workspace.cases.find((record) => record.id === caseId)?.title) || '';
@@ -252,12 +355,14 @@ function partnerName(workspace: Workspace, partnerId: string | null): string {
 }
 
 function newPartnerCandidate(item: FoundItem, workspace: Workspace): ImportCandidate | null {
+  // The summary is not kept on the partner record: what was said goes on
+  // the partner's first touch when the row is saved.
   const contact = cleanContact({
     name: item.personName,
     organization: item.organization,
     phone: item.phone,
     email: item.email,
-    note: item.summary,
+    note: '',
     hint: item.partnerType,
   });
   if (!contact.name && !contact.organization) return null;
@@ -266,141 +371,410 @@ function newPartnerCandidate(item: FoundItem, workspace: Workspace): ImportCandi
   return item.partnerType ? { ...candidate, types: candidate.match ? candidate.types : [item.partnerType] } : candidate;
 }
 
-/** The rows the review shows, in the function's order (anything urgent first). */
-export function buildRows(items: FoundItem[], workspace: Workspace, today: string): ReviewRow[] {
-  return items.map((found, index) => {
-    const row: ReviewRow = {
-      key: `r${index}`,
-      kind: found.kind,
-      found,
-      text: found.summary,
-      callerName: found.personName,
-      phone: found.phone,
-      email: found.email,
-      aboutRelationship: found.aboutRelationship,
-      aboutFirstName: found.aboutFirstName,
-      caseId: null,
-      partnerId: null,
-      caseChoices: [],
-      partnerChoices: [],
-      unsure: false,
-      dueOn: found.dueDate || (found.missed ? today : addDays(today, 1)),
-      clientLabel: '',
-      candidate: null,
-      include: found.verified,
-      hint: found.verified ? '' : 'Not found word for word in your notes. Check it before saving.',
-    };
-    const pickCase = () => {
-      const matches = matchCases(found, workspace);
-      row.caseChoices = matches.ids;
-      if (matches.ids.length === 1) { row.caseId = matches.ids[0]; row.unsure = !matches.sure; }
-    };
-    const pickPartner = () => {
-      const matches = matchPartners(found, workspace);
-      row.partnerChoices = matches.ids;
-      if (matches.ids.length === 1) { row.partnerId = matches.ids[0]; row.unsure = row.unsure || !matches.sure; }
-    };
+// Mirrors leadCaseTitle in cases.ts (not imported: that file talks to the server).
+function pendingLeadTitle(row: Pick<ReviewRow, 'callerName' | 'aboutRelationship' | 'aboutFirstName'>): string {
+  const caller = row.callerName.trim() || 'New lead';
+  const about = `${row.aboutRelationship.trim()} ${row.aboutFirstName.trim()}`.trim();
+  return about ? `${caller} — ${about}` : caller;
+}
 
-    switch (found.kind) {
-      case 'new_lead': {
-        // Someone already on a case is a note on that case, not a new lead.
-        const matches = matchCases({ ...found, aboutFirstName: '' }, workspace);
-        if (matches.sure) {
-          row.kind = 'case_note';
-          row.caseId = matches.ids[0];
-          row.caseChoices = matches.ids;
-          row.hint = row.hint || `Already a case: ${caseTitle(workspace, row.caseId)}.`;
-        }
-        break;
-      }
-      case 'case_note':
-        pickCase();
-        break;
-      case 'partner_note': {
-        pickPartner();
-        // A program nobody has added yet: offer it as a new partner instead.
-        if (!row.partnerChoices.length && found.organization) {
-          const candidate = newPartnerCandidate(found, workspace);
-          if (candidate && !candidate.existingPartnerId) {
-            row.kind = 'new_partner';
-            row.candidate = candidate;
-            row.hint = row.hint || `${found.organization} is not in your network yet.`;
-          }
-        }
-        break;
-      }
-      case 'follow_up': {
-        const professional = found.regarding === 'professional' || (found.regarding === 'none' && Boolean(found.organization));
-        if (professional) pickPartner(); else if (found.personName || found.aboutFirstName) pickCase();
-        if (!row.caseId && !row.partnerId && !professional && found.organization) pickPartner();
-        const duplicate = workspace.followUps.find((item) => item.status === 'open'
-          && item.dueOn === row.dueOn
-          && (row.caseId ? item.caseId === row.caseId : row.partnerId ? item.partnerId === row.partnerId : !item.caseId && !item.partnerId)
-          && sameTask(item.title, row.text));
-        if (duplicate) {
-          row.include = false;
-          row.hint = 'Already on Today.';
-        } else if (found.missed) {
-          row.hint = row.hint || 'Possibly missed: nothing in your notes says it was done.';
-        }
-        break;
-      }
-      case 'referral': {
-        pickPartner();
-        if (found.personName || found.aboutFirstName) pickCase();
-        row.clientLabel = caseTitle(workspace, row.caseId);
-        const direction = found.direction === 'received' ? 'Inbound' : 'Outbound';
-        const duplicate = row.partnerId && workspace.referrals.some((item) => item.partnerId === row.partnerId
-          && item.direction === direction && item.date === today && (!row.caseId || !item.caseId || item.caseId === row.caseId));
-        if (duplicate) {
-          row.include = false;
-          row.hint = 'Already in the referral history today.';
-        }
-        break;
-      }
-      case 'new_partner': {
-        const candidate = newPartnerCandidate(found, workspace);
-        if (candidate?.existingPartnerId) {
-          // Already a partner: what was said about them is a note.
-          row.kind = 'partner_note';
-          row.partnerId = candidate.existingPartnerId;
-          row.partnerChoices = [candidate.existingPartnerId];
-          row.hint = row.hint || `Already a partner: ${partnerName(workspace, row.partnerId)}.`;
-        } else {
-          row.candidate = candidate;
-        }
-        break;
+/**
+ * The workspace with the review's new leads added as cases, so a follow-up
+ * or note about a caller who is new today can go on the case the lead will
+ * create. A lead already saved is in the workspace itself.
+ */
+export function withPendingLeads(workspace: Workspace, rows: ReviewRow[]): Workspace {
+  const known = new Set(workspace.cases.map((record) => record.id));
+  const leads = rows.filter((row) => row.kind === 'new_lead' && row.include && !known.has(row.ids.caseId));
+  if (!leads.length) return workspace;
+  return {
+    ...workspace,
+    cases: [...leads.map((row) => ({ id: row.ids.caseId, title: pendingLeadTitle(row), status: PENDING_STATUS, updatedAt: '' })), ...workspace.cases],
+    contacts: [...leads.map((row) => ({ caseId: row.ids.caseId, name: row.callerName, phone: row.phone, email: row.email })), ...workspace.contacts],
+  };
+}
+
+function newRowIds(makeId: () => string): RowIds {
+  return { caseId: makeId(), contactId: makeId(), followUpId: makeId(), write: makeId() };
+}
+
+function blankRow(found: FoundItem, index: number, today: string, makeId: () => string): ReviewRow {
+  return {
+    key: `r${index}`,
+    kind: found.kind,
+    found,
+    text: found.summary,
+    callerName: found.personName,
+    phone: found.phone,
+    email: found.email,
+    aboutRelationship: found.aboutRelationship,
+    aboutFirstName: found.aboutFirstName,
+    caseId: null,
+    partnerId: null,
+    caseChoices: [],
+    partnerChoices: [],
+    caseUnsure: false,
+    partnerUnsure: false,
+    possibleCases: [],
+    noLink: false,
+    dueOn: found.dueDate || (found.missed ? today : addDays(today, 1)),
+    clientLabel: '',
+    autoLabel: '',
+    direction: found.kind === 'referral' ? found.direction : '',
+    licenseConfirmed: null,
+    candidate: null,
+    include: found.verified,
+    hint: found.verified ? '' : 'Not found word for word in your notes. Check it before saving.',
+    ids: newRowIds(makeId),
+  };
+}
+
+function addHint(row: ReviewRow, hint: string) {
+  row.hint = row.hint ? `${row.hint} ${hint}` : hint;
+}
+
+function sameCaller(a: ReviewRow, b: ReviewRow): boolean {
+  const phone = phoneKey(a.phone);
+  const email = cleanEmail(a.email);
+  if (phone && phone === phoneKey(b.phone)) return true;
+  if (email && email === cleanEmail(b.email)) return true;
+  const left = nameWords(a.callerName);
+  const right = nameWords(b.callerName);
+  return left.length >= 2 && right.length >= 2 && left[0] === right[0] && left[left.length - 1] === right[right.length - 1];
+}
+
+// A new lead: a note on a case instead only when the caller's phone or
+// email is already on exactly one open case. A name alone, or several
+// cases, keeps the lead and says which cases it may be; a closed or lost
+// case never takes the note (a family coming back is a new inquiry).
+function placeLead(row: ReviewRow, workspace: Workspace, earlierLeads: ReviewRow[]) {
+  const sameAsEarlier = earlierLeads.find((lead) => sameCaller(row, lead));
+  if (sameAsEarlier) {
+    row.kind = 'case_note';
+    row.caseId = sameAsEarlier.ids.caseId;
+    row.caseChoices = [sameAsEarlier.ids.caseId];
+    addHint(row, 'The same caller as a new lead above: this goes on that case.');
+    return;
+  }
+  const byContact = casesByContact(row.found, workspace);
+  const open = byContact.filter((id) => isOpenCase(workspace, id));
+  if (open.length === 1) {
+    row.kind = 'case_note';
+    row.caseId = open[0];
+    row.caseChoices = open;
+    row.possibleCases = open;
+    addHint(row, `Already a case with this phone or email: ${caseTitle(workspace, open[0])}.`);
+    return;
+  }
+  const byName = matchCases({ ...row.found, phone: '', email: '', aboutFirstName: '' }, workspace).ids.filter((id) => isOpenCase(workspace, id));
+  row.possibleCases = [...new Set([...open, ...byName])].slice(0, 6);
+  if (row.possibleCases.length) {
+    addHint(row, `Possibly already a case: ${row.possibleCases.map((id) => caseTitle(workspace, id)).join('; ')}.`);
+  } else {
+    const closed = byContact.find((id) => !isOpenCase(workspace, id));
+    if (closed) addHint(row, `A closed case has the same contact: ${caseTitle(workspace, closed)}. This starts a new one.`);
+  }
+}
+
+function pickCase(row: ReviewRow, workspace: Workspace) {
+  const matches = matchCases(row.found, workspace);
+  row.caseChoices = matches.ids;
+  if (matches.ids.length === 1) { row.caseId = matches.ids[0]; row.caseUnsure = !matches.sure; }
+}
+
+function pickPartner(row: ReviewRow, workspace: Workspace) {
+  const matches = matchPartners(row.found, workspace);
+  row.partnerChoices = matches.ids;
+  if (matches.ids.length === 1) { row.partnerId = matches.ids[0]; row.partnerUnsure = !matches.sure; }
+}
+
+// The words in a row that are names, left out when comparing task titles.
+function rowNames(row: ReviewRow, workspace: Workspace): string[] {
+  return [row.found.personName, row.found.aboutFirstName, row.found.organization, caseTitle(workspace, row.caseId), partnerName(workspace, row.partnerId)];
+}
+
+function daysApart(a: string, b: string): number {
+  if (!validDay(a) || !validDay(b)) return Number.POSITIVE_INFINITY;
+  return Math.abs(Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / 86_400_000;
+}
+
+/**
+ * An open follow-up that already says what this row says, on the same case
+ * or partner: the same task at any due date, or else a call when a call is
+ * already open there for about the same day ("Call Ana back" and the case's
+ * first call). A call the notes set for another day ("call her Wednesday")
+ * is a new step, not a repeat.
+ */
+export function existingFollowUp(row: ReviewRow, workspace: Workspace): FollowUpLike | null {
+  const names = rowNames(row, workspace);
+  const open = workspace.followUps.filter((item) => item.status === 'open' && (row.caseId ? item.caseId === row.caseId
+    : row.partnerId ? item.partnerId === row.partnerId
+      : !item.caseId && !item.partnerId));
+  const same = open.find((item) => sameTask(item.title, row.text, names));
+  if (same) return same;
+  if (!(row.caseId || row.partnerId) || !callTask(row.text)) return null;
+  const dated = Boolean(row.found.dueDate) && !row.found.missed;
+  return open.find((item) => (CALL_KINDS.has(item.kind || '') || callTask(item.title))
+    && (!dated || daysApart(item.dueOn, row.dueOn) <= 1)) ?? null;
+}
+
+function placeFollowUp(row: ReviewRow, workspace: Workspace) {
+  const found = row.found;
+  const professional = found.regarding === 'professional' || (found.regarding === 'none' && Boolean(found.organization));
+  if (professional) pickPartner(row, workspace); else if (found.personName || found.aboutFirstName) pickCase(row, workspace);
+  if (!row.caseId && !row.partnerId && !professional && found.organization) pickPartner(row, workspace);
+  // One place only: a follow-up is saved on its case, or else its partner.
+  if (row.caseId && row.partnerId) { row.partnerId = null; row.partnerUnsure = false; }
+  const duplicate = row.caseId || row.partnerId || (!row.caseChoices.length && !row.partnerChoices.length) ? existingFollowUp(row, workspace) : null;
+  if (duplicate) {
+    row.include = false;
+    addHint(row, `Already a follow-up: ${duplicate.title.replace(/[.!?\s]+$/, '')} (due ${duplicate.dueOn}).`);
+  } else if (found.missed) {
+    addHint(row, 'Possibly missed: nothing in your notes says it was done.');
+  }
+}
+
+function setReferralCase(row: ReviewRow, workspace: Workspace, caseId: string | null) {
+  const label = caseId ? labelInitials(caseTitle(workspace, caseId)) : '';
+  // A label the practitioner typed stays; one filled in automatically follows the case.
+  if (!row.clientLabel.trim() || row.clientLabel === row.autoLabel) row.clientLabel = label;
+  row.autoLabel = label;
+  row.caseId = caseId;
+}
+
+function placeReferral(row: ReviewRow, workspace: Workspace, today: string) {
+  pickPartner(row, workspace);
+  if (row.found.personName || row.found.aboutFirstName) pickCase(row, workspace);
+  setReferralCase(row, workspace, row.caseId);
+  const directions = row.direction === 'received' ? ['Inbound'] : row.direction === 'sent' ? ['Outbound'] : ['Inbound', 'Outbound'];
+  const duplicate = row.partnerId && workspace.referrals.some((item) => item.partnerId === row.partnerId
+    && directions.includes(item.direction) && item.date === today && (!row.caseId || !item.caseId || item.caseId === row.caseId));
+  if (duplicate) {
+    row.include = false;
+    addHint(row, 'Already in the referral history today.');
+  }
+}
+
+function placePartner(row: ReviewRow, workspace: Workspace) {
+  const found = row.found;
+  if (row.kind === 'partner_note') {
+    pickPartner(row, workspace);
+    // A program nobody has added yet: offer it as a new partner instead.
+    if (!row.partnerChoices.length && found.organization) {
+      const candidate = newPartnerCandidate(found, workspace);
+      if (candidate && !candidate.existingPartnerId) {
+        row.kind = 'new_partner';
+        row.candidate = candidate;
+        addHint(row, `${found.organization} is not in your network yet.`);
       }
     }
-    return row;
-  });
+    return;
+  }
+  const candidate = newPartnerCandidate(found, workspace);
+  if (candidate?.existingPartnerId) {
+    // Already a partner: what was said about them is a note.
+    row.kind = 'partner_note';
+    row.partnerId = candidate.existingPartnerId;
+    row.partnerChoices = [candidate.existingPartnerId];
+    addHint(row, `Already a partner: ${partnerName(workspace, row.partnerId)}.`);
+    return;
+  }
+  row.candidate = candidate;
+  // A name written a little differently ("Juniper Ridge" for "Juniper Ridge
+  // Recovery"): offered, never assumed.
+  const similar = matchPartners(found, workspace).ids;
+  if (similar.length) {
+    row.partnerChoices = similar;
+    addHint(row, `Possibly already in your network: ${similar.map((id) => partnerName(workspace, id)).join('; ')}. Tap one to add this as a note on it instead.`);
+  }
+}
+
+/**
+ * The rows the review shows, in the function's order (anything urgent
+ * first). New leads are placed first so that a follow-up or note about a
+ * caller who is new today goes on the case the lead will create.
+ */
+export function buildRows(items: FoundItem[], workspace: Workspace, today: string, makeId: () => string): ReviewRow[] {
+  const rows = items.map((found, index) => blankRow(found, index, today, makeId));
+  const leads: ReviewRow[] = [];
+  for (const row of rows) {
+    if (row.kind !== 'new_lead') continue;
+    placeLead(row, withPendingLeads(workspace, leads), leads);
+    if (row.kind === 'new_lead') leads.push(row);
+  }
+  for (const row of rows) {
+    if (row.found.kind === 'new_lead') continue;
+    // Rows can be about a new lead above whether or not its switch is on:
+    // rowProblem stops them from saving until the lead is.
+    const view = withPendingLeads(workspace, leads.map((lead) => ({ ...lead, include: true })));
+    switch (row.kind) {
+      case 'case_note': pickCase(row, view); break;
+      case 'partner_note':
+      case 'new_partner': placePartner(row, view); break;
+      case 'follow_up': placeFollowUp(row, view); break;
+      case 'referral': placeReferral(row, view, today); break;
+      default: break;
+    }
+  }
+  return rows;
+}
+
+/**
+ * Turns a row into another kind it can be: a new lead into a note on one of
+ * the cases it may be (and back), a new partner into a note on a partner it
+ * may be (and back).
+ */
+export function switchKind(row: ReviewRow, kind: ReviewKind): ReviewRow {
+  if (kind === row.kind) return row;
+  if (row.found.kind === 'new_lead' && kind === 'case_note') {
+    const choices = row.possibleCases.length ? row.possibleCases : row.caseChoices;
+    return { ...row, kind, caseChoices: choices, caseId: choices.length === 1 ? choices[0] : null, caseUnsure: choices.length === 1 };
+  }
+  if (row.found.kind === 'new_lead' && kind === 'new_lead') {
+    return { ...row, kind, caseId: null, caseUnsure: false, possibleCases: row.possibleCases.length ? row.possibleCases : row.caseChoices };
+  }
+  if (row.candidate && kind === 'partner_note') return { ...row, kind, partnerId: null, partnerUnsure: false };
+  if (row.candidate && kind === 'new_partner') return { ...row, kind, partnerId: null, partnerUnsure: false };
+  return row;
+}
+
+/** The kinds a row can be switched to (always including its own), or [] when it has no choice. */
+export function kindChoices(row: ReviewRow): ReviewKind[] {
+  if (row.found.kind === 'new_lead') return ['new_lead', 'case_note'];
+  if (row.candidate) return ['new_partner', 'partner_note'];
+  return [];
+}
+
+/** A case picked (or unpicked) on a row: the referral label follows when it was filled in automatically. */
+export function chooseCase(row: ReviewRow, caseId: string | null, workspace: Workspace): ReviewRow {
+  const next: ReviewRow = { ...row, caseUnsure: false, noLink: false };
+  if (row.kind === 'referral') setReferralCase(next, workspace, caseId);
+  else next.caseId = caseId;
+  // A follow-up goes on one place: its case, or its partner.
+  if (row.kind === 'follow_up' && caseId) next.partnerId = null;
+  return next;
+}
+
+export function choosePartner(row: ReviewRow, partnerId: string | null): ReviewRow {
+  const next: ReviewRow = { ...row, partnerId, partnerUnsure: false, noLink: false };
+  if (row.kind === 'follow_up' && partnerId) { next.caseId = null; next.caseUnsure = false; }
+  // Picking a partner on a new partner row: it is a note on that partner.
+  if (row.kind === 'new_partner' && partnerId) next.kind = 'partner_note';
+  return next;
 }
 
 // ─── Ready to save ─────────────────────────────────────────────────────────
 
+export type RowContext = {
+  /** The whole review: a row about a new lead in it waits for that lead. */
+  rows?: ReviewRow[];
+  /** True when sending a client to this partner raises a license concern (integrity.ts). */
+  licenseConcern?: (partnerId: string) => boolean;
+};
+
+// A row on the case a new lead in this review will create.
+function pendingLeadProblem(row: ReviewRow, rows: ReviewRow[]): string {
+  if (!row.caseId) return '';
+  const owner = rows.find((other) => other.key !== row.key && other.ids.caseId === row.caseId);
+  if (!owner) return '';
+  if (owner.kind !== 'new_lead') return 'Choose the case: the new lead it was on is now a note.';
+  if (!owner.include) return 'Turn on the new lead above, or choose another case.';
+  if (rowProblem(owner)) return 'Finish the new lead above first.';
+  return '';
+}
+
+function phoneProblem(phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length < 10 || digits.length > 15 || phone.trim().length > 40) return 'Add a phone number (10 to 15 digits).';
+  return '';
+}
+
 /** What a row still needs before it can be saved; '' when it is ready. */
-export function rowProblem(row: ReviewRow): string {
+export function rowProblem(row: ReviewRow, context: RowContext = {}): string {
   if (!row.text.trim()) return 'Add a note.';
+  const rows = context.rows ?? [];
+  const onLead = pendingLeadProblem(row, rows);
   switch (row.kind) {
     case 'new_lead': {
       if (!row.callerName.trim()) return 'Add the caller’s name.';
-      const digits = row.phone.replace(/\D/g, '');
-      if (digits.length < 10 || digits.length > 15) return 'Add a phone number.';
+      const phone = phoneProblem(row.phone);
+      if (phone) return phone;
       if (row.email.trim() && !cleanEmail(row.email)) return 'Check the email address.';
       return '';
     }
-    case 'case_note': return row.caseId ? '' : row.caseChoices.length ? 'Choose the case.' : 'Choose a case.';
-    case 'partner_note': return row.partnerId ? '' : row.partnerChoices.length ? 'Choose the partner.' : 'Choose a partner.';
-    case 'follow_up': return /^\d{4}-\d{2}-\d{2}$/.test(row.dueOn) ? '' : 'Set a due date.';
-    case 'referral':
+    case 'case_note':
+      if (!row.caseId) return row.caseChoices.length ? 'Choose the case.' : 'Choose a case.';
+      if (onLead) return onLead;
+      return row.caseUnsure ? 'Confirm the case.' : '';
+    case 'partner_note':
       if (!row.partnerId) return row.partnerChoices.length ? 'Choose the partner.' : 'Choose a partner.';
-      return row.clientLabel.trim() ? '' : 'Add a client label (initials or a private label).';
+      return row.partnerUnsure ? 'Confirm the partner.' : '';
+    case 'follow_up':
+      if (!validDay(row.dueOn)) return 'Set a due date (YYYY-MM-DD).';
+      if (!row.caseId && !row.partnerId && !row.noLink && (row.caseChoices.length || row.partnerChoices.length)) {
+        return 'Choose where it goes, or tap Not linked.';
+      }
+      if (onLead) return onLead;
+      if (row.caseId && row.caseUnsure) return 'Confirm the case.';
+      if (row.partnerId && row.partnerUnsure) return 'Confirm the partner.';
+      return '';
+    case 'referral':
+      if (!row.direction) return 'Choose which way the referral went.';
+      if (!row.partnerId) return row.partnerChoices.length ? 'Choose the partner.' : 'Choose a partner.';
+      if (row.partnerUnsure) return 'Confirm the partner.';
+      if (onLead) return onLead;
+      if (row.caseId && row.caseUnsure) return 'Confirm the case.';
+      if (!row.clientLabel.trim()) return 'Add a client label (initials or a private label).';
+      if (row.direction === 'sent' && context.licenseConcern?.(row.partnerId) && row.licenseConfirmed !== row.partnerId) {
+        return 'Check the license first.';
+      }
+      return '';
     case 'new_partner': return row.candidate && importReady({ ...row.candidate, include: true }) ? '' : 'Choose a type.';
   }
 }
 
-export function rowReady(row: ReviewRow): boolean {
-  return row.include && !rowProblem(row);
+export function rowReady(row: ReviewRow, context: RowContext = {}): boolean {
+  return row.include && !rowProblem(row, context);
+}
+
+/**
+ * The order rows are saved in: new leads first (a note or follow-up below
+ * may go on the case a lead creates), then the review's order.
+ */
+export function saveOrder<T extends Pick<ReviewRow, 'kind'>>(rows: T[]): T[] {
+  return rows.filter((row) => row.kind === 'new_lead').concat(rows.filter((row) => row.kind !== 'new_lead'));
+}
+
+/** The new lead a row depends on, when it is on that lead's case. */
+export function leadFor(row: ReviewRow, rows: ReviewRow[]): ReviewRow | null {
+  if (!row.caseId) return null;
+  return rows.find((other) => other.key !== row.key && other.kind === 'new_lead' && other.ids.caseId === row.caseId) ?? null;
+}
+
+// ─── Already saved in this review ──────────────────────────────────────────
+
+/**
+ * What a saved row was, to recognize it when the same notes are read again
+ * ("Back to the notes", then Find): by its kind and target with either its
+ * text or its quote.
+ */
+export function rowSignatures(row: ReviewRow): string[] {
+  const target = row.kind === 'new_lead' ? phoneKey(row.phone) || cleanEmail(row.email) || comparable(row.callerName)
+    : row.kind === 'new_partner' ? orgKey(row.candidate?.organization || row.found.organization) || comparable(row.found.personName)
+      : `${row.caseId || ''}|${row.partnerId || ''}`;
+  const base = `${row.found.kind}|${target}`;
+  const out = [`${base}|t:${comparable(row.text)}`, `${base}|s:${comparable(row.found.summary)}`];
+  if (row.found.evidence) out.push(`${base}|q:${comparable(row.found.evidence)}`);
+  return out;
+}
+
+/** Rows that were saved earlier in this review start switched off. */
+export function markSavedBefore(rows: ReviewRow[], saved: Set<string>): ReviewRow[] {
+  if (!saved.size) return rows;
+  return rows.map((row) => {
+    if (!rowSignatures(row).some((signature) => saved.has(signature))) return row;
+    return { ...row, include: false, hint: row.hint ? `Saved earlier in this review. ${row.hint}` : 'Saved earlier in this review.' };
+  });
 }
 
 // ─── The writes ────────────────────────────────────────────────────────────
@@ -426,7 +800,7 @@ export type LeadWrite = {
 export function leadWrite(row: ReviewRow): LeadWrite {
   return {
     callerName: row.callerName.trim().slice(0, 120),
-    phone: row.phone.trim(),
+    phone: row.phone.trim().slice(0, 40),
     email: cleanEmail(row.email),
     aboutRelationship: row.aboutRelationship.trim().slice(0, 60),
     aboutFirstName: row.aboutFirstName.trim().slice(0, 60),
@@ -436,17 +810,17 @@ export function leadWrite(row: ReviewRow): LeadWrite {
   };
 }
 
-export function caseEventWrite(row: ReviewRow, id: string, occurredAt: string) {
-  return { id, caseId: row.caseId!, kind: EVENT_KIND[row.found.channel], body: row.text.trim(), occurredAt };
+export function caseEventWrite(row: ReviewRow, occurredAt: string) {
+  return { id: row.ids.write, caseId: row.caseId!, kind: EVENT_KIND[row.found.channel], body: row.text.trim(), occurredAt };
 }
 
-export function partnerTouchWrite(row: ReviewRow, id: string, occurredAt: string) {
-  return { id, partnerId: row.partnerId!, kind: TOUCH_KIND[row.found.channel], note: row.text.trim(), occurredAt };
+export function partnerTouchWrite(row: ReviewRow, occurredAt: string, partnerId = row.partnerId!) {
+  return { id: row.ids.write, partnerId, kind: TOUCH_KIND[row.found.channel], note: row.text.trim(), occurredAt };
 }
 
-export function followUpWrite(row: ReviewRow, id: string) {
+export function followUpWrite(row: ReviewRow) {
   return {
-    id,
+    id: row.ids.write,
     ...(row.caseId ? { caseId: row.caseId } : {}),
     ...(row.partnerId && !row.caseId ? { partnerId: row.partnerId } : {}),
     title: row.text.trim().slice(0, 200),
@@ -457,15 +831,17 @@ export function followUpWrite(row: ReviewRow, id: string) {
   };
 }
 
-export function referralWrite(row: ReviewRow, id: string, today: string) {
+/** `licenseNote`: the line kept when the practitioner went ahead despite a license concern. */
+export function referralWrite(row: ReviewRow, today: string, licenseNote = '') {
+  const note = row.text.trim();
   return {
-    id,
+    id: row.ids.write,
     partnerId: row.partnerId!,
-    direction: row.found.direction === 'received' ? 'Inbound' as const : 'Outbound' as const,
+    direction: row.direction === 'received' ? 'Inbound' as const : 'Outbound' as const,
     date: today,
     clientLabel: row.clientLabel.trim().slice(0, 120),
     outcome: 'Pending' as const,
-    note: row.text.trim(),
+    note: licenseNote ? `${note}\n\n${licenseNote}` : note,
     ...(row.caseId ? { caseId: row.caseId } : {}),
   };
 }
@@ -506,7 +882,18 @@ export function countLine(kinds: ReviewKind[]): string {
   return parts.length ? `${parts.join(', ')}.` : 'Nothing to add.';
 }
 
-/** Where a row goes, in words: "Case: Ana Rivera — son Luis". */
+/** A case's title for the review; a new lead above reads as one. */
+export function caseLabel(workspace: Workspace, caseId: string): string {
+  const record = workspace.cases.find((item) => item.id === caseId);
+  if (!record) return 'A case';
+  return record.status === PENDING_STATUS ? `${record.title} (new lead above)` : record.title;
+}
+
+/**
+ * Where a row goes, in words: "Case: Ana Rivera — son Luis". Pass the
+ * workspace with the review's new leads (withPendingLeads). A follow-up
+ * names only the place it is saved: its case, or else its partner.
+ */
 export function destination(row: ReviewRow, workspace: Workspace): string {
   if (row.kind === 'new_lead') return 'A new case, with a first call on Today.';
   if (row.kind === 'new_partner') {
@@ -514,9 +901,13 @@ export function destination(row: ReviewRow, workspace: Workspace): string {
     const what = match ? `Adds ${match.organization || match.name} from the Directory` : 'Adds a partner to your network';
     return `${what}, with this note on it.`;
   }
+  if (row.kind === 'follow_up') {
+    if (row.caseId) return `Case: ${caseLabel(workspace, row.caseId)}`;
+    if (row.partnerId) return `Partner: ${partnerName(workspace, row.partnerId)}`;
+    return row.noLink || (!row.caseChoices.length && !row.partnerChoices.length) ? 'Today, not linked to a case or partner.' : '';
+  }
   const parts: string[] = [];
-  if (row.caseId) parts.push(`Case: ${caseTitle(workspace, row.caseId)}`);
+  if (row.caseId) parts.push(`Case: ${caseLabel(workspace, row.caseId)}`);
   if (row.partnerId) parts.push(`Partner: ${partnerName(workspace, row.partnerId)}`);
-  if (!parts.length) return row.kind === 'follow_up' ? 'Today, not linked to a case or partner.' : '';
   return parts.join(' · ');
 }
