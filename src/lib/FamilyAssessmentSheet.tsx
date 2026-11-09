@@ -119,7 +119,8 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
   const finished = current?.status === 'submitted' ? current : null;
   const live = current && current.id === newest?.id && isOpen(current) ? current : null;
   // Danger in answers saved before the family finished: the alerts show (the answers do not, until they send it).
-  const earlyAlerts = current && !finished && Object.keys(current.answers).length ? assessmentAlerts(current) : [];
+  // Only on the newest assessment: an old stopped or expired one is history, not "reach out today".
+  const earlyAlerts = current && current.id === newest?.id && !finished && Object.keys(current.answers).length ? assessmentAlerts(current) : [];
 
   // Card photos: short-lived links, fetched when a finished assessment has them.
   useEffect(() => {

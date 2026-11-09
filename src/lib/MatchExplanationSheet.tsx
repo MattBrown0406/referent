@@ -89,6 +89,9 @@ export default function MatchExplanationSheet({ visible, userId, profile, ranked
     setCount(EXPLAIN_DEFAULT);
     setRewrite(null);
     setEdited(false);
+    // Now, not on the next render: the text effect below runs in this same
+    // pass and must write the fresh explanation, not keep last time's edits.
+    editedRef.current = false;
     setStale(false);
     setBusy(false);
     setMessage(null);
@@ -114,6 +117,14 @@ export default function MatchExplanationSheet({ visible, userId, profile, ranked
     setEdited(false);
     setStale(false);
   }, [visible, generated]);
+
+  // A rewrite whose facts changed since (a fit, a bed, a cost) is set aside
+  // and says so, rather than quietly turning back into the plain wording.
+  useEffect(() => {
+    if (!visible || !rewrite || rewriteMatches(explanation, rewrite)) return;
+    setRewrite(null);
+    setMessage({ ok: false, text: 'The ranking or its details changed, so the warmer wording was set aside. Rewrite it again if you like.' });
+  }, [visible, rewrite, explanation]);
 
   function writeAgain() {
     setText(generatedRef.current);

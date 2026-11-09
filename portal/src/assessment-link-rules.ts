@@ -128,6 +128,23 @@ export function sameAnswers(a: unknown, b: unknown): boolean {
   return keys.length === Object.keys(right).length && keys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && sameAnswers(left[key], right[key]));
 }
 
+/**
+ * Two sets of changes to the same assessment, put together: the newest
+ * answers on the server, with every answer this page changed since `base`
+ * (the answers it last knew were saved) kept as this page has it. So a
+ * family member typing never loses words to another tab or device; where
+ * both changed the same question, this page's answer is kept.
+ */
+export function mergeAnswers(base: Answers, local: Answers, server: Answers): Answers {
+  const merged: Answers = { ...server };
+  for (const key of new Set([...Object.keys(base), ...Object.keys(local)])) {
+    if (sameAnswers(local[key], base[key])) continue;
+    if (local[key] === undefined) delete merged[key];
+    else merged[key] = local[key];
+  }
+  return merged;
+}
+
 /** "December 8, 2026" for an ISO time, or ''. */
 export function longDate(iso: string): string {
   const at = new Date(iso);

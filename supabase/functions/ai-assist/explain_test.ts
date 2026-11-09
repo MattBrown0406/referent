@@ -128,3 +128,16 @@ Deno.test('rankings, outcomes, beds, money ties and outside names are refused; p
   const fine = parseExplainOutput(first(`${base} You can always ask them questions. Their team speaks with families before Monday.`), request());
   assertStringIncludes(fine.programs[0].text, 'always ask');
 });
+
+Deno.test('faithful rewrites pass: possessives, a state written out, everyday words', () => {
+  const second = 'Cedar House costs $4,500 a month, within your $6,000 budget.';
+  const first = (text: string) => answer({ programs: [{ rank: 1, text }, { rank: 2, text: second }] });
+  for (const text of [
+    'Juniper Ridge Recovery\'s team offers inpatient care and works with Aetna. It comes before Cedar House\'s program because it offers more of what your loved one needs.',
+    'Juniper Ridge Recovery is in Bend, Oregon, offers inpatient care and works with Aetna.',
+    'Juniper Ridge Recovery offers inpatient care. On top of that, it works with Aetna, so you and your partner can ask about the fee and the results you can expect while waiting to hear back.',
+  ]) {
+    const result = parseExplainOutput(first(text), request());
+    assertEquals(result.programs[0].text, text);
+  }
+});

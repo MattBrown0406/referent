@@ -125,23 +125,49 @@ export type SaveOptions = {
  * Saves one approved row under the ids it was given when the review was
  * built, so trying again writes the same records, never second copies.
  */
-const likeExactly = (value: string) => value.replace(/[\\%_]/g, (match) => `\\${match}`);
+const likeExactly = (value: string) => value.replace(/[\\%_*]/g, (match) => `\\${match}`);
+const lower = (value: unknown) => (typeof value === 'string' ? value.trim().toLowerCase() : '');
+const lastTen = (value: unknown) => (typeof value === 'string' ? value.replace(/\D/g, '') : '').slice(-10);
 
-/** The partner an import skipped as already there: by directory listing, email, or organization. */
+/**
+ * The partner an import skipped as already there, by the same keys the
+ * server skips on (import_partner_keys, 20261108180000): its directory
+ * listing, then email, then phone, then organization and name together
+ * (organization alone only for a card with no person on it), so a note for
+ * Dana at a program never lands on Tom at the same program.
+ */
 async function existingPartnerId(importRow: NonNullable<ReturnType<typeof newPartnerWrite>>): Promise<string | null> {
-  const attempts = 'global_id' in importRow
-    ? [supabase.from('partners').select('id').eq('global_partner_id', importRow.global_id).limit(1)]
-    : [
-      importRow.email ? supabase.from('partners').select('id').ilike('email', likeExactly(importRow.email)).limit(1) : null,
-      importRow.organization ? supabase.from('partners').select('id').ilike('organization', likeExactly(importRow.organization)).limit(1) : null,
-    ];
-  for (const attempt of attempts) {
-    if (!attempt) continue;
-    const { data, error } = await attempt;
+  if ('global_id' in importRow) {
+    const { data, error } = await supabase.from('partners').select('id').eq('global_partner_id', importRow.global_id).limit(1);
     const id = !error && Array.isArray(data) ? (data[0] as { id?: unknown } | undefined)?.id : null;
-    if (typeof id === 'string') return id;
+    return typeof id === 'string' ? id : null;
   }
-  return null;
+  type Candidate = { id: string; name: unknown; organization: unknown; email: unknown; phone: unknown };
+  const columns = 'id, name, organization, email, phone';
+  const queries = [
+    importRow.email ? supabase.from('partners').select(columns).ilike('email', likeExactly(importRow.email.trim())).limit(20) : null,
+    lastTen(importRow.phone).length === 10 ? supabase.from('partners').select(columns).ilike('phone', `%${lastTen(importRow.phone).slice(-4)}`).limit(50) : null,
+    importRow.organization || importRow.name
+      ? supabase.from('partners').select(columns).ilike('organization', likeExactly((importRow.organization || importRow.name).trim())).limit(50)
+      : null,
+  ];
+  const found: Candidate[] = [];
+  for (const query of queries) {
+    if (!query) continue;
+    const { data, error } = await query;
+    if (!error && Array.isArray(data)) found.push(...(data as Candidate[]));
+  }
+  const org = lower(importRow.organization) || lower(importRow.name);
+  const person = lower(importRow.name) || lower(importRow.organization);
+  const keyOf = (item: Candidate) => ({
+    org: lower(item.organization) || lower(item.name),
+    person: lower(item.name) || lower(item.organization),
+  });
+  const pick = (test: (item: Candidate) => boolean) => found.find(test)?.id ?? null;
+  return pick((item) => Boolean(importRow.email) && lower(item.email) === lower(importRow.email))
+    ?? pick((item) => lastTen(importRow.phone).length === 10 && lastTen(item.phone) === lastTen(importRow.phone))
+    ?? pick((item) => keyOf(item).org === org && keyOf(item).person === person)
+    ?? (person === org ? pick((item) => keyOf(item).org === org) : null);
 }
 
 export async function saveReviewRow(row: ReviewRow, userId: string, options: SaveOptions): Promise<SaveResult> {

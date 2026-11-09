@@ -23,6 +23,7 @@ import {
   longDate,
   photoContentType,
   photoProblem,
+  mergeAnswers,
   sameAnswers,
   saveOutcome,
   savedLine,
@@ -120,6 +121,14 @@ export default function FamilyAssessment() {
   const answersRef = useRef<Answers>({});
   const stepRef = useRef(0);
   const revisionRef = useRef(0);
+  // The answers the server is known to have at revisionRef: what this page
+  // changed since is what it keeps when another tab or device saved too.
+  const baseRef = useRef<Answers>({});
+  // Saves whose answer never came back (the network dropped, the phone
+  // slept): if one of them landed, a refusal later is this page's own save.
+  const unconfirmedRef = useRef<Answers[]>([]);
+  const editsRef = useRef(0);
+  const conflictsRef = useRef(0);
 
   // What is waiting to be saved; one save at a time, the newest answers last.
   const dirtyRef = useRef(false);
@@ -131,18 +140,26 @@ export default function FamilyAssessment() {
 
   const open = view && view.status === 'open' ? view as OpenAssessment : null;
 
-  /** Loads the assessment. `keepPlace`: stay on the step the family is on (a reload after another tab saved). */
+  /**
+   * Loads the assessment. `keepPlace`: stay on the step the family is on (a
+   * refresh when the page comes back); a refresh never replaces answers
+   * typed, or waiting to be saved, while it was on its way.
+   */
   const fetchView = useCallback(async (keepPlace = false): Promise<AssessmentView | null> => {
     if (!token) { setLoad('unavailable'); return null; }
+    const edits = editsRef.current;
     try {
       const { data, error } = await supabase.rpc('public_family_assessment_open', { p_token: token });
       if (error) { setLoad((current) => (current === 'ready' ? current : 'unreachable')); return null; }
       const next = assessmentViewFromJson(data);
       if (!next) { closedRef.current = true; setLoad('unavailable'); return null; }
+      if (keepPlace && next.status === 'open' && (editsRef.current !== edits || dirtyRef.current || savingRef.current)) return next;
       setView(next);
       if (next.status === 'open') {
         answersRef.current = next.answers;
+        baseRef.current = next.answers;
         revisionRef.current = next.revision;
+        unconfirmedRef.current = [];
         dirtyRef.current = false;
         setAnswers(next.answers);
         setFlagAnswers(next.answers);
@@ -172,6 +189,49 @@ export default function FamilyAssessment() {
     return () => window.removeEventListener('hashchange', onHash);
   }, [fetchView]);
 
+  /**
+   * Another tab or device saved since this page's revision (RFA02). Its
+   * answers are taken, with every answer this page changed kept on top
+   * (mergeAnswers), and saved again. When the server's answers are this
+   * page's own (a save whose answer was lost), nothing was changed elsewhere.
+   */
+  const resolveConflict = useCallback(async (sent: Answers): Promise<boolean> => {
+    if (!token) return false;
+    const { data, error } = await supabase.rpc('public_family_assessment_open', { p_token: token });
+    const fresh = error ? null : assessmentViewFromJson(data);
+    if (!fresh || fresh.status !== 'open') { closedRef.current = true; await fetchView(); return false; }
+    const own = sameAnswers(fresh.answers, sent) || unconfirmedRef.current.some((item) => sameAnswers(item, fresh.answers));
+    const merged = mergeAnswers(baseRef.current, answersRef.current, fresh.answers);
+    revisionRef.current = fresh.revision;
+    baseRef.current = fresh.answers;
+    unconfirmedRef.current = [];
+    answersRef.current = merged;
+    setAnswers(merged);
+    setFlagAnswers(merged);
+    setCards({ front: fresh.cardFront, back: fresh.cardBack });
+    if (!sameAnswers(merged, fresh.answers)) dirtyRef.current = true;
+    if (!own) {
+      conflictsRef.current += 1;
+      setNotice('Some answers were also changed in another tab or on another device. Both sets of changes are kept; please look this section over.');
+    }
+    return !own;
+  }, [token, fetchView]);
+
+  // Every save goes with keepalive (when small enough for it), so one made
+  // as the page is hidden or closed still arrives after the page is gone.
+  const sendSave = useCallback(async (answersToSave: Answers, stepToSave: number, revision: number) => {
+    const body = JSON.stringify({ p_token: token, p_answers: answersToSave, p_step: stepToSave, p_revision: revision });
+    const response = await fetch(`${projectUrl}/rest/v1/rpc/public_family_assessment_save`, {
+      method: 'POST',
+      keepalive: body.length < 60_000,
+      headers: { apikey: publishableKey, authorization: `Bearer ${publishableKey}`, 'content-type': 'application/json' },
+      body,
+    });
+    const json = await response.json().catch(() => null) as Record<string, unknown> | null;
+    if (response.ok) return { data: json, error: null };
+    return { data: null, error: { code: typeof json?.code === 'string' ? json.code : String(response.status), message: typeof json?.message === 'string' ? json.message : '' } };
+  }, [token]);
+
   const flush = useCallback(async () => {
     if (!token || savingRef.current || !dirtyRef.current || closedRef.current) return;
     if (timerRef.current) { window.clearTimeout(timerRef.current); timerRef.current = null; }
@@ -181,29 +241,22 @@ export default function FamilyAssessment() {
     setSaveState('saving');
     let retry = false;
     try {
-      const { data, error } = await supabase.rpc('public_family_assessment_save', {
-        p_token: token, p_answers: pending.answers, p_step: pending.step, p_revision: revisionRef.current,
-      });
+      const { data, error } = await sendSave(pending.answers, pending.step, revisionRef.current);
       switch (saveOutcome(error)) {
         case 'saved': {
-          const revision = Number((data as { revision?: unknown } | null)?.revision);
+          const revision = Number(data?.revision);
           if (Number.isInteger(revision)) revisionRef.current = revision;
+          baseRef.current = pending.answers;
+          unconfirmedRef.current = [];
           setSavedAt(new Date());
           setSaveState(dirtyRef.current ? 'saving' : 'saved');
           if (pending.step >= 1) setResumeStep(pending.step);
           break;
         }
-        case 'changed_elsewhere': {
-          // Another tab or family member saved since this page loaded: show
-          // theirs rather than write over it. (When the newest answers are
-          // these, it was this page's own save as it was closing.)
-          const fresh = await fetchView(true);
-          if (fresh?.status === 'open' && !sameAnswers(fresh.answers, pending.answers)) {
-            setNotice('These answers were changed in another tab or on another device. The newest answers are shown; please check this section.');
-          }
-          setSaveState('idle');
+        case 'changed_elsewhere':
+          await resolveConflict(pending.answers);
+          setSaveState(dirtyRef.current ? 'saving' : 'saved');
           break;
-        }
         case 'already_sent':
         case 'link_stopped':
           closedRef.current = true;
@@ -219,6 +272,8 @@ export default function FamilyAssessment() {
           setSaveState('failed');
       }
     } catch {
+      // The save may still have landed: remember what it carried.
+      unconfirmedRef.current = [...unconfirmedRef.current, pending.answers].slice(-5);
       dirtyRef.current = true;
       retry = true;
       setSaveState('failed');
@@ -230,7 +285,7 @@ export default function FamilyAssessment() {
       if (timerRef.current) window.clearTimeout(timerRef.current);
       timerRef.current = window.setTimeout(() => { void flush(); }, retry ? SAVE_DELAY_MS * 4 : SAVE_DELAY_MS);
     }
-  }, [token, fetchView]);
+  }, [token, fetchView, resolveConflict, sendSave]);
 
   function queueSave(now = false) {
     if (closedRef.current) return;
@@ -239,23 +294,6 @@ export default function FamilyAssessment() {
     timerRef.current = window.setTimeout(() => { void flush(); }, now ? 0 : SAVE_DELAY_MS);
   }
 
-  // A save that must survive the page going away (closing the tab, iOS
-  // unloading it): keepalive lets the request finish after the page is gone.
-  const saveOnExit = useCallback(() => {
-    if (!token || !dirtyRef.current || savingRef.current || closedRef.current) return;
-    dirtyRef.current = false;
-    try {
-      void fetch(`${projectUrl}/rest/v1/rpc/public_family_assessment_save`, {
-        method: 'POST',
-        keepalive: true,
-        headers: { apikey: publishableKey, authorization: `Bearer ${publishableKey}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ p_token: token, p_answers: answersRef.current, p_step: stepRef.current, p_revision: revisionRef.current }),
-      }).catch(() => undefined);
-    } catch {
-      dirtyRef.current = true;
-    }
-  }, [token]);
-
   // Phones: save when the page is hidden (another app, the lock screen, the
   // camera) and as it goes away; when it comes back with nothing waiting,
   // pick up what another tab or device saved. A sent assessment shown again
@@ -263,24 +301,37 @@ export default function FamilyAssessment() {
   useEffect(() => {
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') { void flush(); return; }
-      if (!dirtyRef.current && !savingRef.current && !closedRef.current && stepRef.current > 0) void fetchView(true);
+      if (dirtyRef.current) { void flush(); return; }
+      if (!savingRef.current && !closedRef.current && stepRef.current > 0) void fetchView(true);
     };
-    const onPageHide = () => saveOnExit();
+    const onPageHide = () => { void flush(); };
     const onPageShow = (event: PageTransitionEvent) => {
       if (!event.persisted) return;
       if (submittedRef.current) { window.location.reload(); return; }
-      // Back from the back-forward cache: the save made as the page left moved the revision on.
-      if (!dirtyRef.current && !savingRef.current && !closedRef.current) void fetchView(true);
+      // Back from the back-forward cache: send what is still waiting, or
+      // pick up the revision the save made as the page left.
+      if (dirtyRef.current) { void flush(); return; }
+      if (!savingRef.current && !closedRef.current) void fetchView(true);
+    };
+    // Closing the tab with answers not saved yet: the browser asks first
+    // (the save is sent either way).
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (closedRef.current || (!dirtyRef.current && !savingRef.current)) return;
+      void flush();
+      event.preventDefault();
+      event.returnValue = '';
     };
     document.addEventListener('visibilitychange', onVisibility);
     window.addEventListener('pagehide', onPageHide);
     window.addEventListener('pageshow', onPageShow);
+    window.addEventListener('beforeunload', onBeforeUnload);
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('pagehide', onPageHide);
       window.removeEventListener('pageshow', onPageShow);
+      window.removeEventListener('beforeunload', onBeforeUnload);
     };
-  }, [flush, fetchView, saveOnExit]);
+  }, [flush, fetchView]);
 
   useEffect(() => () => {
     if (timerRef.current) window.clearTimeout(timerRef.current);
@@ -288,6 +339,7 @@ export default function FamilyAssessment() {
   }, []);
 
   function setAnswer(field: Field, value: unknown) {
+    editsRef.current += 1;
     const next = { ...answersRef.current, [field.id]: value };
     answersRef.current = next;
     setAnswers(next);
@@ -359,12 +411,22 @@ export default function FamilyAssessment() {
     }
     if (!agreed) { setProblem('Check the box to agree before sending.'); return; }
     if (signName.trim().length < 2) { setProblem('Type your full name to sign.'); return; }
+    if (uploading) { setProblem('Wait a moment for the card photo to finish sending.'); return; }
     setSubmitting(true);
     setProblem('');
     if (timerRef.current) window.clearTimeout(timerRef.current);
     // A save still on its way would move the revision on: wait for it (a few seconds at most).
+    const conflicts = conflictsRef.current;
     for (let waited = 0; savingRef.current && waited < 8000; waited += 100) {
       await new Promise((resolve) => window.setTimeout(resolve, 100));
+    }
+    if (savingRef.current) { setSubmitting(false); setProblem('Still saving your answers. Try again in a moment.'); return; }
+    // Answers came in from another device while waiting: the family looks
+    // them over before signing for them.
+    if (conflictsRef.current !== conflicts) {
+      setSubmitting(false);
+      setNotice('Some answers were changed on another device while you were signing. Please look them over, then sign again.');
+      return;
     }
     // Answers to questions that are now hidden are not kept.
     const final = pruneHidden(answersRef.current);
@@ -382,8 +444,9 @@ export default function FamilyAssessment() {
         const outcome = saveOutcome(error);
         if (outcome === 'already_sent' || outcome === 'link_stopped') { closedRef.current = true; await fetchView(); return; }
         if (outcome === 'changed_elsewhere') {
-          setNotice('These answers were changed in another tab or on another device. Please look over the newest answers, then sign again.');
-          await fetchView(true);
+          await resolveConflict(answersRef.current);
+          if (dirtyRef.current) queueSave(true);
+          setNotice('Some answers were changed in another tab or on another device. Please look them over, then sign again.');
           return;
         }
         setProblem(error.code && error.message ? error.message : 'It was not sent. Check your connection and try again.');

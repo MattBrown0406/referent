@@ -71,15 +71,34 @@ Deno.serve(async (request) => {
       p_token: upload.token, p_side: upload.side, p_path: upload.path,
     });
     if (error) {
-      if (error.code === 'P0002') return failure(404, 'not_active', error.message || 'This link is not active.');
-      if (error.code === '22023') return failure(400, 'bad_request', 'The photo could not be matched. Choose it again.');
+      if (error.code === 'P0002' || error.code === '22023') {
+        // Not recorded (sent, stopped, deleted, or not this assessment's):
+        // an upload that did land is removed, unless it is the photo some
+        // assessment already shows. The name was checked (parseUploadRequest).
+        const { data: recorded, error: checkError } = await supabase.rpc('family_assessment_photo_recorded', { p_path: upload.path });
+        if (!checkError && recorded === false) {
+          const { error: removeError } = await supabase.storage.from('assessment-files').remove([upload.path]);
+          if (removeError) console.error('removing an unrecorded card photo failed');
+        }
+        return error.code === 'P0002'
+          ? failure(404, 'not_active', error.message || 'This link is not active.')
+          : failure(400, 'bad_request', 'The photo could not be matched. Choose it again.');
+      }
       console.error('family_assessment_photo_done failed', error.code || 'unknown');
       return failure(500, 'server_error', 'The photo could not be saved right now. Try again.');
     }
-    if (typeof replaced === 'string' && replaced) {
-      // The photo this one replaced: nobody sees it any more.
-      const { error: removeError } = await supabase.storage.from('assessment-files').remove([replaced]);
-      if (removeError) console.error('removing the replaced card photo failed');
+    // The photo this one replaced, and any other upload of this side that
+    // never got recorded (a tab closed between upload and done): nobody
+    // sees them any more.
+    const folder = upload.path.slice(0, upload.path.lastIndexOf('/'));
+    const { data: listed } = await supabase.storage.from('assessment-files').list(folder, { limit: 100 });
+    const stale = new Set((listed || [])
+      .map((item) => `${folder}/${item.name}`)
+      .filter((path) => path !== upload.path && path.startsWith(`${folder}/card-${upload.side}-`)));
+    if (typeof replaced === 'string' && replaced) stale.add(replaced);
+    if (stale.size) {
+      const { error: removeError } = await supabase.storage.from('assessment-files').remove([...stale]);
+      if (removeError) console.error('removing replaced card photos failed');
     }
     return reply({ done: true });
   }

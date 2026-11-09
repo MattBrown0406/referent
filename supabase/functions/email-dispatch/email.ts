@@ -420,9 +420,9 @@ export async function idempotencyKey(row: OutboxRow, from: string, replyTo: stri
 /**
  * Who an email is from and where replies go. A practice's own email (the
  * family assessment invite) is from "<practice> via ReferralFit" at the
- * same address, and replies go to the practitioner who sent it. Anything
- * unusable falls back to the defaults, so one row's sender can never stop
- * the queue.
+ * same address, and replies go to the practitioner who sent it (or
+ * nowhere else). A name Resend refuses is retried from ReferralFit's own
+ * (index.ts), so one row's sender can never stop the queue.
  */
 export function senderFor(row: OutboxRow, from: string, replyTo: string | undefined): { from: string; replyTo?: string } {
   if (row.kind !== 'family_assessment_invite') return { from, replyTo };
@@ -430,8 +430,11 @@ export function senderFor(row: OutboxRow, from: string, replyTo: string | undefi
   const practice = plain(row.data?.practice_name, 60).replace(/[^A-Za-z0-9 .&'-]+/g, ' ').replace(/\s+/g, ' ').trim();
   const reply = typeof row.data?.reply_to === 'string' ? row.data.reply_to.trim().toLowerCase() : '';
   return {
-    from: practice ? `${practice} via ReferralFit <${address}>` : from,
-    replyTo: EMAIL_PATTERN.test(reply) && reply.length <= 254 ? reply : replyTo,
+    // Quoted: the name may have a period or an ampersand.
+    from: practice ? `"${practice} via ReferralFit" <${address}>` : from,
+    // The practitioner who sent it, or no reply-to at all: a family's reply
+    // never goes to anyone else.
+    replyTo: EMAIL_PATTERN.test(reply) && reply.length <= 254 ? reply : undefined,
   };
 }
 

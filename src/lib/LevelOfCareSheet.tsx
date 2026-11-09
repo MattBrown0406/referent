@@ -115,6 +115,9 @@ const SAVED = DIMENSION_KEYS.length + 1;
 type ChoiceMode = 'recommended' | 'different';
 
 export default function LevelOfCareSheet({ caseId, seed = null, names, previous, backRef, onClose, onSaved, onFindPlacement }: Props) {
+  // Opened from the family assessment (the seed is cleared once it is saved,
+  // so it is remembered from the start): "Back" returns there.
+  const [fromAssessment] = useState(Boolean(seed));
   const [step, setStep] = useState(INTRO);
   const [draft, setDraft] = useState<AssessmentDraft>(() => (seed?.fromAi
     // The AI's ratings to start from; its reasons stay in the suggestion box,
@@ -483,7 +486,7 @@ export default function LevelOfCareSheet({ caseId, seed = null, names, previous,
           <Text style={styles.primaryButtonText}>Find placement with this level</Text>
         </TouchableOpacity>
         <TouchableOpacity accessibilityRole="button" onPress={onClose} style={styles.textButton}>
-          <Text style={styles.textButtonText}>{seed ? 'Back to the family assessment' : 'Back to the case file'}</Text>
+          <Text style={styles.textButtonText}>{fromAssessment ? 'Back to the family assessment' : 'Back to the case file'}</Text>
         </TouchableOpacity>
       </>
     );

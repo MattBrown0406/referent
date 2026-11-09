@@ -467,6 +467,33 @@ check(() => {
   assert.equal(second.caseUnsure, true, 'two callers with one name: the practitioner confirms it is the same person');
   assert.match(second.hint, /same name as a new lead above/);
 }, 'the same name is not the same caller until confirmed');
+check(() => {
+  const quote = 'Promised to call Ana Rivera and Sarah Miller back tomorrow';
+  const [ana, sarah] = build(
+    found({ kind: 'follow_up', personName: 'Ana Rivera', summary: 'Call Ana back.', regarding: 'family', evidence: quote }),
+    found({ kind: 'follow_up', personName: 'Sarah Miller', summary: 'Call Sarah back.', regarding: 'family', evidence: quote }),
+  );
+  const saved = new Set(rules.rowSignatures(ana));
+  const [, again] = rules.markSavedBefore([ana, sarah], saved);
+  assert.equal(again.include, sarah.include, 'one sentence about two people is still two things to save');
+}, 'a shared quote marks only a lead as saved');
+check(() => {
+  const [lead, callBack] = build(
+    found({ kind: 'new_lead', personName: 'Kevin Brooks', phone: '541-555-0300', summary: 'Kevin called about Jenna.', verified: false }),
+    found({ kind: 'follow_up', personName: 'Kevin Brooks', summary: 'Call Kevin back.', regarding: 'family' }),
+  );
+  assert.equal(lead.include, false);
+  assert.equal(callBack.include, true, 'a lead that is off makes no first call, so the call-back stays');
+  const [, later] = build(
+    found({ kind: 'new_lead', personName: 'Kevin Brooks', phone: '541-555-0300', summary: 'Kevin called about Jenna.' }),
+    found({ kind: 'follow_up', personName: 'Kevin Brooks', summary: 'Call Kevin Wednesday.', regarding: 'family', dueDate: '2026-11-11' }),
+  );
+  assert.equal(later.include, true, 'a call two days out is not the first call made today');
+}, 'the lead\'s first call is today, and only when the lead is on');
+check(() => {
+  const [row] = build(found({ verified: false, namesFound: false }));
+  assert.match(row.hint, /^A name or organization here is not in your notes\./);
+}, 'a name not in the notes says so');
 
 // ─── Writes ────────────────────────────────────────────────────────────────
 check(() => {

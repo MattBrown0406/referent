@@ -101,7 +101,7 @@ check(() => {
   assert.deepEqual(schema.safetyFlags({}), []);
   assert.deepEqual(schema.safetyFlags({ suicideIdeation: 'yes', homicidalIdeation: 'yes', urgencyLevel: 'crisis', immediateSafetyConcerns: 'He has a gun.' }),
     ['suicidal_thoughts', 'homicidal_thoughts', 'crisis', 'safety_concern']);
-  for (const none of ['None.', 'n/a', 'N/A!', 'no concerns', 'none at this time', '---', '  ', '\n None.', 'None that I\'m aware of', 'No concerns at this time!', 'none\nat this time', 'Not\u00a0right now']) {
+  for (const none of ['None.', 'n/a', 'N/A!', 'no concerns', 'none at this time', '---', '  ', '\n None.', 'None that I\'m aware of', 'No concerns at this time!', 'none\nat this time', 'Not\u00a0right now', 'no\u0085concerns']) {
     assert.deepEqual(schema.safetyFlags({ immediateSafetyConcerns: none }), [], `"${none}" is not a concern`);
   }
   assert.deepEqual(schema.safetyFlags({ suicideIdeation: 'unknown', urgencyLevel: 'urgent' }), []);
@@ -114,7 +114,7 @@ check(() => {
   const words = /const NO_CONCERN = \/(.+)\/;/.exec(ts)[1].replaceAll('\\/', '/');
   assert.ok(sql.includes(`!~ '${words}'`), 'the database uses the same "no concern" words');
   assert.ok(sql.includes(`'[[:space:]]+', ' ', 'g'), '[^a-z0-9/ -]+', '', 'g'), ' +', ' ', 'g')`), 'and compares them the same way (normalizeConcern)');
-  assert.match(ts, /replace\(\/\\s\+\/g, ' '\)\.replace\(\/\[\^a-z0-9\/ -\]\+\/g, ''\)\.replace\(\/ \+\/g, ' '\)/);
+  assert.match(ts, /replace\(\/\[\\s\\u0085\]\+\/g, ' '\)\.replace\(\/\[\^a-z0-9\/ -\]\+\/g, ''\)\.replace\(\/ \+\/g, ' '\)/);
   for (const [key, flag] of [['suicideIdeation', 'suicidal_thoughts'], ['homicidalIdeation', 'homicidal_thoughts'], ['urgencyLevel', 'crisis']]) {
     assert.match(sql, new RegExp(`p_answers ->> '${key}'[^]*?THEN '${flag}'`), `${flag} in the database`);
   }
@@ -180,6 +180,11 @@ check(() => {
   assert.equal(link.sameAnswers({ a: 1, b: [{ x: 'y' }] }, { b: [{ x: 'y' }], a: 1 }), true, 'key order does not matter');
   assert.equal(link.sameAnswers({ a: 1 }, { a: 1, b: 2 }), false);
   assert.equal(link.sameAnswers({ a: [1, 2] }, { a: [2, 1] }), false);
+  // Two devices: this page changed b and removed c; the other changed a and d.
+  const base = { a: 1, b: 1, c: 1, d: 1 };
+  assert.deepEqual(link.mergeAnswers(base, { a: 1, b: 2, d: 1 }, { a: 9, b: 1, c: 1, d: 9 }), { a: 9, b: 2, d: 9 }, 'both sets of changes are kept');
+  assert.deepEqual(link.mergeAnswers(base, { ...base, a: 5 }, { ...base, a: 9 }), { ...base, a: 5 }, 'where both changed one answer, this page\'s is kept');
+  assert.deepEqual(link.mergeAnswers(base, base, { ...base, e: 3 }), { ...base, e: 3 }, 'nothing changed here: the newest answers as they are');
   assert.equal(link.assessmentViewFromJson({ status: 'open', practice_name: 'X', consent_text: 'a', consent_version: 'v', revision: 7 }).revision, 7);
 }, 'saving with a revision');
 
@@ -286,7 +291,10 @@ check(() => {
   assert.match(page, /\{flags\.length \? <CrisisLine urgent \/> : null\}/, '911 and 988 the moment an answer suggests danger');
   assert.match(page, /href="tel:911"[^]*href="tel:988"[^]*href="sms:988"/, 'one tap to call 911, or to call or text 988');
   assert.match(page, /p_revision: revisionRef\.current/, 'every save says which revision it is from');
-  assert.match(page, /keepalive: true/, 'answers are saved as the page goes away');
+  assert.match(page, /keepalive: body\.length < 60_000/, 'every save goes with keepalive, so one sent as the page goes away arrives');
+  assert.match(page, /mergeAnswers\(baseRef\.current, answersRef\.current, fresh\.answers\)/, 'a conflict keeps the family\'s own changes');
+  assert.match(page, /if \(uploading\) \{ setProblem\(/, 'sending waits for a card photo on its way');
+  assert.match(page, /conflictsRef\.current !== conflicts/, 'answers from another device while signing are looked over first');
   assert.match(page, /pruneHidden\(answersRef\.current\)/, 'answers to hidden questions are not sent');
   assert.match(page, /withdrawalWarning\(answers\) \? <div className="fa-warning" role="alert">\{WITHDRAWAL_TEXT\}/, 'the withdrawal warning shows where it was asked');
   assert.match(page, /p_consent_version: open\.consentVersion/);

@@ -758,7 +758,8 @@ const NO_CONCERN = /^(none|no|nope|n\/?a|na|not applicable|nothing|no concerns?|
  * (family_assessment_urgent in the database does exactly this).
  */
 export function normalizeConcern(value: unknown): string {
-  return text(value).toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9/ -]+/g, '').replace(/ +/g, ' ').trim();
+  // \u0085 too: the database counts it as white space, JavaScript does not.
+  return text(value).toLowerCase().replace(/[\s\u0085]+/g, ' ').replace(/[^a-z0-9/ -]+/g, '').replace(/ +/g, ' ').trim();
 }
 
 export type SafetyFlag = 'suicidal_thoughts' | 'homicidal_thoughts' | 'crisis' | 'safety_concern';

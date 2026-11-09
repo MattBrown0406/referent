@@ -5,7 +5,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(101);
+SELECT plan(105);
 
 -- Actors
 --   p1  owner of practice P (sends assessments)
@@ -165,6 +165,8 @@ SELECT is((public.public_family_assessment_save(current_setting('test.token'), '
   1, 'the family saves as they go, and each save is a new revision');
 SELECT throws_ok(format($$ SELECT public.public_family_assessment_save(%L, '{"contactName": "Old tab"}', 2, 0) $$, current_setting('test.token')),
   'RFA02', NULL, 'a page with older answers cannot write over newer ones');
+SELECT is((public.public_family_assessment_save(current_setting('test.token'), '{"suicideIdeation": "no", "contactName": "Maria Lopez"}', 3, 0) ->> 'revision')::int,
+  1, 'the same answers from an older page are no conflict and no new revision (moving between sections)');
 SELECT throws_ok(format($$ SELECT public.public_family_assessment_save(%L, '[1]', 1, 1) $$, current_setting('test.token')),
   '22023', NULL, 'answers must be an object');
 SELECT throws_ok(format($$ SELECT public.public_family_assessment_save(%L, jsonb_build_object('x', repeat('y', 300000)), 1, 1) $$, current_setting('test.token')),
@@ -329,6 +331,12 @@ SET LOCAL ROLE authenticated;
 SELECT public.family_assessment_send('fac20000-0000-0000-0000-0000000000fa', '', '', false);
 RESET ROLE;
 SELECT is(public.public_family_assessment_open(current_setting('test.share3')), NULL, 'sending an expired assessment again does not bring its old links back');
+-- The invite to ana.r@ was prepared above; sending the expired assessment again retired its link.
+SELECT is((SELECT count(*)::int FROM public.email_outbox_prepare(
+            (SELECT o.id FROM public.email_outbox o WHERE o.kind = 'family_assessment_invite' AND o.data ->> 'to' = 'ana.r@example.test'))),
+  0, 'a retried invite whose link was retired meanwhile is not sent with a dead link');
+SELECT is((SELECT error FROM public.email_outbox WHERE kind = 'family_assessment_invite' AND data ->> 'to' IS NULL AND error = 'link_retired' LIMIT 1),
+  'link_retired', 'and says why');
 
 -- ===========================================================================
 -- F. Stopping and deleting
@@ -345,6 +353,9 @@ SELECT is(public.family_assessment_revoke(current_setting('test.id2')::uuid), tr
 RESET ROLE;
 SELECT is((SELECT count(*)::int FROM public.family_assessment_links WHERE assessment_id = current_setting('test.id2')::uuid), 0, 'its links stop');
 SELECT public.email_enqueue('fa100000-0000-0000-0000-0000000000fa', 'family_assessment_urgent', jsonb_build_object('assessment_id', current_setting('test.id2')));
+SELECT is((SELECT email FROM public.email_outbox_prepare(
+            (SELECT o.id FROM public.email_outbox o WHERE o.kind = 'family_assessment_urgent' AND o.data ->> 'assessment_id' = current_setting('test.id2')))),
+  'assess-p1@example.test', 'stopping the link does not cancel an alert that someone may be in danger');
 SELECT set_config('request.jwt.claim.sub', 'fa100000-0000-0000-0000-0000000000fa', true);
 SET LOCAL ROLE authenticated;
 SELECT is(public.family_assessment_delete(current_setting('test.id2')::uuid), true, 'the practice deletes it');

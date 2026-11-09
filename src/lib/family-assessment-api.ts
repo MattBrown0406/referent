@@ -57,9 +57,16 @@ export async function revokeFamilyAssessment(id: string): Promise<void> {
 /** Every file in an assessment's folder (its card photos, current and any left over). */
 export async function assessmentFolderFiles(caseId: string, id: string): Promise<string[]> {
   const folder = `${caseId}/${id}`;
-  const { data, error } = await supabase.storage.from('assessment-files').list(folder, { limit: 100 });
-  if (error) throw error;
-  return (data || []).filter((item) => item.name && item.id).map((item) => `${folder}/${item.name}`);
+  const files: string[] = [];
+  // Page by page: a listing stops at 100, and every photo must go.
+  for (let offset = 0; offset < 10_000; offset += 100) {
+    const { data, error } = await supabase.storage.from('assessment-files').list(folder, { limit: 100, offset });
+    if (error) throw error;
+    const page = data || [];
+    files.push(...page.filter((item) => item.name && item.id).map((item) => `${folder}/${item.name}`));
+    if (page.length < 100) break;
+  }
+  return files;
 }
 
 /**

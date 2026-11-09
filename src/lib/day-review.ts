@@ -48,6 +48,8 @@ export type FoundItem = {
   missed: boolean;
   evidence: string;
   verified: boolean;
+  /** False when the review gave a name or organization the notes never mention. */
+  namesFound: boolean;
 };
 
 const CHANNELS = ['call', 'meeting', 'text', 'email', 'unknown'] as const;
@@ -92,6 +94,7 @@ export function readFoundItems(value: unknown): FoundItem[] {
       missed: item.missed === true,
       evidence: text(item.evidence, 300),
       verified: item.verified === true,
+      namesFound: item.namesFound !== false,
     });
   }
   return out;
@@ -385,7 +388,7 @@ function pendingLeadTitle(row: Pick<ReviewRow, 'callerName' | 'aboutRelationship
  * or note about a caller who is new today can go on the case the lead will
  * create. A lead already saved is in the workspace itself.
  */
-export function withPendingLeads(workspace: Workspace, rows: ReviewRow[]): Workspace {
+export function withPendingLeads(workspace: Workspace, rows: ReviewRow[], firstCalls: { today: string; leads: ReviewRow[] } | null = null): Workspace {
   const known = new Set(workspace.cases.map((record) => record.id));
   const leads = rows.filter((row) => row.kind === 'new_lead' && row.include && !known.has(row.ids.caseId));
   if (!leads.length) return workspace;
@@ -393,11 +396,13 @@ export function withPendingLeads(workspace: Workspace, rows: ReviewRow[]): Works
     ...workspace,
     cases: [...leads.map((row) => ({ id: row.ids.caseId, title: pendingLeadTitle(row), status: PENDING_STATUS, updatedAt: '' })), ...workspace.cases],
     contacts: [...leads.map((row) => ({ caseId: row.ids.caseId, name: row.callerName, phone: row.phone, email: row.email })), ...workspace.contacts],
-    // The first call create_lead makes with each lead, so a "call her back"
-    // below is recognized as that call, not a second one.
-    followUps: [...leads.map((row) => ({
-      caseId: row.ids.caseId, title: `First call with ${row.callerName || 'the new caller'}`, dueOn: row.dueOn, status: 'open', kind: 'first_call',
-    })), ...workspace.followUps],
+    // With firstCalls: the first call create_lead makes (due today) with
+    // each lead that is on, so a "call her back" below is recognized as that
+    // call, not a second one. A lead that is off makes no call, so nothing
+    // is folded into it.
+    followUps: firstCalls ? [...firstCalls.leads.filter((row) => row.include && leads.includes(row)).map((row) => ({
+      caseId: row.ids.caseId, title: `First call with ${row.callerName || 'the new caller'}`, dueOn: firstCalls.today, status: 'open', kind: 'first_call',
+    })), ...workspace.followUps] : workspace.followUps,
   };
 }
 
@@ -431,7 +436,9 @@ function blankRow(found: FoundItem, index: number, today: string, makeId: () => 
     licenseConfirmed: null,
     candidate: null,
     include: found.verified,
-    hint: found.verified ? '' : 'Not found word for word in your notes. Check it before saving.',
+    hint: found.verified ? ''
+      : found.namesFound === false ? 'A name or organization here is not in your notes. Check it before saving.'
+        : 'Not found word for word in your notes. Check it before saving.',
     ids: newRowIds(makeId),
   };
 }
@@ -620,7 +627,8 @@ export function buildRows(items: FoundItem[], workspace: Workspace, today: strin
     if (row.found.kind === 'new_lead') continue;
     // Rows can be about a new lead above whether or not its switch is on:
     // rowProblem stops them from saving until the lead is.
-    const view = withPendingLeads(workspace, leads.map((lead) => ({ ...lead, include: true })));
+    const on = leads.map((lead) => ({ ...lead, include: true }));
+    const view = withPendingLeads(workspace, on, { today, leads: on.filter((_, index) => leads[index].include) });
     switch (row.kind) {
       case 'case_note': pickCase(row, view); break;
       case 'partner_note':
@@ -782,8 +790,10 @@ export function rowSignatures(row: ReviewRow): string[] {
   // Whatever it is matched to now: a lead saved earlier is a case today, so
   // the same words from the notes read again become a note on it. Its
   // quote, word for word from the notes, still says it was saved.
+  // Only for a lead: two other items often quote one sentence ("call Ana
+  // and Sarah back tomorrow") and are still two things to save.
   const quote = comparable(row.found.evidence);
-  if (row.found.verified && quote.split(' ').length >= 4) out.push(`${row.found.kind}|any|q:${quote}`);
+  if (row.found.kind === 'new_lead' && row.found.verified && quote.split(' ').length >= 4) out.push(`new_lead|any|q:${quote}`);
   return out;
 }
 

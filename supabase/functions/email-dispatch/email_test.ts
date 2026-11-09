@@ -233,10 +233,10 @@ Deno.test('the invite never goes out without a link, and a bad logo path is left
 
 Deno.test('the invite is from the practice via ReferralFit, and replies reach the practitioner', () => {
   const sender = senderFor(row('family_assessment_invite', ASSESSMENT), 'ReferralFit <notifications@referralfit.com>', DEFAULT_REPLY_TO);
-  assertEquals(sender, { from: 'Okafor Family Interventions via ReferralFit <notifications@referralfit.com>', replyTo: 'grace@okafor.example.test' });
+  assertEquals(sender, { from: '"Okafor Family Interventions via ReferralFit" <notifications@referralfit.com>', replyTo: 'grace@okafor.example.test' });
   const odd = senderFor(row('family_assessment_invite', { ...ASSESSMENT, practice_name: 'Evil <x@y.z>, "Inc"', reply_to: 'not an email' }), 'ReferralFit <notifications@referralfit.com>', DEFAULT_REPLY_TO);
-  assertEquals(odd.from, 'Evil x y.z Inc via ReferralFit <notifications@referralfit.com>');
-  assertEquals(odd.replyTo, DEFAULT_REPLY_TO, 'an unusable reply-to falls back');
+  assertEquals(odd.from, '"Evil x y.z Inc via ReferralFit" <notifications@referralfit.com>');
+  assertEquals(odd.replyTo, undefined, 'an unusable reply-to sends replies nowhere else, never to a default address');
   assertEquals(senderFor(row('daily_summary', {}), 'ReferralFit <n@r.com>', 'm@r.com'), { from: 'ReferralFit <n@r.com>', replyTo: 'm@r.com' });
   const body = resendBody(row('family_assessment_invite', ASSESSMENT), renderEmail(row('family_assessment_invite', ASSESSMENT), LINKS, NOW), sender.from, sender.replyTo);
   assertEquals(body.reply_to, 'grace@okafor.example.test');

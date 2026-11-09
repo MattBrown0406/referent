@@ -73,6 +73,7 @@ Rules:
 - Keep every number exactly as written.
 - Never say a program is the best choice, and never promise results, admission, a bed or a cost.
 - No clinical judgments or diagnoses. Do not name or guess at anyone in the family; say "your loved one".
+- Write names, places and abbreviations exactly as the facts write them: do not spell out an abbreviation (EMDR, CA) or add a name the facts do not give.
 - The intro: one or two sentences, from the intro fact.`;
 
 export function buildExplainPrompt(request: ExplainRequest): string {
@@ -106,13 +107,28 @@ export function explainSchema(): Record<string, unknown> {
 // Words and phrases a rewrite may use only when its facts already do:
 // promises, rankings, outcomes, beds and admission, and money ties (the app
 // adds the disclosures itself, below the text).
+// Single words only where they are claims in any sentence; words that are
+// ordinary in other sentences ("on top of that", "you and your partner",
+// "ask about the fee") are checked as the phrases that make them claims.
 const UNSAID = [
   'best', 'guarantee', 'guaranteed', 'guarantees', 'cure', 'cured', 'cures', 'promise', 'promises', 'promised', 'definitely', 'certainly',
-  'recommend', 'recommends', 'recommended', 'recommendation', 'top', 'strongest', 'ideal', 'perfect', 'excellent', 'superior', 'leading',
-  'proven', 'success', 'successful', 'outcome', 'outcomes', 'results', 'bed', 'beds', 'admit', 'admits', 'admitted', 'admission', 'waiting',
-  'financial', 'fee', 'fees', 'paid', 'pays', 'ties', 'commission', 'sponsor', 'sponsored', 'partner', 'partnered',
+  'recommend', 'recommends', 'recommended', 'recommendation', 'strongest', 'ideal', 'perfect', 'excellent', 'superior', 'leading',
+  'proven', 'success', 'successful', 'bed', 'beds', 'admit', 'admits', 'admitted', 'financial', 'commission', 'sponsor', 'sponsored',
 ];
-const UNSAID_PHRASES = ['right choice', 'right fit', 'first choice', 'no connection', 'not connected', 'no relationship'];
+const UNSAID_PHRASES = [
+  'right choice', 'right fit', 'first choice', 'top choice', 'top pick', 'top program', 'top recommendation', 'top rated', 'top notch',
+  'no connection', 'not connected', 'no relationship', 'no ties', 'ties to', 'referral fee', 'referral fees', 'finder fee', 'no fee', 'no fees',
+  'we are paid', 'we get paid', 'pays us', 'our partner', 'partner program', 'partnered with', 'we partner', 'in partnership',
+  'great results', 'good results', 'strong results', 'better results', 'real results', 'great outcomes', 'good outcomes', 'strong outcomes',
+  'better outcomes', 'bed waiting', 'spot waiting', 'no waiting', 'no wait', 'waiting for your', 'can start today', 'start right away',
+];
+
+// US states written out, for a rewrite that spells out the facts' "OR" or "CA".
+const STATE_NAMES = ['alabama', 'alaska', 'arizona', 'arkansas', 'california', 'colorado', 'connecticut', 'delaware', 'florida', 'georgia',
+  'hawaii', 'idaho', 'illinois', 'indiana', 'iowa', 'kansas', 'kentucky', 'louisiana', 'maine', 'maryland', 'massachusetts', 'michigan',
+  'minnesota', 'mississippi', 'missouri', 'montana', 'nebraska', 'nevada', 'hampshire', 'jersey', 'mexico', 'york', 'carolina', 'dakota',
+  'ohio', 'oklahoma', 'oregon', 'pennsylvania', 'rhode', 'island', 'tennessee', 'texas', 'utah', 'vermont', 'virginia', 'washington',
+  'west', 'wisconsin', 'wyoming', 'north', 'south', 'district', 'columbia'];
 
 function addsWords(text: string, facts: string): string | null {
   const factWords = ` ${comparable(facts)} `;
@@ -131,9 +147,12 @@ function addsWords(text: string, facts: string): string | null {
  */
 function addsNames(text: string, facts: string): boolean {
   const known = ` ${comparable(facts)} `;
+  const isKnown = (word: string) => !word || known.includes(` ${word} `) || ALWAYS_CAPITALIZED.has(word) || STATE_NAMES.includes(word);
   for (const match of text.matchAll(/(?<=[^.!?:;\s"“(]\s+)[A-Z][a-zA-Z'’-]*/g)) {
-    const word = comparable(match[0]);
-    if (word && !known.includes(` ${word} `) && !ALWAYS_CAPITALIZED.has(word)) return true;
+    // "Juniper Ridge Recovery's", "Pine Valley's": the name without its 's.
+    const bare = match[0].replace(/['’]s$/i, '');
+    // A hyphenated name is known when each part is.
+    if (!comparable(bare).split(' ').every(isKnown)) return true;
   }
   return false;
 }

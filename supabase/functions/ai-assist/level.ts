@@ -300,7 +300,7 @@ function clip(value: string, max: number): string {
   return (space > max / 2 ? cut.slice(0, space) : value.slice(0, max)).trim();
 }
 
-const NAMES_A_LEVEL = /\b(needs?|requires?|recommend\w*|should (go|enter|attend|start|be (in|at|admitted|placed))|warrants?|calls? for|appropriate for|best suited (for|to)|suited for)\b[^.]{0,40}\b(inpatient|residential|detox\w*|outpatient|iop|php|partial hospitali[sz]ation|sober living|hospitali[sz]\w*|level of care)\b/i;
+const NAMES_A_LEVEL = /\b(needs?|requires?|recommend\w*|should (go|enter|attend|start|be (in|at|admitted|placed))|warrants?|calls? for|appropriate for|best suited (for|to)|suited for)\b[^.;,]{0,40}\b(inpatient|residential|detox\w*|outpatient|iop|php|partial hospitali[sz]ation|sober living|hospitali[sz]\w*|level of care)\b/i;
 
 /** The answers alone ("Question: answer" lines without their questions). */
 export function answerValues(request: LevelRequest): string {

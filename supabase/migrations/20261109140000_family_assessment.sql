@@ -591,8 +591,8 @@ GRANT EXECUTE ON FUNCTION public.family_assessment_urgent(jsonb) TO authenticate
 -- The answers, as the family has them so far (the whole object each time),
 -- and the step they are on, so they can stop and come back. p_revision is
 -- the revision the page loaded or last saved; an older one (another tab or
--- device saved since) is refused with RFA02, and a sent assessment with
--- RFA01. A yes to suicidal or homicidal thoughts, or "crisis", emails the
+-- device saved since) is refused with RFA02, unless the answers are the
+-- ones already saved; a sent assessment answers RFA01. A yes to suicidal or homicidal thoughts, or "crisis", emails the
 -- practitioner once, before the family finishes.
 DROP FUNCTION IF EXISTS public.public_family_assessment_save(text, jsonb, integer);
 CREATE OR REPLACE FUNCTION public.public_family_assessment_save(p_token text, p_answers jsonb, p_step integer, p_revision integer)
@@ -616,6 +616,15 @@ BEGIN
   SELECT * INTO a FROM public.family_assessments x WHERE x.id = v_id FOR UPDATE;
   IF a.status NOT IN ('sent', 'started') THEN
     RAISE EXCEPTION 'This assessment was already sent to your practitioner' USING ERRCODE = 'RFA01';
+  END IF;
+  -- The same answers (a page moving between sections, or a save that
+  -- already landed): only the step and time change, never the revision.
+  IF p_answers = a.answers THEN
+    UPDATE public.family_assessments x
+       SET step = greatest(0, least(coalesce(p_step, x.step), 40)), status = 'started',
+           started_at = coalesce(x.started_at, v_at), last_saved_at = v_at
+     WHERE x.id = v_id;
+    RETURN jsonb_build_object('saved_at', v_at, 'revision', a.revision);
   END IF;
   IF p_revision IS DISTINCT FROM a.revision THEN
     RAISE EXCEPTION 'These answers were changed in another tab or on another device' USING ERRCODE = 'RFA02';
@@ -666,20 +675,39 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM storage.objects o WHERE o.bucket_id = 'assessment-files' AND o.name = p_path) THEN
     RAISE EXCEPTION 'The photo did not arrive. Try again.' USING ERRCODE = 'P0002';
   END IF;
+  -- Checked again under the lock: a send or stop that finished meanwhile wins.
   SELECT CASE WHEN p_side = 'front' THEN a.card_front_path ELSE a.card_back_path END INTO v_old
-    FROM public.family_assessments a WHERE a.id = v_id FOR UPDATE;
+    FROM public.family_assessments a
+   WHERE a.id = v_id AND a.status IN ('sent', 'started') AND a.expires_at > now()
+     FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'This link is not active' USING ERRCODE = 'P0002';
+  END IF;
   UPDATE public.family_assessments a
      SET card_front_path = CASE WHEN p_side = 'front' THEN p_path ELSE a.card_front_path END,
          card_front_at = CASE WHEN p_side = 'front' THEN now() ELSE a.card_front_at END,
          card_back_path = CASE WHEN p_side = 'back' THEN p_path ELSE a.card_back_path END,
          card_back_at = CASE WHEN p_side = 'back' THEN now() ELSE a.card_back_at END,
          status = 'started', started_at = coalesce(a.started_at, now()), last_saved_at = now()
-   WHERE a.id = v_id;
+   WHERE a.id = v_id AND a.status IN ('sent', 'started');
   RETURN CASE WHEN v_old IS NULL OR v_old = p_path THEN '' ELSE v_old END;
 END
 $$;
 REVOKE ALL ON FUNCTION public.family_assessment_photo_done(text, text, text) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.family_assessment_photo_done(text, text, text) TO service_role;
+
+-- Whether a card photo is the one an assessment shows. A photo that arrived
+-- too late to be recorded (the assessment was sent, stopped or deleted) is
+-- not, and the upload function removes it rather than leave it behind.
+CREATE OR REPLACE FUNCTION public.family_assessment_photo_recorded(p_path text)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (SELECT 1 FROM public.family_assessments a WHERE a.card_front_path = p_path OR a.card_back_path = p_path)
+$$;
+REVOKE ALL ON FUNCTION public.family_assessment_photo_recorded(text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.family_assessment_photo_recorded(text) TO service_role;
 
 -- The family sends the assessment: the final answers, the consent box
 -- checked, their typed full name as the signature, the consent version
@@ -820,7 +848,9 @@ BEGIN
       'practice_name', p.practice_name, 'logo_path', p.logo_path, 'reply_to', p_user_email,
       'recipient_name', coalesce(p_data ->> 'recipient_name', a.recipient_name), 'expires_at', a.expires_at));
   END IF;
-  IF p_kind = 'family_assessment_urgent' AND a.status IN ('sent', 'started') THEN
+  -- A stop does not cancel it (someone may still be in danger); a finished
+  -- assessment's own email says it instead.
+  IF p_kind = 'family_assessment_urgent' AND a.status IN ('sent', 'started', 'revoked') THEN
     RETURN jsonb_build_object('to', p_user_email, 'data', jsonb_build_object('urgent', true));
   END IF;
   IF p_kind = 'family_assessment_submitted' AND a.status = 'submitted' THEN
@@ -859,6 +889,11 @@ BEGIN
     END IF;
   ELSIF o.kind IN ('family_assessment_invite', 'family_assessment_submitted', 'family_assessment_urgent') THEN
     IF public.email_family_assessment_details(o.kind, o.data, '') IS NULL THEN RETURN 'not_open'; END IF;
+    -- An invite prepared before, and retried: its link must still work.
+    IF o.kind = 'family_assessment_invite' AND coalesce((o.data ->> 'prepared')::boolean, false)
+       AND public.family_assessment_for_token(o.data ->> 'link_token') IS DISTINCT FROM (o.data ->> 'assessment_id')::uuid THEN
+      RETURN 'link_retired';
+    END IF;
   END IF;
   RETURN NULL;
 END
@@ -892,6 +927,11 @@ BEGIN
   ELSIF o.kind IN ('claim_request', 'claim_decision') THEN
     v_data := v_data || coalesce(public.email_claim_details(o.kind, o.data), '{}'::jsonb);
   ELSIF o.kind IN ('family_assessment_invite', 'family_assessment_submitted', 'family_assessment_urgent') THEN
+    -- Held while the invite's link is made, so a corrected address sent at
+    -- the same moment cannot slip between the check and the new link.
+    IF o.kind = 'family_assessment_invite' AND coalesce(o.data ->> 'assessment_id', '') ~ '^[0-9a-f-]{36}$' THEN
+      PERFORM 1 FROM public.family_assessments x WHERE x.id = (o.data ->> 'assessment_id')::uuid FOR UPDATE;
+    END IF;
     v_details := public.email_family_assessment_details(o.kind, o.data,
                    (SELECT coalesce(u.email, '') FROM auth.users u WHERE u.id = o.user_id));
     v_data := v_data || coalesce(v_details -> 'data', '{}'::jsonb)

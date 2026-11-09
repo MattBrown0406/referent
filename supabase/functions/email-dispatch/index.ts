@@ -106,11 +106,14 @@ async function sendOne(row: OutboxRow, apiKey: string, defaultFrom: string, defa
     return { id: row.id, error: 'render_failed', retry: false };
   }
   const sent = await post(row, email, apiKey, from, replyTo, target);
-  // Resend refused a practice's own sender name or reply-to (a 422): send
-  // that one email from ReferralFit's own sender instead, so one practice's
-  // name can never stop the queue for everyone.
-  if (sent.charge && (from !== defaultFrom || replyTo !== defaultReplyTo)) {
-    return post(row, email, apiKey, defaultFrom, defaultReplyTo, target);
+  // Resend refused a practice's own sender (a 422 about it): send that one
+  // email from ReferralFit's own name instead, still replying to the
+  // practitioner (never to anyone else: the family may reply with health
+  // details). If that is refused too, this one email fails on its own, so
+  // one practice's settings can never stop the queue for everyone.
+  if (sent.charge && from !== defaultFrom) {
+    const again = await post(row, email, apiKey, defaultFrom, replyTo, target);
+    return again.charge ? { id: row.id, error: again.error, retry: false } : again;
   }
   return sent;
 }

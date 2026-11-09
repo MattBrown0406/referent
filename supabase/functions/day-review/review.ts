@@ -55,6 +55,8 @@ export type FoundItem = {
   evidence: string;
   /** The quote was found in the notes, word for word. */
   verified: boolean;
+  /** False when a name or organization it gives is not in the notes (then verified is false too). */
+  namesFound: boolean;
 };
 
 export class ReviewRequestError extends Error {}
@@ -293,10 +295,24 @@ function emailFromNotes(value: unknown, emails: Set<string>): string {
 
 // A quote counts only when it is long enough to show something and appears
 // in the notes word for word (ignoring case, punctuation and line breaks).
-// Words an organization's name may gain or lose between the notes and the
-// review ("Juniper Ridge" for "Juniper Ridge Recovery Center").
-const NAME_FILLER = new Set(['the', 'of', 'and', 'for', 'at', 'a', 'an', 'inc', 'llc', 'pc', 'pllc', 'recovery', 'center', 'centre',
-  'treatment', 'program', 'programs', 'services', 'service', 'house', 'behavioral', 'health', 'clinic', 'group', 'counseling']);
+// Words a name may gain or lose between the notes and the review
+// ("Juniper Ridge" for "Juniper Ridge Recovery Center", "Dr. Patel" for
+// "Patel", "the Rivera family" for "the Riveras"): titles, and the words
+// in many program names that say nothing about which one (as GENERIC_ORG
+// in src/lib/day-review.ts).
+const NAME_FILLER = new Set([
+  'the', 'of', 'and', 'for', 'at', 'a', 'an', 'inc', 'llc', 'pc', 'pllc', 'mr', 'mrs', 'ms', 'miss', 'dr', 'doctor', 'family', 'families',
+  'new', 'recovery', 'center', 'centers', 'centre', 'treatment', 'house', 'home', 'homes', 'health', 'healthcare', 'behavioral', 'mental',
+  'services', 'service', 'wellness', 'sober', 'living', 'detox', 'inpatient', 'outpatient', 'residential', 'program', 'programs',
+  'institute', 'clinic', 'intervention', 'interventions', 'counseling', 'therapy', 'care', 'addiction', 'rehab', 'rehabilitation',
+  'foundation', 'associates', 'partners', 'network', 'solutions', 'academy', 'campus', 'hospital', 'group', 'iop', 'php',
+]);
+
+/** A word of a name in the notes as written, or as a plural or possessive ("Riveras", "Patel's"). */
+function wordInNotes(word: string, notesComparable: string): boolean {
+  return [` ${word} `, ` ${word}s `, ` ${word}es `, ` ${word} s `].some((form) => notesComparable.includes(form))
+    || (word.endsWith('s') && notesComparable.includes(` ${word.slice(0, -1)} `));
+}
 
 /**
  * A name or organization the review gives is in the notes: every word of it
@@ -306,7 +322,7 @@ const NAME_FILLER = new Set(['the', 'of', 'and', 'for', 'at', 'a', 'an', 'inc', 
 export function nameInNotes(name: string, notesComparable: string): boolean {
   const words = comparable(name).split(' ').filter((word) => word.length > 1 && !NAME_FILLER.has(word));
   if (!words.length) return comparable(name) === '' ? true : notesComparable.includes(` ${comparable(name)} `);
-  return words.every((word) => notesComparable.includes(` ${word} `));
+  return words.every((word) => wordInNotes(word, notesComparable));
 }
 
 function quoteInNotes(evidence: string, notesComparable: string): boolean {
@@ -374,9 +390,10 @@ export function parseReviewOutput(raw: string, request: ReviewRequest): FoundIte
       missed: kind === 'follow_up' && input.missed === true,
       evidence: clipWords(fullEvidence, LIMITS.evidence),
       verified: false,
+      namesFound: true,
     };
-    item.verified = quoteInNotes(fullEvidence, notesComparable)
-      && [item.personName, item.organization, item.aboutFirstName].every((name) => nameInNotes(name, notesComparable));
+    item.namesFound = [item.personName, item.organization, item.aboutFirstName].every((name) => nameInNotes(name, notesComparable));
+    item.verified = quoteInNotes(fullEvidence, notesComparable) && item.namesFound;
     // A promise nobody kept is due now.
     if (item.missed && !item.dueDate) item.dueDate = request.today;
     // A referral whose direction the notes do not make clear stays '': the

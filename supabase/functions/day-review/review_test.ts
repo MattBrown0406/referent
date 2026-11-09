@@ -171,6 +171,12 @@ Deno.test('a person or organization the notes never name is not verified', () =>
   assertEquals(nameInNotes('', notes), true);
   assertEquals(nameInNotes('Harbor Light', notes), true);
   assertEquals(nameInNotes('The Center', notes), false, 'a name of nothing but filler must be there whole');
+  const more = ` ${comparable('Spoke with the Riveras. Faxed Patel\'s office. Called Cedar House about a bed.')} `;
+  assertEquals(nameInNotes('the Rivera family', more), true, 'a plural family name');
+  assertEquals(nameInNotes('Ana Rivera', more), false, 'a first name the notes never give');
+  assertEquals(nameInNotes('Dr. Patel', more), true, 'a title and a possessive');
+  assertEquals(nameInNotes('Cedar House Detox', more), true, 'a program word added');
+  assertEquals(nameInNotes('Kathy Smith', more), false);
 });
 
 Deno.test('a quote too short to show anything is not verified', () => {

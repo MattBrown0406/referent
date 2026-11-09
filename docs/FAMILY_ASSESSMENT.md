@@ -46,19 +46,25 @@ questions, options and stored values follow the FI form, with these changes:
   link stops when the assessment is stopped, deleted, or after 30 days
   (each new link gives 30 more days). A corrected email address, or sending
   an expired assessment again, retires the older links (a mistyped address
-  cannot keep reading). An emailed link is made when the email is prepared,
-  so no token waits in the outbox. The token leaves the address bar on open.
+  cannot keep reading). An emailed link is made only when the email is prepared
+  (not when it is queued), leaves the outbox row once the email is sent or
+  will never be, and a retried email whose link was retired meanwhile is
+  dropped. The token leaves the address bar on open.
 - **Limits a day:** 40 links per practitioner and 3 invites to one address,
   counted in `family_assessment_sends` (never trimmed by a new link).
 - **Saves as they go:** every change saves after a moment, on every step,
   when the page is hidden, and as it closes (`public_family_assessment_save`).
   Every save carries the page's revision: if another tab or family member
-  saved since (`RFA02`), the page shows their answers instead of writing over
-  them. Nothing is kept in the browser.
+  saved since (`RFA02`), the page takes their answers and keeps on top every
+  answer it changed itself, then saves again (a save of unchanged answers,
+  such as moving between sections, never counts as a change). Sending waits
+  for a save on its way and for a photo being sent, and asks the family to
+  look again if answers came in from another device meanwhile. Nothing is
+  kept in the browser.
 - **Danger before they finish:** a yes to suicidal or homicidal thoughts, or
   "crisis", emails the practitioner once while the family is still filling it
-  in ("needs your attention today", no names or answers), and the case shows
-  the alert. The answers themselves show only once the family sends it.
+  in ("needs your attention today", no names or answers; stopping the link
+  does not cancel it), and the case shows the alert. The answers themselves show only once the family sends it.
 - **Card photos:** go straight to the private `assessment-files` bucket
   through a one-time signed URL from the `family-assessment-upload`
   function, which checks the link and picks a new name for every upload
