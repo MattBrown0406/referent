@@ -130,7 +130,8 @@ const UNSAID_PHRASES = [
   'free with', 'free of charge', 'at no cost', 'no cost to', 'full cost', 'no out of pocket', 'costs you nothing', 'cost you nothing',
   'owe nothing', 'pay nothing', 'not pay out of pocket', 'won t pay out of pocket', 'never pay out of pocket', 'not have to pay',
   'don t have to pay', 'won t have to pay', 'we charge', 'charge a fee', 'our fee', 'our fees', 'placement fee', 'placement fees', 'we bill',
-  'we take',
+  'we take a fee', 'we take a cut', 'we take a share', 'we take money', 'we take a percentage', 'no self pay', 'no private pay',
+  'have to self pay', 'have to private pay', 'not self pay', 'not private pay',
 ];
 // Everyday phrases with one of the words above, set aside before the word
 // check (never before the phrase check, which refuses "not pay out of
@@ -141,8 +142,10 @@ const EVERYDAY_PHRASES = ['on top of that', 'on top of this', 'on top of', 'you 
   'waiting to hear', 'pays privately', 'pay privately', 'paid privately', 'paid in cash', 'pay cash', 'paid out of pocket',
   'pays out of pocket', 'pay out of pocket', 'cash pay', 'self pay', 'private pay', 'pay for it yourself', 'how you would pay',
   'pay attention'];
-// A cash price the facts give, in dollars: "a monthly fee of $4,500", "its fee is $4,500" (the amount must be in the facts).
-const PRICED_FEE = /\bfees?\s+(?:of|is)\s+(?=\$\s?\d)/gi;
+// A cash price the facts give, in dollars: "a monthly fee of $4,500", "its
+// fee is $4,500", only when the facts write that very dollar amount.
+const PRICED_FEE = /\bfees?\s+(?:of|is)\s+(\$\s?\d[\d,]*(?:\.\d+)?)/gi;
+const dollars = (value: string) => value.replace(/[^\d.]/g, '').replace(/\.0+$/, '');
 
 function addsWords(text: string, facts: string): string | null {
   const factWords = ` ${comparable(facts)} `;
@@ -150,7 +153,8 @@ function addsWords(text: string, facts: string): string | null {
   const whole = ` ${comparable(text)} `;
   const phrase = UNSAID_PHRASES.find((item) => whole.includes(` ${item} `) && !factWords.includes(` ${item} `));
   if (phrase) return phrase;
-  let rest = ` ${comparable(text.replace(PRICED_FEE, ' '))} `;
+  const priced = new Set([...facts.matchAll(/\$\s?\d[\d,]*(?:\.\d+)?/g)].map((match) => dollars(match[0])));
+  let rest = ` ${comparable(text.replace(PRICED_FEE, (whole, amount: string) => (priced.has(dollars(amount)) ? ` ${amount}` : whole)))} `;
   for (const item of EVERYDAY_PHRASES) rest = rest.split(` ${item} `).join(' ');
   const words = new Set(rest.trim().split(' '));
   return UNSAID.find((word) => words.has(word) && !said.has(word)) ?? null;
@@ -177,8 +181,9 @@ const OPENERS = new Set([
  */
 function addsNames(text: string, facts: string, names: string[] = []): boolean {
   const known = ` ${comparable(facts)} `;
-  // Part of a program's name, not all of it ("Ridge Recovery" of "Juniper Ridge Recovery").
-  const partOfName = (phrase: string) => names.some((name) => name !== phrase && ` ${name} `.includes(` ${phrase} `));
+  // The end of a program's name without its start ("Ridge Recovery" of
+  // "Juniper Ridge Recovery"); its start alone ("Juniper Ridge") is a short name for it.
+  const partOfName = (phrase: string) => names.some((name) => name !== phrase && ` ${name} `.includes(` ${phrase} `) && !name.startsWith(`${phrase} `));
   // A state written out only where the facts give its code ("Bend, OR" lets "Oregon" through).
   const states = new Set([...facts.matchAll(/\b([A-Z]{2})\b/g)].map((match) => STATE_BY_CODE[match[1]] || '').filter(Boolean));
   const WORD = String.raw`\p{Lu}[\p{L}\p{M}'’-]*`;
@@ -265,7 +270,9 @@ export function parseExplainOutput(raw: string, request: ExplainRequest): Explai
   const list = Array.isArray(answer.programs) ? answer.programs : [];
   if (!intro || intro.length > EXPLAIN_LIMITS.outIntro) throw new AssistOutputError('The rewrite’s introduction did not fit.');
   const names = request.programs.map((program) => comparable(program.name));
-  if (addsNumbers(intro, request.intro) || addsWords(intro, request.intro) || addsNames(intro, request.intro, names)) {
+  // The introduction may name the programs it introduces.
+  const introNames = `${request.intro}\n${request.programs.map((program) => program.name).join('\n')}`;
+  if (addsNumbers(intro, request.intro) || addsWords(intro, request.intro) || addsNames(intro, introNames, names)) {
     throw new AssistOutputError('The rewrite added to the facts.');
   }
   if (list.length !== request.programs.length) throw new AssistOutputError('The rewrite left out or added a program.');

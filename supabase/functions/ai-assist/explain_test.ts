@@ -135,6 +135,8 @@ Deno.test('rankings, outcomes, beds, money ties and outside names are refused; p
     assertThrows(() => parseExplainOutput(first(claim), request()), AssistOutputError, undefined, claim);
   }
   assertThrows(() => parseExplainOutput(answer({ intro: 'Here are two programs; the strongest match comes first.' }), request()), AssistOutputError);
+  const named = parseExplainOutput(answer({ intro: 'Juniper Ridge Recovery and Cedar House fit your loved one, in order. Here we take you through both.' }), request());
+  assertStringIncludes(named.intro, 'Juniper Ridge Recovery', 'the introduction may name its programs');
   const fine = parseExplainOutput(first(`${base} You can always ask them questions. Their team speaks with families before Monday.`), request());
   assertStringIncludes(fine.programs[0].text, 'always ask');
 });
@@ -170,6 +172,7 @@ Deno.test('claims in ordinary words are refused; faithful wording about cost and
     'Aetna will pay for it.', 'Your insurance may pay for most of it.', 'Aetna is covering it.', 'Aetna reimburses the stay.',
     'There are no out-of-pocket costs with Aetna.', 'With Aetna it costs you nothing.', 'You will not pay out of pocket.', 'We take a fee of our own.',
     'Our fee is 100 dollars.', 'We charge a fee of 87 dollars.', 'Next Ridge Recovery is close by.', 'One Ridge Recovery program is close by.',
+    'Each referral carries a fee of $100.', 'A fee of $87 comes back to us.', 'With Aetna there is no self-pay.', 'You won\'t have to self-pay.',
   ]) {
     assertThrows(() => parseExplainOutput(first(`${base} ${claim}`), request()), AssistOutputError, undefined, claim);
   }
@@ -183,6 +186,7 @@ Deno.test('claims in ordinary words are refused; faithful wording about cost and
     'It\'s Juniper Ridge Recovery that offers EMDR. Here\'s Juniper Ridge Recovery again: it works with Aetna.',
     'Contact Juniper Ridge Recovery to ask about EMDR… Both Juniper Ridge Recovery and Cedar House work with families.',
     'The Juniper Ridge Recovery team offers EMDR. Ask them how you would pay, and pay attention to what Aetna says.',
+    'Juniper Ridge Recovery offers EMDR. At Juniper Ridge, your loved one can get EMDR. The Juniper Ridge team works with Aetna.',
   ]) {
     assertEquals(parseExplainOutput(first(text), request()).programs[0].text, text);
   }

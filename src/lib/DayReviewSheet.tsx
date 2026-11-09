@@ -40,7 +40,9 @@ import {
   rowProblem,
   rowReady,
   rowSignatures,
+  savedBefore,
   saveOrder,
+  signatureHash,
   switchKind,
   withPendingLeads,
   type ReviewRow,
@@ -58,6 +60,8 @@ import {
   markRecordingsReviewed,
   readNewRecordings,
   recorderStatus,
+  rememberSaved,
+  savedFrom,
 } from './fieldy-api';
 import { licenseConcernAlert, licenseOverrideNote, type LicenseConcern } from './integrity';
 import { aiKeysSupported, getAnthropicKey } from './outreach-api';
@@ -249,8 +253,13 @@ export default function DayReviewSheet({
   function rowDecided(row: ReviewRow, results: Record<string, SaveResult>): boolean {
     if (results[row.key]?.saved === true) return true;
     if (row.include) return false;
-    return switchedOffRef.current.has(row.key) || row.found.verified
-      || rowSignatures(row).some((signature) => savedSignaturesRef.current.has(signature));
+    return switchedOffRef.current.has(row.key) || row.found.verified || savedBefore(row, savedSignaturesRef.current);
+  }
+
+  // An item still undecided that matches no one recording: closing asks, and "read again" holds them all.
+  function unmatchedUndecided(results: Record<string, SaveResult>, current: ReviewRow[]): boolean {
+    const read = recorderReadRef.current;
+    return Boolean(read) && current.some((row) => !(read!.rowIds.get(row.key)?.length) && !rowDecided(row, results));
   }
 
   function recordingsDone(results: Record<string, SaveResult>, current: ReviewRow[]): string[] {
@@ -269,8 +278,8 @@ export default function DayReviewSheet({
     if (done.length) void markRecordingsReviewed(read.recorder, userId, done).then(() => onRecordersChanged?.());
   }
 
-  function finish() {
-    if (phase !== 'finding' && phase !== 'saving') settleRecordings(saved, rows);
+  function finish(hold = false) {
+    if (!hold && phase !== 'finding' && phase !== 'saving') settleRecordings(saved, rows);
     openingRef.current += 1;
     clearReview();
     onClose();
@@ -288,13 +297,16 @@ export default function DayReviewSheet({
     const read = recorderReadRef.current;
     // Recordings with items not decided on (off from the start, never
     // looked at): read again next time, or done with, as the practitioner says.
-    const undecided = read && rows.length ? read.blocks.length - recordingsDone(saved, rows).length : 0;
+    // An undecided item tied to no one recording could be from any: all of them are in question.
+    const holdAll = Boolean(read && rows.length) && unmatchedUndecided(saved, rows);
+    const undecided = read && rows.length ? (holdAll ? read.blocks.length : read.blocks.length - recordingsDone(saved, rows).length) : 0;
     if (!unsaved && read && undecided > 0) {
       const noun = undecided === 1 ? read.recorder.noun : `${read.recorder.noun}s`;
       Alert.alert(`Read ${undecided === 1 ? 'this' : 'these'} ${read.recorder.name} ${noun} again?`,
         `${undecided} ${noun} ${undecided === 1 ? 'has items' : 'have items'} you did not save or switch off. ReferralFit can read ${undecided === 1 ? 'it' : 'them'} again next time, or leave ${undecided === 1 ? 'it' : 'them'}.`, [
-          { text: 'Keep reviewing', style: 'cancel' },
-          { text: 'Read again next time', onPress: finish },
+          // Once everything is saved the rows are locked: nothing to go back to.
+          ...(phase === 'done' ? [] : [{ text: 'Keep reviewing', style: 'cancel' as const }]),
+          { text: 'Read again next time', onPress: () => finish(holdAll) },
           {
             text: `Done with ${undecided === 1 ? 'it' : 'them'}`,
             onPress: () => {
@@ -315,7 +327,7 @@ export default function DayReviewSheet({
         : 'Nothing from these notes has been saved yet.') + again,
       [
         { text: 'Keep reviewing', style: 'cancel' },
-        { text: 'Discard', style: 'destructive', onPress: finish },
+        { text: 'Discard', style: 'destructive', onPress: () => finish() },
       ],
     );
   }
@@ -355,6 +367,12 @@ export default function DayReviewSheet({
       const { items } = await requestDayReview(text, day, key);
       if (opening !== openingRef.current) return;
       const blocks = fromRecorder?.blocks ?? null;
+      // Items saved from these recordings in an earlier review are known again.
+      if (fromRecorder) {
+        const before = await savedFrom(fromRecorder.recorder, userId, fromRecorder.blocks.map((block) => block.id)).catch(() => [] as string[]);
+        if (opening !== openingRef.current) return;
+        for (const fingerprint of before) savedSignaturesRef.current.add(fingerprint);
+      }
       const built = markSavedBefore(
         buildRows(items, workspaceRef.current, day, newUuid, blocks ? (found) => {
           const from = blocksFor(found.evidence, blocks);
@@ -540,6 +558,7 @@ export default function DayReviewSheet({
     const order = saveOrder(ready);
     const dueTime = leadDueTime(leadResponseMinutes);
     let any = false;
+    const fromRecordings: Record<string, string[]> = {};
     try {
       // One at a time: new leads first, then what may go on their cases.
       for (const row of order) {
@@ -553,7 +572,12 @@ export default function DayReviewSheet({
         if (result.saved) {
           any = true;
           savedCountRef.current += 1;
-          for (const signature of rowSignatures(row, true)) savedSignaturesRef.current.add(signature);
+          const signatures = rowSignatures(row, true);
+          for (const signature of signatures) savedSignaturesRef.current.add(signature);
+          // Kept with each recording it came from, for when that recording is read again.
+          for (const id of recorderReadRef.current?.rowIds.get(row.key) ?? []) {
+            fromRecordings[id] = [...(fromRecordings[id] ?? []), ...signatures.map(signatureHash)];
+          }
         }
         if (opening !== openingRef.current) break;
       }
@@ -561,6 +585,7 @@ export default function DayReviewSheet({
       savingRef.current = false;
     }
     if (any) onSaved();
+    if (recorderReadRef.current) void rememberSaved(recorderReadRef.current.recorder, userId, fromRecordings).catch(() => undefined);
     settleRecordings(results, rows);
     if (opening !== openingRef.current) return;
     setSaved(results);

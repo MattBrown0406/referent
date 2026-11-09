@@ -107,8 +107,11 @@ const REVIEWED_KEEP_MS = 14 * 24 * 60 * 60 * 1000;
 const LOOK_BACK_MS = 7 * 24 * 60 * 60 * 1000;
 
 // `failing`: recordings whose summary or transcript could not be read, and
-// since when; one that keeps failing for a day is taken as having no text.
-type ReadState = { floor: string; reviewed: Record<string, string>; failing: Record<string, string> };
+// since when; one that fails again a day later is taken as having no text.
+// `saved`: per recording, when, and the fingerprints of items saved from it
+// (src/lib/day-review.ts signatureHash), so a recording read again does not
+// offer them twice.
+type ReadState = { floor: string; reviewed: Record<string, string>; failing: Record<string, string>; saved: Record<string, string> };
 
 const readKey = (recorder: Recorder, userId: string) => `referralfit.${recorder.id}.read.v1.${clean(userId)}`;
 
@@ -124,10 +127,15 @@ async function readState(recorder: Recorder, userId: string): Promise<ReadState 
       }
       return out;
     };
+    const saved: Record<string, string> = {};
+    for (const [id, value] of Object.entries(data.saved && typeof data.saved === 'object' ? data.saved : {})) {
+      if (typeof value === 'string' && !Number.isNaN(Date.parse(value.split(' ')[0]))) saved[id] = value;
+    }
     return {
       floor: typeof data.floor === 'string' && !Number.isNaN(Date.parse(data.floor)) ? data.floor : startOfToday(),
       reviewed: times(data.reviewed),
       failing: times(data.failing),
+      saved,
     };
   } catch {
     return null;
@@ -136,11 +144,14 @@ async function readState(recorder: Recorder, userId: string): Promise<ReadState 
 
 async function writeState(recorder: Recorder, userId: string, value: ReadState): Promise<void> {
   const cutoff = Date.now() - REVIEWED_KEEP_MS;
-  const recent = (entries: Record<string, string>) => Object.fromEntries(Object.entries(entries).filter(([, at]) => Date.parse(at) >= cutoff).slice(-2000));
-  await SecureStore.setItemAsync(readKey(recorder, userId), JSON.stringify({ floor: value.floor, reviewed: recent(value.reviewed), failing: recent(value.failing) }), KEYCHAIN);
+  const recent = (entries: Record<string, string>, limit = 2000) => Object.fromEntries(Object.entries(entries)
+    .filter(([, at]) => Date.parse(at.split(' ')[0]) >= cutoff).slice(-limit));
+  await SecureStore.setItemAsync(readKey(recorder, userId), JSON.stringify({
+    floor: value.floor, reviewed: recent(value.reviewed), failing: recent(value.failing), saved: recent(value.saved, 200),
+  }), KEYCHAIN);
 }
 
-const emptyState = (now = new Date()): ReadState => ({ floor: startOfToday(now), reviewed: {}, failing: {} });
+const emptyState = (now = new Date()): ReadState => ({ floor: startOfToday(now), reviewed: {}, failing: {}, saved: {} });
 
 // Accounts deleted in this session: what was reviewed is never written for them again.
 const forgotten = new Set<string>();
@@ -544,14 +555,11 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
   const started = Date.now();
   let reads = 0;
   for (const item of order) {
-    // Failing for a day already: taken as having no text, without another try.
-    if (failedFor(item) >= FAILING_GIVE_UP_MS) { read.push(item); continue; }
     if (reads >= DETAIL_READS || Date.now() - started > DETAIL_TIME_MS) continue;
     reads += 1;
     let failed = false;
     let fromNote = '';
     let fromTranscript = '';
-    let transcriptRead = false;
     if (note) {
       try { fromNote = await detail(recorder, session, note, item, now.getTime(), noteText); } catch { failed = true; }
     }
@@ -559,14 +567,13 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
     if (fromNote.length < SHORT_NOTE && transcript && !Number.isNaN(ended) && now.getTime() - ended >= SUMMARY_WAIT_MS) {
       try {
         fromTranscript = await detail(recorder, session, transcript, item, now.getTime(), (payload) => transcriptText(payload, item.id));
-        transcriptRead = true;
       } catch {
         failed = true;
       }
     }
-    // A short note ("No note has been generated…") is used only when the
-    // transcript was read and has no words, or there is no transcript to read.
-    const shortNoteOk = fromNote.length >= SHORT_NOTE || !transcript || transcriptRead;
+    // A short note ("No note has been generated…") is used only when there
+    // is no transcript to read; with an empty transcript it is no text.
+    const shortNoteOk = fromNote.length >= SHORT_NOTE || !transcript;
     const text = fromTranscript && fromNote.length < SHORT_NOTE ? fromTranscript : shortNoteOk ? fromNote || fromTranscript : '';
     if (text) {
       texts[item.id] = text;
@@ -576,7 +583,7 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
     }
     if (failed) {
       // Not read this time (never taken for "no text" at once): tried again
-      // next time, until it has failed for a day.
+      // next time; given up only when it fails again a day after it first did.
       const since = state.failing[item.id] ?? now.toISOString();
       failing[item.id] = since;
       if (now.getTime() - Date.parse(since) < FAILING_GIVE_UP_MS) continue;
@@ -602,8 +609,28 @@ export async function markRecordingsReviewed(recorder: Recorder, userId: string,
     for (const id of ids) {
       state.reviewed[id] = at;
       delete state.failing[id];
+      delete state.saved[id];
     }
   });
+}
+
+/** Fingerprints of items saved from these recordings, kept until each is reviewed. */
+export async function rememberSaved(recorder: Recorder, userId: string, byRecording: Record<string, string[]>): Promise<void> {
+  const ids = Object.keys(byRecording).filter((id) => byRecording[id].length);
+  if (!ids.length) return;
+  const at = new Date().toISOString();
+  await changeState(recorder, userId, (state) => {
+    for (const id of ids) {
+      const before = state.saved[id]?.split(' ').slice(1) ?? [];
+      state.saved[id] = [at, ...new Set([...before, ...byRecording[id]])].slice(0, 201).join(' ');
+    }
+  });
+}
+
+/** The fingerprints of items saved earlier from these recordings. */
+export async function savedFrom(recorder: Recorder, userId: string, ids: string[]): Promise<string[]> {
+  const state = await readState(recorder, userId);
+  return state ? ids.flatMap((id) => state.saved[id]?.split(' ').slice(1) ?? []) : [];
 }
 
 /**

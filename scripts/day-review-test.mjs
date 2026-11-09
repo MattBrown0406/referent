@@ -475,6 +475,17 @@ check(() => {
   assert.equal(kevinJones.include, true, 'but "Kevin Smith" saved never hides "Kevin Jones"');
   const [otherKevin] = rules.markSavedBefore(build({ ...kevin, personName: 'Kevin Walsh', phone: '541-555-0300' }), new Set(rules.rowSignatures(kevinRow, true)));
   assert.equal(otherKevin.include, true, 'a Kevin at another number is another caller');
+  const [typed] = build({ ...kevin, personName: 'Dana Cole', phone: '', evidence: 'Dana Cole called about her son, wants a call back' });
+  const savedTyped = new Set(rules.rowSignatures({ ...typed, phone: '503-555-0199' }, true));
+  const [later] = rules.markSavedBefore(build({ ...kevin, personName: 'Dana Cole', phone: '503-555-0199', evidence: 'Dana Cole called about her son, wants a call back' }), savedTyped);
+  assert.equal(later.include, false, 'a lead saved with a phone typed by hand is known by it when the notes give it later');
+  // Saved in an earlier review of the same recording: known by its fingerprint alone.
+  const fingerprints = new Set(rules.rowSignatures(kevinRow, true).map(rules.signatureHash));
+  assert.ok([...fingerprints].every((value) => /^h:[0-9a-z]+$/.test(value)), 'fingerprints keep no words');
+  const [again] = rules.markSavedBefore(build(kevin), fingerprints);
+  assert.equal(again.include, false, 'an item saved from a recording before is not offered again');
+  assert.equal(rules.signatureHash('abc'), rules.signatureHash('abc'));
+  assert.notEqual(rules.signatureHash('abc'), rules.signatureHash('abd'));
 }, 'saved leads are matched by who called');
 check(() => {
   const at = (when) => rules.buildRows([found({ personName: 'Ana Rivera' })], workspace, TODAY, makeId, () => ({ label: 'From Fieldy, Nov 9', at: when }))[0].occurredAt;
@@ -613,7 +624,7 @@ check(() => {
   assert.match(sheet, /<View pointerEvents=\{locked \? 'none' : 'auto'\}>/, 'rows are locked while saving and when done');
   assert.match(sheet, /automaticallyAdjustKeyboardInsets/);
   assert.match(sheet, /licenseOverrideNote\(partnerLabel\(row\.partnerId\), concern, 'refer'\)/, 'going ahead is noted on the referral');
-  assert.match(sheet, /function finish\(\) \{\n    if \(phase !== 'finding' && phase !== 'saving'\) settleRecordings\(saved, rows\);\n    openingRef\.current \+= 1;\n    clearReview\(\);/, 'a closed review is cleared');
+  assert.match(sheet, /function finish\(hold = false\) \{\n    if \(!hold && phase !== 'finding' && phase !== 'saving'\) settleRecordings\(saved, rows\);\n    openingRef\.current \+= 1;\n    clearReview\(\);/, 'a closed review is cleared');
 }, 'the sheet');
 check(() => {
   for (const label of ['CALLER', 'PHONE', 'EMAIL', 'CALLING ABOUT', 'THEIR FIRST NAME']) assert.match(sheet, new RegExp(`>${label}<`));

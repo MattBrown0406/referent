@@ -280,8 +280,10 @@ check(() => {
   assert.match(api, /if \(later && !count\) break;/, 'a page past the end, empty or in words, ends the list');
   assert.match(api, /if \(later && error instanceof FieldyError && error\.reason === 'tool'\) break;/, 'so does an error on a page past the end');
   assert.match(api, /fromNote\.length < SHORT_NOTE && transcript/, 'a note too short to be one is checked against the transcript');
-  assert.match(api, /const shortNoteOk = fromNote\.length >= SHORT_NOTE \|\| !transcript \|\| transcriptRead;/, 'and used only when the transcript was read and is empty, or there is none');
-  assert.match(api, /if \(failedFor\(item\) >= FAILING_GIVE_UP_MS\) \{ read\.push\(item\); continue; \}/, 'a recording failing for a day is given up without another try');
+  assert.match(api, /const shortNoteOk = fromNote\.length >= SHORT_NOTE \|\| !transcript;/, 'and used only when there is no transcript to read');
+  assert.doesNotMatch(api, /FAILING_GIVE_UP_MS\) \{ read\.push/, 'a failing recording is always tried again before it is given up');
+  assert.match(api, /export async function rememberSaved[^]*export async function savedFrom/, 'items saved from a recording are remembered with it');
+  assert.match(api, /delete state\.saved\[id\];/, 'and forgotten once it is reviewed');
   assert.match(api, /\.sort\(\(a, b\) => Date\.parse\(a\.startTime\) - Date\.parse\(b\.startTime\)/, 'detail reads go oldest first');
   assert.match(api, /if \(forgotten\.has\(slot\(recorder, userId\)\)\) return;/, 'a deleted account\'s read state is never written again');
   assert.match(api, /await Promise\.all\(RECORDERS\.map\(async \(recorder\) =>/, 'deleting the account forgets every recorder at once');
@@ -302,10 +304,14 @@ check(() => {
     'an item is decided when saved, switched off by the practitioner, or off for a reason the app gave; one off only because it could not be checked is not');
   assert.match(sheet, /switchedOffRef\.current = new Set\(\);\s*setSaved\(\{\}\);/, 'what was switched off in an earlier review is not this one\'s');
   assert.match(sheet, /phase === 'done' \? \(\s*<TouchableOpacity accessibilityRole="button" onPress=\{close\}/, 'the Done button asks about undecided recordings too');
+  assert.match(sheet, /\.\.\.\(phase === 'done' \? \[\] : \[\{ text: 'Keep reviewing'/, 'with everything saved there is no "Keep reviewing" to go back to');
+  assert.match(sheet, /\{ text: 'Read again next time', onPress: \(\) => finish\(holdAll\) \}/, 'an undecided item from no one recording holds them all when read again');
+  assert.match(sheet, /for \(const fingerprint of before\) savedSignaturesRef\.current\.add\(fingerprint\);/, 'a recording read again knows what was saved from it');
+  assert.doesNotMatch(sheet, /onPress=\{finish\}/, 'finish is never handed a press event');
   assert.match(sheet, /if \(!unsaved && read && undecided > 0\)/, 'closing asks about recordings with items never decided on');
   assert.doesNotMatch(sheet, /settleRecordings\(\{\}, built\)/, 'nothing is settled just because its items start switched off');
   assert.match(sheet, /return read\.blocks\.map\(\(block\) => block\.id\)/, 'every recording is considered, those with no items too');
-  assert.match(sheet, /function finish\(\) \{\s*if \(phase !== 'finding' && phase !== 'saving'\) settleRecordings\(saved, rows\);/, 'closing the review settles what was set aside');
+  assert.match(sheet, /function finish\(hold = false\) \{\s*if \(!hold && phase !== 'finding' && phase !== 'saving'\) settleRecordings\(saved, rows\);/, 'closing the review settles what was set aside');
   assert.match(sheet, /if \(phase === 'finding' && \(!notes\.trim\(\) \|\| recorderText\)\) \{ finish\(\); return; \}/, 'a slow read can be stopped; typed or pasted notes are not thrown away without asking');
   assert.match(sheet, /if \(current\.some\(\(row\) => !matched\(row\) && row\.include && !rowDecided\(row, results\)\)\) return \[\];/, 'an item still on from no one recording holds them all');
   assert.match(sheet, /\/\/ Kept before the review runs, so a retry after a failed one is still these recordings\./);

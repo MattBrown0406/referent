@@ -829,11 +829,18 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
     const names = nameWords(row.found.personName);
     // A name matches only with the same phone or email, or when the row read
     // again has neither: "Kevin" at one number is not "Kevin Walsh" at another.
+    // A saved row is also known by the phone and email it was saved with
+    // (typed in by hand, say), a row read again by what the notes gave.
     const contact = phoneKey(row.found.phone) || cleanEmail(row.found.email);
-    const withContact = (key: string) => (saved ? [`${key}|${contact || '-'}`, `${key}|-`] : [`${key}|${contact || '-'}`]);
+    const savedContact = saved ? phoneKey(row.phone) || cleanEmail(row.email) : '';
+    const withContact = (key: string) => (saved
+      ? [...new Set([`${key}|${contact || '-'}`, `${key}|${savedContact || '-'}`, `${key}|-`])]
+      : [`${key}|${contact || '-'}`]);
     const keys = [
       phoneKey(row.found.phone) ? `p:${phoneKey(row.found.phone)}` : '',
       cleanEmail(row.found.email) ? `e:${cleanEmail(row.found.email)}` : '',
+      saved && phoneKey(row.phone) ? `p:${phoneKey(row.phone)}` : '',
+      saved && cleanEmail(row.email) ? `e:${cleanEmail(row.email)}` : '',
       ...(names.length >= 2 ? withContact(`n:${names.join(' ')}`) : []),
       ...(names.length && (saved || names.length === 1) ? withContact(`f:${names[0]}`) : []),
       // Saved with a first name only ("Kevin"): read again with a full name ("Kevin Walsh"), still that caller.
@@ -844,11 +851,34 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
   return out;
 }
 
+/**
+ * A short fingerprint of a signature (cyrb53), kept on the phone with the
+ * recording it was saved from, so the same item is known when that
+ * recording is read again in a later review, without keeping its words.
+ */
+export function signatureHash(value: string): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `h:${(4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)}`;
+}
+
+/** This row was saved before: in this review (its signature), or from the same recording in an earlier one (its fingerprint). */
+export function savedBefore(row: ReviewRow, saved: Set<string>): boolean {
+  return rowSignatures(row).some((signature) => saved.has(signature) || saved.has(signatureHash(signature)));
+}
+
 /** Rows that were saved earlier in this review start switched off. */
 export function markSavedBefore(rows: ReviewRow[], saved: Set<string>): ReviewRow[] {
   if (!saved.size) return rows;
   return rows.map((row) => {
-    if (!rowSignatures(row).some((signature) => saved.has(signature))) return row;
+    if (!savedBefore(row, saved)) return row;
     return { ...row, include: false, hint: row.hint ? `Saved earlier in this review. ${row.hint}` : 'Saved earlier in this review.' };
   });
 }
