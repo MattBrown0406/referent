@@ -159,6 +159,8 @@ export default function DayReviewSheet({
   // The recordings this review was read from, which recording each row came
   // from, and those skipped for having no text.
   const recorderReadRef = useRef<{ recorder: Recorder; text: string; blocks: FieldyBlock[]; rowIds: Map<string, string[]>; skipped: string[] } | null>(null);
+  // Rows the practitioner switched off: set aside (one off from the start, unchecked, is not).
+  const switchedOffRef = useRef<Set<string>>(new Set());
   const setRecorder = (id: RecorderId, value: RecorderState | ((current: RecorderState) => RecorderState)) =>
     setRecorders((current) => ({ ...current, [id]: typeof value === 'function' ? value(current[id]) : value }));
 
@@ -181,6 +183,7 @@ export default function DayReviewSheet({
     savedCountRef.current = 0;
     savingRef.current = false;
     recorderReadRef.current = null;
+    switchedOffRef.current = new Set();
   }
 
   // A fresh sheet each time it opens, and for each account; nothing from a
@@ -235,17 +238,25 @@ export default function DayReviewSheet({
   const busy = phase === 'finding' || phase === 'saving';
   const locked = phase === 'saving' || phase === 'done';
 
-  // A recording is done once every item from it is saved or switched off (set
-  // aside); one with an item still on and unsaved comes back next time. A
-  // row whose quote is in no one recording could be from any: until it is
-  // settled, none is done.
+  // A recording is done once every item from it is saved, saved earlier in
+  // this review, or switched off by the practitioner (set aside); one with
+  // an item still on, or never looked at (off from the start, unchecked),
+  // comes back next time. A row whose quote is in no one recording could be
+  // from any: until it is settled, none is done.
+  function recordingsDone(results: Record<string, SaveResult>, current: ReviewRow[]): string[] {
+    const read = recorderReadRef.current;
+    if (!read) return [];
+    const settled = (row: ReviewRow) => results[row.key]?.saved === true
+      || (!row.include && (switchedOffRef.current.has(row.key) || rowSignatures(row).some((signature) => savedSignaturesRef.current.has(signature))));
+    if (current.some((row) => !(read.rowIds.get(row.key)?.length) && !settled(row))) return [];
+    return read.blocks.map((block) => block.id)
+      .filter((id) => current.filter((row) => (read.rowIds.get(row.key) ?? []).includes(id)).every(settled));
+  }
+
   function settleRecordings(results: Record<string, SaveResult>, current: ReviewRow[]) {
     const read = recorderReadRef.current;
     if (!read || !current.length) return;
-    const settled = (row: ReviewRow) => results[row.key]?.saved === true || !row.include;
-    if (current.some((row) => !(read.rowIds.get(row.key)?.length) && !settled(row))) return;
-    const ids = new Set([...read.rowIds.values()].flat());
-    const done = [...ids].filter((id) => current.filter((row) => (read.rowIds.get(row.key) ?? []).includes(id)).every(settled));
+    const done = recordingsDone(results, current);
     if (done.length) void markRecordingsReviewed(read.recorder, userId, done).then(() => onRecordersChanged?.());
   }
 
@@ -258,15 +269,35 @@ export default function DayReviewSheet({
 
   function close() {
     if (phase === 'saving') return;
-    // Reading or reviewing can be stopped (what comes back late is ignored).
-    if (phase === 'finding') { finish(); return; }
+    // A read or a review can be stopped (what comes back late is ignored);
+    // pasted notes are not thrown away without asking.
+    if (phase === 'finding' && (!notes.trim() || recorderReadRef.current)) { finish(); return; }
     const unsaved = phase === 'review'
       ? pending.some((row) => row.include)
-      : phase === 'paste' && notes.trim().length > 0;
+      : (phase === 'paste' || phase === 'finding') && notes.trim().length > 0;
+    const read = recorderReadRef.current;
+    // Recordings with items not decided on (off from the start, never
+    // looked at): read again next time, or done with, as the practitioner says.
+    const undecided = read && rows.length ? read.blocks.length - recordingsDone(saved, rows).length : 0;
+    if (!unsaved && read && undecided > 0) {
+      const noun = undecided === 1 ? read.recorder.noun : `${read.recorder.noun}s`;
+      Alert.alert(`Read ${undecided === 1 ? 'this' : 'these'} ${read.recorder.name} ${noun} again?`,
+        `${undecided} ${noun} ${undecided === 1 ? 'has items' : 'have items'} you did not save or switch off. ReferralFit can read ${undecided === 1 ? 'it' : 'them'} again next time, or leave ${undecided === 1 ? 'it' : 'them'}.`, [
+          { text: 'Keep reviewing', style: 'cancel' },
+          { text: 'Read again next time', onPress: finish },
+          {
+            text: `Done with ${undecided === 1 ? 'it' : 'them'}`,
+            onPress: () => {
+              void markRecordingsReviewed(read.recorder, userId, read.blocks.map((block) => block.id)).then(() => onRecordersChanged?.());
+              finish();
+            },
+          },
+        ]);
+      return;
+    }
     if (!unsaved) { finish(); return; }
     const kept = savedCountRef.current;
-    const read = recorderReadRef.current;
-    const again = read ? ` Your ${read.recorder.name} ${read.recorder.noun}s with items still waiting will be read again next time.` : '';
+    const again = read ? ` Your ${read.recorder.name} ${read.recorder.noun}s with items not saved or switched off will be read again next time.` : '';
     Alert.alert(
       'Discard this review?',
       (kept
@@ -347,8 +378,6 @@ export default function DayReviewSheet({
       } else if (read?.skipped?.length) {
         setMessage({ ok: true, text: `${read.skipped.length} ${read.skipped.length === 1 ? read.recorder.noun : `${read.recorder.noun}s`} had no summary or transcript a day after ${read.skipped.length === 1 ? 'it' : 'they'} ended and ${read.skipped.length === 1 ? 'was' : 'were'} skipped.` });
       }
-      // Nothing to approve (all off, say): what is settled is done now, not only on Approve.
-      if (fromRecorder && !built.some((row) => row.include)) settleRecordings({}, built);
     } catch (error) {
       if (opening !== openingRef.current) return;
       if (error instanceof ReviewUnavailableError && error.reason === 'key') setKeyState('missing');
@@ -671,7 +700,11 @@ export default function DayReviewSheet({
             <Switch
               accessibilityLabel={`Include this ${KIND_LABEL[row.kind].toLowerCase()}`}
               value={row.include}
-              onValueChange={(include) => patch(row.key, { include })}
+              onValueChange={(include) => {
+                if (include) switchedOffRef.current.delete(row.key);
+                else switchedOffRef.current.add(row.key);
+                patch(row.key, { include });
+              }}
               trackColor={{ true: COLORS.forest }}
             />
           )}
@@ -893,7 +926,7 @@ export default function DayReviewSheet({
       <SafeAreaView style={styles.page}>
         <View style={styles.header}>
           <TouchableOpacity accessibilityRole="button" accessibilityLabel={phase === 'done' ? 'Done' : 'Close review'} disabled={phase === 'saving'} onPress={close} style={styles.headerButton}>
-            <Text style={[styles.headerButtonText, busy && styles.off]}>{phase === 'done' ? 'Done' : 'Cancel'}</Text>
+            <Text style={[styles.headerButtonText, phase === 'saving' && styles.off]}>{phase === 'done' ? 'Done' : 'Cancel'}</Text>
           </TouchableOpacity>
           <Text style={styles.headerTitle} accessibilityRole="header">Review notes</Text>
           <View style={styles.headerButton} />

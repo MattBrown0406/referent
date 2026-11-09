@@ -36,7 +36,6 @@ import {
   FieldyError,
   formBody,
   hasAnswer,
-  LIST_PAGE_SIZE,
   listArguments,
   listPlan,
   logoutPlan,
@@ -107,7 +106,9 @@ async function writeToken(recorder: Recorder, userId: string, value: Token): Pro
 const REVIEWED_KEEP_MS = 14 * 24 * 60 * 60 * 1000;
 const LOOK_BACK_MS = 7 * 24 * 60 * 60 * 1000;
 
-type ReadState = { floor: string; reviewed: Record<string, string> };
+// `failing`: recordings whose summary or transcript could not be read, and
+// since when; one that keeps failing for a day is taken as having no text.
+type ReadState = { floor: string; reviewed: Record<string, string>; failing: Record<string, string> };
 
 const readKey = (recorder: Recorder, userId: string) => `referralfit.${recorder.id}.read.v1.${clean(userId)}`;
 
@@ -116,11 +117,18 @@ async function readState(recorder: Recorder, userId: string): Promise<ReadState 
     const raw = await SecureStore.getItemAsync(readKey(recorder, userId));
     if (!raw) return null;
     const data = JSON.parse(raw) as Partial<ReadState>;
-    const reviewed: Record<string, string> = {};
-    for (const [id, at] of Object.entries(data.reviewed && typeof data.reviewed === 'object' ? data.reviewed : {})) {
-      if (typeof at === 'string' && !Number.isNaN(Date.parse(at))) reviewed[id] = at;
-    }
-    return { floor: typeof data.floor === 'string' && !Number.isNaN(Date.parse(data.floor)) ? data.floor : startOfToday(), reviewed };
+    const times = (value: unknown) => {
+      const out: Record<string, string> = {};
+      for (const [id, at] of Object.entries(value && typeof value === 'object' ? value : {})) {
+        if (typeof at === 'string' && !Number.isNaN(Date.parse(at))) out[id] = at;
+      }
+      return out;
+    };
+    return {
+      floor: typeof data.floor === 'string' && !Number.isNaN(Date.parse(data.floor)) ? data.floor : startOfToday(),
+      reviewed: times(data.reviewed),
+      failing: times(data.failing),
+    };
   } catch {
     return null;
   }
@@ -128,8 +136,19 @@ async function readState(recorder: Recorder, userId: string): Promise<ReadState 
 
 async function writeState(recorder: Recorder, userId: string, value: ReadState): Promise<void> {
   const cutoff = Date.now() - REVIEWED_KEEP_MS;
-  const reviewed = Object.fromEntries(Object.entries(value.reviewed).filter(([, at]) => Date.parse(at) >= cutoff).slice(-2000));
-  await SecureStore.setItemAsync(readKey(recorder, userId), JSON.stringify({ floor: value.floor, reviewed }), KEYCHAIN);
+  const recent = (entries: Record<string, string>) => Object.fromEntries(Object.entries(entries).filter(([, at]) => Date.parse(at) >= cutoff).slice(-2000));
+  await SecureStore.setItemAsync(readKey(recorder, userId), JSON.stringify({ floor: value.floor, reviewed: recent(value.reviewed), failing: recent(value.failing) }), KEYCHAIN);
+}
+
+const emptyState = (now = new Date()): ReadState => ({ floor: startOfToday(now), reviewed: {}, failing: {} });
+
+/** A change to what was reviewed, in its own queue (apart from the sign-in's). */
+function changeState(recorder: Recorder, userId: string, change: (state: ReadState) => void): Promise<void> {
+  return serial(`${slot(recorder, userId)}:read`, async () => {
+    const state = (await readState(recorder, userId)) ?? emptyState();
+    change(state);
+    await writeState(recorder, userId, state);
+  });
 }
 
 // ─── One queue per recorder and account ────────────────────────────────────
@@ -241,7 +260,7 @@ export async function connectRecorder(recorder: Recorder, userId: string): Promi
     await writeToken(recorder, userId, { refreshToken: tokens.refreshToken, email: '', connectedAt: new Date().toISOString() });
     access.set(key, { token: tokens.accessToken, expiresAt: tokens.expiresAt });
     // The first time: reading starts today. A reconnect keeps what was reviewed.
-    if (!(await readState(recorder, userId))) await writeState(recorder, userId, { floor: startOfToday(), reviewed: {} });
+    if (!(await readState(recorder, userId))) await writeState(recorder, userId, emptyState());
   });
   const email = await accountEmail(recorder, userId, tokens.accessToken);
   if (email) {
@@ -274,25 +293,33 @@ async function accountEmail(recorder: Recorder, userId: string, token: string): 
 // Read and forgotten in one step of the queue: a refresh on its way
 // finishes first, and the newest token is the one revoked; one queued after
 // finds nothing, so a disconnect is never undone by it. Plaud's logout is a
-// tool on its MCP server, so its access token is taken first.
+// tool on its MCP server: it is called with the access token in hand, or
+// one fetched with the refresh token in hand (never kept).
 async function revokeAndForget(recorder: Recorder, userId: string): Promise<void> {
   const key = slot(recorder, userId);
-  const live = recorder.revokeUrl ? null : await accessToken(recorder, userId).catch(() => null);
-  const token = await serial(key, async () => {
-    const current = await readToken(recorder, userId);
+  const held = await serial(key, async () => {
+    const token = await readToken(recorder, userId);
+    const cached = access.get(key);
     access.delete(key);
     await SecureStore.deleteItemAsync(tokenKey(recorder, userId)).catch(() => undefined);
-    return current;
+    return { token, live: cached && cached.expiresAt > Date.now() ? cached.token : '' };
   });
+  const { token } = held;
   if (!token) return;
   try {
     if (recorder.revokeUrl) {
       await postForm(recorder, recorder.revokeUrl, { token: token.refreshToken, token_type_hint: 'refresh_token', client_id: recorder.clientId });
-    } else if (live) {
-      const session = await openSession(recorder, userId, live);
-      const name = logoutPlan(await tools(recorder, session));
-      if (name) await session.call('tools/call', { name, arguments: {} });
+      return;
     }
+    const live = held.live || tokensFrom(await postForm(recorder, recorder.tokenUrl, {
+      grant_type: 'refresh_token',
+      refresh_token: token.refreshToken,
+      client_id: recorder.clientId,
+      resource: recorder.mcpUrl,
+    }), Date.now(), recorder.name, token.refreshToken).accessToken;
+    const session = await openSession(recorder, userId, live);
+    const name = logoutPlan(await tools(recorder, session));
+    if (name) await session.call('tools/call', { name, arguments: {} });
   } catch {
     // Unreachable: it is forgotten here all the same.
   }
@@ -410,9 +437,19 @@ async function listConversations(recorder: Recorder, session: Session, toolList:
   if (!plan) throw new FieldyError(`${recorder.name} did not offer a way to list your ${recorder.noun}s. Paste the summary instead.`);
   const found = new Map<string, FieldyConversation>();
   let cursor: string | null = null;
-  for (let page = 1; page <= 10; page += 1) {
-    const payload = toolPayload(await session.call('tools/call', { name: plan.name, arguments: listArguments(plan, since, until, cursor, page) }), recorder);
-    const { conversations, nextCursor, text, unreadable } = conversationsFrom(payload);
+  for (let page = plan.firstPage; page < plan.firstPage + 10; page += 1) {
+    const later = page > plan.firstPage;
+    let payload: unknown;
+    try {
+      payload = toolPayload(await session.call('tools/call', { name: plan.name, arguments: listArguments(plan, since, until, cursor, page) }), recorder);
+    } catch (error) {
+      // A page past the end answered with an error: the list has ended.
+      if (later && error instanceof FieldyError && error.reason === 'tool') break;
+      throw error;
+    }
+    const { conversations, nextCursor, text, unreadable, count } = conversationsFrom(payload);
+    // A page past the end, empty or in words ("No files found"): the list has ended.
+    if (later && !count) break;
     // An answer in words, or a list none of whose recordings could be read:
     // never taken for "nothing new".
     if ((!conversations.length && text) || unreadable) {
@@ -424,8 +461,9 @@ async function listConversations(recorder: Recorder, session: Session, toolList:
       if (!nextCursor || nextCursor === cursor) break;
       cursor = nextCursor;
     } else if (plan.page) {
-      // Pages by number: until a short page, or one with nothing new.
-      if (conversations.length < LIST_PAGE_SIZE || found.size === before) break;
+      // Pages by number: until an empty page, or one with nothing new (a
+      // server that ignores the page number sends the same one again).
+      if (!count || found.size === before) break;
     } else {
       break;
     }
@@ -450,25 +488,27 @@ function windowStart(state: ReadState, now: Date): string {
   return new Date(Math.max(Date.parse(state.floor), now.getTime() - LOOK_BACK_MS)).toISOString();
 }
 
-async function unreviewed(recorder: Recorder, userId: string, session: Session, toolList: McpTool[], now: Date): Promise<FieldyConversation[]> {
-  const state = (await readState(recorder, userId)) ?? { floor: startOfToday(now), reviewed: {} };
+async function unreviewed(recorder: Recorder, userId: string, session: Session, toolList: McpTool[], now: Date): Promise<{ fresh: FieldyConversation[]; state: ReadState }> {
+  const state = (await readState(recorder, userId)) ?? emptyState(now);
   const since = windowStart(state, now);
   const listed = await listConversations(recorder, session, toolList, since, now.toISOString());
-  return listed.filter((item) => Date.parse(item.startTime) >= Date.parse(since) && !state.reviewed[item.id]);
+  return { fresh: listed.filter((item) => Date.parse(item.startTime) >= Date.parse(since) && !state.reviewed[item.id]), state };
 }
 
-// One recording's text, by a tool: '' when the recorder has none for it
-// (its answer says so, or is an error about that recording); thrown only
-// when the recorder could not be reached, so the recording is tried again.
+// One recording's text, by a tool ('' when it has none). Throws when the
+// recorder could not be reached or answered with an error.
 async function detail(recorder: Recorder, session: Session, plan: TranscriptPlan, item: FieldyConversation, now: number,
   read: (payload: unknown) => string): Promise<string> {
-  try {
-    return read(toolPayload(await session.call('tools/call', { name: plan.name, arguments: recordingArguments(plan, item, now) }), recorder));
-  } catch (error) {
-    if (error instanceof FieldyError && error.reason === 'tool') return '';
-    throw error;
-  }
+  return read(toolPayload(await session.call('tools/call', { name: plan.name, arguments: recordingArguments(plan, item, now) }), recorder));
 }
+
+// A note this short may be the recorder saying it has none ("No note has
+// been generated"): the transcript is read too, and used when it has words.
+const SHORT_NOTE = 120;
+// A recording whose summary and transcript keep failing (an error, or too
+// slow) is taken as having no text after a day of failures; until then it
+// waits, behind those not failing.
+const FAILING_GIVE_UP_MS = 24 * 60 * 60 * 1000;
 
 /**
  * The recordings not reviewed yet, ready for the day review. Nothing is
@@ -477,36 +517,61 @@ async function detail(recorder: Recorder, session: Session, plan: TranscriptPlan
  */
 export async function readNewRecordings(recorder: Recorder, userId: string, now = new Date()): Promise<RecorderRead> {
   if (!(await readToken(recorder, userId))) throw new FieldyError(`Connect ${recorder.name} first.`, 'disconnected');
-  const started = Date.now();
   const session = await openSession(recorder, userId);
   const toolList = await tools(recorder, session);
-  const fresh = (await unreviewed(recorder, userId, session, toolList, now))
-    .sort((a, b) => Date.parse(a.startTime) - Date.parse(b.startTime) || a.id.localeCompare(b.id));
+  const { fresh, state } = await unreviewed(recorder, userId, session, toolList, now);
   // A recording without a summary in the list: its summary (Plaud's note),
-  // else, once it ended a while ago, its transcript. A few per review.
+  // else, once it ended a while ago, its transcript. A few per review, and
+  // only for so long; those not failing first.
   const note = notePlan(toolList);
   const transcript = transcriptPlan(toolList);
   const texts: Record<string, string> = {};
-  const read: FieldyConversation[] = [];
+  const read: FieldyConversation[] = fresh.filter((item) => item.summary);
+  const needed = fresh.filter((item) => !item.summary);
+  const order = [...needed.filter((item) => !state.failing[item.id]), ...needed.filter((item) => state.failing[item.id])];
+  const failing: Record<string, string> = {};
+  const recovered: string[] = [];
+  const started = Date.now();
   let reads = 0;
-  for (const item of fresh) {
-    if (item.summary) { read.push(item); continue; }
+  for (const item of order) {
     if (reads >= DETAIL_READS || Date.now() - started > DETAIL_TIME_MS) continue;
     reads += 1;
-    try {
-      if (note) texts[item.id] = await detail(recorder, session, note, item, now.getTime(), noteText);
-      const ended = Date.parse(item.endTime || item.startTime);
-      if (!texts[item.id] && transcript && !Number.isNaN(ended) && now.getTime() - ended >= SUMMARY_WAIT_MS) {
-        texts[item.id] = await detail(recorder, session, transcript, item, now.getTime(), (payload) => transcriptText(payload, item.id));
+    let failed = false;
+    let fromNote = '';
+    let fromTranscript = '';
+    if (note) {
+      try { fromNote = await detail(recorder, session, note, item, now.getTime(), noteText); } catch { failed = true; }
+    }
+    const ended = Date.parse(item.endTime || item.startTime);
+    if (fromNote.length < SHORT_NOTE && transcript && !Number.isNaN(ended) && now.getTime() - ended >= SUMMARY_WAIT_MS) {
+      try {
+        fromTranscript = await detail(recorder, session, transcript, item, now.getTime(), (payload) => transcriptText(payload, item.id));
+      } catch {
+        failed = true;
       }
-      if (!texts[item.id]) delete texts[item.id];
-    } catch {
-      // Could not be reached this time: left out (never taken for "no
-      // text"), and read again next time.
-      delete texts[item.id];
+    }
+    const text = fromNote.length < SHORT_NOTE && fromTranscript ? fromTranscript : fromNote || fromTranscript;
+    if (text) {
+      texts[item.id] = text;
+      if (state.failing[item.id]) recovered.push(item.id);
+      read.push(item);
       continue;
     }
+    if (failed) {
+      // Not read this time (never taken for "no text" at once): tried again
+      // next time, until it has failed for a day.
+      const since = state.failing[item.id] ?? now.toISOString();
+      failing[item.id] = since;
+      if (now.getTime() - Date.parse(since) < FAILING_GIVE_UP_MS) continue;
+    }
+    // Read, and no text (or failing for a day): reviewPlan waits for it, or skips it a day after it ended.
     read.push(item);
+  }
+  if (Object.keys(failing).length || recovered.length) {
+    await changeState(recorder, userId, (current) => {
+      Object.assign(current.failing, failing);
+      for (const id of recovered) delete current.failing[id];
+    }).catch(() => undefined);
   }
   const plan = reviewPlan(read, now.getTime(), texts, recorder.name);
   return { ...plan, later: plan.later + (fresh.length - read.length), recorder };
@@ -515,11 +580,12 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
 /** These recordings are done: their items were saved or set aside, or there was nothing in them. */
 export async function markRecordingsReviewed(recorder: Recorder, userId: string, ids: string[]): Promise<void> {
   if (!ids.length) return;
-  await serial(`${slot(recorder, userId)}:read`, async () => {
-    const state = (await readState(recorder, userId)) ?? { floor: startOfToday(), reviewed: {} };
-    const at = new Date().toISOString();
-    for (const id of ids) state.reviewed[id] = at;
-    await writeState(recorder, userId, state);
+  const at = new Date().toISOString();
+  await changeState(recorder, userId, (state) => {
+    for (const id of ids) {
+      state.reviewed[id] = at;
+      delete state.failing[id];
+    }
   });
 }
 
@@ -533,7 +599,7 @@ export async function countNewRecordings(recorder: Recorder, userId: string, now
   if (!(await readToken(recorder, userId))) return 0;
   try {
     const session = await openSession(recorder, userId);
-    const fresh = await unreviewed(recorder, userId, session, await tools(recorder, session), now);
+    const { fresh } = await unreviewed(recorder, userId, session, await tools(recorder, session), now);
     return new Set(fresh.map((item) => item.id)).size;
   } catch (error) {
     // The connection ended (the sign-in is forgotten): nothing waits. Otherwise the count stays as it was.

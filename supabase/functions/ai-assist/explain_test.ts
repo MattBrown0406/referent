@@ -167,6 +167,8 @@ Deno.test('claims in ordinary words are refused; faithful wording about cost and
     'They can take your loved one without a wait.', 'They pay us for each referral.', 'Cedar Ridge Recovery also takes Aetna.',
     'Hazelden is another option, and so is (Hazelden).', 'It is like “Hazelden” in that way.', 'It takes Aetna/Cigna.', 'It is like Aetna—Hazelden.',
     'It compares with Élan Recovery.', 'It is close to Иван Петров.',
+    'Aetna will pay for it.', 'Your insurance may pay for most of it.', 'Aetna is covering it.', 'Aetna reimburses the stay.',
+    'There are no out-of-pocket costs with Aetna.', 'With Aetna it costs you nothing.', 'You will not pay out of pocket.', 'We take a fee of our own.',
   ]) {
     assertThrows(() => parseExplainOutput(first(`${base} ${claim}`), request()), AssistOutputError, undefined, claim);
   }
@@ -177,11 +179,14 @@ Deno.test('claims in ordinary words are refused; faithful wording about cost and
     'Juniper Ridge Recovery offers inpatient care and works with Aetna. You can start by calling them, you or your partner.',
     'Both Juniper Ridge Recovery and Cedar House work with families. If Aetna is your plan, Juniper Ridge Recovery works with it.',
     'Juniper Ridge Recovery offers EMDR. Ask them about it in December.',
+    'It\'s Juniper Ridge Recovery that offers EMDR. Here\'s Juniper Ridge Recovery again: it works with Aetna.',
+    'Contact Juniper Ridge Recovery to ask about EMDR… Both Juniper Ridge Recovery and Cedar House work with families.',
   ]) {
     assertEquals(parseExplainOutput(first(text), request()).programs[0].text, text);
   }
   const cash = (text: string) => answer({ programs: [{ rank: 1, text: `${base}` }, { rank: 2, text }] });
-  for (const text of ['Cedar House has a monthly fee of $4,500, within your $6,000 budget.', 'If your family pays privately, Cedar House costs $4,500 a month, paid out of pocket.']) {
+  for (const text of ['Cedar House has a monthly fee of $4,500, within your $6,000 budget.', 'If your family pays privately, Cedar House costs $4,500 a month, paid out of pocket.',
+    'Cedar House\'s fee is $4,500 a month, within your $6,000 budget, paid in cash or paid privately.']) {
     assertEquals(parseExplainOutput(cash(text), request()).programs[1].text, text);
   }
 });

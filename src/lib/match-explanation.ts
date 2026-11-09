@@ -208,7 +208,9 @@ export function rewriteFacts(explanation: MatchExplanation): RewriteFacts {
   };
 }
 
-const loose = (value: string) => ` ${value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()} `;
+// As the ai-assist function compares (supabase/functions/ai-assist/common.ts): any alphabet, accents dropped, ł ø ß folded.
+const FOLD: Record<string, string> = { 'ł': 'l', 'ø': 'o', 'ß': 'ss', 'æ': 'ae', 'œ': 'oe', 'đ': 'd', 'þ': 'th', 'ı': 'i' };
+const loose = (value: string) => ` ${value.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/[łøßæœđþı]/g, (letter) => FOLD[letter] ?? letter).replace(/[^\p{L}\p{N}]+/gu, ' ').trim()} `;
 
 /**
  * The rewrite fits only the explanation it was made for: the same facts

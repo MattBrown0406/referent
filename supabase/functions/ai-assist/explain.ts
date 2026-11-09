@@ -115,7 +115,8 @@ const UNSAID = [
   'exceptional', 'superior', 'leading', 'trusted', 'proven', 'success', 'successful', 'outcome', 'outcomes', 'results', 'recover',
   'recovers', 'bed', 'beds', 'admit', 'admits', 'admitted', 'admission', 'admissions', 'financial', 'commission', 'compensated',
   'compensation', 'sponsor', 'sponsored', 'partner', 'partners', 'partnered', 'partnership', 'affiliated', 'affiliate', 'accredited',
-  'licensed', 'waitlist', 'waiting', 'fee', 'fees', 'paid', 'pays', 'earn', 'earns', 'cover', 'covers', 'covered', 'coverage',
+  'licensed', 'waitlist', 'waiting', 'fee', 'fees', 'pay', 'paid', 'pays', 'earn', 'earns', 'cover', 'covers', 'covered', 'covering',
+  'coverage', 'reimburse', 'reimburses', 'reimbursed', 'reimbursement',
 ];
 // Claims made of ordinary words; checked on the whole text first.
 const UNSAID_PHRASES = [
@@ -126,15 +127,20 @@ const UNSAID_PHRASES = [
   'get in today', 'go in today', 'there today', 'start today', 'can start treatment', 'can start there', 'can start this',
   'can start next', 'referral fee', 'referral fees', 'finder fee', 'no fee', 'no fees', 'we are paid', 'we get paid', 'paid by', 'pays us',
   'pay us', 'paid us', 'paid to', 'we receive', 'receive nothing', 'nothing in return', 'no money', 'money changes', 'is free', 'for free',
-  'free with', 'free of charge', 'at no cost', 'no cost to', 'full cost',
+  'free with', 'free of charge', 'at no cost', 'no cost to', 'full cost', 'no out of pocket', 'costs you nothing', 'cost you nothing',
+  'owe nothing', 'pay nothing', 'not pay out of pocket', 'won t pay out of pocket', 'never pay out of pocket', 'not have to pay',
+  'don t have to pay', 'won t have to pay',
 ];
 // Everyday phrases with one of the words above, set aside before the word
-// check (never before the phrase check): "on top of that", "you and your
-// partner", "ask about the fee", a cash price the facts give ("a monthly
-// fee of $4,500": the number must be in the facts), paying privately.
+// check (never before the phrase check, which refuses "not pay out of
+// pocket"): "on top of that", "you and your partner", "ask about the fee",
+// paying privately or in cash.
 const EVERYDAY_PHRASES = ['on top of that', 'on top of this', 'on top of', 'you and your partner', 'you or your partner',
   'your spouse or partner', 'spouse or partner', 'ask about the fee', 'ask about fees', 'ask about the fees', 'while waiting',
-  'waiting to hear', 'fee of', 'pays privately', 'pay privately', 'paid out of pocket', 'pays out of pocket', 'pay out of pocket'];
+  'waiting to hear', 'pays privately', 'pay privately', 'paid privately', 'paid in cash', 'pay cash', 'paid out of pocket',
+  'pays out of pocket', 'pay out of pocket'];
+// A cash price the facts give: "a monthly fee of $4,500", "its fee is $4,500" (the number must be in the facts).
+const PRICED_FEE = / fees? (?:of|is) (?=\d)/g;
 
 function addsWords(text: string, facts: string): string | null {
   const factWords = ` ${comparable(facts)} `;
@@ -142,7 +148,7 @@ function addsWords(text: string, facts: string): string | null {
   const whole = ` ${comparable(text)} `;
   const phrase = UNSAID_PHRASES.find((item) => whole.includes(` ${item} `) && !factWords.includes(` ${item} `));
   if (phrase) return phrase;
-  let rest = whole;
+  let rest = whole.replace(PRICED_FEE, ' ');
   for (const item of EVERYDAY_PHRASES) rest = rest.split(` ${item} `).join(' ');
   const words = new Set(rest.trim().split(' '));
   return UNSAID.find((word) => words.has(word) && !said.has(word)) ?? null;
@@ -155,7 +161,8 @@ const OPENERS = new Set([
   'while', 'because', 'since', 'for', 'with', 'at', 'in', 'on', 'and', 'but', 'so', 'also', 'as', 'a', 'an', 'we', 'our', 'like',
   'unlike', 'another', 'one', 'some', 'many', 'most', 'all', 'every', 'no', 'not', 'then', 'after', 'before', 'during', 'although',
   'though', 'however', 'still', 'yet', 'what', 'which', 'who', 'where', 'how', 'why', 'overall', 'next', 'second', 'first', 'only',
-  'just', 'even', 'compared', 'beyond', 'besides', 'plus', 'ask', 'call', 'about',
+  'just', 'even', 'compared', 'beyond', 'besides', 'plus', 'ask', 'call', 'about', 'contact', 'visit', 'reach', 'together', 'today',
+  'now', 'again', 'finally', 'from', 'to', 'by', 'here', 'consider',
 ]);
 
 /**
@@ -171,14 +178,21 @@ function addsNames(text: string, facts: string): boolean {
   // A state written out only where the facts give its code ("Bend, OR" lets "Oregon" through).
   const states = new Set([...facts.matchAll(/\b([A-Z]{2})\b/g)].map((match) => STATE_BY_CODE[match[1]] || '').filter(Boolean));
   const WORD = String.raw`\p{Lu}[\p{L}\p{M}'’-]*`;
+  const ordinary = new Set([...facts.matchAll(/(?<![\p{L}\p{M}])\p{Ll}[\p{L}\p{M}]*/gu)].map((match) => comparable(match[0])));
   for (const match of text.matchAll(new RegExp(String.raw`(?<![\p{L}\p{M}\p{N}'’])${WORD}(?:\s+${WORD})*`, 'gu'))) {
     let at = (match.index ?? 0) - 1;
     while (at >= 0 && /[\s"“”'‘(\[]/.test(text[at])) at -= 1;
-    const starts = at < 0 || /[.!?:;]/.test(text[at]);
+    const starts = at < 0 || /[.!?:;…]/.test(text[at]);
     let words = match[0].split(/\s+/);
+    // A first word the facts use as an ordinary word, in lower case
+    // ("Inpatient Care at…"): the rest may be the name. Never a word of a
+    // name ("Cedar" of "Cedar House" does not make "Cedar Ridge Recovery").
+    let optionalFirst = false;
     if (starts) {
       if (words.length === 1) continue;
-      if (OPENERS.has(comparable(words[0]))) words = words.slice(1);
+      // "It's Cedar House", "Here's Cedar House": the opener is "it", "here".
+      if (OPENERS.has(comparable(words[0].replace(/['’]s$/i, '')))) words = words.slice(1);
+      else optionalFirst = ordinary.has(comparable(words[0]));
     }
     // A possessive ends a name: "Juniper Ridge Recovery's EMDR" is two.
     const runs: string[][] = [[]];
@@ -196,6 +210,10 @@ function addsNames(text: string, facts: string): boolean {
       }
       const phrase = comparable(named.join(' '));
       if (!phrase || known.includes(` ${phrase} `) || states.has(phrase)) continue;
+      if (optionalFirst && run === runs[0] && named.length > 1) {
+        const rest = comparable(named.slice(1).join(' '));
+        if (known.includes(` ${rest} `)) continue;
+      }
       return true;
     }
   }

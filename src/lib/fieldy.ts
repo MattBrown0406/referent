@@ -188,7 +188,7 @@ function messagesIn(text: string, contentType: string): unknown[] | null {
       try { messages.push(JSON.parse(data.join('\n'))); } catch { /* not a message */ }
       data = [];
     };
-    for (const line of text.split(/\r?\n/)) {
+    for (const line of text.split(/\r\n|\r|\n/)) {
       if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
       else if (!line.trim()) flushEvent();
     }
@@ -211,10 +211,11 @@ function answerTo(messages: unknown[], id: number): { result?: unknown; error?: 
 
 /** An event stream read so far already holds the answer to `id` (the rest need not be waited for). */
 export function hasAnswer(text: string, id: number): boolean {
-  // Only whole events: an event ends with a blank line.
-  const end = Math.max(text.lastIndexOf('\n\n'), text.lastIndexOf('\r\n\r\n'));
+  // Only whole events: an event ends with a blank line (any line ending).
+  const lines = text.replace(/\r\n?/g, '\n');
+  const end = lines.lastIndexOf('\n\n');
   if (end < 0) return false;
-  return Boolean(answerTo(messagesIn(text.slice(0, end + 2), 'text/event-stream') ?? [], id));
+  return Boolean(answerTo(messagesIn(lines.slice(0, end + 2), 'text/event-stream') ?? [], id));
 }
 
 /** The result of JSON-RPC request `id`, from a JSON or event-stream answer. */
@@ -248,7 +249,8 @@ function keyIn(properties: Record<string, unknown>, keys: string[]): string | nu
   return keys.find((key) => Object.prototype.hasOwnProperty.call(properties, key)) ?? null;
 }
 
-export type ListPlan = { name: string; start: string | null; end: string | null; size: string | null; cursor: string | null; page: string | null };
+/** `page`: pages by number (no cursor), the first being `firstPage` (0 or 1, from the tool's schema). */
+export type ListPlan = { name: string; start: string | null; end: string | null; size: string | null; cursor: string | null; page: string | null; firstPage: number };
 
 /**
  * The tool that lists conversations in a time window. Fieldy's MCP tools
@@ -268,7 +270,10 @@ export function listPlan(tools: McpTool[]): ListPlan | null {
       const score = (/list|recent|get_conversations|conversations$|files$|recordings$/.test(name) ? 4 : 0) + (start ? 2 : 0) + (end ? 1 : 0)
         - (/search/.test(name) ? 1 : 0) - (/(^|_)get_(conversation|file|recording)$|by_id/.test(name) ? 5 : 0);
       const cursor = keyIn(properties, CURSOR_KEYS);
-      return { score, plan: { name: tool.name, start, end, size: keyIn(properties, SIZE_KEYS), cursor, page: cursor ? null : keyIn(properties, PAGE_KEYS) } };
+      const page = cursor ? null : keyIn(properties, PAGE_KEYS);
+      const pageSchema = (page ? properties[page] : null) as { minimum?: unknown; default?: unknown } | null;
+      const firstPage = pageSchema && (pageSchema.minimum === 0 || pageSchema.default === 0) ? 0 : 1;
+      return { score, plan: { name: tool.name, start, end, size: keyIn(properties, SIZE_KEYS), cursor, page, firstPage } };
     })
     .filter((item): item is { score: number; plan: ListPlan } => Boolean(item) && item!.score > 0)
     .sort((a, b) => b.score - a.score);
@@ -285,7 +290,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  */
 export const LIST_PAGE_SIZE = 50;
 
-export function listArguments(plan: ListPlan, since: string, until: string, cursor: string | null, page = 1): Record<string, unknown> {
+export function listArguments(plan: ListPlan, since: string, until: string, cursor: string | null, page = plan.firstPage): Record<string, unknown> {
   const args: Record<string, unknown> = {};
   const day = (iso: string, shift: number) => new Date(Date.parse(iso) + shift * DAY_MS).toISOString().slice(0, 10);
   if (plan.start) args[plan.start] = /date/i.test(plan.start) ? day(since, -1) : since;
@@ -436,7 +441,7 @@ function endOf(item: Record<string, unknown>, start: string): string {
  * conversations, files, items or data). `text`: the answer was words, not a
  * list (the caller says it could not be read, never "nothing new").
  */
-export function conversationsFrom(payload: unknown): { conversations: FieldyConversation[]; nextCursor: string | null; text: string; unreadable: boolean } {
+export function conversationsFrom(payload: unknown): { conversations: FieldyConversation[]; nextCursor: string | null; text: string; unreadable: boolean; count: number } {
   const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
   const list = Array.isArray(payload) ? payload
     : [data.conversations, data.files, data.recordings, data.items, data.data, data.results].find(Array.isArray) as unknown[] | undefined;
@@ -456,7 +461,7 @@ export function conversationsFrom(payload: unknown): { conversations: FieldyConv
   const cursor = [data.nextCursor, data.next_cursor, data.cursor, (data.pagination as Record<string, unknown> | undefined)?.nextCursor]
     .find((value) => typeof value === 'string' && value) as string | undefined;
   // Recordings listed, none of them readable (an id or time in a shape not known): never "nothing new".
-  return { conversations, nextCursor: cursor ?? null, text: typeof data.text === 'string' && !list ? data.text : '', unreadable: entries.length > 0 && !conversations.length };
+  return { conversations, nextCursor: cursor ?? null, text: typeof data.text === 'string' && !list ? data.text : '', unreadable: entries.length > 0 && !conversations.length, count: entries.length };
 }
 
 /** A transcript answer as text: its segments' "Speaker: words" (only this recording's, when they say), or its text. */
@@ -558,7 +563,9 @@ export function reviewPlan(conversations: FieldyConversation[], now = Date.now()
 }
 
 // Any alphabet, accents dropped, as the review compares quotes.
-const loose = (value: string) => value.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+const FOLD: Record<string, string> = { 'ł': 'l', 'ø': 'o', 'ß': 'ss', 'æ': 'ae', 'œ': 'oe', 'đ': 'd', 'þ': 'th', 'ı': 'i' };
+const loose = (value: string) => value.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase()
+  .replace(/[łøßæœđþı]/g, (letter) => FOLD[letter] ?? letter).replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 
 /** The recordings a found item's quote came from (more than one when the same words are in several). */
 export function blocksFor(quote: string, blocks: FieldyBlock[]): FieldyBlock[] {

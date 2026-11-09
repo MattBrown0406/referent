@@ -304,8 +304,9 @@ function clip(value: string, max: number): string {
 // benefit from detox", "inpatient is the right level") is dropped: the
 // rating stays, the practitioner decides the level.
 const LEVELS = String.raw`(inpatient|residential|detox\w*|outpatient|iop|php|partial hospitali[sz]ation|sober living|hospitali[sz]\w*|level of care)`;
-const NAMES_A_LEVEL = new RegExp(String.raw`\b(needs?|requires?|recommend\w*|should (go|enter|attend|start|consider|be (in|at|admitted|placed))|warrants?|calls? for|appropriate for|best suited (for|to)|suited for|benefits? from|would benefit|consider\w*)\b(?:(?!,\s*(?:but|though|although|while|yet)\b)[^.;]){0,40}\b${LEVELS}\b`
-  + String.raw`|\b${LEVELS}\b[^.;]{0,30}\b(is|are|would be|seems?|may be|might be|could be)\s+(?:the\s+|an?\s+|most\s+)?(needed|necessary|warranted|appropriate|right|indicated|recommended|best|required|called for)\b`, 'i');
+const NAMES_A_LEVEL = new RegExp(String.raw`\b(needs?|requires?|recommend\w*|should (go|enter|attend|start|consider|be (in|at|admitted|placed))|warrants?|calls? for|appropriate for|best suited (for|to)|suited for|(?:would|could|may|might|will) (?:likely |really |greatly |most )?benefit|consider(?:ing|s)?)\b(?:(?!,\s*(?:but|though|although|while|yet)\b)[^.;]){0,40}\b${LEVELS}\b`
+  // The level as what is needed ("Residential is the right next step"), not someone's ("His IOP group is…"), nor a plan's rule ("required by her plan").
+  + String.raw`|(?<!\b(?:his|her|their|its|my|your|our)\s)\b${LEVELS}\b[^.;]{0,30}\b(is|are|would be|seems?|may be|might be|could be)\s+(?:the\s+|an?\s+|most\s+)?(needed|necessary|warranted|appropriate|right|indicated|recommended|required(?!\s+by)|called for)\b`, 'i');
 
 /** The answers alone ("Question: answer" lines without their questions). */
 export function answerValues(request: LevelRequest): string {

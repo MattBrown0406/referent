@@ -832,6 +832,8 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
       cleanEmail(row.found.email) ? `e:${cleanEmail(row.found.email)}` : '',
       names.length >= 2 ? `n:${names.join(' ')}` : '',
       names.length && (saved || names.length === 1) ? `f:${names[0]}` : '',
+      // Saved with a first name only ("Kevin"): read again with a full name ("Kevin Walsh"), still that caller.
+      names.length === 1 && saved ? `f1:${names[0]}` : names.length >= 2 && !saved ? `f1:${names[0]}` : '',
     ].filter(Boolean);
     for (const key of keys) out.push(`new_lead|any|q:${quote}|${key}`);
   }

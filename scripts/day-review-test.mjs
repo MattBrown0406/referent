@@ -466,6 +466,13 @@ check(() => {
   const [momRow] = build(mom);
   const [dadRow] = rules.markSavedBefore(build(dad), new Set(rules.rowSignatures(momRow, true)));
   assert.equal(dadRow.include, true, 'callers with nothing to tell them by are not taken for each other');
+  const kevin = found({ kind: 'new_lead', personName: 'Kevin', phone: '503-555-0142', summary: 'Kevin called about his wife.', evidence: 'Kevin called about his wife, wants a call back', verified: true });
+  const [kevinRow] = build(kevin);
+  const [fuller] = rules.markSavedBefore(build({ ...kevin, personName: 'Kevin Walsh', phone: '' }), new Set(rules.rowSignatures(kevinRow, true)));
+  assert.equal(fuller.include, false, 'saved as "Kevin", read again as "Kevin Walsh": still that caller');
+  const [kevinSmith] = build({ ...kevin, personName: 'Kevin Smith' });
+  const [kevinJones] = rules.markSavedBefore(build({ ...kevin, personName: 'Kevin Jones', phone: '' }), new Set(rules.rowSignatures(kevinSmith, true)));
+  assert.equal(kevinJones.include, true, 'but "Kevin Smith" saved never hides "Kevin Jones"');
 }, 'saved leads are matched by who called');
 check(() => {
   const at = (when) => rules.buildRows([found({ personName: 'Ana Rivera' })], workspace, TODAY, makeId, () => ({ label: 'From Fieldy, Nov 9', at: when }))[0].occurredAt;

@@ -96,6 +96,12 @@ Deno.test('a reason that prescribes a level of care is dropped; the rating stays
   ]), request());
   assertEquals(other.slice(0, 4).map((item) => item.reason), ['', '', '', ''], 'other ways of prescribing a level');
   assertEquals(other[4].reason, 'Was in residential treatment in 2023 and relapsed.', 'past care is history, not a prescription');
+  const history = [
+    'Considerable cravings since leaving detox last spring.', 'She considered outpatient last year but did not go.',
+    'Benefits from outpatient therapy weekly.', 'His IOP group is the best part of his week.', 'Detox is required by her plan before any admission.',
+  ];
+  const kept = parseLevelOutput(answer(history.map((reason) => ({ reason }))), request());
+  assertEquals(kept.slice(0, history.length).map((item) => item.reason), history, 'history and description are kept');
 });
 
 Deno.test('a missing, repeated or out-of-range rating is refused', () => {

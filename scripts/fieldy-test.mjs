@@ -78,7 +78,7 @@ check(() => {
     { name: 'create_sharable', inputSchema: { properties: { conversationId: {} } } },
   ];
   const plan = f.listPlan(tools);
-  assert.deepEqual(plan, { name: 'list_conversations', start: 'startTime', end: 'endTime', size: 'pageSize', cursor: 'cursor', page: null });
+  assert.deepEqual(plan, { name: 'list_conversations', start: 'startTime', end: 'endTime', size: 'pageSize', cursor: 'cursor', page: null, firstPage: 1 });
   assert.deepEqual(f.listArguments(plan, 'S', 'E', null), { startTime: 'S', endTime: 'E', pageSize: 50 });
   assert.deepEqual(f.listArguments(plan, 'S', 'E', 'C2'), { startTime: 'S', endTime: 'E', pageSize: 50, cursor: 'C2' });
   assert.deepEqual(f.transcriptPlan(tools), { name: 'get_transcriptions', id: 'conversationId' });
@@ -179,10 +179,13 @@ check(() => {
     { name: 'get_transcript', inputSchema: { properties: { file_id: {} }, required: ['file_id'] } },
   ];
   const plan = f.listPlan(tools);
-  assert.deepEqual(plan, { name: 'list_files', start: 'date_from', end: 'date_to', size: 'page_size', cursor: null, page: 'page' });
+  assert.deepEqual(plan, { name: 'list_files', start: 'date_from', end: 'date_to', size: 'page_size', cursor: null, page: 'page', firstPage: 1 });
   assert.deepEqual(f.listArguments(plan, '2026-11-09T07:00:00.000Z', '2026-11-09T23:00:00.000Z', null),
     { date_from: '2026-11-08', date_to: '2026-11-10', page_size: 50, page: 1 }, 'a date-only window is widened a day each way');
   assert.equal(f.listArguments(plan, '2026-11-09T07:00:00.000Z', '2026-11-09T23:00:00.000Z', null, 3).page, 3, 'pages by number');
+  const fromZero = f.listPlan([{ name: 'list_files', inputSchema: { properties: { date_from: {}, page: { type: 'integer', minimum: 0 } } } }]);
+  assert.equal(fromZero.firstPage, 0, 'the first page is 0 when the tool says so');
+  assert.equal(f.listArguments(fromZero, '2026-11-09T07:00:00.000Z', '2026-11-09T23:00:00.000Z', null).page, 0);
   assert.deepEqual(f.notePlan(tools), { name: 'get_note', id: 'file_id' });
   assert.deepEqual(f.transcriptPlan(tools), { name: 'get_transcript', id: 'file_id' });
   assert.equal(f.userPlan(tools), 'get_current_user');
@@ -211,6 +214,7 @@ check(() => {
   const epoch = f.conversationsFrom({ files: [{ id: 'e1', name: 'x', start_at: 1762707600, duration: 60000 }, { id: 'e2', start_at: 1762707600000 }, { id: 'e3', start_at: '2026-11-09 14:15:00' }] });
   assert.deepEqual(epoch.conversations.map((item) => item.startTime.slice(0, 13)), ['2025-11-09T17', '2025-11-09T17', '2026-11-09T14'], 'seconds, milliseconds, or a space for the T');
   assert.equal(epoch.unreadable, false);
+  assert.equal(epoch.count, 3, 'every entry listed is counted, readable or not (paging goes by it)');
   assert.equal(f.conversationsFrom({ files: [{ id: 'u', start_at: { when: 'today' } }] }).unreadable, true, 'recordings none of which can be read are never "nothing new"');
   assert.equal(f.conversationsFrom({ files: [] }).unreadable, false);
   const plan = f.reviewPlan([{ ...conversations[0], summary: 'Ana asked about detox.' }], Date.parse('2026-11-09T23:00:00Z'), {}, 'Plaud');
@@ -234,6 +238,8 @@ check(() => {
   assert.equal(f.hasAnswer(`${head}data: {"jsonrpc":"2.0","id":2,"res`, 2), false, 'not until the event is whole');
   assert.equal(f.hasAnswer(`${head}data: {"jsonrpc":"2.0","id":2,"result":{}}\n\n`, 2), true);
   assert.equal(f.hasAnswer(`${head}data: {"jsonrpc":"2.0","id":2,"method":"sampling/createMessage"}\n\n`, 2), false, 'a server request with the same id is not the answer');
+  assert.equal(f.hasAnswer('data: {"jsonrpc":"2.0","id":3,"result":{}}\r\r', 3), true, 'lines ending in a bare CR');
+  assert.deepEqual(f.rpcResult('data: {"jsonrpc":"2.0","id":3,"result":{"ok":1}}\r\r', 'text/event-stream', 3), { ok: 1 });
   // A refresh without a new refresh token keeps the old one.
   assert.equal(f.tokensFrom({ access_token: 'A', expires_in: 3600 }, 0, 'Plaud', 'R-OLD').refreshToken, 'R-OLD');
   assert.throws(() => f.tokensFrom({ access_token: 'A' }, 0, 'Plaud'), /lasting access/, 'a first sign-in still needs one');
@@ -265,26 +271,36 @@ check(() => {
   assert.match(api, /const slot = \(recorder: Recorder, userId: string\) => `\$\{recorder\.id\}:\$\{userId\}`/, 'tokens are kept per recorder and per account');
   assert.match(api, /return serial\(key, async \(\) => \{[^]*await writeToken\(recorder, userId, \{ \.\.\.token, refreshToken: tokens\.refreshToken \}\)/, 'the new refresh token is kept at once, inside the queue');
   assert.match(api, /recorder\.revokeUrl[^]*logoutPlan/, 'disconnecting revokes the access at the recorder (Fieldy: revocation; Plaud: logout)');
-  assert.match(api, /const token = await serial\(key, async \(\) => \{\s*const current = await readToken\(recorder, userId\);\s*access\.delete\(key\);\s*await SecureStore\.deleteItemAsync\(tokenKey\(recorder, userId\)\)/,
-    'a disconnect reads and forgets the newest token in one step, before revoking it');
+  assert.match(api, /const held = await serial\(key, async \(\) => \{\s*const token = await readToken\(recorder, userId\);\s*const cached = access\.get\(key\);\s*access\.delete\(key\);\s*await SecureStore\.deleteItemAsync\(tokenKey\(recorder, userId\)\)/,
+    'a disconnect reads and forgets the newest token in one step, before anything goes over the network');
+  assert.doesNotMatch(api.slice(api.indexOf('async function revokeAndForget'), api.indexOf('export function disconnectRecorder')), /accessToken\(recorder, userId\)/,
+    'Plaud too: nothing is fetched before the sign-in is forgotten');
+  assert.match(api, /const FAILING_GIVE_UP_MS = 24 \* 60 \* 60 \* 1000;/, 'a recording whose text keeps failing is given up after a day of failures, not at once');
+  assert.match(api, /if \(now\.getTime\(\) - Date\.parse\(since\) < FAILING_GIVE_UP_MS\) continue;/);
+  assert.match(api, /if \(later && !count\) break;/, 'a page past the end, empty or in words, ends the list');
+  assert.match(api, /if \(later && error instanceof FieldyError && error\.reason === 'tool'\) break;/, 'so does an error on a page past the end');
+  assert.match(api, /fromNote\.length < SHORT_NOTE && transcript/, 'a note too short to be one is checked against the transcript');
   assert.match(api, /await Promise\.all\(RECORDERS\.map\(async \(recorder\) =>/, 'deleting the account forgets every recorder at once');
   assert.match(api, /return await Promise\.race\(\[work, deadline\]\)/, 'the deadline covers the whole answer, body included');
   assert.match(api, /if \(until!\(text\)\) \{ reader\.cancel\(\)/, 'an event stream is read only until the answer is in');
   assert.match(api, /if \(reads >= DETAIL_READS \|\| Date\.now\(\) - started > DETAIL_TIME_MS\) continue;/, 'the cap never holds back recordings after it');
-  assert.match(api, /error instanceof FieldyError && error\.reason === 'tool'\) return ''/, 'a recording the recorder has no note for is "no text"');
+  assert.match(api, /const started = Date\.now\(\);\s*let reads = 0;/, 'the time budget starts at the detail reads');
   assert.match(api, /error\.reason === 'disconnected' \? 0 : null/, 'a connection that ended counts nothing');
   assert.match(api, /const readKey = [^\n]*\.read\.v1\./, 'what was reviewed is kept apart from the sign-in');
   assert.match(api, /export async function forgetRecorders[^]*deleteItemAsync\(readKey\(recorder, userId\)\)/, 'deleting the account forgets what was reviewed too');
   assert.match(api, /signal: controller\.signal/, 'every call gives up after a while');
-  assert.match(api, /Could not be reached this time[^]*continue;/, 'a failed read is never taken for "no text"');
+  assert.match(api, /never taken for "no text" at once/, 'a failed read is never taken for "no text" at once');
   assert.match(api, /WebBrowser\.openAuthSessionAsync\(authorizeUrl\(challenge, state, recorder\), recorder\.redirectUri\)/);
 }, 'the connection');
 check(() => {
   assert.doesNotMatch(sheet, /commitRecorderRead/);
-  assert.match(sheet, /results\[row\.key\]\?\.saved === true \|\| !row\.include/, 'a recording is done once every item from it is saved or set aside');
+  assert.match(sheet, /results\[row\.key\]\?\.saved === true\s*\|\| \(!row\.include && \(switchedOffRef\.current\.has\(row\.key\)/, 'a recording is done once every item from it is saved or switched off by the practitioner');
+  assert.match(sheet, /if \(!unsaved && read && undecided > 0\)/, 'closing asks about recordings with items never decided on');
+  assert.doesNotMatch(sheet, /settleRecordings\(\{\}, built\)/, 'nothing is settled just because its items start switched off');
+  assert.match(sheet, /return read\.blocks\.map\(\(block\) => block\.id\)/, 'every recording is considered, those with no items too');
   assert.match(sheet, /function finish\(\) \{\s*if \(phase !== 'finding' && phase !== 'saving'\) settleRecordings\(saved, rows\);/, 'closing the review settles what was set aside');
-  assert.match(sheet, /if \(phase === 'finding'\) \{ finish\(\); return; \}/, 'a slow read can be stopped');
-  assert.match(sheet, /if \(current\.some\(\(row\) => !\(read\.rowIds\.get\(row\.key\)\?\.length\) && !settled\(row\)\)\) return;/, 'an item from no one recording holds them all');
+  assert.match(sheet, /if \(phase === 'finding' && \(!notes\.trim\(\) \|\| recorderReadRef\.current\)\) \{ finish\(\); return; \}/, 'a slow read can be stopped; pasted notes are not thrown away without asking');
+  assert.match(sheet, /if \(current\.some\(\(row\) => !\(read\.rowIds\.get\(row\.key\)\?\.length\) && !settled\(row\)\)\) return \[\];/, 'an item from no one recording holds them all');
   assert.match(sheet, /\/\/ Kept before the review runs, so a retry after a failed one is still these recordings\./);
   assert.match(sheet, /\.concat\(skipped\);/, 'one with nothing found, or skipped, is done on reading');
   assert.match(sheet, /function markAllReviewed\(\)/, 'the practitioner can be done with them');
