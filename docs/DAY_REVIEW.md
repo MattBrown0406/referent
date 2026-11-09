@@ -92,7 +92,12 @@ OAuth (`src/lib/fieldy.ts` has both; `src/lib/fieldy-api.ts` the calls).
   off (on Approve, or when the review is closed), or when nothing was found
   in it. One with an item still waiting (left on, or failed to save) comes
   back next time, as do all of them while an item's quote is in none of
-  them. "Done with these" marks them all. Every call to a recorder gives up
+  them. "Done with these" marks them all. Items saved from a recording are remembered with it on
+  this phone, as fingerprints (no words), until it is reviewed, so a
+  recording read again never offers them twice; an item is taken as saved
+  only when its text or summary (with its case or partner, and a
+  follow-up's date) matches, or a lead's quote and caller: a phone or a
+  quote alone never hides an item. Every call to a recorder gives up
   after 30 seconds (the whole answer, not only its start), and a read can
   be stopped with Close. Which ones were reviewed is kept apart from the sign-in (for 14
   days), so disconnecting and reconnecting never reads them again.
