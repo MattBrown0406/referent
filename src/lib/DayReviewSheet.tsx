@@ -238,19 +238,28 @@ export default function DayReviewSheet({
   const busy = phase === 'finding' || phase === 'saving';
   const locked = phase === 'saving' || phase === 'done';
 
-  // A recording is done once every item from it is saved, saved earlier in
-  // this review, or switched off by the practitioner (set aside); one with
-  // an item still on, or never looked at (off from the start, unchecked),
-  // comes back next time. A row whose quote is in no one recording could be
-  // from any: until it is settled, none is done.
+  // A recording is done once every item from it is decided: saved; switched
+  // off by the practitioner; or off for a reason the app gave (already a
+  // follow-up, already in the referral history, saved earlier in this
+  // review). An item off only because it could not be checked against the
+  // notes, never looked at, is not decided: closing asks about it. An item
+  // still on and unsaved whose quote is in no one recording could be from
+  // any: until it is decided, none is done (one off and unchecked, tied to
+  // no recording, holds none).
+  function rowDecided(row: ReviewRow, results: Record<string, SaveResult>): boolean {
+    if (results[row.key]?.saved === true) return true;
+    if (row.include) return false;
+    return switchedOffRef.current.has(row.key) || row.found.verified
+      || rowSignatures(row).some((signature) => savedSignaturesRef.current.has(signature));
+  }
+
   function recordingsDone(results: Record<string, SaveResult>, current: ReviewRow[]): string[] {
     const read = recorderReadRef.current;
     if (!read) return [];
-    const settled = (row: ReviewRow) => results[row.key]?.saved === true
-      || (!row.include && (switchedOffRef.current.has(row.key) || rowSignatures(row).some((signature) => savedSignaturesRef.current.has(signature))));
-    if (current.some((row) => !(read.rowIds.get(row.key)?.length) && !settled(row))) return [];
+    const matched = (row: ReviewRow) => Boolean(read.rowIds.get(row.key)?.length);
+    if (current.some((row) => !matched(row) && row.include && !rowDecided(row, results))) return [];
     return read.blocks.map((block) => block.id)
-      .filter((id) => current.filter((row) => (read.rowIds.get(row.key) ?? []).includes(id)).every(settled));
+      .filter((id) => current.filter((row) => (read.rowIds.get(row.key) ?? []).includes(id)).every((row) => rowDecided(row, results)));
   }
 
   function settleRecordings(results: Record<string, SaveResult>, current: ReviewRow[]) {
@@ -270,8 +279,9 @@ export default function DayReviewSheet({
   function close() {
     if (phase === 'saving') return;
     // A read or a review can be stopped (what comes back late is ignored);
-    // pasted notes are not thrown away without asking.
-    if (phase === 'finding' && (!notes.trim() || recorderReadRef.current)) { finish(); return; }
+    // notes the practitioner typed or pasted are not thrown away without asking.
+    const recorderText = Boolean(recorderReadRef.current) && notes.trim() === recorderReadRef.current?.text.trim();
+    if (phase === 'finding' && (!notes.trim() || recorderText)) { finish(); return; }
     const unsaved = phase === 'review'
       ? pending.some((row) => row.include)
       : (phase === 'paste' || phase === 'finding') && notes.trim().length > 0;
@@ -353,6 +363,8 @@ export default function DayReviewSheet({
         savedSignaturesRef.current,
       );
       setRows(built);
+      // Rows are keyed by position: what was switched off in an earlier review is not this one's.
+      switchedOffRef.current = new Set();
       setSaved({});
       setPicker(null);
       setPhase('review');
@@ -461,6 +473,16 @@ export default function DayReviewSheet({
     if (opening === openingRef.current && read.later) {
       setMessage((current) => current ?? { ok: true, text: `${read.later} more ${read.later === 1 ? `${recorder.noun} waits` : `${recorder.noun}s wait`} for the next review.` });
     }
+  }
+
+  // Reading puts the recordings in the box: notes typed or pasted there are not replaced without asking.
+  function readRecorderAsking(recorder: Recorder) {
+    const typed = notes.trim() && notes.trim() !== recorderReadRef.current?.text.trim();
+    if (!typed) { void readRecorder(recorder); return; }
+    Alert.alert(`Read your ${recorder.name} ${recorder.noun}s instead?`, `Your ${recorder.noun}s replace the notes in the box. Review those notes first if you want to keep them.`, [
+      { text: 'Keep my notes', style: 'cancel' },
+      { text: `Read ${recorder.name}`, onPress: () => { void readRecorder(recorder); } },
+    ]);
   }
 
   // The practitioner is done with these recordings (nothing to save, or the
@@ -865,7 +887,7 @@ export default function DayReviewSheet({
               <>
                 <Text style={styles.hint}>Connected{status.email ? ` as ${status.email}` : ''}. ReferralFit reads your new {recorder.noun}s here; you approve each item.</Text>
                 {keyMissing ? null : (
-                  <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void readRecorder(recorder); }} style={[styles.primaryButton, busy && styles.off]}>
+                  <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => readRecorderAsking(recorder)} style={[styles.primaryButton, busy && styles.off]}>
                     <Text style={styles.primaryButtonText}>Read new {recorder.name} {recorder.noun}s</Text>
                   </TouchableOpacity>
                 )}
@@ -973,7 +995,7 @@ export default function DayReviewSheet({
                 ) : <Text style={styles.primaryButtonText}>Find what's in it</Text>}
               </TouchableOpacity>
             ) : phase === 'done' ? (
-              <TouchableOpacity accessibilityRole="button" onPress={finish} style={styles.primaryButton}>
+              <TouchableOpacity accessibilityRole="button" onPress={close} style={styles.primaryButton}>
                 <Text style={styles.primaryButtonText}>Done</Text>
               </TouchableOpacity>
             ) : (

@@ -827,13 +827,17 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
   // email to tell it by is known by its own text and quote only).
   if (row.found.kind === 'new_lead' && row.found.verified && quote.split(' ').length >= 4) {
     const names = nameWords(row.found.personName);
+    // A name matches only with the same phone or email, or when the row read
+    // again has neither: "Kevin" at one number is not "Kevin Walsh" at another.
+    const contact = phoneKey(row.found.phone) || cleanEmail(row.found.email);
+    const withContact = (key: string) => (saved ? [`${key}|${contact || '-'}`, `${key}|-`] : [`${key}|${contact || '-'}`]);
     const keys = [
       phoneKey(row.found.phone) ? `p:${phoneKey(row.found.phone)}` : '',
       cleanEmail(row.found.email) ? `e:${cleanEmail(row.found.email)}` : '',
-      names.length >= 2 ? `n:${names.join(' ')}` : '',
-      names.length && (saved || names.length === 1) ? `f:${names[0]}` : '',
+      ...(names.length >= 2 ? withContact(`n:${names.join(' ')}`) : []),
+      ...(names.length && (saved || names.length === 1) ? withContact(`f:${names[0]}`) : []),
       // Saved with a first name only ("Kevin"): read again with a full name ("Kevin Walsh"), still that caller.
-      names.length === 1 && saved ? `f1:${names[0]}` : names.length >= 2 && !saved ? `f1:${names[0]}` : '',
+      ...((names.length === 1 && saved) || (names.length >= 2 && !saved) ? withContact(`f1:${names[0]}`) : []),
     ].filter(Boolean);
     for (const key of keys) out.push(`new_lead|any|q:${quote}|${key}`);
   }

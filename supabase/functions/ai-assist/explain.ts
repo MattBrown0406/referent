@@ -129,7 +129,8 @@ const UNSAID_PHRASES = [
   'pay us', 'paid us', 'paid to', 'we receive', 'receive nothing', 'nothing in return', 'no money', 'money changes', 'is free', 'for free',
   'free with', 'free of charge', 'at no cost', 'no cost to', 'full cost', 'no out of pocket', 'costs you nothing', 'cost you nothing',
   'owe nothing', 'pay nothing', 'not pay out of pocket', 'won t pay out of pocket', 'never pay out of pocket', 'not have to pay',
-  'don t have to pay', 'won t have to pay',
+  'don t have to pay', 'won t have to pay', 'we charge', 'charge a fee', 'our fee', 'our fees', 'placement fee', 'placement fees', 'we bill',
+  'we take',
 ];
 // Everyday phrases with one of the words above, set aside before the word
 // check (never before the phrase check, which refuses "not pay out of
@@ -138,9 +139,10 @@ const UNSAID_PHRASES = [
 const EVERYDAY_PHRASES = ['on top of that', 'on top of this', 'on top of', 'you and your partner', 'you or your partner',
   'your spouse or partner', 'spouse or partner', 'ask about the fee', 'ask about fees', 'ask about the fees', 'while waiting',
   'waiting to hear', 'pays privately', 'pay privately', 'paid privately', 'paid in cash', 'pay cash', 'paid out of pocket',
-  'pays out of pocket', 'pay out of pocket'];
-// A cash price the facts give: "a monthly fee of $4,500", "its fee is $4,500" (the number must be in the facts).
-const PRICED_FEE = / fees? (?:of|is) (?=\d)/g;
+  'pays out of pocket', 'pay out of pocket', 'cash pay', 'self pay', 'private pay', 'pay for it yourself', 'how you would pay',
+  'pay attention'];
+// A cash price the facts give, in dollars: "a monthly fee of $4,500", "its fee is $4,500" (the amount must be in the facts).
+const PRICED_FEE = /\bfees?\s+(?:of|is)\s+(?=\$\s?\d)/gi;
 
 function addsWords(text: string, facts: string): string | null {
   const factWords = ` ${comparable(facts)} `;
@@ -148,7 +150,7 @@ function addsWords(text: string, facts: string): string | null {
   const whole = ` ${comparable(text)} `;
   const phrase = UNSAID_PHRASES.find((item) => whole.includes(` ${item} `) && !factWords.includes(` ${item} `));
   if (phrase) return phrase;
-  let rest = whole.replace(PRICED_FEE, ' ');
+  let rest = ` ${comparable(text.replace(PRICED_FEE, ' '))} `;
   for (const item of EVERYDAY_PHRASES) rest = rest.split(` ${item} `).join(' ');
   const words = new Set(rest.trim().split(' '));
   return UNSAID.find((word) => words.has(word) && !said.has(word)) ?? null;
@@ -173,8 +175,10 @@ const OPENERS = new Set([
  * "Ridge Recovery"), unless it starts with an ordinary opener; a single word
  * starting a sentence is left alone. The app then shows its own wording.
  */
-function addsNames(text: string, facts: string): boolean {
+function addsNames(text: string, facts: string, names: string[] = []): boolean {
   const known = ` ${comparable(facts)} `;
+  // Part of a program's name, not all of it ("Ridge Recovery" of "Juniper Ridge Recovery").
+  const partOfName = (phrase: string) => names.some((name) => name !== phrase && ` ${name} `.includes(` ${phrase} `));
   // A state written out only where the facts give its code ("Bend, OR" lets "Oregon" through).
   const states = new Set([...facts.matchAll(/\b([A-Z]{2})\b/g)].map((match) => STATE_BY_CODE[match[1]] || '').filter(Boolean));
   const WORD = String.raw`\p{Lu}[\p{L}\p{M}'’-]*`;
@@ -188,10 +192,11 @@ function addsNames(text: string, facts: string): boolean {
     // ("Inpatient Care at…"): the rest may be the name. Never a word of a
     // name ("Cedar" of "Cedar House" does not make "Cedar Ridge Recovery").
     let optionalFirst = false;
+    let opened = false;
     if (starts) {
       if (words.length === 1) continue;
       // "It's Cedar House", "Here's Cedar House": the opener is "it", "here".
-      if (OPENERS.has(comparable(words[0].replace(/['’]s$/i, '')))) words = words.slice(1);
+      if (OPENERS.has(comparable(words[0].replace(/['’]s$/i, '')))) { words = words.slice(1); opened = true; }
       else optionalFirst = ordinary.has(comparable(words[0]));
     }
     // A possessive ends a name: "Juniper Ridge Recovery's EMDR" is two.
@@ -209,10 +214,12 @@ function addsNames(text: string, facts: string): boolean {
         if (named.length > size && states.has(comparable(named.slice(-size).join(' ')))) { named = named.slice(0, -size); break; }
       }
       const phrase = comparable(named.join(' '));
+      // After an opener, part of a program's name is not a name ("Next Ridge Recovery").
+      if (opened && run === runs[0] && partOfName(phrase)) return true;
       if (!phrase || known.includes(` ${phrase} `) || states.has(phrase)) continue;
       if (optionalFirst && run === runs[0] && named.length > 1) {
         const rest = comparable(named.slice(1).join(' '));
-        if (known.includes(` ${rest} `)) continue;
+        if (known.includes(` ${rest} `) && !partOfName(rest)) continue;
       }
       return true;
     }
@@ -257,11 +264,11 @@ export function parseExplainOutput(raw: string, request: ExplainRequest): Explai
   const intro = clean(answer.intro, EXPLAIN_LIMITS.outIntro * 2);
   const list = Array.isArray(answer.programs) ? answer.programs : [];
   if (!intro || intro.length > EXPLAIN_LIMITS.outIntro) throw new AssistOutputError('The rewrite’s introduction did not fit.');
-  if (addsNumbers(intro, request.intro) || addsWords(intro, request.intro) || addsNames(intro, request.intro)) {
+  const names = request.programs.map((program) => comparable(program.name));
+  if (addsNumbers(intro, request.intro) || addsWords(intro, request.intro) || addsNames(intro, request.intro, names)) {
     throw new AssistOutputError('The rewrite added to the facts.');
   }
   if (list.length !== request.programs.length) throw new AssistOutputError('The rewrite left out or added a program.');
-  const names = request.programs.map((program) => comparable(program.name));
   const programs = list.map((raw, index) => {
     const program = request.programs[index];
     const item = record(raw);
@@ -279,7 +286,7 @@ export function parseExplainOutput(raw: string, request: ExplainRequest): Explai
     }
     if (addsNumbers(text, facts)) throw new AssistOutputError('The rewrite added a number.');
     if (addsWords(text, facts)) throw new AssistOutputError('The rewrite added a claim.');
-    if (addsNames(text, facts)) throw new AssistOutputError('The rewrite named something the facts did not.');
+    if (addsNames(text, facts, names)) throw new AssistOutputError('The rewrite named something the facts did not.');
     return { rank: program.rank, text };
   });
   return { intro, programs };

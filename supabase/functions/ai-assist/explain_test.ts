@@ -169,6 +169,7 @@ Deno.test('claims in ordinary words are refused; faithful wording about cost and
     'It compares with Élan Recovery.', 'It is close to Иван Петров.',
     'Aetna will pay for it.', 'Your insurance may pay for most of it.', 'Aetna is covering it.', 'Aetna reimburses the stay.',
     'There are no out-of-pocket costs with Aetna.', 'With Aetna it costs you nothing.', 'You will not pay out of pocket.', 'We take a fee of our own.',
+    'Our fee is 100 dollars.', 'We charge a fee of 87 dollars.', 'Next Ridge Recovery is close by.', 'One Ridge Recovery program is close by.',
   ]) {
     assertThrows(() => parseExplainOutput(first(`${base} ${claim}`), request()), AssistOutputError, undefined, claim);
   }
@@ -181,6 +182,7 @@ Deno.test('claims in ordinary words are refused; faithful wording about cost and
     'Juniper Ridge Recovery offers EMDR. Ask them about it in December.',
     'It\'s Juniper Ridge Recovery that offers EMDR. Here\'s Juniper Ridge Recovery again: it works with Aetna.',
     'Contact Juniper Ridge Recovery to ask about EMDR… Both Juniper Ridge Recovery and Cedar House work with families.',
+    'The Juniper Ridge Recovery team offers EMDR. Ask them how you would pay, and pay attention to what Aetna says.',
   ]) {
     assertEquals(parseExplainOutput(first(text), request()).programs[0].text, text);
   }

@@ -142,9 +142,13 @@ async function writeState(recorder: Recorder, userId: string, value: ReadState):
 
 const emptyState = (now = new Date()): ReadState => ({ floor: startOfToday(now), reviewed: {}, failing: {} });
 
+// Accounts deleted in this session: what was reviewed is never written for them again.
+const forgotten = new Set<string>();
+
 /** A change to what was reviewed, in its own queue (apart from the sign-in's). */
 function changeState(recorder: Recorder, userId: string, change: (state: ReadState) => void): Promise<void> {
   return serial(`${slot(recorder, userId)}:read`, async () => {
+    if (forgotten.has(slot(recorder, userId))) return;
     const state = (await readState(recorder, userId)) ?? emptyState();
     change(state);
     await writeState(recorder, userId, state);
@@ -334,7 +338,10 @@ export function disconnectRecorder(recorder: Recorder, userId: string): Promise<
 export async function forgetRecorders(userId: string): Promise<void> {
   if (!fieldySupported || !userId) return;
   await Promise.all(RECORDERS.map(async (recorder) => {
-    await SecureStore.deleteItemAsync(readKey(recorder, userId)).catch(() => undefined);
+    // In the read queue, and never written again in this session: a read
+    // still on its way cannot bring it back.
+    forgotten.add(slot(recorder, userId));
+    await serial(`${slot(recorder, userId)}:read`, () => SecureStore.deleteItemAsync(readKey(recorder, userId))).catch(() => undefined);
     await revokeAndForget(recorder, userId).catch(() => undefined);
   }));
 }
@@ -527,18 +534,24 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
   const transcript = transcriptPlan(toolList);
   const texts: Record<string, string> = {};
   const read: FieldyConversation[] = fresh.filter((item) => item.summary);
-  const needed = fresh.filter((item) => !item.summary);
-  const order = [...needed.filter((item) => !state.failing[item.id]), ...needed.filter((item) => state.failing[item.id])];
+  // Oldest first (the list may come newest first), those not failing before those failing.
+  const needed = fresh.filter((item) => !item.summary)
+    .sort((a, b) => Date.parse(a.startTime) - Date.parse(b.startTime) || a.id.localeCompare(b.id));
+  const failedFor = (item: FieldyConversation) => (state.failing[item.id] ? now.getTime() - Date.parse(state.failing[item.id]) : -1);
+  const order = [...needed.filter((item) => failedFor(item) < 0), ...needed.filter((item) => failedFor(item) >= 0)];
   const failing: Record<string, string> = {};
   const recovered: string[] = [];
   const started = Date.now();
   let reads = 0;
   for (const item of order) {
+    // Failing for a day already: taken as having no text, without another try.
+    if (failedFor(item) >= FAILING_GIVE_UP_MS) { read.push(item); continue; }
     if (reads >= DETAIL_READS || Date.now() - started > DETAIL_TIME_MS) continue;
     reads += 1;
     let failed = false;
     let fromNote = '';
     let fromTranscript = '';
+    let transcriptRead = false;
     if (note) {
       try { fromNote = await detail(recorder, session, note, item, now.getTime(), noteText); } catch { failed = true; }
     }
@@ -546,11 +559,15 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
     if (fromNote.length < SHORT_NOTE && transcript && !Number.isNaN(ended) && now.getTime() - ended >= SUMMARY_WAIT_MS) {
       try {
         fromTranscript = await detail(recorder, session, transcript, item, now.getTime(), (payload) => transcriptText(payload, item.id));
+        transcriptRead = true;
       } catch {
         failed = true;
       }
     }
-    const text = fromNote.length < SHORT_NOTE && fromTranscript ? fromTranscript : fromNote || fromTranscript;
+    // A short note ("No note has been generated…") is used only when the
+    // transcript was read and has no words, or there is no transcript to read.
+    const shortNoteOk = fromNote.length >= SHORT_NOTE || !transcript || transcriptRead;
+    const text = fromTranscript && fromNote.length < SHORT_NOTE ? fromTranscript : shortNoteOk ? fromNote || fromTranscript : '';
     if (text) {
       texts[item.id] = text;
       if (state.failing[item.id]) recovered.push(item.id);

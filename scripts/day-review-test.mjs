@@ -473,6 +473,8 @@ check(() => {
   const [kevinSmith] = build({ ...kevin, personName: 'Kevin Smith' });
   const [kevinJones] = rules.markSavedBefore(build({ ...kevin, personName: 'Kevin Jones', phone: '' }), new Set(rules.rowSignatures(kevinSmith, true)));
   assert.equal(kevinJones.include, true, 'but "Kevin Smith" saved never hides "Kevin Jones"');
+  const [otherKevin] = rules.markSavedBefore(build({ ...kevin, personName: 'Kevin Walsh', phone: '541-555-0300' }), new Set(rules.rowSignatures(kevinRow, true)));
+  assert.equal(otherKevin.include, true, 'a Kevin at another number is another caller');
 }, 'saved leads are matched by who called');
 check(() => {
   const at = (when) => rules.buildRows([found({ personName: 'Ana Rivera' })], workspace, TODAY, makeId, () => ({ label: 'From Fieldy, Nov 9', at: when }))[0].occurredAt;

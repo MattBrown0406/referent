@@ -280,6 +280,10 @@ check(() => {
   assert.match(api, /if \(later && !count\) break;/, 'a page past the end, empty or in words, ends the list');
   assert.match(api, /if \(later && error instanceof FieldyError && error\.reason === 'tool'\) break;/, 'so does an error on a page past the end');
   assert.match(api, /fromNote\.length < SHORT_NOTE && transcript/, 'a note too short to be one is checked against the transcript');
+  assert.match(api, /const shortNoteOk = fromNote\.length >= SHORT_NOTE \|\| !transcript \|\| transcriptRead;/, 'and used only when the transcript was read and is empty, or there is none');
+  assert.match(api, /if \(failedFor\(item\) >= FAILING_GIVE_UP_MS\) \{ read\.push\(item\); continue; \}/, 'a recording failing for a day is given up without another try');
+  assert.match(api, /\.sort\(\(a, b\) => Date\.parse\(a\.startTime\) - Date\.parse\(b\.startTime\)/, 'detail reads go oldest first');
+  assert.match(api, /if \(forgotten\.has\(slot\(recorder, userId\)\)\) return;/, 'a deleted account\'s read state is never written again');
   assert.match(api, /await Promise\.all\(RECORDERS\.map\(async \(recorder\) =>/, 'deleting the account forgets every recorder at once');
   assert.match(api, /return await Promise\.race\(\[work, deadline\]\)/, 'the deadline covers the whole answer, body included');
   assert.match(api, /if \(until!\(text\)\) \{ reader\.cancel\(\)/, 'an event stream is read only until the answer is in');
@@ -294,16 +298,20 @@ check(() => {
 }, 'the connection');
 check(() => {
   assert.doesNotMatch(sheet, /commitRecorderRead/);
-  assert.match(sheet, /results\[row\.key\]\?\.saved === true\s*\|\| \(!row\.include && \(switchedOffRef\.current\.has\(row\.key\)/, 'a recording is done once every item from it is saved or switched off by the practitioner');
+  assert.match(sheet, /if \(results\[row\.key\]\?\.saved === true\) return true;\s*if \(row\.include\) return false;\s*return switchedOffRef\.current\.has\(row\.key\) \|\| row\.found\.verified/,
+    'an item is decided when saved, switched off by the practitioner, or off for a reason the app gave; one off only because it could not be checked is not');
+  assert.match(sheet, /switchedOffRef\.current = new Set\(\);\s*setSaved\(\{\}\);/, 'what was switched off in an earlier review is not this one\'s');
+  assert.match(sheet, /phase === 'done' \? \(\s*<TouchableOpacity accessibilityRole="button" onPress=\{close\}/, 'the Done button asks about undecided recordings too');
   assert.match(sheet, /if \(!unsaved && read && undecided > 0\)/, 'closing asks about recordings with items never decided on');
   assert.doesNotMatch(sheet, /settleRecordings\(\{\}, built\)/, 'nothing is settled just because its items start switched off');
   assert.match(sheet, /return read\.blocks\.map\(\(block\) => block\.id\)/, 'every recording is considered, those with no items too');
   assert.match(sheet, /function finish\(\) \{\s*if \(phase !== 'finding' && phase !== 'saving'\) settleRecordings\(saved, rows\);/, 'closing the review settles what was set aside');
-  assert.match(sheet, /if \(phase === 'finding' && \(!notes\.trim\(\) \|\| recorderReadRef\.current\)\) \{ finish\(\); return; \}/, 'a slow read can be stopped; pasted notes are not thrown away without asking');
-  assert.match(sheet, /if \(current\.some\(\(row\) => !\(read\.rowIds\.get\(row\.key\)\?\.length\) && !settled\(row\)\)\) return \[\];/, 'an item from no one recording holds them all');
+  assert.match(sheet, /if \(phase === 'finding' && \(!notes\.trim\(\) \|\| recorderText\)\) \{ finish\(\); return; \}/, 'a slow read can be stopped; typed or pasted notes are not thrown away without asking');
+  assert.match(sheet, /if \(current\.some\(\(row\) => !matched\(row\) && row\.include && !rowDecided\(row, results\)\)\) return \[\];/, 'an item still on from no one recording holds them all');
   assert.match(sheet, /\/\/ Kept before the review runs, so a retry after a failed one is still these recordings\./);
   assert.match(sheet, /\.concat\(skipped\);/, 'one with nothing found, or skipped, is done on reading');
   assert.match(sheet, /function markAllReviewed\(\)/, 'the practitioner can be done with them');
+  assert.match(sheet, /onPress=\{\(\) => readRecorderAsking\(recorder\)\}/, 'reading a recorder asks before replacing typed notes');
   assert.match(sheet, /if \(keyMissing && status\.state !== 'on' && status\.state !== 'leaving'\) return null;/, 'a connected recorder can be disconnected without a key');
   assert.match(sheet, /blocksFor\(found\.evidence, blocks\)/);
   assert.match(read('src/lib/WorkspaceScreen.tsx'), /forgetRecorders\(userId\)/, 'deleting the account disconnects every recorder');

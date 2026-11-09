@@ -95,6 +95,8 @@ Deno.test('a reason that prescribes a level of care is dropped; the rating stays
     { reason: 'Was in residential treatment in 2023 and relapsed.' },
   ]), request());
   assertEquals(other.slice(0, 4).map((item) => item.reason), ['', '', '', ''], 'other ways of prescribing a level');
+  const owned = parseLevelOutput(answer([{ reason: 'Her detox is needed now.' }, { reason: 'Their residential stay is necessary.' }, { reason: 'Her IOP is right there in town.' }]), request());
+  assertEquals(owned.slice(0, 3).map((item) => item.reason), ['', '', 'Her IOP is right there in town.'], 'a level with "her" in front still prescribes; a place does not');
   assertEquals(other[4].reason, 'Was in residential treatment in 2023 and relapsed.', 'past care is history, not a prescription');
   const history = [
     'Considerable cravings since leaving detox last spring.', 'She considered outpatient last year but did not go.',
