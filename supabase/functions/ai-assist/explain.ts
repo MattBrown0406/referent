@@ -107,34 +107,31 @@ export function explainSchema(): Record<string, unknown> {
 // Words and phrases a rewrite may use only when its facts already do:
 // promises, rankings, outcomes, beds and admission, and money ties (the app
 // adds the disclosures itself, below the text).
-// Single words only where they are claims in any sentence; words that are
-// ordinary in other sentences ("on top of that", "you and your partner",
-// "ask about the fee") are checked as the phrases that make them claims.
+// Words a rewrite may use only when its facts already do: promises,
+// rankings, outcomes, beds and admission, and money ties (the app adds the
+// disclosures itself, below the text). A few everyday phrases that contain
+// one of them ("on top of that", "your partner", "ask about the fee") are
+// taken out before the check; nothing else is let through.
 const UNSAID = [
   'best', 'guarantee', 'guaranteed', 'guarantees', 'cure', 'cured', 'cures', 'promise', 'promises', 'promised', 'definitely', 'certainly',
-  'recommend', 'recommends', 'recommended', 'recommendation', 'strongest', 'ideal', 'perfect', 'excellent', 'superior', 'leading',
-  'proven', 'success', 'successful', 'bed', 'beds', 'admit', 'admits', 'admitted', 'financial', 'commission', 'sponsor', 'sponsored',
+  'recommend', 'recommends', 'recommended', 'recommendation', 'top', 'tier', 'strongest', 'ideal', 'perfect', 'excellent', 'outstanding',
+  'superior', 'leading', 'trusted', 'proven', 'success', 'successful', 'outcome', 'outcomes', 'results', 'bed', 'beds', 'admit', 'admits',
+  'admitted', 'admission', 'admissions', 'waiting', 'financial', 'fee', 'fees', 'paid', 'pays', 'ties', 'commission', 'sponsor', 'sponsored',
+  'partner', 'partners', 'partnered', 'partnership', 'affiliated', 'affiliate',
 ];
 const UNSAID_PHRASES = [
-  'right choice', 'right fit', 'first choice', 'top choice', 'top pick', 'top program', 'top recommendation', 'top rated', 'top notch',
-  'no connection', 'not connected', 'no relationship', 'no ties', 'ties to', 'referral fee', 'referral fees', 'finder fee', 'no fee', 'no fees',
-  'we are paid', 'we get paid', 'pays us', 'our partner', 'partner program', 'partnered with', 'we partner', 'in partnership',
-  'great results', 'good results', 'strong results', 'better results', 'real results', 'great outcomes', 'good outcomes', 'strong outcomes',
-  'better outcomes', 'bed waiting', 'spot waiting', 'no waiting', 'no wait', 'waiting for your', 'can start today', 'start right away',
+  'right choice', 'right fit', 'first choice', 'no connection', 'not connected', 'no relationship', 'same day', 'can start today',
+  'start right away',
 ];
-
-// US states written out, for a rewrite that spells out the facts' "OR" or "CA".
-const STATE_NAMES = ['alabama', 'alaska', 'arizona', 'arkansas', 'california', 'colorado', 'connecticut', 'delaware', 'florida', 'georgia',
-  'hawaii', 'idaho', 'illinois', 'indiana', 'iowa', 'kansas', 'kentucky', 'louisiana', 'maine', 'maryland', 'massachusetts', 'michigan',
-  'minnesota', 'mississippi', 'missouri', 'montana', 'nebraska', 'nevada', 'hampshire', 'jersey', 'mexico', 'york', 'carolina', 'dakota',
-  'ohio', 'oklahoma', 'oregon', 'pennsylvania', 'rhode', 'island', 'tennessee', 'texas', 'utah', 'vermont', 'virginia', 'washington',
-  'west', 'wisconsin', 'wyoming', 'north', 'south', 'district', 'columbia'];
+const EVERYDAY_PHRASES = ['on top of that', 'on top of this', 'you and your partner', 'your partner', 'ask about the fee', 'ask about fees',
+  'ask about the fees', 'while waiting', 'waiting to hear'];
 
 function addsWords(text: string, facts: string): string | null {
   const factWords = ` ${comparable(facts)} `;
   const said = new Set(factWords.trim().split(' '));
-  const words = new Set(comparable(text).split(' '));
-  const textWords = ` ${comparable(text)} `;
+  let textWords = ` ${comparable(text)} `;
+  for (const phrase of EVERYDAY_PHRASES) textWords = textWords.split(` ${phrase} `).join(' ');
+  const words = new Set(textWords.trim().split(' '));
   return UNSAID.find((word) => words.has(word) && !said.has(word))
     ?? UNSAID_PHRASES.find((phrase) => textWords.includes(` ${phrase} `) && !factWords.includes(` ${phrase} `))
     ?? null;
@@ -147,15 +144,30 @@ function addsWords(text: string, facts: string): string | null {
  */
 function addsNames(text: string, facts: string): boolean {
   const known = ` ${comparable(facts)} `;
-  const isKnown = (word: string) => !word || known.includes(` ${word} `) || ALWAYS_CAPITALIZED.has(word) || STATE_NAMES.includes(word);
-  for (const match of text.matchAll(/(?<=[^.!?:;\s"“(]\s+)[A-Z][a-zA-Z'’-]*/g)) {
-    // "Juniper Ridge Recovery's", "Pine Valley's": the name without its 's.
-    const bare = match[0].replace(/['’]s$/i, '');
-    // A hyphenated name is known when each part is.
-    if (!comparable(bare).split(' ').every(isKnown)) return true;
+  // A state written out only where the facts give its code ("Bend, OR" lets "Oregon" through).
+  const states = new Set([...facts.matchAll(/\b([A-Z]{2})\b/g)].map((match) => STATE_BY_CODE[match[1]] || '').filter(Boolean));
+  // Each run of capitalized words is one name ("Juniper Ridge Recovery's",
+  // "Oregon Recovery"): the whole run must be in the facts, or be a state
+  // they give, or be a word that is always capitalized.
+  for (const match of text.matchAll(/(?<=[^.!?:;\s"“(]\s+)[A-Z][a-zA-Z'’-]*(?:\s+[A-Z][a-zA-Z'’-]*)*/g)) {
+    const words = match[0].split(/\s+/).map((word) => word.replace(/['’]s$/i, ''));
+    const phrase = comparable(words.join(' '));
+    if (!phrase || known.includes(` ${phrase} `) || states.has(phrase)) continue;
+    if (words.every((word) => ALWAYS_CAPITALIZED.has(comparable(word)))) continue;
+    return true;
   }
   return false;
 }
+
+const STATE_BY_CODE: Record<string, string> = {
+  AL: 'alabama', AK: 'alaska', AZ: 'arizona', AR: 'arkansas', CA: 'california', CO: 'colorado', CT: 'connecticut', DE: 'delaware',
+  DC: 'district of columbia', FL: 'florida', GA: 'georgia', HI: 'hawaii', ID: 'idaho', IL: 'illinois', IN: 'indiana', IA: 'iowa',
+  KS: 'kansas', KY: 'kentucky', LA: 'louisiana', ME: 'maine', MD: 'maryland', MA: 'massachusetts', MI: 'michigan', MN: 'minnesota',
+  MS: 'mississippi', MO: 'missouri', MT: 'montana', NE: 'nebraska', NV: 'nevada', NH: 'new hampshire', NJ: 'new jersey',
+  NM: 'new mexico', NY: 'new york', NC: 'north carolina', ND: 'north dakota', OH: 'ohio', OK: 'oklahoma', OR: 'oregon',
+  PA: 'pennsylvania', RI: 'rhode island', SC: 'south carolina', SD: 'south dakota', TN: 'tennessee', TX: 'texas', UT: 'utah',
+  VT: 'vermont', VA: 'virginia', WA: 'washington', WV: 'west virginia', WI: 'wisconsin', WY: 'wyoming',
+};
 
 const ALWAYS_CAPITALIZED = new Set(['i', 'referralfit', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']);
 

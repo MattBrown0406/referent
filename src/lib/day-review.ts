@@ -793,7 +793,10 @@ export function rowSignatures(row: ReviewRow): string[] {
   // Only for a lead: two other items often quote one sentence ("call Ana
   // and Sarah back tomorrow") and are still two things to save.
   const quote = comparable(row.found.evidence);
-  if (row.found.kind === 'new_lead' && row.found.verified && quote.split(' ').length >= 4) out.push(`new_lead|any|q:${quote}`);
+  // Two leads quoting one sentence are two callers: the caller is part of it.
+  if (row.found.kind === 'new_lead' && row.found.verified && quote.split(' ').length >= 4) {
+    out.push(`new_lead|any|q:${quote}|${comparable(row.found.personName) || phoneKey(row.found.phone) || cleanEmail(row.found.email)}`);
+  }
   return out;
 }
 

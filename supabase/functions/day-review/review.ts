@@ -295,34 +295,45 @@ function emailFromNotes(value: unknown, emails: Set<string>): string {
 
 // A quote counts only when it is long enough to show something and appears
 // in the notes word for word (ignoring case, punctuation and line breaks).
-// Words a name may gain or lose between the notes and the review
-// ("Juniper Ridge" for "Juniper Ridge Recovery Center", "Dr. Patel" for
-// "Patel", "the Rivera family" for "the Riveras"): titles, and the words
-// in many program names that say nothing about which one (as GENERIC_ORG
-// in src/lib/day-review.ts).
-const NAME_FILLER = new Set([
-  'the', 'of', 'and', 'for', 'at', 'a', 'an', 'inc', 'llc', 'pc', 'pllc', 'mr', 'mrs', 'ms', 'miss', 'dr', 'doctor', 'family', 'families',
-  'new', 'recovery', 'center', 'centers', 'centre', 'treatment', 'house', 'home', 'homes', 'health', 'healthcare', 'behavioral', 'mental',
-  'services', 'service', 'wellness', 'sober', 'living', 'detox', 'inpatient', 'outpatient', 'residential', 'program', 'programs',
-  'institute', 'clinic', 'intervention', 'interventions', 'counseling', 'therapy', 'care', 'addiction', 'rehab', 'rehabilitation',
-  'foundation', 'associates', 'partners', 'network', 'solutions', 'academy', 'campus', 'hospital', 'group', 'iop', 'php',
+// Words a name may gain or lose between the notes and the review. For a
+// person, only titles ("Dr. Patel" for "Patel") and "family" ("the Rivera
+// family" for "the Riveras"); for an organization, also the words in many
+// program names that say nothing about which one ("Juniper Ridge" for
+// "Juniper Ridge Recovery Center"; as GENERIC_ORG in src/lib/day-review.ts).
+const PERSON_FILLER = new Set(['the', 'of', 'and', 'mr', 'mrs', 'ms', 'miss', 'dr', 'doctor', 'family', 'families']);
+const ORG_FILLER = new Set([
+  ...PERSON_FILLER, 'for', 'at', 'a', 'an', 'inc', 'llc', 'pc', 'pllc', 'new', 'recovery', 'center', 'centers', 'centre', 'treatment',
+  'house', 'home', 'homes', 'health', 'healthcare', 'behavioral', 'mental', 'services', 'service', 'wellness', 'sober', 'living', 'detox',
+  'inpatient', 'outpatient', 'residential', 'program', 'programs', 'institute', 'clinic', 'intervention', 'interventions', 'counseling',
+  'therapy', 'care', 'addiction', 'rehab', 'rehabilitation', 'foundation', 'associates', 'partners', 'network', 'solutions', 'academy',
+  'campus', 'hospital', 'group', 'iop', 'php',
 ]);
 
-/** A word of a name in the notes as written, or as a plural or possessive ("Riveras", "Patel's"). */
-function wordInNotes(word: string, notesComparable: string): boolean {
-  return [` ${word} `, ` ${word}s `, ` ${word}es `, ` ${word} s `].some((form) => notesComparable.includes(form))
-    || (word.endsWith('s') && notesComparable.includes(` ${word.slice(0, -1)} `));
+/** The words the notes write with a capital letter, without a trailing 's ("Patel's" is "patel"). */
+export function capitalizedWords(notes: string): Set<string> {
+  return new Set([...notes.matchAll(/[A-Z][A-Za-z'’-]*/g)].map((match) => comparable(match[0].replace(/['’]s$/i, ''))).filter(Boolean));
 }
 
 /**
  * A name or organization the review gives is in the notes: every word of it
- * that is not filler is a word there. A name the notes never mention makes
- * the item unverified, so it is never saved without the practitioner looking.
+ * that is not filler is a word there, or (written with a capital letter, as
+ * a name is) its plural or possessive ("the Riveras", "Patel's"). In notes
+ * written with capitals, at least one of its words must be written with one
+ * there too, so ordinary words ("hope", "life") never make up a name. A
+ * name the notes never mention makes the item unverified, so it is never
+ * saved without the practitioner looking.
  */
-export function nameInNotes(name: string, notesComparable: string): boolean {
-  const words = comparable(name).split(' ').filter((word) => word.length > 1 && !NAME_FILLER.has(word));
-  if (!words.length) return comparable(name) === '' ? true : notesComparable.includes(` ${comparable(name)} `);
-  return words.every((word) => wordInNotes(word, notesComparable));
+export function nameInNotes(name: string, notesComparable: string, capitals: Set<string> | null = null, kind: 'person' | 'organization' = 'person'): boolean {
+  const filler = kind === 'organization' ? ORG_FILLER : PERSON_FILLER;
+  const all = comparable(name);
+  if (!all) return true;
+  const words = all.split(' ').filter((word) => word.length > 1 && !filler.has(word));
+  if (!words.length) return notesComparable.includes(` ${all} `);
+  const proper = (word: string) => Boolean(capitals && (capitals.has(word) || capitals.has(`${word}s`) || capitals.has(`${word}es`)));
+  const found = words.every((word) => notesComparable.includes(` ${word} `) || proper(word));
+  // Notes typed all in lower case have no capitals to go by.
+  const needsCapital = Boolean(capitals && capitals.size >= 3);
+  return found && (!needsCapital || words.some(proper));
 }
 
 function quoteInNotes(evidence: string, notesComparable: string): boolean {
@@ -364,6 +375,7 @@ export function parseReviewOutput(raw: string, request: ReviewRequest): FoundIte
   const phones = notesPhones(request.text);
   const emails = notesEmails(request.text);
   const notesComparable = ` ${comparable(request.text)} `;
+  const capitals = capitalizedWords(request.text);
   const items: FoundItem[] = [];
   for (const entry of list) {
     if (items.length >= LIMITS.items) break;
@@ -392,7 +404,8 @@ export function parseReviewOutput(raw: string, request: ReviewRequest): FoundIte
       verified: false,
       namesFound: true,
     };
-    item.namesFound = [item.personName, item.organization, item.aboutFirstName].every((name) => nameInNotes(name, notesComparable));
+    item.namesFound = nameInNotes(item.personName, notesComparable, capitals) && nameInNotes(item.aboutFirstName, notesComparable, capitals)
+      && nameInNotes(item.organization, notesComparable, capitals, 'organization');
     item.verified = quoteInNotes(fullEvidence, notesComparable) && item.namesFound;
     // A promise nobody kept is due now.
     if (item.missed && !item.dueDate) item.dueDate = request.today;

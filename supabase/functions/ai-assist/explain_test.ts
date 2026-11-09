@@ -121,6 +121,16 @@ Deno.test('rankings, outcomes, beds, money ties and outside names are refused; p
     `${base} It has an excellent success rate and proven results.`,
     `${base} We have no financial ties to it.`,
     `${base} Families often compare it with Hazelden.`,
+    `${base} It is a ReferralFit partner.`,
+    `${base} It is a trusted partner of ours.`,
+    `${base} We are not paid by Juniper Ridge Recovery.`,
+    `${base} It offers same-day admission.`,
+    `${base} Families see positive outcomes and lasting results.`,
+    `${base} It has outstanding results.`,
+    `${base} It is a top-tier program.`,
+    `${base} It is at the top of our list.`,
+    `${base} It ranks above Oregon Recovery.`,
+    `${base} It is affiliated with Columbia.`,
   ]) {
     assertThrows(() => parseExplainOutput(first(claim), request()), AssistOutputError, undefined, claim);
   }
@@ -135,7 +145,7 @@ Deno.test('faithful rewrites pass: possessives, a state written out, everyday wo
   for (const text of [
     'Juniper Ridge Recovery\'s team offers inpatient care and works with Aetna. It comes before Cedar House\'s program because it offers more of what your loved one needs.',
     'Juniper Ridge Recovery is in Bend, Oregon, offers inpatient care and works with Aetna.',
-    'Juniper Ridge Recovery offers inpatient care. On top of that, it works with Aetna, so you and your partner can ask about the fee and the results you can expect while waiting to hear back.',
+    'Juniper Ridge Recovery offers inpatient care. On top of that, it works with Aetna, so you and your partner can ask about the fee while waiting to hear back.',
   ]) {
     const result = parseExplainOutput(first(text), request());
     assertEquals(result.programs[0].text, text);

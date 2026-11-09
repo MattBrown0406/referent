@@ -75,6 +75,13 @@ Deno.test('a reason that prescribes a level of care is dropped; the rating stays
   assertEquals(ratings[0].reason, '');
   assertEquals(ratings[0].rating, 4);
   assertEquals(ratings[1].reason, 'Prior detox at a hospital.', 'naming past care is fine');
+  const more = parseLevelOutput(answer([
+    { reason: 'Needs a safe, structured residential setting.' },
+    { reason: 'Requires 24-hour, medically managed detox.' },
+    { reason: 'Needs help with cravings, though two past outpatient programs did not stop the drinking.' },
+  ]), request());
+  assertEquals([more[0].reason, more[1].reason], ['', ''], 'a comma inside the clause still prescribes');
+  assertEquals(more[2].reason, 'Needs help with cravings, though two past outpatient programs did not stop the drinking.', 'a new clause that names past care does not');
 });
 
 Deno.test('a missing, repeated or out-of-range rating is refused', () => {

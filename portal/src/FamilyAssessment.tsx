@@ -195,13 +195,23 @@ export default function FamilyAssessment() {
    * (mergeAnswers), and saved again. When the server's answers are this
    * page's own (a save whose answer was lost), nothing was changed elsewhere.
    */
-  const resolveConflict = useCallback(async (sent: Answers): Promise<boolean> => {
-    if (!token) return false;
-    const { data, error } = await supabase.rpc('public_family_assessment_open', { p_token: token });
-    const fresh = error ? null : assessmentViewFromJson(data);
-    if (!fresh || fresh.status !== 'open') { closedRef.current = true; await fetchView(); return false; }
+  const resolveConflict = useCallback(async (sent: Answers): Promise<'merged' | 'own' | 'retry' | 'closed'> => {
+    if (!token) return 'retry';
+    let fresh: AssessmentView | null;
+    try {
+      const { data, error } = await supabase.rpc('public_family_assessment_open', { p_token: token });
+      // A failed read is not a closed assessment: keep everything and try again.
+      if (error) { dirtyRef.current = true; return 'retry'; }
+      fresh = assessmentViewFromJson(data);
+    } catch {
+      dirtyRef.current = true;
+      return 'retry';
+    }
+    if (!fresh || fresh.status !== 'open') { closedRef.current = true; await fetchView(); return 'closed'; }
     const own = sameAnswers(fresh.answers, sent) || unconfirmedRef.current.some((item) => sameAnswers(item, fresh.answers));
-    const merged = mergeAnswers(baseRef.current, answersRef.current, fresh.answers);
+    // The server holds this page's own earlier save: the page's answers as
+    // they are now are the newest (an answer changed back stays changed back).
+    const merged = own ? answersRef.current : mergeAnswers(baseRef.current, answersRef.current, fresh.answers);
     revisionRef.current = fresh.revision;
     baseRef.current = fresh.answers;
     unconfirmedRef.current = [];
@@ -214,7 +224,7 @@ export default function FamilyAssessment() {
       conflictsRef.current += 1;
       setNotice('Some answers were also changed in another tab or on another device. Both sets of changes are kept; please look this section over.');
     }
-    return !own;
+    return own ? 'own' : 'merged';
   }, [token, fetchView]);
 
   // Every save goes with keepalive (when small enough for it), so one made
@@ -223,7 +233,8 @@ export default function FamilyAssessment() {
     const body = JSON.stringify({ p_token: token, p_answers: answersToSave, p_step: stepToSave, p_revision: revision });
     const response = await fetch(`${projectUrl}/rest/v1/rpc/public_family_assessment_save`, {
       method: 'POST',
-      keepalive: body.length < 60_000,
+      // The 64 KB keepalive limit is in bytes (a character can be up to 4).
+      keepalive: new TextEncoder().encode(body).length < 60_000,
       headers: { apikey: publishableKey, authorization: `Bearer ${publishableKey}`, 'content-type': 'application/json' },
       body,
     });
@@ -253,10 +264,12 @@ export default function FamilyAssessment() {
           if (pending.step >= 1) setResumeStep(pending.step);
           break;
         }
-        case 'changed_elsewhere':
-          await resolveConflict(pending.answers);
+        case 'changed_elsewhere': {
+          const outcome = await resolveConflict(pending.answers);
+          if (outcome === 'retry') { retry = true; setSaveState('failed'); break; }
           setSaveState(dirtyRef.current ? 'saving' : 'saved');
           break;
+        }
         case 'already_sent':
         case 'link_stopped':
           closedRef.current = true;
@@ -444,9 +457,10 @@ export default function FamilyAssessment() {
         const outcome = saveOutcome(error);
         if (outcome === 'already_sent' || outcome === 'link_stopped') { closedRef.current = true; await fetchView(); return; }
         if (outcome === 'changed_elsewhere') {
-          await resolveConflict(answersRef.current);
+          const resolved = await resolveConflict(answersRef.current);
           if (dirtyRef.current) queueSave(true);
-          setNotice('Some answers were changed in another tab or on another device. Please look them over, then sign again.');
+          if (resolved === 'merged') setNotice('Some answers were changed in another tab or on another device. Please look them over, then sign again.');
+          else if (resolved === 'own' || resolved === 'retry') setProblem('It was not sent yet. Your answers are being saved; please try again in a moment.');
           return;
         }
         setProblem(error.code && error.message ? error.message : 'It was not sent. Check your connection and try again.');

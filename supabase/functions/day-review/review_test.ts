@@ -6,6 +6,7 @@ import {
   clipWords,
   comparable,
   LIMITS,
+  capitalizedWords,
   nameInNotes,
   notesEmails,
   notesPhones,
@@ -168,15 +169,26 @@ Deno.test('a person or organization the notes never name is not verified', () =>
   assertEquals(shortened.verified, true, '"Center" added to a name in the notes is fine');
   assertEquals(named.verified, true);
   const notes = ` ${comparable(NOTES)} `;
-  assertEquals(nameInNotes('', notes), true);
-  assertEquals(nameInNotes('Harbor Light', notes), true);
-  assertEquals(nameInNotes('The Center', notes), false, 'a name of nothing but filler must be there whole');
-  const more = ` ${comparable('Spoke with the Riveras. Faxed Patel\'s office. Called Cedar House about a bed.')} `;
-  assertEquals(nameInNotes('the Rivera family', more), true, 'a plural family name');
-  assertEquals(nameInNotes('Ana Rivera', more), false, 'a first name the notes never give');
-  assertEquals(nameInNotes('Dr. Patel', more), true, 'a title and a possessive');
-  assertEquals(nameInNotes('Cedar House Detox', more), true, 'a program word added');
-  assertEquals(nameInNotes('Kathy Smith', more), false);
+  const caps = capitalizedWords(NOTES);
+  assertEquals(nameInNotes('', notes, caps), true);
+  assertEquals(nameInNotes('Harbor Light', notes, caps, 'organization'), true);
+  assertEquals(nameInNotes('The Center', notes, caps, 'organization'), false, 'a name of nothing but filler must be there whole');
+  const text = 'Spoke with the Riveras. Faxed Patel\'s office. Called Cedar House about a bed. She hopes he will go. His life is a mess. Saw the Lees at home.';
+  const more = ` ${comparable(text)} `;
+  const moreCaps = capitalizedWords(text);
+  assertEquals(nameInNotes('the Rivera family', more, moreCaps), true, 'a plural family name');
+  assertEquals(nameInNotes('Ana Rivera', more, moreCaps), false, 'a first name the notes never give');
+  assertEquals(nameInNotes('Dr. Patel', more, moreCaps), true, 'a title and a possessive');
+  assertEquals(nameInNotes('Cedar House Detox', more, moreCaps, 'organization'), true, 'a program word added');
+  assertEquals(nameInNotes('Kathy Smith', more, moreCaps), false);
+  for (const invented of ['Hope Sober Living', 'Homes of Hope', 'New Life Home', 'Sons Recovery']) {
+    assertEquals(nameInNotes(invented, more, moreCaps, 'organization'), false, `"${invented}" is ordinary words, not a name in the notes`);
+  }
+  for (const invented of ['Mrs. Hope', 'Tom Lee', 'Dr. Tom']) {
+    assertEquals(nameInNotes(invented, more, moreCaps), false, `"${invented}" is not in the notes`);
+  }
+  assertEquals(nameInNotes('Sarah Miller', ' called sarah miller about her son ', capitalizedWords('called sarah miller about her son')), true,
+    'notes typed in lower case are matched as written');
 });
 
 Deno.test('a quote too short to show anything is not verified', () => {

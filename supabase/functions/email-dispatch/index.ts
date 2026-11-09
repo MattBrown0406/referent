@@ -105,16 +105,16 @@ async function sendOne(row: OutboxRow, apiKey: string, defaultFrom: string, defa
   } catch {
     return { id: row.id, error: 'render_failed', retry: false };
   }
+  // A practice's invite needs the practitioner to reply to: without one a
+  // family's reply (it may carry health details) would go to someone else.
+  if (row.kind === 'family_assessment_invite' && !replyTo) return { id: row.id, error: 'no_reply_to', retry: false };
   const sent = await post(row, email, apiKey, from, replyTo, target);
-  // Resend refused a practice's own sender (a 422 about it): send that one
-  // email from ReferralFit's own name instead, still replying to the
-  // practitioner (never to anyone else: the family may reply with health
-  // details). If that is refused too, this one email fails on its own, so
-  // one practice's settings can never stop the queue for everyone.
-  if (sent.charge && from !== defaultFrom) {
-    const again = await post(row, email, apiKey, defaultFrom, replyTo, target);
-    return again.charge ? { id: row.id, error: again.error, retry: false } : again;
-  }
+  // Resend refused a practice's own sender name (a 422 about the sender):
+  // send that one email from ReferralFit's own name instead, still replying
+  // to the practitioner. A second refusal is about the account or the
+  // reply-to, and is handled as any sender refusal (the run stops and the
+  // email waits), never by changing who replies reach.
+  if (sent.charge && from !== defaultFrom) return post(row, email, apiKey, defaultFrom, replyTo, target);
   return sent;
 }
 

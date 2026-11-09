@@ -291,7 +291,7 @@ check(() => {
   assert.match(page, /\{flags\.length \? <CrisisLine urgent \/> : null\}/, '911 and 988 the moment an answer suggests danger');
   assert.match(page, /href="tel:911"[^]*href="tel:988"[^]*href="sms:988"/, 'one tap to call 911, or to call or text 988');
   assert.match(page, /p_revision: revisionRef\.current/, 'every save says which revision it is from');
-  assert.match(page, /keepalive: body\.length < 60_000/, 'every save goes with keepalive, so one sent as the page goes away arrives');
+  assert.match(page, /keepalive: new TextEncoder\(\)\.encode\(body\)\.length < 60_000/, 'every save goes with keepalive, so one sent as the page goes away arrives');
   assert.match(page, /mergeAnswers\(baseRef\.current, answersRef\.current, fresh\.answers\)/, 'a conflict keeps the family\'s own changes');
   assert.match(page, /if \(uploading\) \{ setProblem\(/, 'sending waits for a card photo on its way');
   assert.match(page, /conflictsRef\.current !== conflicts/, 'answers from another device while signing are looked over first');

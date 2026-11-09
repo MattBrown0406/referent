@@ -23,6 +23,9 @@ import { createClient } from 'npm:@supabase/supabase-js@2.110.8';
 import { requiredEnv } from '../_shared/webhooks.ts';
 import { parseUploadRequest, uploadName, UploadRequestError } from './upload.ts';
 
+// Supabase's signed upload links work for two hours; a little more, to be sure.
+const UPLOAD_LINK_LIFETIME_MS = 2.5 * 60 * 60 * 1000;
+
 const CORS_HEADERS = {
   'access-control-allow-origin': '*',
   'access-control-allow-headers': 'authorization, x-client-info, apikey, content-type',
@@ -87,17 +90,25 @@ Deno.serve(async (request) => {
       console.error('family_assessment_photo_done failed', error.code || 'unknown');
       return failure(500, 'server_error', 'The photo could not be saved right now. Try again.');
     }
-    // The photo this one replaced, and any other upload of this side that
-    // never got recorded (a tab closed between upload and done): nobody
-    // sees them any more.
+    // The photo this one replaced, and uploads of this side that were never
+    // recorded and are older than any upload link (a tab closed between
+    // upload and done). Each is checked just before: one another tab or
+    // device recorded meanwhile, or one still on its way, is never removed.
     const folder = upload.path.slice(0, upload.path.lastIndexOf('/'));
     const { data: listed } = await supabase.storage.from('assessment-files').list(folder, { limit: 100 });
-    const stale = new Set((listed || [])
+    const cutoff = Date.now() - UPLOAD_LINK_LIFETIME_MS;
+    const candidates = new Set((listed || [])
+      .filter((item) => Date.parse(String(item.created_at || '')) < cutoff)
       .map((item) => `${folder}/${item.name}`)
       .filter((path) => path !== upload.path && path.startsWith(`${folder}/card-${upload.side}-`)));
-    if (typeof replaced === 'string' && replaced) stale.add(replaced);
-    if (stale.size) {
-      const { error: removeError } = await supabase.storage.from('assessment-files').remove([...stale]);
+    if (typeof replaced === 'string' && replaced) candidates.add(replaced);
+    const stale: string[] = [];
+    for (const path of candidates) {
+      const { data: recorded, error: checkError } = await supabase.rpc('family_assessment_photo_recorded', { p_path: path });
+      if (!checkError && recorded === false) stale.push(path);
+    }
+    if (stale.length) {
+      const { error: removeError } = await supabase.storage.from('assessment-files').remove(stale);
       if (removeError) console.error('removing replaced card photos failed');
     }
     return reply({ done: true });

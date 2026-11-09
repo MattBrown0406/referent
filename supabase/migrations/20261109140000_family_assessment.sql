@@ -493,9 +493,14 @@ LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
+  -- SKIP LOCKED: a row the dispatcher is preparing right now is left to it
+  -- (it finds the assessment gone and sends nothing), so a delete never
+  -- waits on the dispatcher while the dispatcher waits on the assessment.
   UPDATE public.email_outbox o SET error = 'deleted'
-   WHERE o.kind IN ('family_assessment_invite', 'family_assessment_submitted', 'family_assessment_urgent')
-     AND o.data ->> 'assessment_id' = OLD.id::text AND o.sent_at IS NULL AND o.error IS NULL;
+   WHERE o.id IN (SELECT x.id FROM public.email_outbox x
+                   WHERE x.kind IN ('family_assessment_invite', 'family_assessment_submitted', 'family_assessment_urgent')
+                     AND x.data ->> 'assessment_id' = OLD.id::text AND x.sent_at IS NULL AND x.error IS NULL
+                     FOR UPDATE SKIP LOCKED);
   RETURN OLD;
 END
 $$;
