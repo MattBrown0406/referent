@@ -1,7 +1,9 @@
 # Day review: your recorder fills in ReferralFit
 
 **Status: Phase 1 built (2026-11-08, branch feat/day-review): paste notes,
-review, approve.** Phases 2 and 3 below are the plan. For practitioners who
+review, approve. Phase 2, Fieldy connected, built 2026-11-08 on the same
+branch** (see "Fieldy, as built" below). The share extension, background
+refresh and push are still the plan. For practitioners who
 have added their own Anthropic key (AI drafts). Goal from Matt: "as
 automated as possible, the fewer steps for the user the better."
 
@@ -43,6 +45,40 @@ or a packet that was promised and never sent.
    the same through a Zapier zap ("Transcript & Summary Ready", then a POST
    to a private ReferralFit link). Both land on ReferralFit's server, so they
    belong to the real-time option under "Decisions".
+
+## Fieldy, as built (2026-11-08)
+
+- **Registration:** ReferralFit registered itself with Fieldy once, by
+  dynamic client registration (Fieldy's guide for apps used by other
+  people): a native public client (no secret), redirect
+  `com.mattbrown.referralfit:/oauth/fieldy`, client id in
+  `src/lib/fieldy.ts`. Nobody registers anything per user.
+- **Connect Fieldy** (Review notes): the practitioner signs in to their own
+  Fieldy account in the system sheet (PKCE S256, state and issuer checked)
+  and approves only `openid email offline_access conversations:read
+  transcripts:read`. The refresh token stays in this phone's keychain for
+  this account (`AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY`: never synced or
+  backed up), rotates on every refresh (one refresh at a time), and is
+  revoked at Fieldy on Disconnect. Nothing about Fieldy reaches
+  ReferralFit's server.
+- **Reading:** Fieldy's MCP server, straight from the phone. The list tool
+  and its argument names are read from `tools/list` (they mirror the Public
+  API's `GET /conversations?startTime&endTime&pageSize&cursor`). New
+  conversations since the last review (the first time: since the start of
+  today), oldest first, each under a header ("From Fieldy, Nov 9, 2:15 PM ·
+  title"), up to the review's 12,000 characters; the rest, and one Fieldy
+  has not summarized yet (ended under 90 minutes ago), wait for the next
+  read. An older one with no summary is read from its transcript.
+- **Review:** the same review as pasted notes. Each item says which
+  conversation it came from, and a note keeps that on the timeline. The read
+  moves on only once something from it is saved (or nothing was found), so
+  conversations read but not reviewed come back next time.
+- **Automatic:** when the app opens or comes back (at most every 15
+  minutes) it counts new conversations, never reviewing them. Today shows
+  "From your day: N new Fieldy conversations to review"; one tap opens the
+  review and reads them. While some wait, one local reminder at 6 PM:
+  "Your Fieldy conversations from today are ready to review." (no names).
+  Background refresh while the app is closed is not built yet.
 
 ## What the AI finds, and what approving does
 

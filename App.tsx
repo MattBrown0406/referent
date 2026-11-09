@@ -84,6 +84,7 @@ import DayReviewSheet from './src/lib/DayReviewSheet';
 import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
 import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
 import type { LevelOfCareSeed } from './src/lib/LevelOfCareSheet';
+import { countNewFieldyConversations, fieldySupported } from './src/lib/fieldy-api';
 import { aiKeysSupported } from './src/lib/outreach-api';
 import {
   caseRecipients,
@@ -236,6 +237,7 @@ import {
   getNotificationPermissionState,
   requestNotificationPermission,
   rescheduleNotifications,
+  setDayReviewWaiting,
   subscribeToNotificationResponses,
   todayLoad,
 } from './src/lib/notifications';
@@ -1303,6 +1305,10 @@ export default function App() {
   // Day review: notes from the day (a recorder's summary, call notes) read by
   // AI on the user's own key, approved row by row (docs/DAY_REVIEW.md).
   const [showDayReview, setShowDayReview] = useState(false);
+  // Fieldy, connected: new conversations waiting (counted, never reviewed
+  // until the user opens them), and whether the review opened to read them.
+  const [fieldyWaiting, setFieldyWaiting] = useState(0);
+  const [dayReviewFromFieldy, setDayReviewFromFieldy] = useState(false);
   const [showMatchExplanation, setShowMatchExplanation] = useState(false);
   const [directorySubmitBusy, setDirectorySubmitBusy] = useState(false);
   // Incremented after the account joins a different practice workspace, which
@@ -1371,6 +1377,27 @@ export default function App() {
   const activeUserId = session?.user?.id || '';
   const activeUserIdRef = useRef(activeUserId);
   const activeOrgIdRef = useRef('');
+  // Fieldy, connected: new conversations are counted when the app opens and
+  // comes back (at most every 15 minutes), on this phone, straight from
+  // Fieldy; the Today card and the 6 PM reminder follow the count.
+  const fieldyCountRef = useRef({ at: 0, userId: '' });
+  const refreshFieldyWaiting = useCallback(async (force = false) => {
+    const userId = activeUserIdRef.current;
+    if (!userId || !fieldySupported || !aiKeysSupported) return;
+    const last = fieldyCountRef.current;
+    if (!force && last.userId === userId && Date.now() - last.at < 15 * 60_000) return;
+    fieldyCountRef.current = { at: Date.now(), userId };
+    const count = await countNewFieldyConversations(userId);
+    if (activeUserIdRef.current !== userId) return;
+    setFieldyWaiting(count);
+    void setDayReviewWaiting(count, userId).catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    if (!activeUserId) return undefined;
+    void refreshFieldyWaiting(true);
+    const subscription = AppState.addEventListener('change', (state) => { if (state === 'active') void refreshFieldyWaiting(); });
+    return () => subscription.remove();
+  }, [activeUserId, refreshFieldyWaiting]);
   const businessLoadGenerationRef = useRef(0);
   const caseLoadGenerationRef = useRef(0);
   // Bumped by every local change (an optimistic write or a timeline entry). A
@@ -1559,6 +1586,8 @@ export default function App() {
     clearPlacementAnswerLinks();
     // A review open for the account that signed out closes (it is cleared as it closes).
     setShowDayReview(false);
+    setDayReviewFromFieldy(false);
+    setFieldyWaiting(0);
     setShowMatchExplanation(false);
     setOutreach(null);
     setAssessmentCaseId(null);
@@ -2478,6 +2507,13 @@ export default function App() {
         if (target === 'workspace') {
           setTab('home');
           setShowWorkspace(true);
+          return;
+        }
+        if (target === 'day_review') {
+          // The 6 PM reminder: the review opens and reads Fieldy at once.
+          setTab('home');
+          setDayReviewFromFieldy(true);
+          setShowDayReview(true);
           return;
         }
         setTab(target);
@@ -6867,17 +6903,34 @@ export default function App() {
             </View>
             <Text style={styles.heroSubtitle}>{loadLine}</Text>
           </View>
+          {aiKeysSupported && fieldyWaiting > 0 ? (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel={`From your day: ${fieldyWaiting} new Fieldy ${fieldyWaiting === 1 ? 'conversation' : 'conversations'} to review`}
+              style={[styles.globalDirectoryBanner, styles.fieldyBanner]}
+              onPress={() => { setDayReviewFromFieldy(true); setShowDayReview(true); }}
+            >
+              <AppIcon name="mic-outline" size={20} color={COLORS.forest} />
+              <View style={styles.globalDirectoryCopy}>
+                <Text style={styles.globalDirectoryTitle}>From your day</Text>
+                <Text style={styles.globalDirectorySubtitle}>
+                  {fieldyWaiting} new Fieldy {fieldyWaiting === 1 ? 'conversation' : 'conversations'} to review. Tap to read {fieldyWaiting === 1 ? 'it' : 'them'}; you approve what is saved.
+                </Text>
+              </View>
+              <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
+            </TouchableOpacity>
+          ) : null}
           {aiKeysSupported ? (
             <TouchableOpacity
               accessibilityRole="button"
               accessibilityLabel="Review notes from your day"
               style={styles.globalDirectoryBanner}
-              onPress={() => setShowDayReview(true)}
+              onPress={() => { setDayReviewFromFieldy(false); setShowDayReview(true); }}
             >
               <AppIcon name="reader-outline" size={20} color={COLORS.forest} />
               <View style={styles.globalDirectoryCopy}>
                 <Text style={styles.globalDirectoryTitle}>Review notes</Text>
-                <Text style={styles.globalDirectorySubtitle}>Paste a Fieldy or Plaud summary or your call notes; approve the leads, notes and follow-ups it finds</Text>
+                <Text style={styles.globalDirectorySubtitle}>Read your Fieldy conversations, or paste a Plaud summary or your call notes; approve the leads, notes and follow-ups it finds</Text>
               </View>
               <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
             </TouchableOpacity>
@@ -10299,8 +10352,10 @@ export default function App() {
         directoryEntitled={entitlements.entitlements.directory}
         leadResponseMinutes={leadSettings.leadResponseTargetMinutes}
         licenseConcernFor={(partnerId) => integrityByPartner.get(partnerId)?.licenseConcern ?? null}
-        onClose={() => setShowDayReview(false)}
+        onClose={() => { setShowDayReview(false); setDayReviewFromFieldy(false); }}
         onSaved={() => refreshAfterServerChange()}
+        startWithFieldy={dayReviewFromFieldy}
+        onFieldyChanged={() => { void refreshFieldyWaiting(true); }}
       />
       <PartnerImportSheet
         visible={showPartnerImport}
@@ -10596,6 +10651,7 @@ const styles = StyleSheet.create({
   assignReferralButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800', flexShrink: 1, minWidth: 0 },
   directoryTitleRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 18 },
   globalDirectoryBanner: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#EFF4FF', borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14, marginBottom: 16 },
+  fieldyBanner: { backgroundColor: '#EDF4EF', borderWidth: 1, borderColor: '#BFD8C8' },
   globalDirectoryCopy: { flex: 1 },
   globalDirectoryTitle: { fontSize: 15, fontWeight: '700', color: '#175CD3' },
   globalDirectorySubtitle: { fontSize: 12.5, color: '#667085', marginTop: 1 },

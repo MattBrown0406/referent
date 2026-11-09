@@ -61,7 +61,9 @@ function check(label, actual, expected) {
 
 // ─── Deep-link scheme matches app.json ───────────────────────────────────────
 const appJson = JSON.parse(readFileSync(path.join(repoRoot, 'app.json'), 'utf8'));
-check('app.json scheme matches APP_SCHEME', appJson.expo.scheme, APP_SCHEME);
+// The first scheme is the app's own (password and email links); the second is
+// for Fieldy's sign-in to return to (src/lib/fieldy.ts, a reverse-domain scheme).
+check('app.json scheme matches APP_SCHEME', Array.isArray(appJson.expo.scheme) ? appJson.expo.scheme[0] : appJson.expo.scheme, APP_SCHEME);
 check('recovery redirect uses the app scheme', PASSWORD_RECOVERY_REDIRECT, 'referralfit://auth/recovery');
 check('confirm redirect uses the app scheme', EMAIL_CONFIRM_REDIRECT, 'referralfit://auth/confirmed');
 

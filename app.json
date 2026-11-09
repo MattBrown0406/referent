@@ -36,7 +36,7 @@
       "themeColor": "#1F5A49",
       "backgroundColor": "#F6F4EE"
     },
-    "scheme": "referralfit",
+    "scheme": ["referralfit", "com.mattbrown.referralfit"],
     "plugins": [
       "expo-font",
       [
@@ -64,7 +64,8 @@
         {
           "contactsPermission": "ReferralFit uses only the contacts you pick, one at a time, to add them as referral partners. It never reads the rest of your address book."
         }
-      ]
+      ],
+      "expo-web-browser"
     ],
     "extra": {
       "eas": {

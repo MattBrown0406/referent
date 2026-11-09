@@ -542,7 +542,7 @@ check(() => {
   assert.match(api, /caseId: row\.ids\.caseId,\n\s+contactId: row\.ids\.contactId,\n\s+followUpId: row\.ids\.followUpId,/);
   assert.match(api, /if \(await alreadyThere\('follow_ups', write\.id\)\) return SAVED;/);
   assert.match(api, /if \(await alreadyThere\('referrals', write\.id\)\) return SAVED;/);
-  assert.match(sheet, /buildRows\(items, workspaceRef\.current, day, newUuid\)/, 'built from the workspace as it is when the answer comes back');
+  assert.match(sheet, /buildRows\(items, workspaceRef\.current, day, newUuid, /, 'built from the workspace as it is when the answer comes back');
 }, 'a retry writes the same records');
 check(() => {
   assert.match(api, /let partnerId = result\.ids\?\.\[0\];[^]*existingPartnerId\(importRow\)/);

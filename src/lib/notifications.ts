@@ -252,6 +252,30 @@ function isScheduleCurrent(generation: number, ownerId: string): boolean {
 // are not re-applied. Forgotten whenever the system's copy is cleared.
 let lastAppliedSchedule: { ownerId: string; signature: string } | null = null;
 
+// New Fieldy conversations waiting for the day review (src/lib/fieldy-api.ts
+// countNewFieldyConversations): one reminder at 6 PM, only while some wait.
+let dayReviewWaiting = 0;
+let lastInput: NotificationInput | null = null;
+const DAY_REVIEW_HOUR = 18;
+
+/** How many Fieldy conversations wait for review; the 6 PM reminder follows it. */
+export function setDayReviewWaiting(count: number, ownerId: string): Promise<void> {
+  const next = Math.max(0, Math.floor(count) || 0);
+  if (next === dayReviewWaiting) return Promise.resolve();
+  dayReviewWaiting = next;
+  if (!lastInput || !ownerId || ownerId !== scheduleOwnerId) return Promise.resolve();
+  const input = lastInput;
+  const generation = ++scheduleGeneration;
+  return queueScheduleWork(() => replaceSchedule(input, generation, ownerId));
+}
+
+/** The 6 PM day review reminder for today, or null (nothing waits, or it is past 6 PM). */
+export function dayReviewReminderAt(waiting: number, now = new Date()): Date | null {
+  if (waiting <= 0) return null;
+  const at = new Date(now.getFullYear(), now.getMonth(), now.getDate(), DAY_REVIEW_HOUR, 0, 0);
+  return at.getTime() > now.getTime() + 60_000 ? at : null;
+}
+
 async function replaceSchedule(input: NotificationInput, generation: number, ownerId: string): Promise<void> {
   const permission = await getNotificationPermissionState();
   if (!isScheduleCurrent(generation, ownerId)) return;
@@ -278,6 +302,22 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   const followUps = reminderFollowUps(input, ownerId);
   let remaining = MAX_SCHEDULED;
   const now = new Date();
+
+  // Generic words on the lock screen: never a name or what was said.
+  const reviewAt = dayReviewReminderAt(dayReviewWaiting, now);
+  if (reviewAt && remaining > 0 && plan({
+    content: {
+      title: 'ReferralFit',
+      body: 'Your Fieldy conversations from today are ready to review.',
+      data: { target: 'day_review', ownerId },
+      ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+    },
+    trigger: {
+      type: Notifications.SchedulableTriggerInputTypes.DATE,
+      date: reviewAt,
+      ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+    },
+  })) remaining -= 1;
 
   // Static copy is intentional: a repeating notification cannot carry a live
   // count. The current count is shown after the user opens the app.
@@ -440,6 +480,11 @@ async function clearSystemNotifications(): Promise<void> {
 }
 
 export function activateReferralFitNotificationOwner(ownerId: string): Promise<void> {
+  if (scheduleOwnerId !== ownerId) {
+    // Another account's count never carries over.
+    dayReviewWaiting = 0;
+    lastInput = null;
+  }
   scheduleOwnerId = ownerId;
   ++scheduleGeneration;
   // A tap that launched the app arrived before anyone was signed in: hand it
@@ -450,12 +495,15 @@ export function activateReferralFitNotificationOwner(ownerId: string): Promise<v
 
 export function rescheduleNotifications(input: NotificationInput, ownerId: string): Promise<void> {
   if (!ownerId || ownerId !== scheduleOwnerId) return Promise.resolve();
+  lastInput = input;
   const generation = ++scheduleGeneration;
   return queueScheduleWork(() => replaceSchedule(input, generation, ownerId));
 }
 
 export function cancelReferralFitNotifications(): Promise<void> {
   scheduleOwnerId = null;
+  dayReviewWaiting = 0;
+  lastInput = null;
   ++scheduleGeneration;
   return queueScheduleWork(clearSystemNotifications);
 }
@@ -466,7 +514,7 @@ export function cancelReferralFitNotifications(): Promise<void> {
 // (see docs/NOTIFICATIONS.md) carry { kind, user_id, case_id, ... } and
 // nothing private: the app resolves the item after sign-in. Either way a tap
 // is honored only for the account the notification was addressed to.
-export type NotificationTarget = 'home' | 'directory' | 'case' | 'workspace' | 'placement';
+export type NotificationTarget = 'home' | 'directory' | 'case' | 'workspace' | 'placement' | 'day_review';
 
 export type RemotePushData = {
   kind?: string;
@@ -526,7 +574,7 @@ function tapOf(response: Notifications.NotificationResponse | null): Tap | null 
     return { requestId, ownerId: data.user_id.toLowerCase(), target: remote.target, caseId: remote.caseId, placementRequestId: remote.placementRequestId };
   }
   if (typeof data.ownerId !== 'string' || !data.ownerId) return null;
-  if (data.target !== 'home' && data.target !== 'directory') return null;
+  if (data.target !== 'home' && data.target !== 'directory' && data.target !== 'day_review') return null;
   return { requestId, ownerId: data.ownerId.toLowerCase(), target: data.target, partnerId: typeof data.partnerId === 'string' ? data.partnerId : undefined };
 }
 

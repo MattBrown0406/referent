@@ -49,6 +49,16 @@ import {
 } from './day-review';
 import { requestDayReview, ReviewUnavailableError, saveReviewRow, type SaveResult } from './day-review-api';
 import { fetchGlobalDirectory } from './directory';
+import { sourceFor, type FieldyBlock } from './fieldy';
+import {
+  commitFieldyRead,
+  connectFieldy,
+  disconnectFieldy,
+  FieldyError,
+  fieldyStatus,
+  fieldySupported,
+  readNewFieldyConversations,
+} from './fieldy-api';
 import { licenseConcernAlert, licenseOverrideNote, type LicenseConcern } from './integrity';
 import { aiKeysSupported, getAnthropicKey } from './outreach-api';
 import { directoryIndex, IMPORT_TYPES, type DirectoryIndex, type ImportType } from './partner-import';
@@ -91,6 +101,10 @@ type Props = {
   onClose: () => void;
   /** Something was saved: the app reloads. */
   onSaved: () => void;
+  /** Opened from "From your day" (the Today card or the evening reminder): read Fieldy at once. */
+  startWithFieldy?: boolean;
+  /** Fieldy was read, connected or disconnected: the Today card counts again. */
+  onFieldyChanged?: () => void;
 };
 
 type Phase = 'paste' | 'finding' | 'review' | 'saving' | 'done';
@@ -117,6 +131,7 @@ const SWITCH_LABEL: Partial<Record<ReviewRow['kind'], string>> = {
 
 export default function DayReviewSheet({
   visible, userId, cases, contacts, partners, followUps, referrals, directoryEntitled, leadResponseMinutes, licenseConcernFor, onClose, onSaved,
+  startWithFieldy = false, onFieldyChanged,
 }: Props) {
   const [phase, setPhase] = useState<Phase>('paste');
   const [notes, setNotes] = useState('');
@@ -134,6 +149,10 @@ export default function DayReviewSheet({
   // What this opening has saved, so reading the same notes again does not offer it twice.
   const savedSignaturesRef = useRef<Set<string>>(new Set());
   const savedCountRef = useRef(0);
+  // Fieldy: connected or not, and the conversations this review was read from
+  // (committed as read once something from them is saved, or nothing was found).
+  const [fieldy, setFieldy] = useState<{ state: 'checking' | 'off' | 'on' | 'busy'; email: string }>({ state: 'checking', email: '' });
+  const fieldyReadRef = useRef<{ blocks: FieldyBlock[]; through: string | null } | null>(null);
 
   const workspace: Workspace = useMemo(() => ({
     cases, contacts, partners, followUps, referrals, directory: index,
@@ -153,6 +172,7 @@ export default function DayReviewSheet({
     savedSignaturesRef.current = new Set();
     savedCountRef.current = 0;
     savingRef.current = false;
+    fieldyReadRef.current = null;
   }
 
   // A fresh sheet each time it opens, and for each account; nothing from a
@@ -164,9 +184,15 @@ export default function DayReviewSheet({
     setToday(localDay());
     setKeyState('checking');
     const opening = openingRef.current;
-    void getAnthropicKey(userId).then((key) => {
-      if (opening === openingRef.current) setKeyState(key ? 'ready' : 'missing');
+    setFieldy({ state: 'checking', email: '' });
+    void Promise.all([getAnthropicKey(userId), fieldyStatus(userId)]).then(([key, status]) => {
+      if (opening !== openingRef.current) return;
+      setKeyState(key ? 'ready' : 'missing');
+      setFieldy({ state: status.connected ? 'on' : 'off', email: status.email });
+      if (startWithFieldy && status.connected && key) void readFieldy(opening);
     });
+    // readFieldy is this opening's own; startWithFieldy is read once, as the sheet opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, userId]);
 
   // The Directory, once per opening, so a new partner can be matched to it.
@@ -225,9 +251,10 @@ export default function DayReviewSheet({
     }
   }
 
-  async function find() {
-    if (busy) return;
-    const text = notes.trim();
+  async function find(fromFieldy: { text: string; blocks: FieldyBlock[]; through: string | null } | null = null) {
+    if (busy && !fromFieldy) return;
+    const text = (fromFieldy ? fromFieldy.text : notes).trim();
+    if (!fromFieldy) fieldyReadRef.current = null;
     if (text.length < 20) { setMessage({ ok: false, text: 'Paste a little more: there is not enough here to review.' }); return; }
     const opening = openingRef.current;
     const day = localDay();
@@ -242,17 +269,100 @@ export default function DayReviewSheet({
       }
       const { items } = await requestDayReview(text, day, key);
       if (opening !== openingRef.current) return;
-      const built = markSavedBefore(buildRows(items, workspaceRef.current, day, newUuid), savedSignaturesRef.current);
+      const blocks = fromFieldy?.blocks ?? null;
+      const built = markSavedBefore(
+        buildRows(items, workspaceRef.current, day, newUuid, blocks ? (found) => sourceFor(found.evidence, blocks) : undefined),
+        savedSignaturesRef.current,
+      );
       setRows(built);
       setSaved({});
       setPicker(null);
       setPhase('review');
-      if (!items.length) setMessage({ ok: true, text: 'Nothing in these notes needs to go into ReferralFit.' });
+      if (fromFieldy) fieldyReadRef.current = { blocks: fromFieldy.blocks, through: fromFieldy.through };
+      if (!items.length) {
+        setMessage({ ok: true, text: fromFieldy ? 'Nothing in your new Fieldy conversations needs to go into ReferralFit.' : 'Nothing in these notes needs to go into ReferralFit.' });
+        // Nothing to approve: these conversations are done.
+        if (fromFieldy) void commitFieldyRead(userId, fromFieldy.through).then(() => onFieldyChanged?.());
+      }
     } catch (error) {
       if (opening !== openingRef.current) return;
       if (error instanceof ReviewUnavailableError && error.reason === 'key') setKeyState('missing');
       setMessage({ ok: false, text: error instanceof Error ? error.message : 'Review is unavailable right now.' });
       setPhase('paste');
+    }
+  }
+
+  // ─── Fieldy ──────────────────────────────────────────────────────────────
+
+  async function connect() {
+    if (busy || fieldy.state === 'busy') return;
+    const opening = openingRef.current;
+    setFieldy((current) => ({ ...current, state: 'busy' }));
+    setMessage(null);
+    try {
+      const status = await connectFieldy(userId);
+      if (opening !== openingRef.current) return;
+      setFieldy({ state: 'on', email: status.email });
+      onFieldyChanged?.();
+      setMessage({ ok: true, text: status.email ? `Fieldy is connected (${status.email}).` : 'Fieldy is connected.' });
+    } catch (error) {
+      if (opening !== openingRef.current) return;
+      setFieldy({ state: 'off', email: '' });
+      if (!(error instanceof FieldyError && error.reason === 'cancelled')) {
+        setMessage({ ok: false, text: error instanceof Error ? error.message : 'Fieldy could not connect right now.' });
+      }
+    }
+  }
+
+  function disconnect() {
+    if (busy || fieldy.state === 'busy') return;
+    Alert.alert('Disconnect Fieldy?', 'ReferralFit stops reading your Fieldy conversations, and its access is removed at Fieldy. Nothing already saved in ReferralFit changes.', [
+      { text: 'Keep it', style: 'cancel' },
+      {
+        text: 'Disconnect',
+        style: 'destructive',
+        onPress: () => {
+          setFieldy((current) => ({ ...current, state: 'busy' }));
+          void disconnectFieldy(userId).finally(() => {
+            setFieldy({ state: 'off', email: '' });
+            onFieldyChanged?.();
+          });
+        },
+      },
+    ]);
+  }
+
+  /** The conversations since the last read, straight into the review. */
+  async function readFieldy(opening = openingRef.current) {
+    if (fieldy.state === 'busy' || savingRef.current) return;
+    setMessage(null);
+    setPhase('finding');
+    let read;
+    try {
+      read = await readNewFieldyConversations(userId);
+    } catch (error) {
+      if (opening !== openingRef.current) return;
+      setPhase('paste');
+      if (error instanceof FieldyError && error.reason === 'disconnected') setFieldy({ state: 'off', email: '' });
+      setMessage({ ok: false, text: error instanceof Error ? error.message : 'Fieldy could not be read right now.' });
+      return;
+    }
+    if (opening !== openingRef.current) return;
+    if (!read.blocks.length) {
+      setPhase('paste');
+      setMessage({
+        ok: true,
+        text: read.later
+          ? 'Fieldy is still writing the summary of your latest conversation. Try again in a little while.'
+          : 'No new Fieldy conversations since the last review.',
+      });
+      if (read.through) void commitFieldyRead(userId, read.through).then(() => onFieldyChanged?.());
+      return;
+    }
+    setNotes(read.text);
+    await find({ text: read.text, blocks: read.blocks, through: read.through });
+    if (opening === openingRef.current && read.later) {
+      setMessage((current) => current ?? { ok: true, text: `${read.later} more ${read.later === 1 ? 'conversation waits' : 'conversations wait'} for the next review.` });
     }
   }
 
@@ -314,6 +424,11 @@ export default function DayReviewSheet({
       savingRef.current = false;
     }
     if (any) onSaved();
+    // Something from these Fieldy conversations is saved: the next read starts after them.
+    if (any && fieldyReadRef.current) {
+      const through = fieldyReadRef.current.through;
+      void commitFieldyRead(userId, through).then(() => onFieldyChanged?.());
+    }
     if (opening !== openingRef.current) return;
     setSaved(results);
     const failed = order.filter((row) => !results[row.key]?.saved);
@@ -607,6 +722,7 @@ export default function DayReviewSheet({
         ) : null}
 
         {found.evidence ? <Text style={styles.quote}>“{found.evidence}”</Text> : null}
+        {row.source ? <Text style={styles.hint}>{row.source}</Text> : null}
         {row.hint && !done ? <Text style={styles.hint}>{row.hint}</Text> : null}
         {result?.message ? <Text style={result.saved ? styles.hint : styles.problem}>{result.message}</Text> : null}
         {!readOnly && row.include && problem && !result ? <Text style={styles.problem}>{problem}</Text> : null}
@@ -623,6 +739,31 @@ export default function DayReviewSheet({
       <Text style={styles.intro}>
         Paste notes from your day: a summary from Fieldy or Plaud, or your own call notes. ReferralFit finds new leads, notes, follow-ups and referrals, and you approve each one before anything is saved.
       </Text>
+      {fieldySupported && !keyMissing ? (
+        <View style={styles.fieldyCard}>
+          <Text style={styles.label}>FIELDY</Text>
+          {fieldy.state === 'on' ? (
+            <>
+              <Text style={styles.hint}>Connected{fieldy.email ? ` as ${fieldy.email}` : ''}. ReferralFit reads your new conversations here; you approve each item.</Text>
+              <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void readFieldy(); }} style={[styles.primaryButton, busy && styles.off]}>
+                <Text style={styles.primaryButtonText}>Read new Fieldy conversations</Text>
+              </TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={disconnect} style={styles.textButton}>
+                <Text style={styles.hint}>Disconnect Fieldy</Text>
+              </TouchableOpacity>
+            </>
+          ) : fieldy.state === 'checking' ? (
+            <ActivityIndicator color={COLORS.forest} accessibilityLabel="Checking Fieldy" />
+          ) : (
+            <>
+              <Text style={styles.hint}>Wear Fieldy? Connect it once and ReferralFit reads your conversations for you: no copying or pasting. You sign in to Fieldy; your sign-in stays on this phone.</Text>
+              <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: fieldy.state === 'busy' }} disabled={busy || fieldy.state === 'busy'} onPress={() => { void connect(); }} style={[styles.secondaryButton, (busy || fieldy.state === 'busy') && styles.off]}>
+                {fieldy.state === 'busy' ? <ActivityIndicator color={COLORS.forest} accessibilityLabel="Connecting" /> : <Text style={styles.secondaryButtonText}>Connect Fieldy</Text>}
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+      ) : null}
       {keyMissing ? (
         <View style={styles.notice} accessibilityRole="alert">
           <Text style={styles.noticeText}>
@@ -744,6 +885,8 @@ const styles = StyleSheet.create({
   label: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, color: COLORS.muted, marginTop: 14, marginBottom: 8 },
   sourceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
   notice: { backgroundColor: COLORS.coralPale, borderRadius: 12, padding: 12, marginTop: 12 },
+  fieldyCard: { backgroundColor: COLORS.white, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, padding: 14, marginTop: 12, gap: 8 },
+  textButton: { paddingVertical: 8, alignItems: 'center' },
   noticeOk: { backgroundColor: COLORS.mintPale },
   noticeText: { fontSize: 13, lineHeight: 19, color: COLORS.coralText, fontWeight: '600' },
   noticeTextOk: { color: COLORS.forest },

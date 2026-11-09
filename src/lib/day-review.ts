@@ -281,6 +281,8 @@ export type ReviewRow = {
   key: string;
   kind: ReviewKind;
   found: FoundItem;
+  /** Where it came from, when the notes were read from a recorder ("From Fieldy, Nov 9, 2:15 PM · Call with Sarah"). */
+  source: string;
   /** The note, the task, or the lead's summary; editable. */
   text: string;
   // A new lead (editable).
@@ -435,6 +437,7 @@ function blankRow(found: FoundItem, index: number, today: string, makeId: () => 
     direction: found.kind === 'referral' ? found.direction : '',
     licenseConfirmed: null,
     candidate: null,
+    source: '',
     include: found.verified,
     hint: found.verified ? ''
       : found.namesFound === false ? 'A name or organization here is not in your notes. Check it before saving.'
@@ -615,8 +618,9 @@ function placePartner(row: ReviewRow, workspace: Workspace) {
  * first). New leads are placed first so that a follow-up or note about a
  * caller who is new today goes on the case the lead will create.
  */
-export function buildRows(items: FoundItem[], workspace: Workspace, today: string, makeId: () => string): ReviewRow[] {
-  const rows = items.map((found, index) => blankRow(found, index, today, makeId));
+export function buildRows(items: FoundItem[], workspace: Workspace, today: string, makeId: () => string,
+  sourceOf: (found: FoundItem) => string = () => ''): ReviewRow[] {
+  const rows = items.map((found, index) => withSource(blankRow(found, index, today, makeId), sourceOf(found)));
   const leads: ReviewRow[] = [];
   for (const row of rows) {
     if (row.kind !== 'new_lead') continue;
@@ -639,6 +643,17 @@ export function buildRows(items: FoundItem[], workspace: Workspace, today: strin
     }
   }
   return rows;
+}
+
+/**
+ * A row read from a recorder says which conversation it came from, and a
+ * note keeps that on the timeline ("… (From Fieldy, Nov 9, 2:15 PM)").
+ */
+function withSource(row: ReviewRow, source: string): ReviewRow {
+  if (!source) return row;
+  const when = source.split(' · ')[0];
+  const note = row.kind === 'case_note' || row.kind === 'partner_note' || row.kind === 'new_lead';
+  return { ...row, source, text: note && row.text && !row.text.includes(when) ? `${row.text} (${when})` : row.text };
 }
 
 /**
