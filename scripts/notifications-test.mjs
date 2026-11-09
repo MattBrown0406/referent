@@ -334,6 +334,36 @@ assert.equal(nativeState.scheduled.some((item) => /Teammate/.test(item.content.b
   unsubscribeWrong();
 }
 
+// ─── The 6 PM day review reminder ─────────────────────────────────────────
+{
+  const morning = new Date(2026, 10, 9, 9, 0, 0);
+  assert.equal(notifications.dayReviewReminderAt(0, morning), null, 'nothing waits: no reminder');
+  assert.equal(notifications.dayReviewReminderAt(3, morning)?.getHours(), 18, 'recordings wait: one at 6 PM');
+  assert.equal(notifications.dayReviewReminderAt(3, new Date(2026, 10, 9, 18, 30, 0)), null, 'never for a time already past');
+  const empty = { partners: [], referrals: [], referralMatches: [], followUps: [] };
+  const reviewReminders = () => nativeState.scheduled.filter((item) => item.content.data.target === 'day_review');
+  const canRemind = Boolean(notifications.dayReviewReminderAt(1, new Date()));
+  // A count that arrives before the account's schedule is active is kept for it.
+  await notifications.cancelReferralFitNotifications();
+  await notifications.setDayReviewWaiting(2, 'user-r');
+  await notifications.activateReferralFitNotificationOwner('user-r');
+  await notifications.rescheduleNotifications(empty, 'user-r');
+  assert.equal(reviewReminders().length, canRemind ? 1 : 0, 'a count set before activation still schedules the reminder');
+  if (canRemind) {
+    assert.equal(reviewReminders()[0].content.body, 'Your recorded conversations from today are ready to review.', 'no name or detail on the lock screen');
+    assert.equal(reviewReminders()[0].content.data.ownerId, 'user-r');
+  }
+  // Another account never gets this account's reminder.
+  await notifications.setDayReviewWaiting(5, 'user-s');
+  await notifications.rescheduleNotifications(empty, 'user-r');
+  assert.equal(reviewReminders().length, canRemind ? 1 : 0);
+  await notifications.activateReferralFitNotificationOwner('user-q');
+  await notifications.rescheduleNotifications(empty, 'user-q');
+  assert.equal(reviewReminders().length, 0, 'an account with nothing waiting has no reminder');
+  await notifications.setDayReviewWaiting(0, 'user-r');
+  await notifications.cancelReferralFitNotifications();
+}
+
 // ─── Cadence counts calendar days in the device's time zone ────────────────
 {
   const previousTz = process.env.TZ;

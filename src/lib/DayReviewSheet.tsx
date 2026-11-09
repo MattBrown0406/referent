@@ -49,13 +49,13 @@ import {
 } from './day-review';
 import { requestDayReview, ReviewUnavailableError, saveReviewRow, type SaveResult } from './day-review-api';
 import { fetchGlobalDirectory } from './directory';
-import { RECORDERS, sourceFor, type FieldyBlock, type Recorder, type RecorderId } from './fieldy';
+import { blocksFor, RECORDERS, type FieldyBlock, type Recorder, type RecorderId } from './fieldy';
 import {
-  commitRecorderRead,
   connectRecorder,
   disconnectRecorder,
   FieldyError,
   fieldySupported,
+  markRecordingsReviewed,
   readNewRecordings,
   recorderStatus,
 } from './fieldy-api';
@@ -156,7 +156,8 @@ export default function DayReviewSheet({
   // review was read from (committed as read once something from them is
   // saved, or nothing was found).
   const [recorders, setRecorders] = useState<Record<RecorderId, RecorderState>>(RECORDERS_CHECKING);
-  const recorderReadRef = useRef<{ recorder: Recorder; blocks: FieldyBlock[]; through: string | null } | null>(null);
+  // The recordings this review was read from, and which recording each row came from.
+  const recorderReadRef = useRef<{ recorder: Recorder; text: string; blocks: FieldyBlock[]; rowIds: Map<string, string[]> } | null>(null);
   const setRecorder = (id: RecorderId, value: RecorderState | ((current: RecorderState) => RecorderState)) =>
     setRecorders((current) => ({ ...current, [id]: typeof value === 'function' ? value(current[id]) : value }));
 
@@ -241,11 +242,13 @@ export default function DayReviewSheet({
       : phase === 'paste' && notes.trim().length > 0;
     if (!unsaved) { finish(); return; }
     const kept = savedCountRef.current;
+    const read = recorderReadRef.current;
+    const again = read ? ` Your ${read.recorder.name} ${read.recorder.noun}s with items still waiting will be read again next time.` : '';
     Alert.alert(
       'Discard this review?',
-      kept
+      (kept
         ? `${kept} ${kept === 1 ? 'item you approved stays' : 'items you approved stay'} saved. Nothing else from these notes is saved.`
-        : 'Nothing from these notes has been saved yet.',
+        : 'Nothing from these notes has been saved yet.') + again,
       [
         { text: 'Keep reviewing', style: 'cancel' },
         { text: 'Discard', style: 'destructive', onPress: finish },
@@ -263,8 +266,11 @@ export default function DayReviewSheet({
     }
   }
 
-  async function find(fromRecorder: { recorder: Recorder; text: string; blocks: FieldyBlock[]; through: string | null } | null = null) {
-    if (busy && !fromRecorder) return;
+  async function find(read: { recorder: Recorder; text: string; blocks: FieldyBlock[]; skipped?: string[] } | null = null) {
+    if (busy && !read) return;
+    // "Back to the notes", then Find again on the same recorder text: still that recorder's recordings.
+    const same = recorderReadRef.current && notes.trim() === recorderReadRef.current.text.trim() ? recorderReadRef.current : null;
+    const fromRecorder = read ?? (same ? { recorder: same.recorder, text: same.text, blocks: same.blocks } : null);
     const text = (fromRecorder ? fromRecorder.text : notes).trim();
     if (!fromRecorder) recorderReadRef.current = null;
     if (text.length < 20) { setMessage({ ok: false, text: 'Paste a little more: there is not enough here to review.' }); return; }
@@ -283,14 +289,24 @@ export default function DayReviewSheet({
       if (opening !== openingRef.current) return;
       const blocks = fromRecorder?.blocks ?? null;
       const built = markSavedBefore(
-        buildRows(items, workspaceRef.current, day, newUuid, blocks ? (found) => sourceFor(found.evidence, blocks) : undefined),
+        buildRows(items, workspaceRef.current, day, newUuid, blocks ? (found) => {
+          const from = blocksFor(found.evidence, blocks);
+          return from.length === 1 ? { label: from[0].label, at: from[0].startTime } : null;
+        } : undefined),
         savedSignaturesRef.current,
       );
       setRows(built);
       setSaved({});
       setPicker(null);
       setPhase('review');
-      if (fromRecorder) recorderReadRef.current = { recorder: fromRecorder.recorder, blocks: fromRecorder.blocks, through: fromRecorder.through };
+      if (fromRecorder) {
+        const rowIds = new Map(built.map((row) => [row.key, blocksFor(row.found.evidence, fromRecorder.blocks).map((block) => block.id)]));
+        recorderReadRef.current = { recorder: fromRecorder.recorder, text: fromRecorder.text, blocks: fromRecorder.blocks, rowIds };
+        // A recording nothing was found in is done now; so is one with no text a day after it ended.
+        const withRows = new Set([...rowIds.values()].flat());
+        const done = fromRecorder.blocks.map((block) => block.id).filter((id) => !withRows.has(id)).concat(read?.skipped ?? []);
+        if (done.length) void markRecordingsReviewed(fromRecorder.recorder, userId, done).then(() => onRecordersChanged?.());
+      }
       if (!items.length) {
         setMessage({
           ok: true,
@@ -298,8 +314,8 @@ export default function DayReviewSheet({
             ? `Nothing in your new ${fromRecorder.recorder.name} ${fromRecorder.recorder.noun}s needs to go into ReferralFit.`
             : 'Nothing in these notes needs to go into ReferralFit.',
         });
-        // Nothing to approve: these recordings are done.
-        if (fromRecorder) void commitRecorderRead(fromRecorder.recorder, userId, fromRecorder.through).then(() => onRecordersChanged?.());
+      } else if (read?.skipped?.length) {
+        setMessage({ ok: true, text: `${read.skipped.length} ${read.skipped.length === 1 ? read.recorder.noun : `${read.recorder.noun}s`} had no summary or transcript a day after ${read.skipped.length === 1 ? 'it' : 'they'} ended and ${read.skipped.length === 1 ? 'was' : 'were'} skipped.` });
       }
     } catch (error) {
       if (opening !== openingRef.current) return;
@@ -367,20 +383,40 @@ export default function DayReviewSheet({
     if (opening !== openingRef.current) return;
     if (!read.blocks.length) {
       setPhase('paste');
+      if (read.skipped.length) void markRecordingsReviewed(recorder, userId, read.skipped).then(() => onRecordersChanged?.());
       setMessage({
         ok: true,
         text: read.later
           ? `${recorder.name} is still writing the summary of your latest ${recorder.noun}. Try again in a little while.`
-          : `No new ${recorder.name} ${recorder.noun}s since the last review.`,
+          : read.skipped.length
+            ? `${read.skipped.length} ${recorder.noun}${read.skipped.length === 1 ? '' : 's'} had no summary or transcript a day after ending and ${read.skipped.length === 1 ? 'was' : 'were'} skipped. Nothing else is new.`
+            : `No new ${recorder.name} ${recorder.noun}s since the last review.`,
       });
-      if (read.through) void commitRecorderRead(recorder, userId, read.through).then(() => onRecordersChanged?.());
       return;
     }
     setNotes(read.text);
-    await find({ recorder, text: read.text, blocks: read.blocks, through: read.through });
+    await find({ recorder, text: read.text, blocks: read.blocks, skipped: read.skipped });
     if (opening === openingRef.current && read.later) {
       setMessage((current) => current ?? { ok: true, text: `${read.later} more ${read.later === 1 ? `${recorder.noun} waits` : `${recorder.noun}s wait`} for the next review.` });
     }
+  }
+
+  // The practitioner is done with these recordings (nothing to save, or the
+  // review could not be read): they are not read again.
+  function markAllReviewed() {
+    const read = recorderReadRef.current;
+    if (!read || busy) return;
+    const { recorder, blocks } = read;
+    Alert.alert(`Done with these ${recorder.noun}s?`, `ReferralFit will not read these ${blocks.length} ${recorder.name} ${blocks.length === 1 ? recorder.noun : `${recorder.noun}s`} again. Anything you have not saved from them is not saved.`, [
+      { text: 'Keep reviewing', style: 'cancel' },
+      {
+        text: 'Done with them',
+        onPress: () => {
+          void markRecordingsReviewed(recorder, userId, blocks.map((block) => block.id)).then(() => onRecordersChanged?.());
+          finish();
+        },
+      },
+    ]);
   }
 
   // An edit to a row clears the reason its last save failed.
@@ -441,10 +477,14 @@ export default function DayReviewSheet({
       savingRef.current = false;
     }
     if (any) onSaved();
-    // Something from these recordings is saved: the next read starts after them.
-    if (any && recorderReadRef.current) {
-      const { recorder, through } = recorderReadRef.current;
-      void commitRecorderRead(recorder, userId, through).then(() => onRecordersChanged?.());
+    // A recording is done once every item from it is saved or set aside; one
+    // with an item still waiting (failed, or left on for later) comes back next time.
+    if (recorderReadRef.current) {
+      const { recorder, rowIds } = recorderReadRef.current;
+      const settled = (row: ReviewRow) => results[row.key]?.saved === true || !row.include;
+      const ids = new Set([...rowIds.values()].flat());
+      const done = [...ids].filter((id) => rows.filter((row) => (rowIds.get(row.key) ?? []).includes(id)).every(settled));
+      if (done.length) void markRecordingsReviewed(recorder, userId, done).then(() => onRecordersChanged?.());
     }
     if (opening !== openingRef.current) return;
     setSaved(results);
@@ -756,17 +796,21 @@ export default function DayReviewSheet({
       <Text style={styles.intro}>
         Paste notes from your day: a summary from Fieldy or Plaud, or your own call notes. ReferralFit finds new leads, notes, follow-ups and referrals, and you approve each one before anything is saved.
       </Text>
-      {fieldySupported && !keyMissing ? RECORDERS.map((recorder) => {
+      {fieldySupported ? RECORDERS.map((recorder) => {
         const status = recorders[recorder.id];
+        // Without a key there is nothing to read with, but a connected recorder can always be disconnected.
+        if (keyMissing && status.state !== 'on') return null;
         return (
           <View key={recorder.id} style={styles.fieldyCard}>
             <Text style={styles.label}>{recorder.name.toUpperCase()}</Text>
             {status.state === 'on' ? (
               <>
                 <Text style={styles.hint}>Connected{status.email ? ` as ${status.email}` : ''}. ReferralFit reads your new {recorder.noun}s here; you approve each item.</Text>
-                <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void readRecorder(recorder); }} style={[styles.primaryButton, busy && styles.off]}>
-                  <Text style={styles.primaryButtonText}>Read new {recorder.name} {recorder.noun}s</Text>
-                </TouchableOpacity>
+                {keyMissing ? null : (
+                  <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void readRecorder(recorder); }} style={[styles.primaryButton, busy && styles.off]}>
+                    <Text style={styles.primaryButtonText}>Read new {recorder.name} {recorder.noun}s</Text>
+                  </TouchableOpacity>
+                )}
                 <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => disconnect(recorder)} style={styles.textButton}>
                   <Text style={styles.hint}>Disconnect {recorder.name}</Text>
                 </TouchableOpacity>
@@ -839,6 +883,11 @@ export default function DayReviewSheet({
                 {phase === 'review' ? (
                   <TouchableOpacity accessibilityRole="button" onPress={() => { setPhase('paste'); setMessage(null); setPicker(null); }} style={styles.secondaryButton}>
                     <Text style={styles.secondaryButtonText}>Back to the notes</Text>
+                  </TouchableOpacity>
+                ) : null}
+                {phase === 'review' && recorderReadRef.current ? (
+                  <TouchableOpacity accessibilityRole="button" onPress={markAllReviewed} style={styles.textButton}>
+                    <Text style={styles.hint}>Done with these {recorderReadRef.current.recorder.noun}s: don't read them again</Text>
                   </TouchableOpacity>
                 ) : null}
               </View>

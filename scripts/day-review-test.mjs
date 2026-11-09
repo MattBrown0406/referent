@@ -506,6 +506,19 @@ check(() => {
   assert.equal(rules.partnerTouchWrite(partnerRow, 'x', 'p-new').partnerId, 'p-new', 'a new partner’s touch');
 }, 'event and touch writes');
 check(() => {
+  const from = { label: 'From Fieldy, Nov 9, 10:15 AM · Call with Ana', at: '2026-11-09T18:15:00Z' };
+  const [row] = rules.buildRows([found({ personName: 'Ana Rivera', summary: 'Talked about the packet.' })], workspace, TODAY, makeId, () => from);
+  assert.equal(row.source, from.label, 'an item says which recording it came from');
+  assert.equal(row.occurredAt, '2026-11-09T18:15:00.000Z', 'its note is dated when the conversation happened');
+  assert.match(row.text, /\(From Fieldy, Nov 9, 10:15 AM\)$/);
+  assert.equal(rules.switchKind(row, 'new_lead').occurredAt, row.occurredAt, 'switching what it is keeps where it came from');
+  const [plain] = build(found({ personName: 'Ana Rivera' }));
+  assert.equal(plain.source, '');
+  assert.equal(plain.occurredAt, '', 'pasted notes are dated when saved');
+  const api = read('src/lib/day-review-api.ts');
+  assert.ok((api.match(/row\.occurredAt \|\| now/g) || []).length >= 3, 'saves use the recording time when there is one');
+}, 'a recording item keeps its source and time');
+check(() => {
   const [row] = build(found({ personName: 'Ana Rivera' }));
   row.text = '   ';
   assert.equal(rules.rowProblem(row), 'Add a note.');
@@ -548,7 +561,7 @@ check(() => {
 }, 'a retry writes the same records');
 check(() => {
   assert.match(api, /let partnerId = result\.ids\?\.\[0\];[^]*existingPartnerId\(importRow\)/);
-  assert.match(api, /partnerTouchWrite\(row, now, partnerId\)/);
+  assert.match(api, /partnerTouchWrite\(row, row\.occurredAt \|\| now, partnerId\)/);
   assert.match(api, /return \{ saved: true, message: 'The partner was added, but the note could not be saved\. Add it from the partner\.' \};/, 'a half-saved new partner counts as saved');
 }, 'a new partner keeps the note as its first touch');
 check(() => assert.match(sheet, /call 911\. For a mental-health crisis, call or text 988/), 'urgent rows show 911 and 988');

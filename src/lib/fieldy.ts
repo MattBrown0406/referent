@@ -6,8 +6,10 @@
 //
 // ReferralFit registered itself once with each (dynamic client
 // registration, 2026-11-08) as a native app with no secret: the client ids
-// below are public. The sign-in, the tokens and the recordings stay on the
-// phone (src/lib/fieldy-api.ts); ReferralFit's server never sees them.
+// below are public. The sign-in and its tokens stay on the phone
+// (src/lib/fieldy-api.ts). A recording's text goes only into the day
+// review: through ReferralFit's day-review function, which neither stores
+// nor logs it, to Anthropic on the practitioner's own key.
 //
 // No React, no network: scripts/fieldy-test.mjs covers this file.
 
@@ -192,7 +194,9 @@ export function rpcResult(text: string, contentType: string, id: number): unknow
       throw new FieldyError('Fieldy sent an answer ReferralFit could not read.');
     }
   }
-  const message = messages.find((item) => item && typeof item === 'object' && (item as { id?: unknown }).id === id) as
+  // A response (result or error), never a request from the server that happens to use the same id.
+  const message = messages.find((item) => item && typeof item === 'object' && (item as { id?: unknown }).id === id
+    && ('result' in (item as object) || 'error' in (item as object))) as
     { result?: unknown; error?: { message?: unknown } } | undefined;
   if (!message) throw new FieldyError('Fieldy sent an answer ReferralFit could not read.');
   if (message.error) throw new FieldyError('Fieldy could not read your conversations right now. Try again.');
@@ -262,15 +266,32 @@ export function listArguments(plan: ListPlan, since: string, until: string, curs
   return args;
 }
 
-export type TranscriptPlan = { name: string; id: string };
+export type TranscriptPlan = { name: string; id: string; start?: string | null; end?: string | null };
 
+// A tool for one recording: its id argument, and its time window when it
+// asks for one (a transcript read by time). One that requires anything else
+// is not used: it could return another recording's words.
 function toolWithId(tools: McpTool[], pattern: RegExp): TranscriptPlan | null {
   for (const tool of tools) {
     if (!pattern.test(tool.name)) continue;
-    const id = keyIn(tool.inputSchema?.properties || {}, ID_KEYS);
-    if (id) return { name: tool.name, id };
+    const properties = tool.inputSchema?.properties || {};
+    const id = keyIn(properties, ID_KEYS);
+    if (!id) continue;
+    const start = keyIn(properties, START_KEYS);
+    const end = keyIn(properties, END_KEYS);
+    const known = new Set([id, start, end].filter(Boolean) as string[]);
+    if ((tool.inputSchema?.required || []).some((key) => !known.has(key))) continue;
+    return start || end ? { name: tool.name, id, start, end } : { name: tool.name, id };
   }
   return null;
+}
+
+/** The arguments for one recording's tool call. */
+export function recordingArguments(plan: TranscriptPlan, item: FieldyConversation, now = Date.now()): Record<string, unknown> {
+  const args: Record<string, unknown> = { [plan.id]: item.id };
+  if (plan.start) args[plan.start] = item.startTime;
+  if (plan.end) args[plan.end] = item.endTime || new Date(now).toISOString();
+  return args;
 }
 
 /** The tool that reads one recording's transcript, for one the recorder has not summarized. */
@@ -353,18 +374,23 @@ function summaryOf(item: Record<string, unknown>): string {
 
 // When a recording ended: its end time, or its start plus its length
 // (Plaud's duration is in milliseconds, Fieldy's durationSeconds in seconds).
+// '' when the recording gives neither: it may still be going on.
 function endOf(item: Record<string, unknown>, start: string): string {
   const end = str(item.endTime ?? item.end_time ?? item.endAt ?? item.end_at, 40);
   if (end && !Number.isNaN(Date.parse(end))) return end;
   const at = Date.parse(start);
-  if (Number.isNaN(at)) return start;
+  if (Number.isNaN(at)) return '';
   const seconds = Number(item.durationSeconds ?? item.duration_seconds);
   const millis = Number(item.duration);
   const length = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : Number.isFinite(millis) && millis > 0 ? millis : 0;
-  return new Date(at + length).toISOString();
+  return length ? new Date(at + length).toISOString() : '';
 }
 
-/** The recordings in a list answer, wherever the list is (an array, or under conversations, files, items or data). */
+/**
+ * The recordings in a list answer, wherever the list is (an array, or under
+ * conversations, files, items or data). `text`: the answer was words, not a
+ * list (the caller says it could not be read, never "nothing new").
+ */
 export function conversationsFrom(payload: unknown): { conversations: FieldyConversation[]; nextCursor: string | null; text: string } {
   const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
   const list = Array.isArray(payload) ? payload
@@ -387,14 +413,18 @@ export function conversationsFrom(payload: unknown): { conversations: FieldyConv
   return { conversations, nextCursor: cursor ?? null, text: typeof data.text === 'string' && !list ? data.text : '' };
 }
 
-/** A transcript answer as text: its segments' "Speaker: words", or its text. */
-export function transcriptText(payload: unknown): string {
+/** A transcript answer as text: its segments' "Speaker: words" (only this recording's, when they say), or its text. */
+export function transcriptText(payload: unknown, recordingId = ''): string {
   const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
   const list = Array.isArray(payload) ? payload
-    : [data.transcripts, data.transcriptions, data.segments, data.items, data.data].find(Array.isArray) as unknown[] | undefined;
+    : [data.transcripts, data.transcriptions, data.segments, data.items, data.data, data.source_list].find(Array.isArray) as unknown[] | undefined;
   if (list) {
     return list
       .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+      .filter((item) => {
+        const owner = item.conversationId ?? item.conversation_id ?? item.fileId ?? item.file_id;
+        return !recordingId || typeof owner !== 'string' || owner === recordingId;
+      })
       .map((item) => [str(item.speaker, 60), str(item.text, 4000)].filter(Boolean).join(': '))
       .filter(Boolean)
       .join('\n');
@@ -411,75 +441,78 @@ export function shortTime(iso: string): string {
   return at.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
-export type FieldyBlock = { id: string; label: string; text: string };
+export type FieldyBlock = { id: string; label: string; text: string; startTime: string };
 
 // The day review reads at most 12,000 characters (LIMITS.textMax in
-// supabase/functions/day-review/review.ts); a conversation that does not fit
+// supabase/functions/day-review/review.ts); a recording that does not fit
 // waits for the next read.
 const REVIEW_MAX = 11_500;
-const SUMMARY_MAX = 2_500;
-// Fieldy writes the summary after a conversation ends; one that ended this
-// recently without one is left for the next read, not read half done.
-const SUMMARY_WAIT_MS = 90 * 60 * 1000;
+// A long summary keeps its beginning and its end (promises are often last).
+const SUMMARY_MAX = 6_000;
+// The recorder writes the summary after a recording ends. One with no text
+// yet waits; after a day with none it is skipped, and the review says so.
+const NO_TEXT_GIVE_UP_MS = 24 * 60 * 60 * 1000;
 
 export type ReviewPlan = {
   text: string;
   blocks: FieldyBlock[];
-  /** Read up to here: the next read starts after it. Null when nothing was read. */
-  through: string | null;
-  /** Conversations left for the next read (no room, or no summary yet). */
+  /** Recordings with no summary or transcript a day after they ended: marked reviewed, and said so. */
+  skipped: string[];
+  /** Recordings left for the next read (no room, still going on, or no summary yet). */
   later: number;
 };
 
-/**
- * The conversations since `since` as review text, oldest first: each
- * under its own header ("[Fieldy · Nov 9, 2:15 PM · Call with Sarah]"), so
- * an item found in it can say where it came from. `transcripts` holds the
- * text for conversations without a summary.
- */
-export function reviewPlan(conversations: FieldyConversation[], since: string, now = Date.now(), transcripts: Record<string, string> = {},
-  recorderName = 'Fieldy'): ReviewPlan {
-  const after = Date.parse(since);
-  const fresh = conversations
-    .filter((item) => Date.parse(item.startTime) > after)
-    .sort((a, b) => Date.parse(a.startTime) - Date.parse(b.startTime) || a.id.localeCompare(b.id));
-  const seen = new Set<string>();
-  const blocks: FieldyBlock[] = [];
-  let length = 0;
-  let through: string | null = null;
-  let later = 0;
-  for (let index = 0; index < fresh.length; index += 1) {
-    const item = fresh[index];
-    if (seen.has(item.id)) continue;
-    seen.add(item.id);
-    const body = (item.summary || transcripts[item.id] || '').slice(0, SUMMARY_MAX).trim();
-    const ended = Date.parse(item.endTime || item.startTime);
-    if (!body && now - ended < SUMMARY_WAIT_MS) {
-      // Not summarized yet: stop here, so the next read starts with it.
-      later = fresh.length - index;
-      break;
-    }
-    if (!body) { through = item.startTime; continue; }
-    const label = `From ${recorderName}, ${shortTime(item.startTime)}${item.title ? ` · ${item.title.slice(0, 80)}` : ''}`;
-    const text = `[${label}]\n${body}`;
-    if (blocks.length && length + text.length + 2 > REVIEW_MAX) {
-      later = fresh.length - index;
-      break;
-    }
-    blocks.push({ id: item.id, label, text: text.slice(0, REVIEW_MAX) });
-    length += text.length + 2;
-    through = item.startTime;
-  }
-  return { text: blocks.map((block) => block.text).join('\n\n').slice(0, 12_000), blocks, through, later };
+function clipMiddle(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const half = Math.floor((max - 3) / 2);
+  return `${text.slice(0, half).trimEnd()}\n…\n${text.slice(-half).trimStart()}`;
 }
 
-const loose = (value: string) => value.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+/**
+ * The recordings not reviewed yet as review text, oldest first: each under
+ * its own header ("[From Fieldy, Nov 9, 2:15 PM · Call with Sarah]"), so an
+ * item found in it can say where it came from. `texts` holds the summary or
+ * transcript of those whose list entry has none. `conversations` are the
+ * ones not reviewed yet; which were reviewed is kept per recording
+ * (src/lib/fieldy-api.ts), so two at the same minute, or one that waited,
+ * are never passed over.
+ */
+export function reviewPlan(conversations: FieldyConversation[], now = Date.now(), texts: Record<string, string> = {}, recorderName = 'Fieldy'): ReviewPlan {
+  const fresh = [...new Map(conversations.map((item) => [item.id, item])).values()]
+    .sort((a, b) => Date.parse(a.startTime) - Date.parse(b.startTime) || a.id.localeCompare(b.id));
+  const blocks: FieldyBlock[] = [];
+  const skipped: string[] = [];
+  let length = 0;
+  let later = 0;
+  for (const item of fresh) {
+    const body = clipMiddle((item.summary || texts[item.id] || '').trim(), SUMMARY_MAX);
+    if (!body) {
+      const ended = item.endTime ? Date.parse(item.endTime) : NaN;
+      if (!Number.isNaN(ended) && now - ended >= NO_TEXT_GIVE_UP_MS) skipped.push(item.id);
+      else later += 1;
+      continue;
+    }
+    const label = `From ${recorderName}, ${shortTime(item.startTime)}${item.title ? ` · ${item.title.slice(0, 80)}` : ''}`;
+    const text = `[${label}]\n${body}`;
+    if (length + text.length + 2 > REVIEW_MAX) { later += 1; continue; }
+    blocks.push({ id: item.id, label, text, startTime: item.startTime });
+    length += text.length + 2;
+  }
+  return { text: blocks.map((block) => block.text).join('\n\n').slice(0, 12_000), blocks, skipped, later };
+}
 
-/** Which conversation a found item's quote came from: its label, or '' when it is not found in one. */
-export function sourceFor(quote: string, blocks: FieldyBlock[]): string {
+const loose = (value: string) => value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+/** The recordings a found item's quote came from (more than one when the same words are in several). */
+export function blocksFor(quote: string, blocks: FieldyBlock[]): FieldyBlock[] {
   const words = loose(quote);
-  if (!words) return '';
-  return blocks.find((block) => loose(block.text).includes(words))?.label ?? '';
+  return words ? blocks.filter((block) => loose(block.text).includes(words)) : [];
+}
+
+/** Which recording a found item came from: its label, or '' when it is in none, or in more than one. */
+export function sourceFor(quote: string, blocks: FieldyBlock[]): string {
+  const found = blocksFor(quote, blocks);
+  return found.length === 1 ? found[0].label : '';
 }
 
 /** Where a Fieldy read starts the first time: the start of today, on the phone's clock. */

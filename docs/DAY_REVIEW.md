@@ -70,21 +70,29 @@ OAuth (`src/lib/fieldy.ts` has both; `src/lib/fieldy-api.ts` the calls).
   and approves only `openid email offline_access conversations:read
   transcripts:read`. The refresh token stays in this phone's keychain for
   this account (`AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY`: never synced or
-  backed up), rotates on every refresh (one refresh at a time), and is
-  revoked at Fieldy on Disconnect. Nothing about Fieldy reaches
-  ReferralFit's server.
+  backed up), rotates on every refresh (one change to it at a time), and is
+  revoked at Fieldy on Disconnect and when the account is deleted. The
+  sign-in never reaches ReferralFit's server. The text of a conversation
+  does, only for the review: through the `day-review` function, which
+  neither stores nor logs it, to Anthropic on the practitioner's own key.
 - **Reading:** Fieldy's MCP server, straight from the phone. The list tool
   and its argument names are read from `tools/list` (they mirror the Public
-  API's `GET /conversations?startTime&endTime&pageSize&cursor`). New
-  conversations since the last review (the first time: since the start of
-  today), oldest first, each under a header ("From Fieldy, Nov 9, 2:15 PM ·
-  title"), up to the review's 12,000 characters; the rest, and one Fieldy
-  has not summarized yet (ended under 90 minutes ago), wait for the next
-  read. An older one with no summary is read from its transcript.
+  API's `GET /conversations?startTime&endTime&pageSize&cursor`).
+  Conversations not yet reviewed, from the last week at most (the first
+  time: since the start of today), oldest first, each under a header
+  ("From Fieldy, Nov 9, 2:15 PM · title"), up to the review's 12,000
+  characters; each summary is kept to 6,000 characters (its start and end).
+  The rest wait for the next read, as does one still in progress or not
+  summarized yet. One with no summary is read from its transcript; one with
+  neither a day after it ended is skipped, and the review says so.
 - **Review:** the same review as pasted notes. Each item says which
-  conversation it came from, and a note keeps that on the timeline. The read
-  moves on only once something from it is saved (or nothing was found), so
-  conversations read but not reviewed come back next time.
+  conversation it came from when only one matches its quote, and a saved
+  note keeps that conversation's time on the timeline. Each conversation is
+  marked reviewed on its own: once every item from it is saved or switched
+  off, or when nothing was found in it. One with an item still waiting
+  (left on, or failed to save) comes back next time. "Done with these" marks
+  them all. Which ones were reviewed is kept apart from the sign-in (for 14
+  days), so disconnecting and reconnecting never reads them again.
 - **Automatic:** when the app opens or comes back (at most every 15
   minutes) it counts new recordings in each connected recorder, never
   reviewing them. Today shows "From your day: N new Fieldy conversations

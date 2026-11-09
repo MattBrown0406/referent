@@ -171,6 +171,8 @@ async function existingPartnerId(importRow: NonNullable<ReturnType<typeof newPar
 }
 
 export async function saveReviewRow(row: ReviewRow, userId: string, options: SaveOptions): Promise<SaveResult> {
+  // A note read from a recorder is dated when the recording was made (a
+  // Friday call reviewed on Monday does not move the last contact to Monday).
   const now = new Date().toISOString();
   const { today } = options;
   try {
@@ -189,10 +191,10 @@ export async function saveReviewRow(row: ReviewRow, userId: string, options: Sav
       }
       case 'case_note':
         // log_contact_activity upserts by id: a repeat changes nothing.
-        await logContactActivity(caseEventWrite(row, now), null, userId);
+        await logContactActivity(caseEventWrite(row, row.occurredAt || now), null, userId);
         return SAVED;
       case 'partner_note':
-        await logContactActivity(null, partnerTouchWrite(row, now), userId);
+        await logContactActivity(null, partnerTouchWrite(row, row.occurredAt || now), userId);
         return SAVED;
       case 'follow_up': {
         const write = followUpWrite(row);
@@ -226,7 +228,7 @@ export async function saveReviewRow(row: ReviewRow, userId: string, options: Sav
           if (!existing) return { saved: true, message: 'Already in your network: nothing was added.' };
           partnerId = existing;
           try {
-            await logContactActivity(null, partnerTouchWrite(row, now, partnerId), userId);
+            await logContactActivity(null, partnerTouchWrite(row, row.occurredAt || now, partnerId), userId);
           } catch {
             return { saved: true, message: 'Already in your network, but the note could not be saved. Add it from the partner.' };
           }
@@ -238,7 +240,7 @@ export async function saveReviewRow(row: ReviewRow, userId: string, options: Sav
         if (!partnerId) return { saved: true, message: 'The partner was added. Add the note from the partner.' };
         if (row.text.trim()) {
           try {
-            await logContactActivity(null, partnerTouchWrite(row, now, partnerId), userId);
+            await logContactActivity(null, partnerTouchWrite(row, row.occurredAt || now, partnerId), userId);
           } catch {
             return { saved: true, message: 'The partner was added, but the note could not be saved. Add it from the partner.' };
           }

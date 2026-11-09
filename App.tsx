@@ -85,7 +85,7 @@ import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
 import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
 import type { LevelOfCareSeed } from './src/lib/LevelOfCareSheet';
 import { countNewRecordings, fieldySupported, RECORDERS, type RecorderId } from './src/lib/fieldy-api';
-import { aiKeysSupported } from './src/lib/outreach-api';
+import { aiKeysSupported, getAnthropicKey } from './src/lib/outreach-api';
 import {
   caseRecipients,
   caseTarget,
@@ -1382,18 +1382,25 @@ export default function App() {
   // comes back (at most every 15 minutes), on this phone, straight from each
   // recorder; the Today card and the 6 PM reminder follow the count.
   const fieldyCountRef = useRef({ at: 0, userId: '' });
+  const recordingsWaitingRef = useRef<{ userId: string; counts: Record<RecorderId, number> }>({ userId: '', counts: { fieldy: 0, plaud: 0 } });
   const refreshFieldyWaiting = useCallback(async (force = false) => {
     const userId = activeUserIdRef.current;
     if (!userId || !fieldySupported || !aiKeysSupported) return;
     const last = fieldyCountRef.current;
     if (!force && last.userId === userId && Date.now() - last.at < 15 * 60_000) return;
     fieldyCountRef.current = { at: Date.now(), userId };
-    const counts = await Promise.all(RECORDERS.map((recorder) => countNewRecordings(recorder, userId)));
+    // Without an Anthropic key nothing can be reviewed: no card, no reminder.
+    const key = await getAnthropicKey(userId).catch(() => null);
+    const counts = key ? await Promise.all(RECORDERS.map((recorder) => countNewRecordings(recorder, userId))) : RECORDERS.map(() => 0);
     if (activeUserIdRef.current !== userId) return;
-    const next = { fieldy: 0, plaud: 0 } as Record<RecorderId, number>;
-    RECORDERS.forEach((recorder, index) => { next[recorder.id] = counts[index]; });
+    // A count that could not be read (offline, recorder down) keeps the last one
+    // rather than saying nothing waits.
+    const previous: Record<RecorderId, number> = recordingsWaitingRef.current.userId === userId ? recordingsWaitingRef.current.counts : { fieldy: 0, plaud: 0 };
+    const next = { ...previous };
+    RECORDERS.forEach((recorder, index) => { next[recorder.id] = counts[index] ?? previous[recorder.id]; });
+    recordingsWaitingRef.current = { userId, counts: next };
     setRecordingsWaiting(next);
-    void setDayReviewWaiting(counts.reduce((sum, count) => sum + count, 0), userId).catch(() => undefined);
+    void setDayReviewWaiting(RECORDERS.reduce((sum, recorder) => sum + next[recorder.id], 0), userId).catch(() => undefined);
   }, []);
   const fieldyWaiting = recordingsWaiting.fieldy + recordingsWaiting.plaud;
   const waitingRecorderRef = useRef<RecorderId | null>(null);
@@ -1603,6 +1610,7 @@ export default function App() {
     setShowDayReview(false);
     setDayReviewRecorder(null);
     setRecordingsWaiting({ fieldy: 0, plaud: 0 });
+    recordingsWaitingRef.current = { userId: '', counts: { fieldy: 0, plaud: 0 } };
     setShowMatchExplanation(false);
     setOutreach(null);
     setAssessmentCaseId(null);

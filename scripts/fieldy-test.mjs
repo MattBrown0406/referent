@@ -113,15 +113,20 @@ check(() => {
   const plan = f.reviewPlan([
     conv('b', '2026-11-09T18:00:00Z', 'Promised to call Ana back tomorrow.'),
     conv('a', '2026-11-09T17:00:00Z', 'Sarah Miller called about her son Jake.'),
-    conv('old', '2026-11-09T08:00:00Z', 'Before the last read.'),
     conv('a', '2026-11-09T17:00:00Z', 'Sarah Miller called about her son Jake.'),
-  ], '2026-11-09T09:00:00Z', now);
-  assert.deepEqual(plan.blocks.map((block) => block.id), ['a', 'b'], 'oldest first, each once, only after the last read');
+  ], now);
+  assert.deepEqual(plan.blocks.map((block) => block.id), ['a', 'b'], 'oldest first, each once');
   assert.match(plan.text, /^\[From Fieldy, Nov 9, \d+:00 (AM|PM) · Talk a\]\nSarah Miller called/);
-  assert.equal(plan.through, '2026-11-09T18:00:00Z');
+  assert.equal(plan.blocks[1].startTime, '2026-11-09T18:00:00Z', 'each block keeps its time, for the note it becomes');
+  assert.deepEqual(plan.skipped, []);
   assert.equal(plan.later, 0);
   assert.equal(f.sourceFor('promised to call  Ana back', plan.blocks), plan.blocks[1].label, 'an item says which conversation it came from');
   assert.equal(f.sourceFor('not there at all', plan.blocks), '');
+  const twice = f.reviewPlan([conv('x', '2026-11-09T17:00:00Z', 'Called Ana.'), conv('y', '2026-11-09T18:00:00Z', 'Called Ana.')], now);
+  assert.equal(f.sourceFor('Called Ana', twice.blocks), '', 'a line in two conversations is not pinned on either');
+  assert.equal(f.blocksFor('Called Ana', twice.blocks).length, 2);
+  const sameMinute = f.reviewPlan([conv('m2', '2026-11-09T17:00:00Z', 'Second.'), conv('m1', '2026-11-09T17:00:00Z', 'First.')], now);
+  assert.deepEqual(sameMinute.blocks.map((block) => block.id), ['m1', 'm2'], 'two at the same minute are both read');
 }, 'conversations become review text, labeled');
 check(() => {
   const now = Date.parse('2026-11-09T18:30:00Z');
@@ -129,21 +134,28 @@ check(() => {
     conv('a', '2026-11-09T17:00:00Z', 'Summary of a.'),
     conv('b', '2026-11-09T18:00:00Z', '', { endTime: '2026-11-09T18:20:00Z' }),
     conv('c', '2026-11-09T18:25:00Z', 'Summary of c.'),
-  ], '2026-11-09T09:00:00Z', now);
-  assert.deepEqual(plan.blocks.map((block) => block.id), ['a']);
-  assert.equal(plan.through, '2026-11-09T17:00:00Z', 'the read stops before a conversation Fieldy has not summarized yet');
-  assert.equal(plan.later, 2);
-  const withTranscript = f.reviewPlan([conv('b', '2026-11-09T12:00:00Z', '')], '2026-11-09T09:00:00Z', now, { b: 'A: we talked' });
+    conv('live', '2026-11-09T18:28:00Z', '', { endTime: '' }),
+  ], now);
+  assert.deepEqual(plan.blocks.map((block) => block.id), ['a', 'c'], 'one not summarized yet never holds back those after it');
+  assert.equal(plan.later, 2, 'it waits, as does one still going on');
+  assert.deepEqual(plan.skipped, []);
+  const withTranscript = f.reviewPlan([conv('b', '2026-11-09T12:00:00Z', '')], now, { b: 'A: we talked' });
   assert.match(withTranscript.text, /A: we talked/, 'an old one with no summary is read from its transcript');
-}, 'a conversation not summarized yet waits');
+  const dayLater = f.reviewPlan([conv('none', '2026-11-08T12:00:00Z', '', { endTime: '2026-11-08T12:30:00Z' })], now);
+  assert.deepEqual(dayLater.skipped, ['none'], 'no text a day after it ended: skipped, and said so');
+  assert.equal(dayLater.later, 0);
+}, 'a conversation not summarized yet waits; one never summarized is skipped');
 check(() => {
   const now = Date.parse('2026-11-10T03:00:00Z');
   const long = 'x '.repeat(1200);
   const many = Array.from({ length: 10 }, (_, index) => conv(`c${index}`, `2026-11-09T1${index}:00:00Z`, long));
-  const plan = f.reviewPlan(many, '2026-11-09T00:00:00Z', now);
+  const plan = f.reviewPlan(many, now);
   assert.ok(plan.text.length <= 12_000, 'within what the review reads');
   assert.ok(plan.blocks.length < 10 && plan.later === 10 - plan.blocks.length, 'the rest wait for the next read');
-  assert.equal(plan.through, plan.blocks[plan.blocks.length - 1] && many[plan.blocks.length - 1].startTime);
+  const huge = f.reviewPlan([conv('h', '2026-11-09T10:00:00Z', `START ${'y '.repeat(5000)} I will send the packet Friday END`)], now);
+  assert.ok(huge.blocks[0].text.length < 6_200, 'a long summary is shortened');
+  assert.match(huge.text, /START/);
+  assert.match(huge.text, /send the packet Friday END/, 'its end is kept (promises are often last)');
 }, 'too much for one review: the rest wait');
 
 // ─── Plaud ─────────────────────────────────────────────────────────────────
@@ -189,7 +201,7 @@ check(() => {
     'Ana asked about detox.\nAction items:\nCall back Friday\nKey topics: detox\ninsurance');
   assert.equal(f.emailFrom({ user: { email: 'matt@example.test' } }), 'matt@example.test');
   assert.equal(f.emailFrom({ name: 'no email' }), '');
-  const plan = f.reviewPlan([{ ...conversations[0], summary: 'Ana asked about detox.' }], '2026-11-09T00:00:00Z', Date.parse('2026-11-09T23:00:00Z'), {}, 'Plaud');
+  const plan = f.reviewPlan([{ ...conversations[0], summary: 'Ana asked about detox.' }], Date.parse('2026-11-09T23:00:00Z'), {}, 'Plaud');
   assert.match(plan.text, /^\[From Plaud, Nov 9, \d+:00 (AM|PM) · Call with Ana\]/);
 }, 'Plaud: recordings, notes and the account');
 
@@ -202,18 +214,30 @@ check(() => {
   assert.match(api, /keychainAccessible: SecureStore\.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY/, 'the sign-in stays on this phone, never synced or backed up');
   assert.doesNotMatch(api, /supabase/, 'nothing about Fieldy goes to ReferralFit\'s server');
   assert.doesNotMatch(api, /console\.(log|error|warn)\([^)]*(token|refresh|summary|text)\b/i, 'no token or conversation is logged');
-  assert.match(api, /refreshing\.set\(key, refresh\)/, 'one refresh at a time per recorder and account (refresh tokens rotate)');
+  assert.match(api, /function serial<T>\(key: string, work: \(\) => Promise<T>\)/, 'every change to the sign-in goes through one queue (refresh tokens rotate)');
   assert.match(api, /const slot = \(recorder: Recorder, userId: string\) => `\$\{recorder\.id\}:\$\{userId\}`/, 'tokens are kept per recorder and per account');
-  assert.match(api, /await writeStored\(recorder, userId, \{ \.\.\.stored, refreshToken: tokens\.refreshToken \}\)/, 'the new refresh token is kept at once');
+  assert.match(api, /return serial\(key, async \(\) => \{[^]*await writeToken\(recorder, userId, \{ \.\.\.token, refreshToken: tokens\.refreshToken \}\)/, 'the new refresh token is kept at once, inside the queue');
   assert.match(api, /recorder\.revokeUrl[^]*logoutPlan/, 'disconnecting revokes the access at the recorder (Fieldy: revocation; Plaud: logout)');
+  assert.match(api, /const token = await serial\(key, \(\) => readToken\(recorder, userId\)\)/, 'a disconnect waits for a refresh on its way, and revokes the newest token');
+  assert.match(api, /const readKey = [^\n]*\.read\.v1\./, 'what was reviewed is kept apart from the sign-in');
+  assert.match(api, /export async function forgetRecorders[^]*deleteItemAsync\(readKey\(recorder, userId\)\)/, 'deleting the account forgets what was reviewed too');
+  assert.match(api, /signal: controller\.signal/, 'every call gives up after a while');
+  assert.match(api, /Could not be read this time[^]*continue;/, 'a failed read is never taken for "no text"');
   assert.match(api, /WebBrowser\.openAuthSessionAsync\(authorizeUrl\(challenge, state, recorder\), recorder\.redirectUri\)/);
 }, 'the connection');
 check(() => {
-  assert.match(sheet, /commitRecorderRead\(recorder, userId, through\)/, 'a read moves on only once something from it is saved');
-  assert.match(sheet, /sourceFor\(found\.evidence, blocks\)/);
+  assert.doesNotMatch(sheet, /commitRecorderRead/);
+  assert.match(sheet, /results\[row\.key\]\?\.saved === true \|\| !row\.include/, 'a recording is done once every item from it is saved or set aside');
+  assert.match(sheet, /concat\(read\?\.skipped \?\? \[\]\)/, 'one with nothing found, or skipped, is done on reading');
+  assert.match(sheet, /function markAllReviewed\(\)/, 'the practitioner can be done with them');
+  assert.match(sheet, /if \(keyMissing && status\.state !== 'on'\) return null;/, 'a connected recorder can be disconnected without a key');
+  assert.match(sheet, /blocksFor\(found\.evidence, blocks\)/);
+  assert.match(read('src/lib/WorkspaceScreen.tsx'), /forgetRecorders\(userId\)/, 'deleting the account disconnects every recorder');
   assert.ok(appJson.expo.scheme.includes('com.mattbrown.referralfit'), 'the app opens for Fieldy\'s return');
   assert.ok(appJson.expo.plugins.includes('expo-web-browser'));
   assert.match(app, /countNewRecordings\(recorder, userId\)/, 'the Today card counts, it does not review');
+  assert.match(app, /const key = await getAnthropicKey\(userId\)/, 'without a key nothing is counted, so no card and no reminder');
+  assert.match(app, /counts\[index\] \?\? previous\[recorder\.id\]/, 'a count that could not be read keeps the last one');
   assert.match(app, /if \(target === 'day_review'\)/, 'the 6 PM reminder opens the review');
 }, 'the review and the app');
 

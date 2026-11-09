@@ -283,6 +283,8 @@ export type ReviewRow = {
   found: FoundItem;
   /** Where it came from, when the notes were read from a recorder ("From Fieldy, Nov 9, 2:15 PM · Call with Sarah"). */
   source: string;
+  /** When that recording was made: a note is dated then, not when it is reviewed. '' for pasted notes. */
+  occurredAt: string;
   /** The note, the task, or the lead's summary; editable. */
   text: string;
   // A new lead (editable).
@@ -438,6 +440,7 @@ function blankRow(found: FoundItem, index: number, today: string, makeId: () => 
     licenseConfirmed: null,
     candidate: null,
     source: '',
+    occurredAt: '',
     include: found.verified,
     hint: found.verified ? ''
       : found.namesFound === false ? 'A name or organization here is not in your notes. Check it before saving.'
@@ -619,7 +622,7 @@ function placePartner(row: ReviewRow, workspace: Workspace) {
  * caller who is new today goes on the case the lead will create.
  */
 export function buildRows(items: FoundItem[], workspace: Workspace, today: string, makeId: () => string,
-  sourceOf: (found: FoundItem) => string = () => ''): ReviewRow[] {
+  sourceOf: (found: FoundItem) => { label: string; at: string } | null = () => null): ReviewRow[] {
   const rows = items.map((found, index) => withSource(blankRow(found, index, today, makeId), sourceOf(found)));
   const leads: ReviewRow[] = [];
   for (const row of rows) {
@@ -649,11 +652,12 @@ export function buildRows(items: FoundItem[], workspace: Workspace, today: strin
  * A row read from a recorder says which conversation it came from, and a
  * note keeps that on the timeline ("… (From Fieldy, Nov 9, 2:15 PM)").
  */
-function withSource(row: ReviewRow, source: string): ReviewRow {
-  if (!source) return row;
-  const when = source.split(' · ')[0];
+function withSource(row: ReviewRow, source: { label: string; at: string } | null): ReviewRow {
+  if (!source?.label) return row;
+  const when = source.label.split(' · ')[0];
   const note = row.kind === 'case_note' || row.kind === 'partner_note' || row.kind === 'new_lead';
-  return { ...row, source, text: note && row.text && !row.text.includes(when) ? `${row.text} (${when})` : row.text };
+  const at = Number.isNaN(Date.parse(source.at)) ? '' : new Date(source.at).toISOString();
+  return { ...row, source: source.label, occurredAt: at, text: note && row.text && !row.text.includes(when) ? `${row.text} (${when})` : row.text };
 }
 
 /**

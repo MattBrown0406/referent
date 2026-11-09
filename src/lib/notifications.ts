@@ -253,17 +253,20 @@ function isScheduleCurrent(generation: number, ownerId: string): boolean {
 let lastAppliedSchedule: { ownerId: string; signature: string } | null = null;
 
 // New Fieldy or Plaud recordings waiting for the day review (src/lib/fieldy-api.ts
-// countNewRecordings): one reminder at 6 PM, only while some wait.
-let dayReviewWaiting = 0;
+// countNewRecordings): one reminder at 6 PM, only while some wait. Kept per
+// account: a count that arrives before the account's schedule is active is
+// still there when it is, and one account's count never shows for another.
+const dayReviewWaiting = new Map<string, number>();
 let lastInput: NotificationInput | null = null;
 const DAY_REVIEW_HOUR = 18;
 
 /** How many recordings wait for review; the 6 PM reminder follows it. */
 export function setDayReviewWaiting(count: number, ownerId: string): Promise<void> {
+  if (!ownerId) return Promise.resolve();
   const next = Math.max(0, Math.floor(count) || 0);
-  if (next === dayReviewWaiting) return Promise.resolve();
-  dayReviewWaiting = next;
-  if (!lastInput || !ownerId || ownerId !== scheduleOwnerId) return Promise.resolve();
+  if (next === (dayReviewWaiting.get(ownerId) ?? 0)) return Promise.resolve();
+  dayReviewWaiting.set(ownerId, next);
+  if (!lastInput || ownerId !== scheduleOwnerId) return Promise.resolve();
   const input = lastInput;
   const generation = ++scheduleGeneration;
   return queueScheduleWork(() => replaceSchedule(input, generation, ownerId));
@@ -304,7 +307,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   const now = new Date();
 
   // Generic words on the lock screen: never a name or what was said.
-  const reviewAt = dayReviewReminderAt(dayReviewWaiting, now);
+  const reviewAt = dayReviewReminderAt(dayReviewWaiting.get(ownerId) ?? 0, now);
   if (reviewAt && remaining > 0 && plan({
     content: {
       title: 'ReferralFit',
@@ -481,8 +484,7 @@ async function clearSystemNotifications(): Promise<void> {
 
 export function activateReferralFitNotificationOwner(ownerId: string): Promise<void> {
   if (scheduleOwnerId !== ownerId) {
-    // Another account's count never carries over.
-    dayReviewWaiting = 0;
+    // Another account's schedule never carries over (counts are per account).
     lastInput = null;
   }
   scheduleOwnerId = ownerId;
@@ -502,7 +504,7 @@ export function rescheduleNotifications(input: NotificationInput, ownerId: strin
 
 export function cancelReferralFitNotifications(): Promise<void> {
   scheduleOwnerId = null;
-  dayReviewWaiting = 0;
+  dayReviewWaiting.clear();
   lastInput = null;
   ++scheduleGeneration;
   return queueScheduleWork(clearSystemNotifications);
