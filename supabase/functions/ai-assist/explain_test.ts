@@ -150,6 +150,21 @@ Deno.test('rankings, outcomes, beds, money ties and outside names are refused; p
     ],
   });
   assertStringIncludes(parseExplainOutput(ordinaryAnswer, parseExplainRequest({ facts: ordinaryNames })).intro, 'two programs below');
+  // A program named after what the intro fact says (its state, insurer, level of care) does not stop a faithful intro.
+  const stateNames = {
+    intro: 'These are the 2 programs that fit your loved one\'s needs best, in order. Each one provides Inpatient care, works with Aetna and serves Oregon.',
+    programs: [{ ...FACTS.programs[0], name: 'Oregon Recovery Center' }, { ...FACTS.programs[1], name: 'Inpatient Recovery House' }],
+  };
+  const stateAnswer = (intro: string) => JSON.stringify({
+    intro,
+    programs: [
+      { rank: 1, text: 'Oregon Recovery Center offers inpatient care, works with Aetna, and offers EMDR. Its fit is 87 of 100.' },
+      { rank: 2, text: 'Inpatient Recovery House costs $4,500 a month, within your $6,000 budget.' },
+    ],
+  });
+  assertStringIncludes(parseExplainOutput(stateAnswer('Two programs fit your loved one best, in order. Each provides Inpatient care, works with Aetna and serves Oregon.'),
+    parseExplainRequest({ facts: stateNames })).intro, 'serves Oregon');
+  assertThrows(() => parseExplainOutput(stateAnswer('Oregon Recovery fits best, then the other.'), parseExplainRequest({ facts: stateNames })), AssistOutputError);
   assertThrows(() => parseExplainOutput(ordinaryAnswer.replace('The two programs below', 'The Haven and two programs below'), parseExplainRequest({ facts: ordinaryNames })), AssistOutputError);
   for (const intro of [
     'Juniper Ridge Recovery and Cedar House fit your loved one, in order.', 'Juniper Ridge is the best one for your loved one.',

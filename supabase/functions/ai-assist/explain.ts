@@ -244,18 +244,28 @@ function addsNames(text: string, facts: string, names: string[] = []): boolean {
   return false;
 }
 
+// The words, as written, appear in the text (letter-bounded, case as written).
+function phraseIn(text: string, words: string[]): boolean {
+  const escaped = words.map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+');
+  return new RegExp(`(?<![\\p{L}\\p{M}])${escaped}(?![\\p{L}\\p{M}])`, 'u').test(text);
+}
+
 /**
  * A program named by the start of its name, as the name writes it ("Cedar"
- * of "Cedar House", "The Haven" of "The Haven Recovery"): its first word,
- * or its first two when the first is an ordinary opener ("The", "New"…) or
- * a word as common as the intro's own.
+ * of "Cedar House"): its first word, or its first two when the first is an
+ * ordinary opener or common word ("The Haven", "New Day"), grown until it
+ * is not something the intro's own fact says ("Oregon Recovery" of "Oregon
+ * Recovery Center" when the fact says the family is in Oregon; "Sober
+ * Living by" when it says "Sober Living care").
  */
-function shortNameIn(text: string, name: string): boolean {
+function shortNameIn(text: string, name: string, fact: string): boolean {
   const words = name.trim().split(/\s+/).filter(Boolean);
   if (!words.length) return false;
-  const lead = OPENERS.has(comparable(words[0])) || COMMON_LEADS.has(comparable(words[0])) ? words.slice(0, 2) : words.slice(0, 1);
-  const escaped = lead.map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+');
-  return new RegExp(`(?<![\\p{L}\\p{M}])${escaped}(?![\\p{L}\\p{M}])`, 'u').test(text);
+  let size = OPENERS.has(comparable(words[0])) || COMMON_LEADS.has(comparable(words[0])) ? Math.min(2, words.length) : 1;
+  while (size < words.length && phraseIn(fact, words.slice(0, size))) size += 1;
+  // A name the fact itself writes in full cannot be told apart from the fact.
+  if (phraseIn(fact, words.slice(0, size))) return false;
+  return phraseIn(text, words.slice(0, size));
 }
 
 // First words of program names that an introduction may use as ordinary words.
@@ -304,7 +314,7 @@ export function parseExplainOutput(raw: string, request: ExplainRequest): Explai
   // shortened): its fact's "fit … best, in order" describes the list, so it
   // can never rank one or change the order.
   if (addsNumbers(intro, request.intro) || addsWords(intro, request.intro) || addsNames(intro, request.intro, names)
-    || request.programs.some((program) => shortNameIn(intro, program.name))) {
+    || request.programs.some((program) => shortNameIn(intro, program.name, request.intro))) {
     throw new AssistOutputError('The rewrite added to the facts.');
   }
   if (list.length !== request.programs.length) throw new AssistOutputError('The rewrite left out or added a program.');
