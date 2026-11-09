@@ -81,6 +81,11 @@ Deno.test('a reason that prescribes a level of care is dropped; the rating stays
     { reason: 'Needs help with cravings, though two past outpatient programs did not stop the drinking.' },
   ]), request());
   assertEquals([more[0].reason, more[1].reason], ['', ''], 'a comma inside the clause still prescribes');
+  const joined = parseLevelOutput(answer([
+    { reason: 'Needs 24-hour supervision, so residential care fits.' },
+    { reason: 'Requires medical monitoring, which inpatient detox provides.' },
+  ]), request());
+  assertEquals([joined[0].reason, joined[1].reason], ['', ''], '", so" and ", which" still lead to a prescribed level');
   assertEquals(more[2].reason, 'Needs help with cravings, though two past outpatient programs did not stop the drinking.', 'a new clause that names past care does not');
 });
 

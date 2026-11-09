@@ -810,7 +810,7 @@ export function rowSignatures(row: ReviewRow): string[] {
   const quote = comparable(row.found.evidence);
   // Two leads quoting one sentence are two callers: the caller is part of it.
   if (row.found.kind === 'new_lead' && row.found.verified && quote.split(' ').length >= 4) {
-    out.push(`new_lead|any|q:${quote}|${comparable(row.found.personName) || phoneKey(row.found.phone) || cleanEmail(row.found.email)}`);
+    out.push(`new_lead|any|q:${quote}|${phoneKey(row.found.phone) || cleanEmail(row.found.email) || nameWords(row.found.personName)[0] || ''}`);
   }
   return out;
 }

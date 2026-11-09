@@ -151,3 +151,29 @@ Deno.test('faithful rewrites pass: possessives, a state written out, everyday wo
     assertEquals(result.programs[0].text, text);
   }
 });
+
+Deno.test('claims in ordinary words are refused; faithful wording about cost and places passes', () => {
+  const second = 'Cedar House costs $4,500 a month, within your $6,000 budget.';
+  const first = (text: string) => answer({ programs: [{ rank: 1, text }, { rank: 2, text: second }] });
+  const base = 'Juniper Ridge Recovery offers inpatient care and works with Aetna.';
+  for (const claim of [
+    'There is no wait to get in.', 'We have no ties to it.', 'It is your partner program.', 'Aetna will cover the full cost.',
+    'It is free with Aetna.', 'We are not compensated by them.', 'No money changes hands.', 'It will help your loved one recover.',
+    'You won\'t have to wait.', 'Your loved one can get in right away.', 'They could go there today.', 'It is first-rate.',
+    'It is highly rated.', 'It is accredited and licensed.', 'It is exceptional.', 'It is a great fit.', 'It is a good match.',
+    'It is the right program.', 'It is a safe choice.', 'We receive nothing from them.',
+  ]) {
+    assertThrows(() => parseExplainOutput(first(`${base} ${claim}`), request()), AssistOutputError, undefined, claim);
+  }
+  for (const text of [
+    'Juniper Ridge Recovery\'s EMDR therapy is part of its program, and it works with Aetna.',
+    'Juniper Ridge Recovery is in Bend Oregon and works with Aetna.',
+    'Juniper Ridge Recovery offers inpatient care. On top of offering EMDR, it works with Aetna, for you and your spouse or partner.',
+  ]) {
+    assertEquals(parseExplainOutput(first(text), request()).programs[0].text, text);
+  }
+  const cash = (text: string) => answer({ programs: [{ rank: 1, text: `${base}` }, { rank: 2, text }] });
+  for (const text of ['Cedar House has a monthly fee of $4,500, within your $6,000 budget.', 'If your family pays privately, Cedar House costs $4,500 a month, paid out of pocket.']) {
+    assertEquals(parseExplainOutput(cash(text), request()).programs[1].text, text);
+  }
+});

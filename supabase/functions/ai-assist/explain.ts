@@ -115,26 +115,37 @@ export function explainSchema(): Record<string, unknown> {
 const UNSAID = [
   'best', 'guarantee', 'guaranteed', 'guarantees', 'cure', 'cured', 'cures', 'promise', 'promises', 'promised', 'definitely', 'certainly',
   'recommend', 'recommends', 'recommended', 'recommendation', 'top', 'tier', 'strongest', 'ideal', 'perfect', 'excellent', 'outstanding',
-  'superior', 'leading', 'trusted', 'proven', 'success', 'successful', 'outcome', 'outcomes', 'results', 'bed', 'beds', 'admit', 'admits',
-  'admitted', 'admission', 'admissions', 'waiting', 'financial', 'fee', 'fees', 'paid', 'pays', 'ties', 'commission', 'sponsor', 'sponsored',
-  'partner', 'partners', 'partnered', 'partnership', 'affiliated', 'affiliate',
+  'exceptional', 'superior', 'leading', 'trusted', 'proven', 'success', 'successful', 'outcome', 'outcomes', 'results', 'recover',
+  'recovers', 'bed', 'beds', 'admit', 'admits', 'admitted', 'admission', 'admissions', 'financial', 'commission', 'compensated',
+  'compensation', 'sponsor', 'sponsored', 'partner', 'partners', 'partnered', 'partnership', 'affiliated', 'affiliate', 'accredited',
+  'licensed', 'waitlist',
 ];
+// Claims made of ordinary words; checked on the whole text first.
 const UNSAID_PHRASES = [
-  'right choice', 'right fit', 'first choice', 'no connection', 'not connected', 'no relationship', 'same day', 'can start today',
-  'start right away',
+  'right choice', 'right fit', 'right program', 'right place', 'first choice', 'safe choice', 'good choice', 'great choice', 'great fit',
+  'good fit', 'perfect fit', 'great match', 'good match', 'first rate', 'highly rated', 'well rated', 'top of our list', 'top of the list',
+  'top of my list', 'no connection', 'not connected', 'no relationship', 'no ties', 'ties to', 'same day', 'no wait', 'no waiting',
+  'not have to wait', 'won t have to wait', 'need to wait', 'right away', 'in today', 'there today', 'start today', 'can start',
+  'referral fee', 'referral fees', 'finder fee', 'no fee', 'no fees', 'we are paid', 'we get paid', 'paid by', 'pays us', 'paid to',
+  'we receive', 'receive nothing', 'nothing in return', 'no money', 'money changes', 'is free', 'for free', 'free with', 'free of charge',
+  'at no cost', 'no cost to', 'will cover', 'covers the', 'fully covered', 'full cost',
 ];
-const EVERYDAY_PHRASES = ['on top of that', 'on top of this', 'you and your partner', 'your partner', 'ask about the fee', 'ask about fees',
-  'ask about the fees', 'while waiting', 'waiting to hear'];
+// Everyday phrases with one of the words above, set aside before the word
+// check (never before the phrase check): "on top of that", "you and your
+// partner", "ask about the fee".
+const EVERYDAY_PHRASES = ['on top of that', 'on top of this', 'on top of', 'you and your partner', 'your spouse or partner',
+  'spouse or partner', 'ask about the fee', 'ask about fees', 'ask about the fees', 'while waiting', 'waiting to hear'];
 
 function addsWords(text: string, facts: string): string | null {
   const factWords = ` ${comparable(facts)} `;
   const said = new Set(factWords.trim().split(' '));
-  let textWords = ` ${comparable(text)} `;
-  for (const phrase of EVERYDAY_PHRASES) textWords = textWords.split(` ${phrase} `).join(' ');
-  const words = new Set(textWords.trim().split(' '));
-  return UNSAID.find((word) => words.has(word) && !said.has(word))
-    ?? UNSAID_PHRASES.find((phrase) => textWords.includes(` ${phrase} `) && !factWords.includes(` ${phrase} `))
-    ?? null;
+  const whole = ` ${comparable(text)} `;
+  const phrase = UNSAID_PHRASES.find((item) => whole.includes(` ${item} `) && !factWords.includes(` ${item} `));
+  if (phrase) return phrase;
+  let rest = whole;
+  for (const item of EVERYDAY_PHRASES) rest = rest.split(` ${item} `).join(' ');
+  const words = new Set(rest.trim().split(' '));
+  return UNSAID.find((word) => words.has(word) && !said.has(word)) ?? null;
 }
 
 /**
@@ -150,11 +161,24 @@ function addsNames(text: string, facts: string): boolean {
   // "Oregon Recovery"): the whole run must be in the facts, or be a state
   // they give, or be a word that is always capitalized.
   for (const match of text.matchAll(/(?<=[^.!?:;\s"“(]\s+)[A-Z][a-zA-Z'’-]*(?:\s+[A-Z][a-zA-Z'’-]*)*/g)) {
-    const words = match[0].split(/\s+/).map((word) => word.replace(/['’]s$/i, ''));
-    const phrase = comparable(words.join(' '));
-    if (!phrase || known.includes(` ${phrase} `) || states.has(phrase)) continue;
-    if (words.every((word) => ALWAYS_CAPITALIZED.has(comparable(word)))) continue;
-    return true;
+    // A possessive ends a name: "Juniper Ridge Recovery's EMDR" is two.
+    const runs: string[][] = [[]];
+    for (const word of match[0].split(/\s+/)) {
+      runs[runs.length - 1].push(word.replace(/['’]s$/i, ''));
+      if (/['’]s$/i.test(word)) runs.push([]);
+    }
+    for (const run of runs) {
+      if (!run.length) continue;
+      if (run.every((word) => ALWAYS_CAPITALIZED.has(comparable(word)))) continue;
+      // A state the facts give may follow a place they give ("Bend Oregon"), never lead a name ("Oregon Recovery").
+      let words = [...run];
+      for (let size = 3; size >= 1; size -= 1) {
+        if (words.length > size && states.has(comparable(words.slice(-size).join(' ')))) { words = words.slice(0, -size); break; }
+      }
+      const phrase = comparable(words.join(' '));
+      if (!phrase || known.includes(` ${phrase} `) || states.has(phrase)) continue;
+      return true;
+    }
   }
   return false;
 }

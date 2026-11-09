@@ -189,6 +189,22 @@ Deno.test('a person or organization the notes never name is not verified', () =>
   }
   assertEquals(nameInNotes('Sarah Miller', ' called sarah miller about her son ', capitalizedWords('called sarah miller about her son')), true,
     'notes typed in lower case are matched as written');
+  const lower = 'Called sarah miller. She wants info. Talked about detox. I said yes.';
+  assertEquals(nameInNotes('Sarah Miller', ` ${comparable(lower)} `, capitalizedWords(lower)), true, 'sentence starts do not make notes "capitalized"');
+  const spanish = 'Llamé a José Ramírez y a la Sra. Muñoz. Ángela Núñez quiere ayuda para su hijo.';
+  for (const name of ['José Ramírez', 'Ángela Núñez', 'Mrs. Muñoz']) {
+    assertEquals(nameInNotes(name, ` ${comparable(spanish)} `, capitalizedWords(spanish)), true, `accented names: ${name}`);
+  }
+  const marks = 'Met Mr. O\'Brien and Ms. Smith-Jones at the clinic. Then saw the Lee family. Called Rivera about the bed.';
+  for (const name of ['Mr. O\'Brien', 'Ms. Smith-Jones', 'the Lees', 'the Riveras']) {
+    assertEquals(nameInNotes(name, ` ${comparable(marks)} `, capitalizedWords(marks)), true, `apostrophes, hyphens and plurals: ${name}`);
+  }
+  const bullets = '- Bridge the gap with the family.\nHope is what she needs. Life has been hard for Tom Parker since May.';
+  for (const invented of ['Bridge Recovery', 'Hope Sober Living', 'New Life Recovery']) {
+    assertEquals(nameInNotes(invented, ` ${comparable(bullets)} `, capitalizedWords(bullets), 'organization'), false,
+      `a word capitalized only to start a sentence or bullet is not a name: ${invented}`);
+  }
+  assertEquals(nameInNotes('Tom Parker', ` ${comparable(bullets)} `, capitalizedWords(bullets)), true);
 });
 
 Deno.test('a quote too short to show anything is not verified', () => {

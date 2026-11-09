@@ -448,6 +448,8 @@ check(() => {
   const [again] = rules.markSavedBefore(rules.buildRows([lead], ws, TODAY, makeId), saved);
   assert.equal(again.kind, 'case_note', 'read again, the lead is now a note on its own case');
   assert.equal(again.include, false, 'and it is still recognized as saved');
+  const [shorter] = rules.markSavedBefore(rules.buildRows([{ ...lead, personName: 'Kevin' }], ws, TODAY, makeId), saved);
+  assert.equal(shorter.include, false, 'even when the AI gives the caller\'s name differently the second time');
 }, 'a saved lead read again is not saved twice');
 check(() => {
   const [lead, callBack] = build(
