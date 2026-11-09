@@ -81,6 +81,7 @@ import BusinessDashboard from './src/lib/BusinessDashboard';
 import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
 import OutreachSheet, { type OutreachSent, type OutreachSheetRequest } from './src/lib/OutreachSheet';
 import DayReviewSheet from './src/lib/DayReviewSheet';
+import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
 import { aiKeysSupported } from './src/lib/outreach-api';
 import {
   caseRecipients,
@@ -1300,6 +1301,7 @@ export default function App() {
   // Day review: notes from the day (a recorder's summary, call notes) read by
   // AI on the user's own key, approved row by row (docs/DAY_REVIEW.md).
   const [showDayReview, setShowDayReview] = useState(false);
+  const [showMatchExplanation, setShowMatchExplanation] = useState(false);
   const [directorySubmitBusy, setDirectorySubmitBusy] = useState(false);
   // Incremented after the account joins a different practice workspace, which
   // re-homes its rows server-side; bumping it re-runs the hydration effect.
@@ -1551,6 +1553,7 @@ export default function App() {
     clearPlacementAnswerLinks();
     // A review open for the account that signed out closes (it is cleared as it closes).
     setShowDayReview(false);
+    setShowMatchExplanation(false);
     setOutreach(null);
     setAssessmentCaseId(null);
     setPlacementSheet(null);
@@ -4623,7 +4626,7 @@ export default function App() {
   latestCasesRef.current = cases;
   const sheetOpenNow = Boolean(
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
-    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory || showPartnerImport || showDayReview
+    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory || showPartnerImport || showDayReview || showMatchExplanation
     || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
     || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible
     || placementSheet || placementCompareId || showHandoffs,
@@ -7260,6 +7263,18 @@ export default function App() {
             <View style={{ flex: 1 }}>
               <Text style={styles.askProgramsTitle}>Ask programs</Text>
               <Text style={styles.askProgramsBody}>One de-identified request to up to 8 of these programs. Compare their answers side by side.</Text>
+            </View>
+            <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+          </TouchableOpacity>
+        ) : null}
+
+        {/* Why these programs: the ranking in plain words for the family. Explains the order, never changes it. */}
+        {matches.length ? (
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Explain these programs to the family" onPress={() => setShowMatchExplanation(true)} style={styles.askProgramsButton}>
+            <AppIcon name="chatbubbles-outline" size={18} color={COLORS.forest} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.askProgramsTitle}>Explain to the family</Text>
+              <Text style={styles.askProgramsBody}>Why these programs, in plain words and in this order, ready to send by text or email.</Text>
             </View>
             <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
           </TouchableOpacity>
@@ -10215,6 +10230,13 @@ export default function App() {
           setShowBusinessDashboard(false);
           afterSheetCloses(() => openCase(caseId));
         }}
+      />
+      <MatchExplanationSheet
+        visible={showMatchExplanation}
+        userId={activeUserId}
+        profile={draftMatchProfile}
+        ranked={matches}
+        onClose={() => setShowMatchExplanation(false)}
       />
       <DayReviewSheet
         visible={showDayReview}

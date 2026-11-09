@@ -493,7 +493,7 @@ check(() => {
 check(() => assert.match(sheet, /call 911\. For a mental-health crisis, call or text 988/), 'urgent rows show 911 and 988');
 check(() => assert.match(sheet, /everyone in it agreed to be recorded/), 'the recording-consent reminder is shown');
 check(() => assert.match(app, /\{aiKeysSupported \? \(\s*<TouchableOpacity[^]*?accessibilityLabel="Review notes from your day"/), 'the entry shows only where AI keys work');
-check(() => assert.match(app, /\|\| showPartnerImport \|\| showDayReview\n/), 'the sheet counts as open');
+check(() => assert.match(app, /\|\| showPartnerImport \|\| showDayReview\b/), 'the sheet counts as open');
 check(() => {
   assert.match(app, /const resetAccountState = useCallback\(\(\) => \{[^]*?setShowDayReview\(false\);/, 'signing out closes it');
   assert.match(app, /leadResponseMinutes=\{leadSettings\.leadResponseTargetMinutes\}/);
