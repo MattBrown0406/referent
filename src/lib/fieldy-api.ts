@@ -35,6 +35,8 @@ import {
   FIELDY,
   FieldyError,
   formBody,
+  hasAnswer,
+  LIST_PAGE_SIZE,
   listArguments,
   listPlan,
   logoutPlan,
@@ -57,6 +59,7 @@ import {
   type McpTool,
   type Recorder,
   type ReviewPlan,
+  type TranscriptPlan,
 } from './fieldy';
 
 export { FieldyError, FIELDY, PLAUD, RECORDERS, type Recorder, type RecorderId } from './fieldy';
@@ -125,7 +128,7 @@ async function readState(recorder: Recorder, userId: string): Promise<ReadState 
 
 async function writeState(recorder: Recorder, userId: string, value: ReadState): Promise<void> {
   const cutoff = Date.now() - REVIEWED_KEEP_MS;
-  const reviewed = Object.fromEntries(Object.entries(value.reviewed).filter(([, at]) => Date.parse(at) >= cutoff).slice(-400));
+  const reviewed = Object.fromEntries(Object.entries(value.reviewed).filter(([, at]) => Date.parse(at) >= cutoff).slice(-2000));
   await SecureStore.setItemAsync(readKey(recorder, userId), JSON.stringify({ floor: value.floor, reviewed }), KEYCHAIN);
 }
 
@@ -152,23 +155,52 @@ export async function recorderStatus(recorder: Recorder, userId: string): Promis
   return { connected: Boolean(token), email: token?.email ?? '' };
 }
 
-// Every call gives up after a while, so the review never waits for good.
+// Every call gives up after a while, the answer's body included (the
+// phone's fetch resolves on the headers, and a stream can stay open), so
+// the review never waits for good.
 const CALL_TIMEOUT_MS = 30_000;
 
-async function timedFetch(url: string, init: RequestInit): Promise<Response> {
+type Answer = { status: number; ok: boolean; contentType: string; sessionId: string; text: string };
+
+/**
+ * One request, read to the end within CALL_TIMEOUT_MS. An event stream is
+ * read only until `until` says the answer is in it (an MCP server may keep
+ * the stream open after answering).
+ */
+async function request(url: string, init: RequestInit, until?: (text: string) => boolean): Promise<Answer> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, CALL_TIMEOUT_MS);
+  });
+  const work = (async (): Promise<Answer> => {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const contentType = response.headers.get('content-type') || '';
+    const head = { status: response.status, ok: response.ok, contentType, sessionId: response.headers.get('mcp-session-id') || '' };
+    const reader = until && /text\/event-stream/i.test(contentType) && typeof TextDecoder !== 'undefined' ? response.body?.getReader() : undefined;
+    if (!reader) return { ...head, text: await response.text() };
+    const decoder = new TextDecoder();
+    let text = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) text += decoder.decode(value, { stream: true });
+      if (done) break;
+      if (until!(text)) { reader.cancel().catch(() => undefined); break; }
+    }
+    return { ...head, text: text + decoder.decode() };
+  })();
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    return await Promise.race([work, deadline]);
   } finally {
     clearTimeout(timer);
+    work.catch(() => undefined);
   }
 }
 
 async function postForm(recorder: Recorder, url: string, fields: Record<string, string>): Promise<unknown> {
-  let response: Response;
+  let answer: Answer;
   try {
-    response = await timedFetch(url, {
+    answer = await request(url, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
       body: formBody(fields),
@@ -176,7 +208,11 @@ async function postForm(recorder: Recorder, url: string, fields: Record<string, 
   } catch {
     throw new FieldyError(`${recorder.name} could not be reached. Check your connection and try again.`);
   }
-  return response.json().catch(() => ({ error: `http_${response.status}` }));
+  try {
+    return JSON.parse(answer.text);
+  } catch {
+    return { error: `http_${answer.status}` };
+  }
 }
 
 /**
@@ -222,40 +258,44 @@ export async function connectRecorder(recorder: Recorder, userId: string): Promi
 async function accountEmail(recorder: Recorder, userId: string, token: string): Promise<string> {
   try {
     if (recorder.userinfoUrl) {
-      const response = await timedFetch(recorder.userinfoUrl, { headers: { authorization: `Bearer ${token}`, accept: 'application/json' } });
-      return emailFrom(await response.json().catch(() => null));
+      const answer = await request(recorder.userinfoUrl, { headers: { authorization: `Bearer ${token}`, accept: 'application/json' } });
+      return emailFrom(JSON.parse(answer.text));
     }
-    const session = await openSession(recorder, userId);
+    const session = await openSession(recorder, userId, token);
     const name = userPlan(await tools(recorder, session));
-    return name ? emailFrom(toolPayload(await session.call('tools/call', { name, arguments: {} }))) : '';
+    return name ? emailFrom(toolPayload(await session.call('tools/call', { name, arguments: {} }), recorder)) : '';
   } catch {
     return '';
   }
 }
 
-// Revoked at the recorder (when it can be reached), then forgotten here.
-// Queued: a refresh on its way finishes first, and the newest token is the
-// one revoked, so a disconnect is never undone by it.
+// Forgotten here first, then revoked at the recorder (when it can be
+// reached), so a slow or closed app never leaves the sign-in on the phone.
+// Read and forgotten in one step of the queue: a refresh on its way
+// finishes first, and the newest token is the one revoked; one queued after
+// finds nothing, so a disconnect is never undone by it. Plaud's logout is a
+// tool on its MCP server, so its access token is taken first.
 async function revokeAndForget(recorder: Recorder, userId: string): Promise<void> {
   const key = slot(recorder, userId);
-  const token = await serial(key, () => readToken(recorder, userId));
-  if (token) {
-    try {
-      if (recorder.revokeUrl) {
-        await postForm(recorder, recorder.revokeUrl, { token: token.refreshToken, token_type_hint: 'refresh_token', client_id: recorder.clientId });
-      } else {
-        const session = await openSession(recorder, userId);
-        const name = logoutPlan(await tools(recorder, session));
-        if (name) await session.call('tools/call', { name, arguments: {} });
-      }
-    } catch {
-      // Unreachable: it is forgotten here all the same.
-    }
-  }
-  await serial(key, async () => {
+  const live = recorder.revokeUrl ? null : await accessToken(recorder, userId).catch(() => null);
+  const token = await serial(key, async () => {
+    const current = await readToken(recorder, userId);
     access.delete(key);
     await SecureStore.deleteItemAsync(tokenKey(recorder, userId)).catch(() => undefined);
+    return current;
   });
+  if (!token) return;
+  try {
+    if (recorder.revokeUrl) {
+      await postForm(recorder, recorder.revokeUrl, { token: token.refreshToken, token_type_hint: 'refresh_token', client_id: recorder.clientId });
+    } else if (live) {
+      const session = await openSession(recorder, userId, live);
+      const name = logoutPlan(await tools(recorder, session));
+      if (name) await session.call('tools/call', { name, arguments: {} });
+    }
+  } catch {
+    // Unreachable: it is forgotten here all the same.
+  }
 }
 
 /** Disconnect: the access is revoked and forgotten; what was reviewed is kept, for a reconnect. */
@@ -266,10 +306,10 @@ export function disconnectRecorder(recorder: Recorder, userId: string): Promise<
 /** The account is deleted: every recorder is disconnected, and what was reviewed is forgotten too. */
 export async function forgetRecorders(userId: string): Promise<void> {
   if (!fieldySupported || !userId) return;
-  for (const recorder of RECORDERS) {
-    await revokeAndForget(recorder, userId).catch(() => undefined);
+  await Promise.all(RECORDERS.map(async (recorder) => {
     await SecureStore.deleteItemAsync(readKey(recorder, userId)).catch(() => undefined);
-  }
+    await revokeAndForget(recorder, userId).catch(() => undefined);
+  }));
 }
 
 async function accessToken(recorder: Recorder, userId: string): Promise<string> {
@@ -284,12 +324,13 @@ async function accessToken(recorder: Recorder, userId: string): Promise<string> 
     if (!token) throw new FieldyError(`Connect ${recorder.name} first.`, 'disconnected');
     let tokens;
     try {
+      // A server that does not rotate refresh tokens sends none back: the one kept stays.
       tokens = tokensFrom(await postForm(recorder, recorder.tokenUrl, {
         grant_type: 'refresh_token',
         refresh_token: token.refreshToken,
         client_id: recorder.clientId,
         resource: recorder.mcpUrl,
-      }), Date.now(), recorder.name);
+      }), Date.now(), recorder.name, token.refreshToken);
     } catch (error) {
       if (error instanceof FieldyError && error.reason === 'disconnected') {
         // Revoked at the recorder, or too old: the sign-in is forgotten so the
@@ -309,14 +350,14 @@ async function accessToken(recorder: Recorder, userId: string): Promise<string> 
 
 type Session = { call: (method: string, params?: Record<string, unknown>) => Promise<unknown> };
 
-async function openSession(recorder: Recorder, userId: string): Promise<Session> {
-  const token = await accessToken(recorder, userId);
+async function openSession(recorder: Recorder, userId: string, given?: string): Promise<Session> {
+  const token = given ?? await accessToken(recorder, userId);
   let sessionId = '';
   let protocol = MCP_PROTOCOL_VERSION;
   let next = 1;
-  const post = async (body: string): Promise<Response> => {
+  const post = async (body: string, id: number | null): Promise<Answer> => {
     try {
-      return await timedFetch(recorder.mcpUrl, {
+      return await request(recorder.mcpUrl, {
         method: 'POST',
         headers: {
           authorization: `Bearer ${token}`,
@@ -326,7 +367,7 @@ async function openSession(recorder: Recorder, userId: string): Promise<Session>
           ...(sessionId ? { 'mcp-session-id': sessionId } : {}),
         },
         body,
-      });
+      }, id === null ? undefined : (text) => hasAnswer(text, id));
     } catch {
       throw new FieldyError(`${recorder.name} could not be reached. Check your connection and try again.`);
     }
@@ -334,28 +375,21 @@ async function openSession(recorder: Recorder, userId: string): Promise<Session>
   const call = async (method: string, params: Record<string, unknown> = {}) => {
     const id = next;
     next += 1;
-    const response = await post(rpcBody(id, method, params));
-    if (response.status === 401) {
-      access.delete(slot(recorder, userId));
+    const answer = await post(rpcBody(id, method, params), id);
+    if (answer.status === 401) {
+      if (!given) access.delete(slot(recorder, userId));
       throw new FieldyError(`Your ${recorder.name} connection needs a moment. Try again.`);
     }
-    if (!response.ok) throw new FieldyError(`${recorder.name} could not read your ${recorder.noun}s right now. Try again.`);
-    const header = response.headers.get('mcp-session-id');
-    if (header) sessionId = header;
-    let text: string;
-    try {
-      text = await response.text();
-    } catch {
-      throw new FieldyError(`${recorder.name} could not be reached. Check your connection and try again.`);
-    }
-    return rpcResult(text, response.headers.get('content-type') || '', id);
+    if (!answer.ok) throw new FieldyError(`${recorder.name} could not read your ${recorder.noun}s right now. Try again.`);
+    if (answer.sessionId) sessionId = answer.sessionId;
+    return rpcResult(answer.text, answer.contentType, id, recorder);
   };
   const init = await call('initialize', { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'ReferralFit', version: '1' } });
   // The version the server agreed to is the one every later request names.
   const agreed = (init as { protocolVersion?: unknown } | null)?.protocolVersion;
   if (typeof agreed === 'string' && agreed) protocol = agreed;
   // A notification has no answer to wait for.
-  await post(rpcBody(null, 'notifications/initialized')).catch(() => undefined);
+  await post(rpcBody(null, 'notifications/initialized'), null).catch(() => undefined);
   return { call };
 }
 
@@ -374,23 +408,36 @@ async function tools(recorder: Recorder, session: Session): Promise<McpTool[]> {
 async function listConversations(recorder: Recorder, session: Session, toolList: McpTool[], since: string, until: string): Promise<FieldyConversation[]> {
   const plan = listPlan(toolList);
   if (!plan) throw new FieldyError(`${recorder.name} did not offer a way to list your ${recorder.noun}s. Paste the summary instead.`);
-  const found: FieldyConversation[] = [];
+  const found = new Map<string, FieldyConversation>();
   let cursor: string | null = null;
-  for (let page = 0; page < 10; page += 1) {
-    const payload = toolPayload(await session.call('tools/call', { name: plan.name, arguments: listArguments(plan, since, until, cursor) }));
-    const { conversations, nextCursor, text } = conversationsFrom(payload);
-    // An answer in words, not a list: never taken for "nothing new".
-    if (!conversations.length && text) throw new FieldyError(`${recorder.name} answered in a way ReferralFit could not read. Paste the summary instead.`);
-    found.push(...conversations);
-    if (!nextCursor || nextCursor === cursor || !plan.cursor) break;
-    cursor = nextCursor;
+  for (let page = 1; page <= 10; page += 1) {
+    const payload = toolPayload(await session.call('tools/call', { name: plan.name, arguments: listArguments(plan, since, until, cursor, page) }), recorder);
+    const { conversations, nextCursor, text, unreadable } = conversationsFrom(payload);
+    // An answer in words, or a list none of whose recordings could be read:
+    // never taken for "nothing new".
+    if ((!conversations.length && text) || unreadable) {
+      throw new FieldyError(`${recorder.name} answered in a way ReferralFit could not read. Paste the summary instead.`);
+    }
+    const before = found.size;
+    for (const item of conversations) found.set(item.id, item);
+    if (plan.cursor) {
+      if (!nextCursor || nextCursor === cursor) break;
+      cursor = nextCursor;
+    } else if (plan.page) {
+      // Pages by number: until a short page, or one with nothing new.
+      if (conversations.length < LIST_PAGE_SIZE || found.size === before) break;
+    } else {
+      break;
+    }
   }
-  return found;
+  return [...found.values()];
 }
 
 // At most this many summaries or transcripts are read one by one in a
-// review (Plaud's list gives none); the rest wait for the next read.
+// review (Plaud's list gives none), and only for so long; the rest wait for
+// the next read, and never hold back recordings whose summary is in the list.
 const DETAIL_READS = 8;
+const DETAIL_TIME_MS = 60_000;
 // A recording the recorder has not summarized is read from its transcript
 // only once it ended this long ago (the summary is written after it ends).
 const SUMMARY_WAIT_MS = 90 * 60 * 1000;
@@ -410,6 +457,19 @@ async function unreviewed(recorder: Recorder, userId: string, session: Session, 
   return listed.filter((item) => Date.parse(item.startTime) >= Date.parse(since) && !state.reviewed[item.id]);
 }
 
+// One recording's text, by a tool: '' when the recorder has none for it
+// (its answer says so, or is an error about that recording); thrown only
+// when the recorder could not be reached, so the recording is tried again.
+async function detail(recorder: Recorder, session: Session, plan: TranscriptPlan, item: FieldyConversation, now: number,
+  read: (payload: unknown) => string): Promise<string> {
+  try {
+    return read(toolPayload(await session.call('tools/call', { name: plan.name, arguments: recordingArguments(plan, item, now) }), recorder));
+  } catch (error) {
+    if (error instanceof FieldyError && error.reason === 'tool') return '';
+    throw error;
+  }
+}
+
 /**
  * The recordings not reviewed yet, ready for the day review. Nothing is
  * marked reviewed here: markRecordingsReviewed does that, one recording at
@@ -417,6 +477,7 @@ async function unreviewed(recorder: Recorder, userId: string, session: Session, 
  */
 export async function readNewRecordings(recorder: Recorder, userId: string, now = new Date()): Promise<RecorderRead> {
   if (!(await readToken(recorder, userId))) throw new FieldyError(`Connect ${recorder.name} first.`, 'disconnected');
+  const started = Date.now();
   const session = await openSession(recorder, userId);
   const toolList = await tools(recorder, session);
   const fresh = (await unreviewed(recorder, userId, session, toolList, now))
@@ -430,23 +491,19 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
   let reads = 0;
   for (const item of fresh) {
     if (item.summary) { read.push(item); continue; }
-    if (reads >= DETAIL_READS) break;
+    if (reads >= DETAIL_READS || Date.now() - started > DETAIL_TIME_MS) continue;
     reads += 1;
     try {
-      if (note) {
-        const text = noteText(toolPayload(await session.call('tools/call', { name: note.name, arguments: recordingArguments(note, item, now.getTime()) })));
-        if (text) texts[item.id] = text;
-      }
-      const ended = item.endTime ? Date.parse(item.endTime) : NaN;
+      if (note) texts[item.id] = await detail(recorder, session, note, item, now.getTime(), noteText);
+      const ended = Date.parse(item.endTime || item.startTime);
       if (!texts[item.id] && transcript && !Number.isNaN(ended) && now.getTime() - ended >= SUMMARY_WAIT_MS) {
-        const text = transcriptText(toolPayload(await session.call('tools/call', {
-          name: transcript.name, arguments: recordingArguments(transcript, item, now.getTime()),
-        })), item.id);
-        if (text) texts[item.id] = text;
+        texts[item.id] = await detail(recorder, session, transcript, item, now.getTime(), (payload) => transcriptText(payload, item.id));
       }
+      if (!texts[item.id]) delete texts[item.id];
     } catch {
-      // Could not be read this time: left out (never taken for "no text"),
-      // and read again next time.
+      // Could not be reached this time: left out (never taken for "no
+      // text"), and read again next time.
+      delete texts[item.id];
       continue;
     }
     read.push(item);
@@ -478,7 +535,8 @@ export async function countNewRecordings(recorder: Recorder, userId: string, now
     const session = await openSession(recorder, userId);
     const fresh = await unreviewed(recorder, userId, session, await tools(recorder, session), now);
     return new Set(fresh.map((item) => item.id)).size;
-  } catch {
-    return null;
+  } catch (error) {
+    // The connection ended (the sign-in is forgotten): nothing waits. Otherwise the count stays as it was.
+    return error instanceof FieldyError && error.reason === 'disconnected' ? 0 : null;
   }
 }

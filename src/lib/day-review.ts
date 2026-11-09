@@ -124,9 +124,14 @@ export const PENDING_STATUS = 'pending';
 
 // ─── Names ─────────────────────────────────────────────────────────────────
 
-/** Letters and digits only, lower case, accents dropped. */
+// Letters the accent split leaves whole ("Łukasz" is "lukasz", "Strauß" is "strauss").
+const FOLD: Record<string, string> = { 'ł': 'l', 'ø': 'o', 'ß': 'ss', 'æ': 'ae', 'œ': 'oe', 'đ': 'd', 'þ': 'th', 'ı': 'i' };
+
+/** Letters (any alphabet) and digits only, lower case, accents dropped (as the day-review function does). */
 export function comparable(value: string): string {
-  return value.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  return value.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase()
+    .replace(/[łøßæœđþı]/g, (letter) => FOLD[letter] ?? letter)
+    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 }
 
 // Words that say nothing about who a person is: titles, and how someone is
@@ -656,7 +661,10 @@ function withSource(row: ReviewRow, source: { label: string; at: string } | null
   if (!source?.label) return row;
   const when = source.label.split(' · ')[0];
   const note = row.kind === 'case_note' || row.kind === 'partner_note' || row.kind === 'new_lead';
-  const at = Number.isNaN(Date.parse(source.at)) ? '' : new Date(source.at).toISOString();
+  // A recording time with its zone, not in the future (a clock off, or a bad
+  // date): anything else and the note is dated when it is saved.
+  const time = /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(source.at.trim()) ? Date.parse(source.at) : NaN;
+  const at = Number.isNaN(time) || time > Date.now() + 5 * 60_000 ? '' : new Date(time).toISOString();
   return { ...row, source: source.label, occurredAt: at, text: note && row.text && !row.text.includes(when) ? `${row.text} (${when})` : row.text };
 }
 
@@ -797,9 +805,11 @@ export function leadFor(row: ReviewRow, rows: ReviewRow[]): ReviewRow | null {
 /**
  * What a saved row was, to recognize it when the same notes are read again
  * ("Back to the notes", then Find): by its kind and target with either its
- * text or its quote.
+ * text or its quote. `saved` is true for a row being saved (it is known by
+ * everything about its caller), false for a row read again (it matches by
+ * what it has: a phone, an email, a full name, or a first name alone).
  */
-export function rowSignatures(row: ReviewRow): string[] {
+export function rowSignatures(row: ReviewRow, saved = false): string[] {
   const target = row.kind === 'new_lead' ? phoneKey(row.phone) || cleanEmail(row.email) || comparable(row.callerName)
     : row.kind === 'new_partner' ? orgKey(row.candidate?.organization || row.found.organization) || comparable(row.found.personName)
       : `${row.caseId || ''}|${row.partnerId || ''}`;
@@ -812,9 +822,18 @@ export function rowSignatures(row: ReviewRow): string[] {
   // Only for a lead: two other items often quote one sentence ("call Ana
   // and Sarah back tomorrow") and are still two things to save.
   const quote = comparable(row.found.evidence);
-  // Two leads quoting one sentence are two callers: the caller is part of it.
+  // Two leads quoting one sentence are two callers: the caller is part of it
+  // ("Mike Smith" saved never hides "Mike Jones"; one with no phone, name or
+  // email to tell it by is known by its own text and quote only).
   if (row.found.kind === 'new_lead' && row.found.verified && quote.split(' ').length >= 4) {
-    out.push(`new_lead|any|q:${quote}|${phoneKey(row.found.phone) || cleanEmail(row.found.email) || nameWords(row.found.personName)[0] || ''}`);
+    const names = nameWords(row.found.personName);
+    const keys = [
+      phoneKey(row.found.phone) ? `p:${phoneKey(row.found.phone)}` : '',
+      cleanEmail(row.found.email) ? `e:${cleanEmail(row.found.email)}` : '',
+      names.length >= 2 ? `n:${names.join(' ')}` : '',
+      names.length && (saved || names.length === 1) ? `f:${names[0]}` : '',
+    ].filter(Boolean);
+    for (const key of keys) out.push(`new_lead|any|q:${quote}|${key}`);
   }
   return out;
 }

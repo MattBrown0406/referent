@@ -300,7 +300,12 @@ function clip(value: string, max: number): string {
   return (space > max / 2 ? cut.slice(0, space) : value.slice(0, max)).trim();
 }
 
-const NAMES_A_LEVEL = /\b(needs?|requires?|recommend\w*|should (go|enter|attend|start|be (in|at|admitted|placed))|warrants?|calls? for|appropriate for|best suited (for|to)|suited for)\b(?:(?!,\s*(?:but|though|although|while|yet)\b)[^.;]){0,40}\b(inpatient|residential|detox\w*|outpatient|iop|php|partial hospitali[sz]ation|sober living|hospitali[sz]\w*|level of care)\b/i;
+// A reason that prescribes a level of care ("needs residential", "would
+// benefit from detox", "inpatient is the right level") is dropped: the
+// rating stays, the practitioner decides the level.
+const LEVELS = String.raw`(inpatient|residential|detox\w*|outpatient|iop|php|partial hospitali[sz]ation|sober living|hospitali[sz]\w*|level of care)`;
+const NAMES_A_LEVEL = new RegExp(String.raw`\b(needs?|requires?|recommend\w*|should (go|enter|attend|start|consider|be (in|at|admitted|placed))|warrants?|calls? for|appropriate for|best suited (for|to)|suited for|benefits? from|would benefit|consider\w*)\b(?:(?!,\s*(?:but|though|although|while|yet)\b)[^.;]){0,40}\b${LEVELS}\b`
+  + String.raw`|\b${LEVELS}\b[^.;]{0,30}\b(is|are|would be|seems?|may be|might be|could be)\s+(?:the\s+|an?\s+|most\s+)?(needed|necessary|warranted|appropriate|right|indicated|recommended|best|required|called for)\b`, 'i');
 
 /** The answers alone ("Question: answer" lines without their questions). */
 export function answerValues(request: LevelRequest): string {

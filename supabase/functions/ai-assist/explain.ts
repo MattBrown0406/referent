@@ -104,9 +104,6 @@ export function explainSchema(): Record<string, unknown> {
   };
 }
 
-// Words and phrases a rewrite may use only when its facts already do:
-// promises, rankings, outcomes, beds and admission, and money ties (the app
-// adds the disclosures itself, below the text).
 // Words a rewrite may use only when its facts already do: promises,
 // rankings, outcomes, beds and admission, and money ties (the app adds the
 // disclosures itself, below the text). A few everyday phrases that contain
@@ -118,23 +115,26 @@ const UNSAID = [
   'exceptional', 'superior', 'leading', 'trusted', 'proven', 'success', 'successful', 'outcome', 'outcomes', 'results', 'recover',
   'recovers', 'bed', 'beds', 'admit', 'admits', 'admitted', 'admission', 'admissions', 'financial', 'commission', 'compensated',
   'compensation', 'sponsor', 'sponsored', 'partner', 'partners', 'partnered', 'partnership', 'affiliated', 'affiliate', 'accredited',
-  'licensed', 'waitlist',
+  'licensed', 'waitlist', 'waiting', 'fee', 'fees', 'paid', 'pays', 'earn', 'earns', 'cover', 'covers', 'covered', 'coverage',
 ];
 // Claims made of ordinary words; checked on the whole text first.
 const UNSAID_PHRASES = [
   'right choice', 'right fit', 'right program', 'right place', 'first choice', 'safe choice', 'good choice', 'great choice', 'great fit',
   'good fit', 'perfect fit', 'great match', 'good match', 'first rate', 'highly rated', 'well rated', 'top of our list', 'top of the list',
   'top of my list', 'no connection', 'not connected', 'no relationship', 'no ties', 'ties to', 'same day', 'no wait', 'no waiting',
-  'not have to wait', 'won t have to wait', 'need to wait', 'right away', 'in today', 'there today', 'start today', 'can start',
-  'referral fee', 'referral fees', 'finder fee', 'no fee', 'no fees', 'we are paid', 'we get paid', 'paid by', 'pays us', 'paid to',
-  'we receive', 'receive nothing', 'nothing in return', 'no money', 'money changes', 'is free', 'for free', 'free with', 'free of charge',
-  'at no cost', 'no cost to', 'will cover', 'covers the', 'fully covered', 'full cost',
+  'have to wait', 'need to wait', 'without a wait', 'get in right away', 'start right away', 'go right away', 'admitted right away',
+  'get in today', 'go in today', 'there today', 'start today', 'can start treatment', 'can start there', 'can start this',
+  'can start next', 'referral fee', 'referral fees', 'finder fee', 'no fee', 'no fees', 'we are paid', 'we get paid', 'paid by', 'pays us',
+  'pay us', 'paid us', 'paid to', 'we receive', 'receive nothing', 'nothing in return', 'no money', 'money changes', 'is free', 'for free',
+  'free with', 'free of charge', 'at no cost', 'no cost to', 'full cost',
 ];
 // Everyday phrases with one of the words above, set aside before the word
 // check (never before the phrase check): "on top of that", "you and your
-// partner", "ask about the fee".
-const EVERYDAY_PHRASES = ['on top of that', 'on top of this', 'on top of', 'you and your partner', 'your spouse or partner',
-  'spouse or partner', 'ask about the fee', 'ask about fees', 'ask about the fees', 'while waiting', 'waiting to hear'];
+// partner", "ask about the fee", a cash price the facts give ("a monthly
+// fee of $4,500": the number must be in the facts), paying privately.
+const EVERYDAY_PHRASES = ['on top of that', 'on top of this', 'on top of', 'you and your partner', 'you or your partner',
+  'your spouse or partner', 'spouse or partner', 'ask about the fee', 'ask about fees', 'ask about the fees', 'while waiting',
+  'waiting to hear', 'fee of', 'pays privately', 'pay privately', 'paid out of pocket', 'pays out of pocket', 'pay out of pocket'];
 
 function addsWords(text: string, facts: string): string | null {
   const factWords = ` ${comparable(facts)} `;
@@ -148,22 +148,41 @@ function addsWords(text: string, facts: string): string | null {
   return UNSAID.find((word) => words.has(word) && !said.has(word)) ?? null;
 }
 
+// Ordinary words that start a sentence before a name ("Both Juniper Ridge
+// Recovery and…", "If Aetna…"): set aside, and the rest checked as a name.
+const OPENERS = new Set([
+  'the', 'it', 'its', 'this', 'that', 'these', 'those', 'your', 'you', 'each', 'both', 'their', 'they', 'there', 'here', 'if', 'when',
+  'while', 'because', 'since', 'for', 'with', 'at', 'in', 'on', 'and', 'but', 'so', 'also', 'as', 'a', 'an', 'we', 'our', 'like',
+  'unlike', 'another', 'one', 'some', 'many', 'most', 'all', 'every', 'no', 'not', 'then', 'after', 'before', 'during', 'although',
+  'though', 'however', 'still', 'yet', 'what', 'which', 'who', 'where', 'how', 'why', 'overall', 'next', 'second', 'first', 'only',
+  'just', 'even', 'compared', 'beyond', 'besides', 'plus', 'ask', 'call', 'about',
+]);
+
 /**
- * A name the facts never give (another program, a person, a place): a word
- * with a capital letter that does not start a sentence and is not in the
- * facts. The app then shows its own wording instead.
+ * A name the facts never give (another program, a person, a place): a run
+ * of words with a capital letter, in any alphabet, after a space or any
+ * punctuation ("(Hazelden)", "Aetna/Cigna"), that is not in the facts. A
+ * run starting a sentence is checked whole ("Cedar Ridge Recovery" is not
+ * "Ridge Recovery"), unless it starts with an ordinary opener; a single word
+ * starting a sentence is left alone. The app then shows its own wording.
  */
 function addsNames(text: string, facts: string): boolean {
   const known = ` ${comparable(facts)} `;
   // A state written out only where the facts give its code ("Bend, OR" lets "Oregon" through).
   const states = new Set([...facts.matchAll(/\b([A-Z]{2})\b/g)].map((match) => STATE_BY_CODE[match[1]] || '').filter(Boolean));
-  // Each run of capitalized words is one name ("Juniper Ridge Recovery's",
-  // "Oregon Recovery"): the whole run must be in the facts, or be a state
-  // they give, or be a word that is always capitalized.
-  for (const match of text.matchAll(/(?<=[^.!?:;\s"“(]\s+)[A-Z][a-zA-Z'’-]*(?:\s+[A-Z][a-zA-Z'’-]*)*/g)) {
+  const WORD = String.raw`\p{Lu}[\p{L}\p{M}'’-]*`;
+  for (const match of text.matchAll(new RegExp(String.raw`(?<![\p{L}\p{M}\p{N}'’])${WORD}(?:\s+${WORD})*`, 'gu'))) {
+    let at = (match.index ?? 0) - 1;
+    while (at >= 0 && /[\s"“”'‘(\[]/.test(text[at])) at -= 1;
+    const starts = at < 0 || /[.!?:;]/.test(text[at]);
+    let words = match[0].split(/\s+/);
+    if (starts) {
+      if (words.length === 1) continue;
+      if (OPENERS.has(comparable(words[0]))) words = words.slice(1);
+    }
     // A possessive ends a name: "Juniper Ridge Recovery's EMDR" is two.
     const runs: string[][] = [[]];
-    for (const word of match[0].split(/\s+/)) {
+    for (const word of words) {
       runs[runs.length - 1].push(word.replace(/['’]s$/i, ''));
       if (/['’]s$/i.test(word)) runs.push([]);
     }
@@ -171,11 +190,11 @@ function addsNames(text: string, facts: string): boolean {
       if (!run.length) continue;
       if (run.every((word) => ALWAYS_CAPITALIZED.has(comparable(word)))) continue;
       // A state the facts give may follow a place they give ("Bend Oregon"), never lead a name ("Oregon Recovery").
-      let words = [...run];
+      let named = [...run];
       for (let size = 3; size >= 1; size -= 1) {
-        if (words.length > size && states.has(comparable(words.slice(-size).join(' ')))) { words = words.slice(0, -size); break; }
+        if (named.length > size && states.has(comparable(named.slice(-size).join(' ')))) { named = named.slice(0, -size); break; }
       }
-      const phrase = comparable(words.join(' '));
+      const phrase = comparable(named.join(' '));
       if (!phrase || known.includes(` ${phrase} `) || states.has(phrase)) continue;
       return true;
     }
@@ -193,7 +212,8 @@ const STATE_BY_CODE: Record<string, string> = {
   VT: 'vermont', VA: 'virginia', WA: 'washington', WV: 'west virginia', WI: 'wisconsin', WY: 'wyoming',
 };
 
-const ALWAYS_CAPITALIZED = new Set(['i', 'referralfit', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']);
+const ALWAYS_CAPITALIZED = new Set(['i', 'referralfit', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+  'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']);
 
 function addsNumbers(text: string, facts: string): boolean {
   const allowed = numbersIn(facts);

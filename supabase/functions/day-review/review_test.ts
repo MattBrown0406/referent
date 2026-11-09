@@ -205,6 +205,32 @@ Deno.test('a person or organization the notes never name is not verified', () =>
       `a word capitalized only to start a sentence or bullet is not a name: ${invented}`);
   }
   assertEquals(nameInNotes('Tom Parker', ` ${comparable(bullets)} `, capitalizedWords(bullets)), true);
+  const check = (name: string, notes: string, kind: 'person' | 'organization' = 'person') =>
+    nameInNotes(name, ` ${comparable(notes)} `, capitalizedWords(notes), kind);
+  // A person named only at the start of a sentence or a bullet is still named.
+  const starts = 'Sarah called about her son Jake. She wants detox info and asked about Aetna. Talked to Dana at Juniper Ridge about a bed.';
+  assertEquals(check('Sarah', starts), true, 'a first name starting a sentence');
+  assertEquals(check('Jessica', '- Jessica called about her husband.\n- Talked to Dana and Tom Parker at Juniper Ridge.'), true, 'a first name starting a bullet');
+  assertEquals(check('Sarah Miller', 'called sarah miller about IOP vs PHP. she has BCBS and goes to AA. I\'m on it, I\'ve called.'), true,
+    'acronyms do not make lower-case notes "capitalized"');
+  // Titles and plurals.
+  assertEquals(check('Don', 'Dan called. He said don\'t call after 9. Talked to Tom Parker and Ana Lopez.'), false, '"don\'t" is not Don');
+  assertEquals(check('Don Smith', 'Dan Smith called. Talked to Tom Parker and Ana Lopez.'), false);
+  assertEquals(check('William', 'Called Ana Williams about the bed. Talked to Tom Parker.'), false, 'a first name is not a plural of another name');
+  assertEquals(check('Rivera', 'Spoke with the Riveras about the bed. Talked to Tom Parker and Ana Lopez.'), true, 'a family name, from "the Riveras"');
+  // Any alphabet.
+  assertEquals(check('Иван Петров', 'Called Ana Lopez about the bed.'), false, 'a name in another alphabet must be there too');
+  assertEquals(check('Иван Петров', 'Звонил Иван Петров. Talked to Tom Parker and Ana Lopez.'), true);
+  assertEquals(check('王伟', 'Called Ana Lopez about the bed.'), false);
+  assertEquals(check('王伟', '王伟 called. Talked to Tom Parker and Ana Lopez.'), true, 'letters without case are matched as written');
+  assertEquals(check('Łukasz Wałęsa', 'Talked to Lukasz Walesa and Tom Parker and Ana Lopez.'), true);
+  assertEquals(check('Anna Strauss', 'Talked to Anna Strauß and Tom Parker and Ana Lopez.'), true);
+  // Numbered items, times, headings, quotes and "etc." start a sentence; a capital inside a word is not one.
+  const items = '1) Hope called back\n10:30 Bridge the gap\n### Life plans\nShe said “fine.” Hope is all.\nAsked about beds etc. Hope again.\nGot her iPhone. Talked to Tom Parker and Ana Lopez at Cedar House.';
+  for (const invented of ['Hope Sober Living', 'Bridge Recovery', 'New Life Recovery', 'Phone Recovery']) {
+    assertEquals(check(invented, items, 'organization'), false, `not a name in the notes: ${invented}`);
+  }
+  assertEquals(check('Cedar House', items, 'organization'), true);
 });
 
 Deno.test('a quote too short to show anything is not verified', () => {

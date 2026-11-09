@@ -76,7 +76,8 @@ export const PLAUD: Recorder = {
 export const RECORDERS: Recorder[] = [FIELDY, PLAUD];
 
 export class FieldyError extends Error {
-  constructor(message: string, readonly reason: 'cancelled' | 'disconnected' | 'unavailable' | 'denied' = 'unavailable') {
+  /** 'tool': the recorder answered with an error about the request itself (a recording it has no note for, say), not a lost connection. */
+  constructor(message: string, readonly reason: 'cancelled' | 'disconnected' | 'unavailable' | 'denied' | 'tool' = 'unavailable') {
     super(message);
   }
 }
@@ -111,8 +112,10 @@ function queryOf(url: string): Record<string, string> {
   for (const part of query.split('&')) {
     if (!part) continue;
     const at = part.indexOf('=');
-    const key = decodeURIComponent((at < 0 ? part : part.slice(0, at)).replace(/\+/g, ' '));
-    out[key] = decodeURIComponent((at < 0 ? '' : part.slice(at + 1)).replace(/\+/g, ' '));
+    const decode = (value: string) => {
+      try { return decodeURIComponent(value.replace(/\+/g, ' ')); } catch { return value; }
+    };
+    out[decode(at < 0 ? part : part.slice(0, at))] = decode(at < 0 ? '' : part.slice(at + 1));
   }
   return out;
 }
@@ -138,8 +141,12 @@ export function codeFromCallback(url: string, state: string, recorder: Recorder 
 
 export type FieldyTokens = { accessToken: string; refreshToken: string; expiresAt: number };
 
-/** Fieldy's token answer, read defensively. A refresh token is required: without one the connection would stop in an hour. */
-export function tokensFrom(json: unknown, now = Date.now(), name = 'Fieldy'): FieldyTokens {
+/**
+ * A token answer, read defensively. A refresh token is required (without
+ * one the connection would stop in an hour), except on a refresh, where a
+ * server that does not rotate them sends none and `keep` stays in use.
+ */
+export function tokensFrom(json: unknown, now = Date.now(), name = 'Fieldy', keep = ''): FieldyTokens {
   const data = json && typeof json === 'object' ? json as Record<string, unknown> : {};
   if (typeof data.error === 'string') {
     throw data.error === 'invalid_grant'
@@ -147,7 +154,7 @@ export function tokensFrom(json: unknown, now = Date.now(), name = 'Fieldy'): Fi
       : new FieldyError(`${name} could not connect right now. Try again.`);
   }
   const accessToken = typeof data.access_token === 'string' ? data.access_token : '';
-  const refreshToken = typeof data.refresh_token === 'string' ? data.refresh_token : '';
+  const refreshToken = typeof data.refresh_token === 'string' && data.refresh_token ? data.refresh_token : keep;
   if (!accessToken || !refreshToken) throw new FieldyError(`${name} did not give ReferralFit lasting access. Try connecting again.`);
   const seconds = Number(data.expires_in);
   // A minute early, so a call never starts with a token about to end.
@@ -172,7 +179,7 @@ export function rpcBody(id: number | null, method: string, params: Record<string
  * The result of JSON-RPC message `id` from an MCP answer: plain JSON, or a
  * server-sent event stream whose data lines carry the messages.
  */
-export function rpcResult(text: string, contentType: string, id: number): unknown {
+function messagesIn(text: string, contentType: string): unknown[] | null {
   const messages: unknown[] = [];
   if (/text\/event-stream/i.test(contentType)) {
     let data: string[] = [];
@@ -186,20 +193,38 @@ export function rpcResult(text: string, contentType: string, id: number): unknow
       else if (!line.trim()) flushEvent();
     }
     flushEvent();
-  } else {
-    try {
-      const parsed = JSON.parse(text);
-      messages.push(...(Array.isArray(parsed) ? parsed : [parsed]));
-    } catch {
-      throw new FieldyError('Fieldy sent an answer ReferralFit could not read.');
-    }
+    return messages;
   }
-  // A response (result or error), never a request from the server that happens to use the same id.
-  const message = messages.find((item) => item && typeof item === 'object' && (item as { id?: unknown }).id === id
-    && ('result' in (item as object) || 'error' in (item as object))) as
-    { result?: unknown; error?: { message?: unknown } } | undefined;
-  if (!message) throw new FieldyError('Fieldy sent an answer ReferralFit could not read.');
-  if (message.error) throw new FieldyError('Fieldy could not read your conversations right now. Try again.');
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return null;
+  }
+}
+
+// A response (result or error), never a request from the server that happens to use the same id.
+function answerTo(messages: unknown[], id: number): { result?: unknown; error?: unknown } | undefined {
+  return messages.find((item) => item && typeof item === 'object' && (item as { id?: unknown }).id === id
+    && ('result' in (item as object) || 'error' in (item as object))) as { result?: unknown; error?: unknown } | undefined;
+}
+
+/** An event stream read so far already holds the answer to `id` (the rest need not be waited for). */
+export function hasAnswer(text: string, id: number): boolean {
+  // Only whole events: an event ends with a blank line.
+  const end = Math.max(text.lastIndexOf('\n\n'), text.lastIndexOf('\r\n\r\n'));
+  if (end < 0) return false;
+  return Boolean(answerTo(messagesIn(text.slice(0, end + 2), 'text/event-stream') ?? [], id));
+}
+
+/** The result of JSON-RPC request `id`, from a JSON or event-stream answer. */
+export function rpcResult(text: string, contentType: string, id: number, recorder: Pick<Recorder, 'name' | 'noun'> = FIELDY): unknown {
+  const unreadable = () => new FieldyError(`${recorder.name} sent an answer ReferralFit could not read.`);
+  const messages = messagesIn(text, contentType);
+  if (!messages) throw unreadable();
+  const message = answerTo(messages, id);
+  if (!message) throw unreadable();
+  if (message.error) throw new FieldyError(`${recorder.name} could not read your ${recorder.noun}s right now. Try again.`, 'tool');
   return message.result;
 }
 
@@ -216,13 +241,14 @@ const START_KEYS = ['startTime', 'start_time', 'startDate', 'start_date', 'from'
 const END_KEYS = ['endTime', 'end_time', 'endDate', 'end_date', 'to', 'until', 'before', 'end', 'dateTo', 'date_to'];
 const SIZE_KEYS = ['pageSize', 'page_size', 'limit', 'maxResults', 'max_results', 'count'];
 const CURSOR_KEYS = ['cursor', 'pageToken', 'page_token', 'nextCursor'];
+const PAGE_KEYS = ['page', 'pageNumber', 'page_number'];
 const ID_KEYS = ['conversationId', 'conversation_id', 'fileId', 'file_id', 'recordingId', 'recording_id', 'id'];
 
 function keyIn(properties: Record<string, unknown>, keys: string[]): string | null {
   return keys.find((key) => Object.prototype.hasOwnProperty.call(properties, key)) ?? null;
 }
 
-export type ListPlan = { name: string; start: string | null; end: string | null; size: string | null; cursor: string | null };
+export type ListPlan = { name: string; start: string | null; end: string | null; size: string | null; cursor: string | null; page: string | null };
 
 /**
  * The tool that lists conversations in a time window. Fieldy's MCP tools
@@ -234,14 +260,15 @@ export function listPlan(tools: McpTool[]): ListPlan | null {
     .map((tool) => {
       const name = tool.name.toLowerCase();
       const properties = tool.inputSchema?.properties || {};
-      const required = (tool.inputSchema?.required || []).filter((key) => ![...START_KEYS, ...END_KEYS, ...SIZE_KEYS, ...CURSOR_KEYS].includes(key));
+      const required = (tool.inputSchema?.required || []).filter((key) => ![...START_KEYS, ...END_KEYS, ...SIZE_KEYS, ...CURSOR_KEYS, ...PAGE_KEYS].includes(key));
       if (!/conversation|file|recording/.test(name) || /transcript|share|sharable|update|delete|create|patch|note|upload|login|logout/.test(name)
         || required.length) return null;
       const start = keyIn(properties, START_KEYS);
       const end = keyIn(properties, END_KEYS);
       const score = (/list|recent|get_conversations|conversations$|files$|recordings$/.test(name) ? 4 : 0) + (start ? 2 : 0) + (end ? 1 : 0)
         - (/search/.test(name) ? 1 : 0) - (/(^|_)get_(conversation|file|recording)$|by_id/.test(name) ? 5 : 0);
-      return { score, plan: { name: tool.name, start, end, size: keyIn(properties, SIZE_KEYS), cursor: keyIn(properties, CURSOR_KEYS) } };
+      const cursor = keyIn(properties, CURSOR_KEYS);
+      return { score, plan: { name: tool.name, start, end, size: keyIn(properties, SIZE_KEYS), cursor, page: cursor ? null : keyIn(properties, PAGE_KEYS) } };
     })
     .filter((item): item is { score: number; plan: ListPlan } => Boolean(item) && item!.score > 0)
     .sort((a, b) => b.score - a.score);
@@ -256,13 +283,16 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * on depends on the time zone, and anything before `since` is left out
  * afterwards (reviewPlan).
  */
-export function listArguments(plan: ListPlan, since: string, until: string, cursor: string | null): Record<string, unknown> {
+export const LIST_PAGE_SIZE = 50;
+
+export function listArguments(plan: ListPlan, since: string, until: string, cursor: string | null, page = 1): Record<string, unknown> {
   const args: Record<string, unknown> = {};
   const day = (iso: string, shift: number) => new Date(Date.parse(iso) + shift * DAY_MS).toISOString().slice(0, 10);
   if (plan.start) args[plan.start] = /date/i.test(plan.start) ? day(since, -1) : since;
   if (plan.end) args[plan.end] = /date/i.test(plan.end) ? day(until, 1) : until;
-  if (plan.size) args[plan.size] = 50;
+  if (plan.size) args[plan.size] = LIST_PAGE_SIZE;
   if (plan.cursor && cursor) args[plan.cursor] = cursor;
+  if (plan.page) args[plan.page] = page;
   return args;
 }
 
@@ -329,18 +359,21 @@ export function noteText(payload: unknown, depth = 0): string {
   if (Array.isArray(payload)) return payload.map((item) => noteText(item, depth + 1)).filter(Boolean).join('\n');
   const data = payload as Record<string, unknown>;
   const parts: string[] = [];
-  for (const key of ['title', 'summary', 'content', 'markdown', 'text', 'note', 'notes', 'note_list', 'noteList', 'action_items', 'actionItems', 'key_topics', 'keyTopics']) {
+  for (const key of ['summary', 'content', 'markdown', 'text', 'note', 'notes', 'note_list', 'noteList', 'action_items', 'actionItems', 'key_topics', 'keyTopics']) {
     if (data[key] === undefined) continue;
     const text = noteText(data[key], depth + 1);
     if (text) parts.push(/action/i.test(key) ? `Action items:\n${text}` : /topic/i.test(key) ? `Key topics: ${text}` : text);
   }
-  return parts.join('\n').trim();
+  // A title alone is not a note (the recording's transcript is read instead).
+  if (!parts.length) return '';
+  const title = typeof data.title === 'string' ? data.title.trim() : '';
+  return [title, ...parts].filter(Boolean).join('\n').trim();
 }
 
 /** What a tool call returned: its structured content, else the JSON in its text, else the text itself. */
-export function toolPayload(result: unknown): unknown {
+export function toolPayload(result: unknown, recorder: Pick<Recorder, 'name' | 'noun'> = FIELDY): unknown {
   const data = result && typeof result === 'object' ? result as { structuredContent?: unknown; content?: unknown; isError?: unknown } : {};
-  if (data.isError === true) throw new FieldyError('Fieldy could not read your conversations right now. Try again.');
+  if (data.isError === true) throw new FieldyError(`${recorder.name} could not read your ${recorder.noun}s right now. Try again.`, 'tool');
   if (data.structuredContent !== undefined && data.structuredContent !== null) return data.structuredContent;
   const parts = Array.isArray(data.content) ? data.content : [];
   const text = parts
@@ -355,6 +388,18 @@ export type FieldyConversation = { id: string; title: string; summary: string; s
 
 function str(value: unknown, max = 20_000): string {
   return typeof value === 'string' ? value.trim().slice(0, max) : '';
+}
+
+// A time as ISO 8601: a string ("2026-11-09 14:15:00" read as "2026-11-09T14:15:00"),
+// or seconds or milliseconds since 1970. '' when it is neither.
+function timeOf(value: unknown): string {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    const at = new Date(value < 1e12 ? value * 1000 : value);
+    return Number.isNaN(at.getTime()) ? '' : at.toISOString();
+  }
+  const text = str(value, 40).replace(/^(\d{4}-\d{2}-\d{2}) (\d)/, '$1T$2');
+  if (/^\d{9,13}$/.test(text)) return timeOf(Number(text));
+  return text && !Number.isNaN(Date.parse(text)) ? text : '';
 }
 
 function summaryOf(item: Record<string, unknown>): string {
@@ -376,8 +421,8 @@ function summaryOf(item: Record<string, unknown>): string {
 // (Plaud's duration is in milliseconds, Fieldy's durationSeconds in seconds).
 // '' when the recording gives neither: it may still be going on.
 function endOf(item: Record<string, unknown>, start: string): string {
-  const end = str(item.endTime ?? item.end_time ?? item.endAt ?? item.end_at, 40);
-  if (end && !Number.isNaN(Date.parse(end))) return end;
+  const end = timeOf(item.endTime ?? item.end_time ?? item.endAt ?? item.end_at);
+  if (end) return end;
   const at = Date.parse(start);
   if (Number.isNaN(at)) return '';
   const seconds = Number(item.durationSeconds ?? item.duration_seconds);
@@ -391,14 +436,14 @@ function endOf(item: Record<string, unknown>, start: string): string {
  * conversations, files, items or data). `text`: the answer was words, not a
  * list (the caller says it could not be read, never "nothing new").
  */
-export function conversationsFrom(payload: unknown): { conversations: FieldyConversation[]; nextCursor: string | null; text: string } {
+export function conversationsFrom(payload: unknown): { conversations: FieldyConversation[]; nextCursor: string | null; text: string; unreadable: boolean } {
   const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
   const list = Array.isArray(payload) ? payload
     : [data.conversations, data.files, data.recordings, data.items, data.data, data.results].find(Array.isArray) as unknown[] | undefined;
-  const conversations = (list || [])
-    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+  const entries = (list || []).filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object');
+  const conversations = entries
     .map((item) => {
-      const startTime = str(item.startTime ?? item.start_time ?? item.startAt ?? item.start_at ?? item.createdAt ?? item.created_at, 40);
+      const startTime = timeOf(item.startTime ?? item.start_time ?? item.startAt ?? item.start_at ?? item.createdAt ?? item.created_at);
       return {
         id: str(item.id ?? item.conversationId ?? item.conversation_id ?? item.file_id ?? item.fileId, 200),
         title: str(item.title ?? item.name, 300),
@@ -410,7 +455,8 @@ export function conversationsFrom(payload: unknown): { conversations: FieldyConv
     .filter((item) => item.id && !Number.isNaN(Date.parse(item.startTime)));
   const cursor = [data.nextCursor, data.next_cursor, data.cursor, (data.pagination as Record<string, unknown> | undefined)?.nextCursor]
     .find((value) => typeof value === 'string' && value) as string | undefined;
-  return { conversations, nextCursor: cursor ?? null, text: typeof data.text === 'string' && !list ? data.text : '' };
+  // Recordings listed, none of them readable (an id or time in a shape not known): never "nothing new".
+  return { conversations, nextCursor: cursor ?? null, text: typeof data.text === 'string' && !list ? data.text : '', unreadable: entries.length > 0 && !conversations.length };
 }
 
 /** A transcript answer as text: its segments' "Speaker: words" (only this recording's, when they say), or its text. */
@@ -425,20 +471,28 @@ export function transcriptText(payload: unknown, recordingId = ''): string {
         const owner = item.conversationId ?? item.conversation_id ?? item.fileId ?? item.file_id;
         return !recordingId || typeof owner !== 'string' || owner === recordingId;
       })
-      .map((item) => [str(item.speaker, 60), str(item.text, 4000)].filter(Boolean).join(': '))
+      .map((item) => {
+        // The words, however they come; a line with a speaker and no words is left out.
+        const said = str(item.text, 4000) || str(item.content, 4000) || str(item.transcript, 4000)
+          || (Array.isArray(item.words) ? item.words.map((word) => (typeof word === 'string' ? word : str((word as Record<string, unknown> | null)?.word ?? (word as Record<string, unknown> | null)?.text, 80))).join(' ').trim() : str(item.words, 4000));
+        if (!said) return '';
+        const speaker = str(item.speaker ?? item.speaker_name ?? item.speakerName, 60);
+        return speaker ? `${speaker}: ${said}` : said;
+      })
       .filter(Boolean)
       .join('\n');
   }
-  return str(data.text);
+  return str(data.text) || str(data.transcript) || str(data.content);
 }
 
 // ─── Into the day review ───────────────────────────────────────────────────
 
-/** "Nov 9, 2:15 PM" in the phone's time. */
-export function shortTime(iso: string): string {
+/** "Nov 9, 2:15 PM" in the phone's time; with the year when it is not this year ("Dec 30, 2026, …" read in January). */
+export function shortTime(iso: string, now = Date.now()): string {
   const at = new Date(iso);
   if (Number.isNaN(at.getTime())) return '';
-  return at.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  const otherYear = at.getFullYear() !== new Date(now).getFullYear();
+  return at.toLocaleString('en-US', { month: 'short', day: 'numeric', ...(otherYear ? { year: 'numeric' } : {}), hour: 'numeric', minute: '2-digit' });
 }
 
 export type FieldyBlock = { id: string; label: string; text: string; startTime: string };
@@ -487,12 +541,14 @@ export function reviewPlan(conversations: FieldyConversation[], now = Date.now()
   for (const item of fresh) {
     const body = clipMiddle((item.summary || texts[item.id] || '').trim(), SUMMARY_MAX);
     if (!body) {
-      const ended = item.endTime ? Date.parse(item.endTime) : NaN;
+      // Given up a day after it ended; one with no end (still going on, or
+      // its length unknown), a day after that.
+      const ended = item.endTime ? Date.parse(item.endTime) : Date.parse(item.startTime) + NO_TEXT_GIVE_UP_MS;
       if (!Number.isNaN(ended) && now - ended >= NO_TEXT_GIVE_UP_MS) skipped.push(item.id);
       else later += 1;
       continue;
     }
-    const label = `From ${recorderName}, ${shortTime(item.startTime)}${item.title ? ` · ${item.title.slice(0, 80)}` : ''}`;
+    const label = `From ${recorderName}, ${shortTime(item.startTime, now)}${item.title ? ` · ${item.title.slice(0, 80)}` : ''}`;
     const text = `[${label}]\n${body}`;
     if (length + text.length + 2 > REVIEW_MAX) { later += 1; continue; }
     blocks.push({ id: item.id, label, text, startTime: item.startTime });
@@ -501,7 +557,8 @@ export function reviewPlan(conversations: FieldyConversation[], now = Date.now()
   return { text: blocks.map((block) => block.text).join('\n\n').slice(0, 12_000), blocks, skipped, later };
 }
 
-const loose = (value: string) => value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+// Any alphabet, accents dropped, as the review compares quotes.
+const loose = (value: string) => value.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 
 /** The recordings a found item's quote came from (more than one when the same words are in several). */
 export function blocksFor(quote: string, blocks: FieldyBlock[]): FieldyBlock[] {

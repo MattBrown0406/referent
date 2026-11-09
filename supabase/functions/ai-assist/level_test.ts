@@ -87,6 +87,15 @@ Deno.test('a reason that prescribes a level of care is dropped; the rating stays
   ]), request());
   assertEquals([joined[0].reason, joined[1].reason], ['', ''], '", so" and ", which" still lead to a prescribed level');
   assertEquals(more[2].reason, 'Needs help with cravings, though two past outpatient programs did not stop the drinking.', 'a new clause that names past care does not');
+  const other = parseLevelOutput(answer([
+    { reason: 'Would benefit from residential treatment.' },
+    { reason: 'Residential care is needed.' },
+    { reason: 'Should consider a detox program first.' },
+    { reason: 'Inpatient detox is the right level.' },
+    { reason: 'Was in residential treatment in 2023 and relapsed.' },
+  ]), request());
+  assertEquals(other.slice(0, 4).map((item) => item.reason), ['', '', '', ''], 'other ways of prescribing a level');
+  assertEquals(other[4].reason, 'Was in residential treatment in 2023 and relapsed.', 'past care is history, not a prescription');
 });
 
 Deno.test('a missing, repeated or out-of-range rating is refused', () => {

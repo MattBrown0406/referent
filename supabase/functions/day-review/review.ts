@@ -236,14 +236,19 @@ export function outputSchema(): Record<string, unknown> {
   };
 }
 
-// Letters and digits only, lower case, single spaces: how a quote is found
-// in the notes despite punctuation, curly quotes or line breaks.
+// Letters the accent split leaves whole ("Łukasz" is "lukasz", "Strauß" is "strauss").
+const FOLD: Record<string, string> = { 'ł': 'l', 'ø': 'o', 'ß': 'ss', 'æ': 'ae', 'œ': 'oe', 'đ': 'd', 'þ': 'th', 'ı': 'i' };
+
+// Letters (any alphabet) and digits only, lower case, accents dropped,
+// single spaces: how a quote is found in the notes despite punctuation,
+// curly quotes or line breaks.
 export function comparable(value: string): string {
   return value
     .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/\p{M}/gu, '')
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/[łøßæœđþı]/g, (letter) => FOLD[letter] ?? letter)
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim();
 }
 
@@ -300,7 +305,7 @@ function emailFromNotes(value: unknown, emails: Set<string>): string {
 // family" for "the Riveras"); for an organization, also the words in many
 // program names that say nothing about which one ("Juniper Ridge" for
 // "Juniper Ridge Recovery Center"; as GENERIC_ORG in src/lib/day-review.ts).
-const PERSON_FILLER = new Set(['the', 'of', 'and', 'mr', 'mrs', 'ms', 'miss', 'dr', 'doctor', 'family', 'families', 'sr', 'sra', 'srta', 'dra', 'don', 'dona']);
+const PERSON_FILLER = new Set(['the', 'of', 'and', 'mr', 'mrs', 'ms', 'miss', 'dr', 'doctor', 'family', 'families', 'sr', 'sra', 'srta', 'dra']);
 const ORG_FILLER = new Set([
   ...PERSON_FILLER, 'for', 'at', 'a', 'an', 'inc', 'llc', 'pc', 'pllc', 'new', 'recovery', 'center', 'centers', 'centre', 'treatment',
   'house', 'home', 'homes', 'health', 'healthcare', 'behavioral', 'mental', 'services', 'service', 'wellness', 'sober', 'living', 'detox',
@@ -309,37 +314,54 @@ const ORG_FILLER = new Set([
   'campus', 'hospital', 'group', 'iop', 'php',
 ]);
 
-const ABBREVIATIONS = new Set(['mr', 'mrs', 'ms', 'dr', 'st', 'jr', 'sr', 'mt', 'ft', 'prof', 'rev', 'vs', 'etc', 'sra', 'srta', 'dra', 'lic', 'ing']);
+// Abbreviations a name follows ("Mr. O'Brien"): the period does not end a sentence.
+const ABBREVIATIONS = new Set(['mr', 'mrs', 'ms', 'dr', 'st', 'jr', 'sr', 'mt', 'ft', 'prof', 'rev', 'vs', 'sra', 'srta', 'dra', 'lic', 'ing']);
 
 /**
  * The words the notes write with a capital letter (any alphabet, accents
- * kept apart: "José" is "jose", "O'Brien" is "o" and "brien"): `all`, and
- * `inside`, those not capitalized only for starting a sentence, a line or
- * a bullet ("Hope is what she needs" does not make "Hope" a name).
+ * kept apart: "José" is "jose", "O'Brien" is "o" and "brien"): `all`;
+ * `inside`, those not capitalized only for starting a sentence, a line, a
+ * bullet or a numbered item ("Hope is what she needs" does not make "Hope"
+ * a name); and `titled`, how many of those inside are written like a name
+ * (a capital, then small letters: not "IOP" or "BCBS"), which says whether
+ * the notes use capitals at all.
  */
-export function capitalizedWords(notes: string): { all: Set<string>; inside: Set<string> } {
+export function capitalizedWords(notes: string): { all: Set<string>; inside: Set<string>; titled: number } {
   const all = new Set<string>();
   const inside = new Set<string>();
+  const titledWords = new Set<string>();
   for (const match of notes.matchAll(/\p{Lu}[\p{L}\p{M}'’-]*/gu)) {
-    const words = comparable(match[0]).split(' ').filter(Boolean);
-    let at = (match.index ?? 0) - 1;
-    while (at >= 0 && /[ \t]/.test(notes[at])) at -= 1;
-    while (at >= 0 && /[-*•·\u2013\u2014]/.test(notes[at])) {
+    const index = match.index ?? 0;
+    // A capital inside a word ("iPhone") starts nothing.
+    if (index > 0 && /[\p{L}\p{M}]/u.test(notes[index - 1])) continue;
+    // "I'm", "I've": the "I" is not a name.
+    const words = comparable(match[0].replace(/^I['’](m|ve|ll|d|re)$/i, 'I')).split(' ').filter(Boolean);
+    let at = index - 1;
+    const skipSpace = () => { while (at >= 0 && /[ \t]/.test(notes[at])) at -= 1; };
+    skipSpace();
+    // Bullets and headings: "- ", "• ", "## ".
+    while (at >= 0 && /[-*•·#–—]/.test(notes[at])) {
       at -= 1;
-      while (at >= 0 && /[ \t]/.test(notes[at])) at -= 1;
+      skipSpace();
     }
-    let starts = at < 0 || /[\n\r:;!?([\]"“]/.test(notes[at]);
+    let starts = at < 0 || /[\n\r:;!?([\]"“”’]/.test(notes[at]);
+    // A numbered item or a time: "1) Hope", "2. Hope", "10:30 Hope".
+    if (!starts && /\d/.test(notes[at])) starts = true;
+    if (!starts && notes[at] === ')' && at > 0 && /\d/.test(notes[at - 1])) starts = true;
     if (!starts && notes[at] === '.') {
       // "Mr. O'Brien" does not start a sentence.
       const before = /([A-Za-z]+)\.$/.exec(notes.slice(Math.max(0, at - 6), at + 1))?.[1]?.toLowerCase() ?? '';
       starts = !ABBREVIATIONS.has(before);
     }
+    const titled = /^\p{Lu}[\p{Ll}\p{M}]/u.test(match[0]);
     for (const word of words) {
       all.add(word);
-      if (!starts && word !== 'i') inside.add(word);
+      if (starts || word.length < 2) continue;
+      inside.add(word);
+      if (titled) titledWords.add(word);
     }
   }
-  return { all, inside };
+  return { all, inside, titled: titledWords.size };
 }
 
 // A name word's other forms: "Riveras" for "Rivera", "Lee" for "Lees".
@@ -347,27 +369,43 @@ function forms(word: string): string[] {
   return [word, `${word}s`, `${word}es`, ...(word.endsWith('s') && word.length > 3 ? [word.slice(0, -1)] : [])];
 }
 
+// A word with letters that have a case (not Chinese or Japanese, say).
+const cased = (word: string) => word.toUpperCase() !== word;
+
 /**
  * A name or organization the review gives is in the notes: every word of it
- * that is not filler is a word there (or its possessive), or a plural or
- * singular of it written with a capital ("the Riveras" for "Rivera"). In
- * notes written with capitals, at least one of its words must be capitalized
- * inside a sentence there too, so ordinary words ("hope", "life", a word
- * that only starts a sentence) never make up a name. A name the notes never
- * mention makes the item unverified, so it is never saved without a look.
+ * that is not filler is a word there (or its possessive). Only a family
+ * name may differ by a plural ("the Riveras" for "Rivera"), and only when
+ * written with a capital. In notes written with capitals, a person's name
+ * must be capitalized there ("Sarah called" counts, even starting a
+ * sentence), and an organization's must be capitalized inside a sentence
+ * (so ordinary words, "hope", "a new life", never make up a program). A
+ * name the notes never mention makes the item unverified, so it is never
+ * saved without a look.
  */
-export function nameInNotes(name: string, notesComparable: string, capitals: { all: Set<string>; inside: Set<string> } | null = null,
+export function nameInNotes(name: string, notesComparable: string, capitals: { all: Set<string>; inside: Set<string>; titled: number } | null = null,
   kind: 'person' | 'organization' = 'person'): boolean {
   const filler = kind === 'organization' ? ORG_FILLER : PERSON_FILLER;
   const whole = comparable(name);
-  if (!whole) return true;
-  const words = whole.split(' ').filter((word) => word.length > 1 && !filler.has(word));
-  if (!words.length) return notesComparable.includes(` ${whole} `);
+  // Nothing to compare: fine for punctuation, never for letters that did not survive.
+  if (!whole) return !/\p{L}/u.test(name);
+  const all = whole.split(' ').filter(Boolean);
+  const words = all.filter((word) => word.length > 1 && !filler.has(word));
+  const named = (word: string) => Boolean(capitals && capitals.all.has(word));
+  if (!words.length) {
+    // Only filler ("Dr.", "the family"): the whole of it, written as a name when the notes use capitals.
+    return notesComparable.includes(` ${whole} `) && (!capitals || capitals.titled < 3 || all.some(named));
+  }
+  // A plural or singular only for the family name, when it is a family ("the Lees", "Mrs. Rivera") or follows a first name.
+  const familyName = kind === 'person' && (all.length > words.length || words.length > 1) ? words[words.length - 1] : '';
   const found = words.every((word) => notesComparable.includes(` ${word} `) || notesComparable.includes(` ${word} s `)
-    || Boolean(capitals && forms(word).some((form) => capitals.all.has(form))));
-  // Notes typed in lower case have no capitals to go by.
-  const needsCapital = Boolean(capitals && capitals.inside.size >= 3);
-  return found && (!needsCapital || words.some((word) => forms(word).some((form) => capitals!.inside.has(form))));
+    || notesComparable.includes(` the ${word}s `) || notesComparable.includes(` the ${word}es `)
+    || Boolean(capitals && word === familyName && forms(word).some((form) => capitals.all.has(form))));
+  if (!found) return false;
+  // Notes typed in lower case (acronyms aside) have no capitals to go by; nor does a name in letters without case.
+  if (!capitals || capitals.titled < 3 || !words.some(cased)) return true;
+  const capitalized = kind === 'person' ? capitals.all : capitals.inside;
+  return words.some((word) => forms(word).some((form) => capitalized.has(form)));
 }
 
 function quoteInNotes(evidence: string, notesComparable: string): boolean {

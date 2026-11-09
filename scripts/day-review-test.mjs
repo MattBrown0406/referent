@@ -438,7 +438,7 @@ check(() => {
 check(() => {
   const lead = found({ kind: 'new_lead', personName: 'Kevin Brooks', phone: '541-555-0300', summary: 'Kevin called about Jenna.', evidence: 'Kevin Brooks called about his wife Jenna', verified: true });
   const [first] = build(lead);
-  const saved = new Set(rules.rowSignatures(first));
+  const saved = new Set(rules.rowSignatures(first, true));
   // After the save the lead is a case with Kevin's phone on it.
   const ws = {
     ...workspace,
@@ -451,6 +451,33 @@ check(() => {
   const [shorter] = rules.markSavedBefore(rules.buildRows([{ ...lead, personName: 'Kevin' }], ws, TODAY, makeId), saved);
   assert.equal(shorter.include, false, 'even when the AI gives the caller\'s name differently the second time');
 }, 'a saved lead read again is not saved twice');
+check(() => {
+  const quote = 'Mike called about his son, wants a call back tonight';
+  const smith = found({ kind: 'new_lead', personName: 'Mike Smith', phone: '541-555-0301', summary: 'Mike called about his son.', evidence: quote, verified: true });
+  const jones = found({ kind: 'new_lead', personName: 'Mike Jones', summary: 'Mike called about his son.', evidence: quote, verified: true });
+  const [first] = build(smith);
+  const saved = new Set(rules.rowSignatures(first, true));
+  const [other] = rules.markSavedBefore(build(jones), saved);
+  assert.equal(other.include, true, 'another caller with the same first name, quoting the same line, is a new lead');
+  const [noPhone] = rules.markSavedBefore(build({ ...smith, phone: '' }), saved);
+  assert.equal(noPhone.include, false, 'the same caller read again without the phone is still saved');
+  const mom = found({ kind: 'new_lead', personName: 'Mom', summary: 'A mother called.', evidence: 'a mother called about her son, wants a call back', verified: true });
+  const dad = found({ kind: 'new_lead', personName: 'Dad', summary: 'A father called.', evidence: 'a mother called about her son, wants a call back', verified: true });
+  const [momRow] = build(mom);
+  const [dadRow] = rules.markSavedBefore(build(dad), new Set(rules.rowSignatures(momRow, true)));
+  assert.equal(dadRow.include, true, 'callers with nothing to tell them by are not taken for each other');
+}, 'saved leads are matched by who called');
+check(() => {
+  const at = (when) => rules.buildRows([found({ personName: 'Ana Rivera' })], workspace, TODAY, makeId, () => ({ label: 'From Fieldy, Nov 9', at: when }))[0].occurredAt;
+  assert.equal(at('2999-01-01T00:00:00Z'), '', 'a recording time in the future is not used');
+  assert.equal(at('2026-11-09 18:15'), '', 'nor one without a time zone');
+  assert.equal(at('2026-11-01T18:15:00-08:00'), '2026-11-02T02:15:00.000Z');
+}, 'a recording time is used only when it is clear');
+check(() => {
+  assert.equal(rules.comparable('Łukasz Wałęsa'), 'lukasz walesa');
+  assert.equal(rules.comparable('Иван  Петров!'), 'иван петров', 'any alphabet');
+  assert.equal(rules.comparable('Strauß'), 'strauss');
+}, 'names compare in any alphabet');
 check(() => {
   const [lead, callBack] = build(
     found({ kind: 'new_lead', personName: 'Kevin Brooks', phone: '541-555-0300', summary: 'Kevin called about Jenna.' }),
@@ -506,11 +533,11 @@ check(() => {
   assert.equal(rules.partnerTouchWrite(partnerRow, 'x', 'p-new').partnerId, 'p-new', 'a new partner’s touch');
 }, 'event and touch writes');
 check(() => {
-  const from = { label: 'From Fieldy, Nov 9, 10:15 AM · Call with Ana', at: '2026-11-09T18:15:00Z' };
+  const from = { label: 'From Fieldy, Nov 1, 10:15 AM · Call with Ana', at: '2026-11-01T18:15:00Z' };
   const [row] = rules.buildRows([found({ personName: 'Ana Rivera', summary: 'Talked about the packet.' })], workspace, TODAY, makeId, () => from);
   assert.equal(row.source, from.label, 'an item says which recording it came from');
-  assert.equal(row.occurredAt, '2026-11-09T18:15:00.000Z', 'its note is dated when the conversation happened');
-  assert.match(row.text, /\(From Fieldy, Nov 9, 10:15 AM\)$/);
+  assert.equal(row.occurredAt, '2026-11-01T18:15:00.000Z', 'its note is dated when the conversation happened');
+  assert.match(row.text, /\(From Fieldy, Nov 1, 10:15 AM\)$/);
   assert.equal(rules.switchKind(row, 'new_lead').occurredAt, row.occurredAt, 'switching what it is keeps where it came from');
   const [plain] = build(found({ personName: 'Ana Rivera' }));
   assert.equal(plain.source, '');
@@ -577,7 +604,7 @@ check(() => {
   assert.match(sheet, /<View pointerEvents=\{locked \? 'none' : 'auto'\}>/, 'rows are locked while saving and when done');
   assert.match(sheet, /automaticallyAdjustKeyboardInsets/);
   assert.match(sheet, /licenseOverrideNote\(partnerLabel\(row\.partnerId\), concern, 'refer'\)/, 'going ahead is noted on the referral');
-  assert.match(sheet, /function finish\(\) \{\n    openingRef\.current \+= 1;\n    clearReview\(\);/, 'a closed review is cleared');
+  assert.match(sheet, /function finish\(\) \{\n    if \(phase !== 'finding' && phase !== 'saving'\) settleRecordings\(saved, rows\);\n    openingRef\.current \+= 1;\n    clearReview\(\);/, 'a closed review is cleared');
 }, 'the sheet');
 check(() => {
   for (const label of ['CALLER', 'PHONE', 'EMAIL', 'CALLING ABOUT', 'THEIR FIRST NAME']) assert.match(sheet, new RegExp(`>${label}<`));

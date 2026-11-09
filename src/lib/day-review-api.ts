@@ -150,6 +150,10 @@ async function existingPartnerId(importRow: NonNullable<ReturnType<typeof newPar
     importRow.organization || importRow.name
       ? supabase.from('partners').select(columns).ilike('organization', likeExactly((importRow.organization || importRow.name).trim())).limit(50)
       : null,
+    // A card with a person's name and no organization: the server keys it by the name.
+    importRow.organization || importRow.name
+      ? supabase.from('partners').select(columns).eq('organization', '').ilike('name', likeExactly((importRow.organization || importRow.name).trim())).limit(50)
+      : null,
   ];
   const found: Candidate[] = [];
   for (const query of queries) {

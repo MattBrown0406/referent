@@ -89,9 +89,12 @@ OAuth (`src/lib/fieldy.ts` has both; `src/lib/fieldy-api.ts` the calls).
   conversation it came from when only one matches its quote, and a saved
   note keeps that conversation's time on the timeline. Each conversation is
   marked reviewed on its own: once every item from it is saved or switched
-  off, or when nothing was found in it. One with an item still waiting
-  (left on, or failed to save) comes back next time. "Done with these" marks
-  them all. Which ones were reviewed is kept apart from the sign-in (for 14
+  off (on Approve, or when the review is closed), or when nothing was found
+  in it. One with an item still waiting (left on, or failed to save) comes
+  back next time, as do all of them while an item's quote is in none of
+  them. "Done with these" marks them all. Every call to a recorder gives up
+  after 30 seconds (the whole answer, not only its start), and a read can
+  be stopped with Close. Which ones were reviewed is kept apart from the sign-in (for 14
   days), so disconnecting and reconnecting never reads them again.
 - **Automatic:** when the app opens or comes back (at most every 15
   minutes) it counts new recordings in each connected recorder, never

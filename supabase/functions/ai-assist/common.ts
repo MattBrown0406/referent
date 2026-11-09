@@ -31,13 +31,17 @@ export function clean(value: unknown, max: number): string {
     .trim();
 }
 
-/** Letters and digits only, lower case, single spaces. */
+// Letters the accent split leaves whole ("Łukasz" is "lukasz", "Strauß" is "strauss").
+const FOLD: Record<string, string> = { 'ł': 'l', 'ø': 'o', 'ß': 'ss', 'æ': 'ae', 'œ': 'oe', 'đ': 'd', 'þ': 'th', 'ı': 'i' };
+
+/** Letters (any alphabet) and digits only, lower case, accents dropped, single spaces. */
 export function comparable(value: string): string {
   return value
     .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/\p{M}/gu, '')
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/[łøßæœđþı]/g, (letter) => FOLD[letter] ?? letter)
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim();
 }
 

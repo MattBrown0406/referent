@@ -162,6 +162,11 @@ Deno.test('claims in ordinary words are refused; faithful wording about cost and
     'You won\'t have to wait.', 'Your loved one can get in right away.', 'They could go there today.', 'It is first-rate.',
     'It is highly rated.', 'It is accredited and licensed.', 'It is exceptional.', 'It is a great fit.', 'It is a good match.',
     'It is the right program.', 'It is a safe choice.', 'We receive nothing from them.',
+    'Aetna pays for treatment there.', 'Your loved one could get in without waiting.', 'We earn a fee when you go there.',
+    'It is covered by Aetna.', 'Aetna covers it all.', 'Aetna should cover it.', 'You don\'t have to wait.', 'You wouldn\'t have to wait.',
+    'They can take your loved one without a wait.', 'They pay us for each referral.', 'Cedar Ridge Recovery also takes Aetna.',
+    'Hazelden is another option, and so is (Hazelden).', 'It is like “Hazelden” in that way.', 'It takes Aetna/Cigna.', 'It is like Aetna—Hazelden.',
+    'It compares with Élan Recovery.', 'It is close to Иван Петров.',
   ]) {
     assertThrows(() => parseExplainOutput(first(`${base} ${claim}`), request()), AssistOutputError, undefined, claim);
   }
@@ -169,6 +174,9 @@ Deno.test('claims in ordinary words are refused; faithful wording about cost and
     'Juniper Ridge Recovery\'s EMDR therapy is part of its program, and it works with Aetna.',
     'Juniper Ridge Recovery is in Bend Oregon and works with Aetna.',
     'Juniper Ridge Recovery offers inpatient care. On top of offering EMDR, it works with Aetna, for you and your spouse or partner.',
+    'Juniper Ridge Recovery offers inpatient care and works with Aetna. You can start by calling them, you or your partner.',
+    'Both Juniper Ridge Recovery and Cedar House work with families. If Aetna is your plan, Juniper Ridge Recovery works with it.',
+    'Juniper Ridge Recovery offers EMDR. Ask them about it in December.',
   ]) {
     assertEquals(parseExplainOutput(first(text), request()).programs[0].text, text);
   }

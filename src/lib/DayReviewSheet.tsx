@@ -109,7 +109,7 @@ type Props = {
 
 type Phase = 'paste' | 'finding' | 'review' | 'saving' | 'done';
 
-type RecorderState = { state: 'checking' | 'off' | 'on' | 'busy'; email: string };
+type RecorderState = { state: 'checking' | 'off' | 'on' | 'busy' | 'leaving'; email: string };
 const RECORDERS_CHECKING: Record<RecorderId, RecorderState> = { fieldy: { state: 'checking', email: '' }, plaud: { state: 'checking', email: '' } };
 
 function localDay(date = new Date()): string {
@@ -156,8 +156,9 @@ export default function DayReviewSheet({
   // review was read from (committed as read once something from them is
   // saved, or nothing was found).
   const [recorders, setRecorders] = useState<Record<RecorderId, RecorderState>>(RECORDERS_CHECKING);
-  // The recordings this review was read from, and which recording each row came from.
-  const recorderReadRef = useRef<{ recorder: Recorder; text: string; blocks: FieldyBlock[]; rowIds: Map<string, string[]> } | null>(null);
+  // The recordings this review was read from, which recording each row came
+  // from, and those skipped for having no text.
+  const recorderReadRef = useRef<{ recorder: Recorder; text: string; blocks: FieldyBlock[]; rowIds: Map<string, string[]>; skipped: string[] } | null>(null);
   const setRecorder = (id: RecorderId, value: RecorderState | ((current: RecorderState) => RecorderState)) =>
     setRecorders((current) => ({ ...current, [id]: typeof value === 'function' ? value(current[id]) : value }));
 
@@ -201,8 +202,13 @@ export default function DayReviewSheet({
         next[recorder.id] = { state: status.connected ? 'on' : 'off', email: status.email };
       });
       setRecorders(next);
-      const start = RECORDERS.find((recorder) => recorder.id === startWithRecorder);
-      if (start && next[start.id].state === 'on' && key) void readRecorder(start, opening);
+      // Opened from the Today card or the reminder: the recorder named, else
+      // another one connected (the counts may not be in yet at launch), and
+      // when the first has nothing new, the other.
+      if (!startWithRecorder || !key) return;
+      const connected = RECORDERS.filter((recorder) => next[recorder.id].state === 'on');
+      const [first, ...rest] = [...connected.filter((recorder) => recorder.id === startWithRecorder), ...connected.filter((recorder) => recorder.id !== startWithRecorder)];
+      if (first) void readRecorder(first, opening, rest[0]);
     });
     // readRecorder is this opening's own; startWithRecorder is read once, as the sheet opens.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -229,14 +235,31 @@ export default function DayReviewSheet({
   const busy = phase === 'finding' || phase === 'saving';
   const locked = phase === 'saving' || phase === 'done';
 
+  // A recording is done once every item from it is saved or switched off (set
+  // aside); one with an item still on and unsaved comes back next time. A
+  // row whose quote is in no one recording could be from any: until it is
+  // settled, none is done.
+  function settleRecordings(results: Record<string, SaveResult>, current: ReviewRow[]) {
+    const read = recorderReadRef.current;
+    if (!read || !current.length) return;
+    const settled = (row: ReviewRow) => results[row.key]?.saved === true || !row.include;
+    if (current.some((row) => !(read.rowIds.get(row.key)?.length) && !settled(row))) return;
+    const ids = new Set([...read.rowIds.values()].flat());
+    const done = [...ids].filter((id) => current.filter((row) => (read.rowIds.get(row.key) ?? []).includes(id)).every(settled));
+    if (done.length) void markRecordingsReviewed(read.recorder, userId, done).then(() => onRecordersChanged?.());
+  }
+
   function finish() {
+    if (phase !== 'finding' && phase !== 'saving') settleRecordings(saved, rows);
     openingRef.current += 1;
     clearReview();
     onClose();
   }
 
   function close() {
-    if (busy) return;
+    if (phase === 'saving') return;
+    // Reading or reviewing can be stopped (what comes back late is ignored).
+    if (phase === 'finding') { finish(); return; }
     const unsaved = phase === 'review'
       ? pending.some((row) => row.include)
       : phase === 'paste' && notes.trim().length > 0;
@@ -270,9 +293,12 @@ export default function DayReviewSheet({
     if (busy && !read) return;
     // "Back to the notes", then Find again on the same recorder text: still that recorder's recordings.
     const same = recorderReadRef.current && notes.trim() === recorderReadRef.current.text.trim() ? recorderReadRef.current : null;
-    const fromRecorder = read ?? (same ? { recorder: same.recorder, text: same.text, blocks: same.blocks } : null);
+    const fromRecorder = read ?? (same ? { recorder: same.recorder, text: same.text, blocks: same.blocks, skipped: same.skipped } : null);
     const text = (fromRecorder ? fromRecorder.text : notes).trim();
-    if (!fromRecorder) recorderReadRef.current = null;
+    // Kept before the review runs, so a retry after a failed one is still these recordings.
+    recorderReadRef.current = fromRecorder
+      ? { recorder: fromRecorder.recorder, text: fromRecorder.text, blocks: fromRecorder.blocks, rowIds: new Map(), skipped: fromRecorder.skipped ?? [] }
+      : null;
     if (text.length < 20) { setMessage({ ok: false, text: 'Paste a little more: there is not enough here to review.' }); return; }
     const opening = openingRef.current;
     const day = localDay();
@@ -301,10 +327,14 @@ export default function DayReviewSheet({
       setPhase('review');
       if (fromRecorder) {
         const rowIds = new Map(built.map((row) => [row.key, blocksFor(row.found.evidence, fromRecorder.blocks).map((block) => block.id)]));
-        recorderReadRef.current = { recorder: fromRecorder.recorder, text: fromRecorder.text, blocks: fromRecorder.blocks, rowIds };
-        // A recording nothing was found in is done now; so is one with no text a day after it ended.
+        const skipped = fromRecorder.skipped ?? [];
+        recorderReadRef.current = { recorder: fromRecorder.recorder, text: fromRecorder.text, blocks: fromRecorder.blocks, rowIds, skipped };
+        // A recording nothing was found in is done now (unless an item's
+        // quote is in none of them: it could be from any); so is one with no
+        // text a day after it ended.
         const withRows = new Set([...rowIds.values()].flat());
-        const done = fromRecorder.blocks.map((block) => block.id).filter((id) => !withRows.has(id)).concat(read?.skipped ?? []);
+        const unmatched = [...rowIds.values()].some((ids) => !ids.length);
+        const done = (unmatched ? [] : fromRecorder.blocks.map((block) => block.id).filter((id) => !withRows.has(id))).concat(skipped);
         if (done.length) void markRecordingsReviewed(fromRecorder.recorder, userId, done).then(() => onRecordersChanged?.());
       }
       if (!items.length) {
@@ -317,6 +347,8 @@ export default function DayReviewSheet({
       } else if (read?.skipped?.length) {
         setMessage({ ok: true, text: `${read.skipped.length} ${read.skipped.length === 1 ? read.recorder.noun : `${read.recorder.noun}s`} had no summary or transcript a day after ${read.skipped.length === 1 ? 'it' : 'they'} ended and ${read.skipped.length === 1 ? 'was' : 'were'} skipped.` });
       }
+      // Nothing to approve (all off, say): what is settled is done now, not only on Approve.
+      if (fromRecorder && !built.some((row) => row.include)) settleRecordings({}, built);
     } catch (error) {
       if (opening !== openingRef.current) return;
       if (error instanceof ReviewUnavailableError && error.reason === 'key') setKeyState('missing');
@@ -348,14 +380,14 @@ export default function DayReviewSheet({
   }
 
   function disconnect(recorder: Recorder) {
-    if (busy || recorders[recorder.id].state === 'busy') return;
+    if (busy || recorders[recorder.id].state !== 'on') return;
     Alert.alert(`Disconnect ${recorder.name}?`, `ReferralFit stops reading your ${recorder.name} ${recorder.noun}s, and its access is removed at ${recorder.name}. Nothing already saved in ReferralFit changes.`, [
       { text: 'Keep it', style: 'cancel' },
       {
         text: 'Disconnect',
         style: 'destructive',
         onPress: () => {
-          setRecorder(recorder.id, (current) => ({ ...current, state: 'busy' }));
+          setRecorder(recorder.id, (current) => ({ ...current, state: 'leaving' }));
           void disconnectRecorder(recorder, userId).finally(() => {
             setRecorder(recorder.id, { state: 'off', email: '' });
             onRecordersChanged?.();
@@ -366,7 +398,7 @@ export default function DayReviewSheet({
   }
 
   /** The recordings since the last read, straight into the review. */
-  async function readRecorder(recorder: Recorder, opening = openingRef.current) {
+  async function readRecorder(recorder: Recorder, opening = openingRef.current, otherwise?: Recorder) {
     if (savingRef.current) return;
     setMessage(null);
     setPhase('finding');
@@ -384,6 +416,7 @@ export default function DayReviewSheet({
     if (!read.blocks.length) {
       setPhase('paste');
       if (read.skipped.length) void markRecordingsReviewed(recorder, userId, read.skipped).then(() => onRecordersChanged?.());
+      if (otherwise && !read.later) { await readRecorder(otherwise, opening); return; }
       setMessage({
         ok: true,
         text: read.later
@@ -469,7 +502,7 @@ export default function DayReviewSheet({
         if (result.saved) {
           any = true;
           savedCountRef.current += 1;
-          for (const signature of rowSignatures(row)) savedSignaturesRef.current.add(signature);
+          for (const signature of rowSignatures(row, true)) savedSignaturesRef.current.add(signature);
         }
         if (opening !== openingRef.current) break;
       }
@@ -477,15 +510,7 @@ export default function DayReviewSheet({
       savingRef.current = false;
     }
     if (any) onSaved();
-    // A recording is done once every item from it is saved or set aside; one
-    // with an item still waiting (failed, or left on for later) comes back next time.
-    if (recorderReadRef.current) {
-      const { recorder, rowIds } = recorderReadRef.current;
-      const settled = (row: ReviewRow) => results[row.key]?.saved === true || !row.include;
-      const ids = new Set([...rowIds.values()].flat());
-      const done = [...ids].filter((id) => rows.filter((row) => (rowIds.get(row.key) ?? []).includes(id)).every(settled));
-      if (done.length) void markRecordingsReviewed(recorder, userId, done).then(() => onRecordersChanged?.());
-    }
+    settleRecordings(results, rows);
     if (opening !== openingRef.current) return;
     setSaved(results);
     const failed = order.filter((row) => !results[row.key]?.saved);
@@ -799,7 +824,7 @@ export default function DayReviewSheet({
       {fieldySupported ? RECORDERS.map((recorder) => {
         const status = recorders[recorder.id];
         // Without a key there is nothing to read with, but a connected recorder can always be disconnected.
-        if (keyMissing && status.state !== 'on') return null;
+        if (keyMissing && status.state !== 'on' && status.state !== 'leaving') return null;
         return (
           <View key={recorder.id} style={styles.fieldyCard}>
             <Text style={styles.label}>{recorder.name.toUpperCase()}</Text>
@@ -815,8 +840,8 @@ export default function DayReviewSheet({
                   <Text style={styles.hint}>Disconnect {recorder.name}</Text>
                 </TouchableOpacity>
               </>
-            ) : status.state === 'checking' ? (
-              <ActivityIndicator color={COLORS.forest} accessibilityLabel={`Checking ${recorder.name}`} />
+            ) : status.state === 'checking' || status.state === 'leaving' ? (
+              <ActivityIndicator color={COLORS.forest} accessibilityLabel={status.state === 'leaving' ? `Disconnecting ${recorder.name}` : `Checking ${recorder.name}`} />
             ) : (
               <>
                 <Text style={styles.hint}>Use {recorder.name}? Connect it once and ReferralFit reads your {recorder.noun}s for you: no copying or pasting. You sign in to {recorder.name}; your sign-in stays on this phone.</Text>
@@ -867,7 +892,7 @@ export default function DayReviewSheet({
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={close}>
       <SafeAreaView style={styles.page}>
         <View style={styles.header}>
-          <TouchableOpacity accessibilityRole="button" accessibilityLabel={phase === 'done' ? 'Done' : 'Close review'} disabled={busy} onPress={close} style={styles.headerButton}>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel={phase === 'done' ? 'Done' : 'Close review'} disabled={phase === 'saving'} onPress={close} style={styles.headerButton}>
             <Text style={[styles.headerButtonText, busy && styles.off]}>{phase === 'done' ? 'Done' : 'Cancel'}</Text>
           </TouchableOpacity>
           <Text style={styles.headerTitle} accessibilityRole="header">Review notes</Text>

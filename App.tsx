@@ -1382,6 +1382,7 @@ export default function App() {
   // comes back (at most every 15 minutes), on this phone, straight from each
   // recorder; the Today card and the 6 PM reminder follow the count.
   const fieldyCountRef = useRef({ at: 0, userId: '' });
+  const fieldyCountGenerationRef = useRef(0);
   const recordingsWaitingRef = useRef<{ userId: string; counts: Record<RecorderId, number> }>({ userId: '', counts: { fieldy: 0, plaud: 0 } });
   const refreshFieldyWaiting = useCallback(async (force = false) => {
     const userId = activeUserIdRef.current;
@@ -1389,10 +1390,12 @@ export default function App() {
     const last = fieldyCountRef.current;
     if (!force && last.userId === userId && Date.now() - last.at < 15 * 60_000) return;
     fieldyCountRef.current = { at: Date.now(), userId };
+    // Only the latest count counts: one started earlier that finishes later is dropped.
+    const generation = ++fieldyCountGenerationRef.current;
     // Without an Anthropic key nothing can be reviewed: no card, no reminder.
     const key = await getAnthropicKey(userId).catch(() => null);
     const counts = key ? await Promise.all(RECORDERS.map((recorder) => countNewRecordings(recorder, userId))) : RECORDERS.map(() => 0);
-    if (activeUserIdRef.current !== userId) return;
+    if (activeUserIdRef.current !== userId || generation !== fieldyCountGenerationRef.current) return;
     // A count that could not be read (offline, recorder down) keeps the last one
     // rather than saying nothing waits.
     const previous: Record<RecorderId, number> = recordingsWaitingRef.current.userId === userId ? recordingsWaitingRef.current.counts : { fieldy: 0, plaud: 0 };
