@@ -1,8 +1,9 @@
 # Day review: your recorder fills in ReferralFit
 
-**Status: plan, not built (2026-11-08).** For practitioners who have added
-their own Anthropic key (AI drafts). Goal from Matt: "as automated as
-possible, the fewer steps for the user the better."
+**Status: Phase 1 built (2026-11-08, branch feat/day-review): paste notes,
+review, approve.** Phases 2 and 3 below are the plan. For practitioners who
+have added their own Anthropic key (AI drafts). Goal from Matt: "as
+automated as possible, the fewer steps for the user the better."
 
 Practitioners who wear a recorder (Fieldy, Plaud) already capture every call
 and conversation. Day review reads those conversations, finds what belongs in
@@ -64,8 +65,9 @@ queue, and is labeled with its source ("From Fieldy, 2:15 PM").
    and times. A full transcript is read only when a conversation has no
    summary yet; Fieldy writes summaries after the conversation ends.
 2. **Extract.** A new Edge Function, `day-review`, built like
-   `draft-follow-up`: the key comes in the `x-anthropic-key` header, is used
-   for that one call, and is never stored or logged. It asks Claude for a
+   `draft-follow-up`: the key comes in the request body (`anthropicKey`,
+   never a header, which platform logs can record), is used for that one
+   call, and is never stored or logged. It asks Claude for a
    strict JSON list of items. Each item must quote the line it came from,
    which the review screen shows. Phone numbers and emails must appear in the
    text; the AI never fills them in.
@@ -136,9 +138,9 @@ queue, and is labeled with its source ("From Fieldy, 2:15 PM").
 
 ## Model and cost
 
-- Claude Sonnet 5.5 (`claude-sonnet-5-5`) for extraction: fast enough to
-  finish inside a background refresh, and cheaper than Opus. AI drafts stay
-  on Opus 5.5.
+- Claude Opus 5.5 (`claude-opus-5-5`), the same model as AI drafts, at low
+  effort with structured output. Claude Sonnet 5.5 (cheaper and faster) is an
+  option to weigh for Phase 2's background runs; it is Matt's call.
 - Billed to the user's own Anthropic account. A day of conversation
   summaries is usually a few cents.
 - A daily cap like the drafts' cap, as an abuse guard.
@@ -183,3 +185,40 @@ release.
    1 and 2 keep keys on the phone.
 3. **Evening reminder: 6 PM by default**, changeable per user, sent only
    when items are waiting.
+
+## Phase 1, as built
+
+| Piece | Where |
+| --- | --- |
+| Edge Function | `supabase/functions/day-review/` (`index.ts`, `review.ts` prompt + schema + output checks, `review_test.ts`) |
+| Daily cap | `supabase/migrations/20261109120000_day_review.sql` (`claim_day_review`, 60 a day; the function runs without it until it is applied), `supabase/tests/day_review_test.sql` |
+| Matching, duplicates, writes | `src/lib/day-review.ts`, tests in `scripts/day-review-test.mjs` |
+| Calling the function, saving | `src/lib/day-review-api.ts` |
+| The sheet | `src/lib/DayReviewSheet.tsx`, opened from Today, "Review notes" (iPhone, where AI keys live) |
+
+What the function checks in the model's answer: a phone number or email not
+in the notes is dropped; a quote not found word for word (ignoring case and
+punctuation) marks the row unverified, and it starts switched off; due dates
+outside yesterday to a year out are cleared; a missed promise is due today;
+anything urgent comes first.
+
+Saving: a new lead goes through `create_lead` with the summary as the case
+summary; a case note is a case event (a call, meeting, text or email stamps
+the first touch like any logged call); a partner note is a touch; a referral
+uses the case title as the client label when a case matched (as program
+referrals do), otherwise the practitioner types one; a new partner goes
+through `import_partners` (the Directory listing when it matched) and the
+row's note becomes its first touch.
+
+### Deploy (Matt)
+
+1. Paste `supabase/migrations/20261109120000_day_review.sql` in the SQL
+   editor (ASCII, one BEGIN/COMMIT, safe to re-run), with its
+   `schema_migrations` row.
+2. Deploy the function: `supabase functions deploy day-review --no-verify-jwt
+   --project-ref ovfafffvcpaahktvlsdm` (it checks the session itself, like
+   `draft-follow-up`).
+3. Before the build that carries it ships: add day review to the privacy
+   policy on referralfit.com (what is sent, to whom, not stored) and to the
+   App Review notes.
+
