@@ -285,6 +285,7 @@ check(() => {
   assert.match(api, /export async function rememberSaved[^]*export async function savedFrom/, 'items saved from a recording are remembered with it');
   assert.match(api, /delete state\.saved\[id\];/, 'and forgotten once it is reviewed');
   assert.match(api, /\.sort\(\(a, b\) => Date\.parse\(a\.startTime\) - Date\.parse\(b\.startTime\)/, 'detail reads go oldest first');
+  assert.match(api, /\[\.\.\.untried\.slice\(0, DETAIL_READS - 2\), \.\.\.retry\.slice\(0, 2\)/, 'two reads are kept for recordings that failed before');
   assert.match(api, /if \(forgotten\.has\(slot\(recorder, userId\)\)\) return;/, 'a deleted account\'s read state is never written again');
   assert.match(api, /await Promise\.all\(RECORDERS\.map\(async \(recorder\) =>/, 'deleting the account forgets every recorder at once');
   assert.match(api, /return await Promise\.race\(\[work, deadline\]\)/, 'the deadline covers the whole answer, body included');
@@ -313,7 +314,8 @@ check(() => {
   assert.match(sheet, /return read\.blocks\.map\(\(block\) => block\.id\)/, 'every recording is considered, those with no items too');
   assert.match(sheet, /function finish\(hold = false\) \{\s*if \(!hold && phase !== 'finding' && phase !== 'saving'\) settleRecordings\(saved, rows\);/, 'closing the review settles what was set aside');
   assert.match(sheet, /if \(phase === 'finding' && \(!notes\.trim\(\) \|\| recorderText\)\) \{ finish\(\); return; \}/, 'a slow read can be stopped; typed or pasted notes are not thrown away without asking');
-  assert.match(sheet, /if \(current\.some\(\(row\) => !matched\(row\) && row\.include && !rowDecided\(row, results\)\)\) return \[\];/, 'an item still on from no one recording holds them all');
+  assert.match(sheet, /if \(unmatchedUndecided\(results, current\)\) return \[\];/, 'an undecided item from no one recording holds them all, on Approve as on close');
+  assert.match(sheet, /laterSignatures\(row\)\.map\(signatureHash\)/, 'what is kept for a later review is never a quote alone');
   assert.match(sheet, /\/\/ Kept before the review runs, so a retry after a failed one is still these recordings\./);
   assert.match(sheet, /\.concat\(skipped\);/, 'one with nothing found, or skipped, is done on reading');
   assert.match(sheet, /function markAllReviewed\(\)/, 'the practitioner can be done with them');

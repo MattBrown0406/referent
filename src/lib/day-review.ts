@@ -848,7 +848,23 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
     ].filter(Boolean);
     for (const key of keys) out.push(`new_lead|any|q:${quote}|${key}`);
   }
+  // A caller is known by a phone or email, whatever the quote: read again
+  // in a later review with other words, still that caller.
+  if (row.found.kind === 'new_lead' && row.found.verified) {
+    const contacts = [phoneKey(row.found.phone) && `p:${phoneKey(row.found.phone)}`, cleanEmail(row.found.email) && `e:${cleanEmail(row.found.email)}`,
+      ...(saved ? [phoneKey(row.phone) && `p:${phoneKey(row.phone)}`, cleanEmail(row.email) && `e:${cleanEmail(row.email)}`] : [])];
+    for (const contact of new Set(contacts.filter(Boolean))) out.push(`new_lead|caller|${contact}`);
+  }
   return out;
+}
+
+/**
+ * What a saved row is known by in a later review of the same recording:
+ * its text, its summary, and a lead's caller, never its quote alone (two
+ * items often quote one sentence; the one not saved must come back).
+ */
+export function laterSignatures(row: ReviewRow): string[] {
+  return rowSignatures(row, true).filter((signature) => !signature.includes('|q:') || signature.startsWith('new_lead|any|'));
 }
 
 /**
@@ -879,7 +895,8 @@ export function markSavedBefore(rows: ReviewRow[], saved: Set<string>): ReviewRo
   if (!saved.size) return rows;
   return rows.map((row) => {
     if (!savedBefore(row, saved)) return row;
-    return { ...row, include: false, hint: row.hint ? `Saved earlier in this review. ${row.hint}` : 'Saved earlier in this review.' };
+    const when = rowSignatures(row).some((signature) => saved.has(signature)) ? 'Saved earlier in this review.' : 'Saved in an earlier review.';
+    return { ...row, include: false, hint: row.hint ? `${when} ${row.hint}` : when };
   });
 }
 

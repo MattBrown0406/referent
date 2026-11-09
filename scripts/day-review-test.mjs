@@ -484,6 +484,21 @@ check(() => {
   assert.ok([...fingerprints].every((value) => /^h:[0-9a-z]+$/.test(value)), 'fingerprints keep no words');
   const [again] = rules.markSavedBefore(build(kevin), fingerprints);
   assert.equal(again.include, false, 'an item saved from a recording before is not offered again');
+  assert.equal(again.hint.startsWith('Saved in an earlier review.'), true, 'and says it was saved in an earlier review');
+  // Two items quoting one sentence: the one saved never hides the other in a later review.
+  const sentence = 'I will call Ana tomorrow and email her the intake packet';
+  const call = found({ kind: 'follow_up', personName: 'Ana Rivera', summary: 'Call Ana tomorrow.', evidence: sentence, regarding: 'family' });
+  const email = found({ kind: 'follow_up', personName: 'Ana Rivera', summary: 'Email Ana the intake packet.', evidence: sentence, regarding: 'family' });
+  const [callRow] = build(call);
+  const kept = new Set(rules.laterSignatures(callRow).map(rules.signatureHash));
+  const [emailAgain] = rules.markSavedBefore(build(email), kept);
+  assert.equal(emailAgain.include, true, 'the follow-up not saved comes back');
+  const [callAgain] = rules.markSavedBefore(build(call), kept);
+  assert.equal(callAgain.include, false, 'the one saved does not');
+  // A caller read again with other words is still that caller.
+  const [kevinOther] = rules.markSavedBefore(build({ ...kevin, evidence: 'Kevin rang about his wife again and left his number' }),
+    new Set(rules.laterSignatures(kevinRow).map(rules.signatureHash)));
+  assert.equal(kevinOther.include, false, 'a lead read again with another quote, same phone, is not offered again');
   assert.equal(rules.signatureHash('abc'), rules.signatureHash('abc'));
   assert.notEqual(rules.signatureHash('abc'), rules.signatureHash('abd'));
 }, 'saved leads are matched by who called');

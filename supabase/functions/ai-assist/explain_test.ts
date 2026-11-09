@@ -137,6 +137,14 @@ Deno.test('rankings, outcomes, beds, money ties and outside names are refused; p
   assertThrows(() => parseExplainOutput(answer({ intro: 'Here are two programs; the strongest match comes first.' }), request()), AssistOutputError);
   const named = parseExplainOutput(answer({ intro: 'Juniper Ridge Recovery and Cedar House fit your loved one, in order. Here we take you through both.' }), request());
   assertStringIncludes(named.intro, 'Juniper Ridge Recovery', 'the introduction may name its programs');
+  for (const intro of [
+    'Juniper Ridge Recovery is the best program for your loved one, and Cedar House comes next.',
+    'Juniper Ridge Recovery is the best choice; Cedar House is also good.',
+    'Cedar House fits your loved one\'s needs best, then Juniper Ridge Recovery.',
+    'Cedar House and Juniper Ridge Recovery fit your loved one, in order.',
+  ]) {
+    assertThrows(() => parseExplainOutput(answer({ intro }), request()), AssistOutputError, undefined, intro);
+  }
   const fine = parseExplainOutput(first(`${base} You can always ask them questions. Their team speaks with families before Monday.`), request());
   assertStringIncludes(fine.programs[0].text, 'always ask');
 });
@@ -191,6 +199,9 @@ Deno.test('claims in ordinary words are refused; faithful wording about cost and
     assertEquals(parseExplainOutput(first(text), request()).programs[0].text, text);
   }
   const cash = (text: string) => answer({ programs: [{ rank: 1, text: `${base}` }, { rank: 2, text }] });
+  for (const claim of ['Cedar House has a fee of $4,500 that goes to us.', 'We get a fee of $4,500 for it from Cedar House.']) {
+    assertThrows(() => parseExplainOutput(cash(claim), request()), AssistOutputError, undefined, claim);
+  }
   for (const text of ['Cedar House has a monthly fee of $4,500, within your $6,000 budget.', 'If your family pays privately, Cedar House costs $4,500 a month, paid out of pocket.',
     'Cedar House\'s fee is $4,500 a month, within your $6,000 budget, paid in cash or paid privately.']) {
     assertEquals(parseExplainOutput(cash(text), request()).programs[1].text, text);

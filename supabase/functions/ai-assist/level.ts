@@ -307,7 +307,7 @@ const LEVELS = String.raw`(inpatient|residential|detox\w*|outpatient|iop|php|par
 const NAMES_A_LEVEL = new RegExp(String.raw`\b(needs?|requires?|recommend\w*|should (go|enter|attend|start|consider|be (in|at|admitted|placed))|warrants?|calls? for|appropriate for|best suited (for|to)|suited for|(?:would|could|may|might|will) (?:likely |really |greatly |most )?benefit|consider(?:ing|s)?)\b(?:(?!,\s*(?:but|though|although|while|yet)\b)[^.;]){0,40}\b${LEVELS}\b`
   // The level as what is needed ("Residential is the right next step", "Her detox is needed now", "Outpatient is right
   // for her"), not a plan's rule ("required by her plan") nor a place ("My IOP is right there", "right next door").
-  + String.raw`|\b${LEVELS}\b[^.;]{0,30}\b(is|are|would be|seems?|may be|might be|could be)\s+(?:the\s+|an?\s+|most\s+)?(needed|necessary|warranted|appropriate|right(?!\s+(?:there|here|around|by|on|in|at|near|next\s+(?:to|door)|across|behind|down|up|outside|away|off|nearby)\b)|indicated|recommended|required(?!\s+by)|called for)\b`, 'i');
+  + String.raw`|\b${LEVELS}\b[^.;]{0,30}\b(is|are|would be|seems?|may be|might be|could be)\s+(?:the\s+|an?\s+|most\s+)?(needed|necessary|warranted|appropriate|right(?!\s+(?:there|here|around|by|on(?!\s+target)|in(?!\s+line)|at(?!\s+the\s+top)|near|next\s+(?:to|door)|across|behind|down|up(?!\s+\w+\s+alley)|outside|away|off|nearby|after|before|beside|downtown|where|along|past)\b)|indicated|recommended|required(?!\s+by)|called for)\b`, 'i');
 
 /** The answers alone ("Question: answer" lines without their questions). */
 export function answerValues(request: LevelRequest): string {

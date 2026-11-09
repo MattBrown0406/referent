@@ -39,6 +39,7 @@ import {
   markSavedBefore,
   rowProblem,
   rowReady,
+  laterSignatures,
   rowSignatures,
   savedBefore,
   saveOrder,
@@ -265,8 +266,8 @@ export default function DayReviewSheet({
   function recordingsDone(results: Record<string, SaveResult>, current: ReviewRow[]): string[] {
     const read = recorderReadRef.current;
     if (!read) return [];
-    const matched = (row: ReviewRow) => Boolean(read.rowIds.get(row.key)?.length);
-    if (current.some((row) => !matched(row) && row.include && !rowDecided(row, results))) return [];
+    // One rule with the close question: an undecided item from no one recording keeps them all.
+    if (unmatchedUndecided(results, current)) return [];
     return read.blocks.map((block) => block.id)
       .filter((id) => current.filter((row) => (read.rowIds.get(row.key) ?? []).includes(id)).every((row) => rowDecided(row, results)));
   }
@@ -576,7 +577,7 @@ export default function DayReviewSheet({
           for (const signature of signatures) savedSignaturesRef.current.add(signature);
           // Kept with each recording it came from, for when that recording is read again.
           for (const id of recorderReadRef.current?.rowIds.get(row.key) ?? []) {
-            fromRecordings[id] = [...(fromRecordings[id] ?? []), ...signatures.map(signatureHash)];
+            fromRecordings[id] = [...(fromRecordings[id] ?? []), ...laterSignatures(row).map(signatureHash)];
           }
         }
         if (opening !== openingRef.current) break;

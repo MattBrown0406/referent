@@ -548,8 +548,10 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
   // Oldest first (the list may come newest first), those not failing before those failing.
   const needed = fresh.filter((item) => !item.summary)
     .sort((a, b) => Date.parse(a.startTime) - Date.parse(b.startTime) || a.id.localeCompare(b.id));
-  const failedFor = (item: FieldyConversation) => (state.failing[item.id] ? now.getTime() - Date.parse(state.failing[item.id]) : -1);
-  const order = [...needed.filter((item) => failedFor(item) < 0), ...needed.filter((item) => failedFor(item) >= 0)];
+  // Two of the reads are kept for recordings that failed before, so new ones never keep them waiting for good.
+  const untried = needed.filter((item) => !state.failing[item.id]);
+  const retry = needed.filter((item) => state.failing[item.id]);
+  const order = [...untried.slice(0, DETAIL_READS - 2), ...retry.slice(0, 2), ...untried.slice(DETAIL_READS - 2), ...retry.slice(2)];
   const failing: Record<string, string> = {};
   const recovered: string[] = [];
   const started = Date.now();

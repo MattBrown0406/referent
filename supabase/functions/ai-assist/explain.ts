@@ -131,7 +131,8 @@ const UNSAID_PHRASES = [
   'owe nothing', 'pay nothing', 'not pay out of pocket', 'won t pay out of pocket', 'never pay out of pocket', 'not have to pay',
   'don t have to pay', 'won t have to pay', 'we charge', 'charge a fee', 'our fee', 'our fees', 'placement fee', 'placement fees', 'we bill',
   'we take a fee', 'we take a cut', 'we take a share', 'we take money', 'we take a percentage', 'no self pay', 'no private pay',
-  'have to self pay', 'have to private pay', 'not self pay', 'not private pay',
+  'have to self pay', 'have to private pay', 'not self pay', 'not private pay', 'best choice', 'best program', 'best option',
+  'best fit', 'best place', 'to us', 'for us', 'we get',
 ];
 // Everyday phrases with one of the words above, set aside before the word
 // check (never before the phrase check, which refuses "not pay out of
@@ -154,7 +155,13 @@ function addsWords(text: string, facts: string): string | null {
   const phrase = UNSAID_PHRASES.find((item) => whole.includes(` ${item} `) && !factWords.includes(` ${item} `));
   if (phrase) return phrase;
   const priced = new Set([...facts.matchAll(/\$\s?\d[\d,]*(?:\.\d+)?/g)].map((match) => dollars(match[0])));
-  let rest = ` ${comparable(text.replace(PRICED_FEE, (whole, amount: string) => (priced.has(dollars(amount)) ? ` ${amount}` : whole)))} `;
+  // Never in a sentence about us ("a fee of $4,500 goes to us").
+  const aboutUs = (at: number) => {
+    const start = Math.max(text.lastIndexOf('.', at), text.lastIndexOf('!', at), text.lastIndexOf('?', at)) + 1;
+    const ends = ['.', '!', '?'].map((mark) => text.indexOf(mark, at)).filter((index) => index >= 0);
+    return /\b(?:we|us|our|i|me|my)\b/i.test(text.slice(start, ends.length ? Math.min(...ends) : text.length));
+  };
+  let rest = ` ${comparable(text.replace(PRICED_FEE, (whole, amount: string, at: number) => (priced.has(dollars(amount)) && !aboutUs(at) ? ` ${amount}` : whole)))} `;
   for (const item of EVERYDAY_PHRASES) rest = rest.split(` ${item} `).join(' ');
   const words = new Set(rest.trim().split(' '));
   return UNSAID.find((word) => words.has(word) && !said.has(word)) ?? null;
@@ -270,10 +277,18 @@ export function parseExplainOutput(raw: string, request: ExplainRequest): Explai
   const list = Array.isArray(answer.programs) ? answer.programs : [];
   if (!intro || intro.length > EXPLAIN_LIMITS.outIntro) throw new AssistOutputError('The rewrite’s introduction did not fit.');
   const names = request.programs.map((program) => comparable(program.name));
-  // The introduction may name the programs it introduces.
+  // The introduction may name the programs it introduces, in their order;
+  // its own fact's "fit … best, in order" never lets it call one the best.
   const introNames = `${request.intro}\n${request.programs.map((program) => program.name).join('\n')}`;
-  if (addsNumbers(intro, request.intro) || addsWords(intro, request.intro) || addsNames(intro, introNames, names)) {
+  const introWords = ` ${comparable(intro)} `;
+  const mentioned = names.map((name) => introWords.indexOf(` ${name} `)).filter((at) => at >= 0);
+  // Its fact's "best" describes the list ("fit … best, in order"), never one program it names.
+  const introFacts = mentioned.length ? request.intro.replace(/\bbest\b/gi, ' ') : request.intro;
+  if (addsNumbers(intro, request.intro) || addsWords(intro, introFacts) || addsNames(intro, introNames, names)) {
     throw new AssistOutputError('The rewrite added to the facts.');
+  }
+  if (mentioned.some((at, index) => index > 0 && at < mentioned[index - 1])) {
+    throw new AssistOutputError('The rewrite changed the order.');
   }
   if (list.length !== request.programs.length) throw new AssistOutputError('The rewrite left out or added a program.');
   const programs = list.map((raw, index) => {
