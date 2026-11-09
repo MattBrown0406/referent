@@ -137,9 +137,23 @@ Deno.test('rankings, outcomes, beds, money ties and outside names are refused; p
   assertThrows(() => parseExplainOutput(answer({ intro: 'Here are two programs; the strongest match comes first.' }), request()), AssistOutputError);
   const warm = parseExplainOutput(answer({ intro: 'We get it: this is hard. Here we take you through two programs that fit your loved one best, in order.' }), request());
   assertStringIncludes(warm.intro, 'take you through', 'the introduction from its fact, warmly worded, passes');
+  // Programs whose names start with ordinary words do not stop an ordinary introduction.
+  const ordinaryNames = {
+    intro: FACTS.intro,
+    programs: [{ ...FACTS.programs[0], name: 'The Haven' }, { ...FACTS.programs[1], name: 'New Day Recovery' }],
+  };
+  const ordinaryAnswer = JSON.stringify({
+    intro: 'The two programs below fit your loved one best, in order, and each is a new place to start.',
+    programs: [
+      { rank: 1, text: 'The Haven offers inpatient care, works with Aetna, and offers EMDR. Its fit is 87 of 100.' },
+      { rank: 2, text: 'New Day Recovery costs $4,500 a month, within your $6,000 budget.' },
+    ],
+  });
+  assertStringIncludes(parseExplainOutput(ordinaryAnswer, parseExplainRequest({ facts: ordinaryNames })).intro, 'two programs below');
+  assertThrows(() => parseExplainOutput(ordinaryAnswer.replace('The two programs below', 'The Haven and two programs below'), parseExplainRequest({ facts: ordinaryNames })), AssistOutputError);
   for (const intro of [
     'Juniper Ridge Recovery and Cedar House fit your loved one, in order.', 'Juniper Ridge is the best one for your loved one.',
-    'Cedar fits best, then Juniper Ridge.', 'Cedar House comes first for your loved one.',
+    'Cedar fits best, then Juniper Ridge.', 'Cedar House comes first for your loved one.', 'Juniper is the one to call.',
     'Juniper Ridge Recovery is the best program for your loved one, and Cedar House comes next.',
     'Juniper Ridge Recovery is the best choice; Cedar House is also good.',
     'Cedar House fits your loved one\'s needs best, then Juniper Ridge Recovery.',

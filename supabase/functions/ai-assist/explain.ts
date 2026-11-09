@@ -210,7 +210,10 @@ function addsNames(text: string, facts: string, names: string[] = []): boolean {
     if (starts) {
       if (words.length === 1) continue;
       // "It's Cedar House", "Here's Cedar House": the opener is "it", "here".
-      if (OPENERS.has(comparable(words[0].replace(/['’]s$/i, '')))) { words = words.slice(1); opened = true; }
+      // …unless the opener is the start of a program's name ("The Haven offers…").
+      const run = comparable(words.join(' '));
+      const isProgram = names.some((name) => run === name || run.startsWith(`${name} `));
+      if (!isProgram && OPENERS.has(comparable(words[0].replace(/['’]s$/i, '')))) { words = words.slice(1); opened = true; }
       else optionalFirst = ordinary.has(comparable(words[0]));
     }
     // A possessive ends a name: "Juniper Ridge Recovery's EMDR" is two.
@@ -240,6 +243,24 @@ function addsNames(text: string, facts: string, names: string[] = []): boolean {
   }
   return false;
 }
+
+/**
+ * A program named by the start of its name, as the name writes it ("Cedar"
+ * of "Cedar House", "The Haven" of "The Haven Recovery"): its first word,
+ * or its first two when the first is an ordinary opener ("The", "New"…) or
+ * a word as common as the intro's own.
+ */
+function shortNameIn(text: string, name: string): boolean {
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+  const lead = OPENERS.has(comparable(words[0])) || COMMON_LEADS.has(comparable(words[0])) ? words.slice(0, 2) : words.slice(0, 1);
+  const escaped = lead.map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+');
+  return new RegExp(`(?<![\\p{L}\\p{M}])${escaped}(?![\\p{L}\\p{M}])`, 'u').test(text);
+}
+
+// First words of program names that an introduction may use as ordinary words.
+const COMMON_LEADS = new Set(['new', 'hope', 'recovery', 'care', 'life', 'family', 'home', 'help', 'path', 'bridge', 'next', 'first', 'fresh',
+  'safe', 'serenity', 'harmony', 'healing', 'journey', 'clear', 'true', 'good', 'better', 'best', 'second', 'one']);
 
 const STATE_BY_CODE: Record<string, string> = {
   AL: 'alabama', AK: 'alaska', AZ: 'arizona', AR: 'arkansas', CA: 'california', CO: 'colorado', CT: 'connecticut', DE: 'delaware',
@@ -283,7 +304,7 @@ export function parseExplainOutput(raw: string, request: ExplainRequest): Explai
   // shortened): its fact's "fit … best, in order" describes the list, so it
   // can never rank one or change the order.
   if (addsNumbers(intro, request.intro) || addsWords(intro, request.intro) || addsNames(intro, request.intro, names)
-    || names.some((name) => ` ${comparable(intro)} `.includes(` ${name.split(' ')[0]} `))) {
+    || request.programs.some((program) => shortNameIn(intro, program.name))) {
     throw new AssistOutputError('The rewrite added to the facts.');
   }
   if (list.length !== request.programs.length) throw new AssistOutputError('The rewrite left out or added a program.');
