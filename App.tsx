@@ -80,6 +80,8 @@ import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
 import OutreachSheet, { type OutreachSent, type OutreachSheetRequest } from './src/lib/OutreachSheet';
+import DayReviewSheet from './src/lib/DayReviewSheet';
+import { aiKeysSupported } from './src/lib/outreach-api';
 import {
   caseRecipients,
   caseTarget,
@@ -1295,6 +1297,9 @@ export default function App() {
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
   // Import partners from the iPhone's contacts or (web) a .csv / .vcf file.
   const [showPartnerImport, setShowPartnerImport] = useState(false);
+  // Day review: notes from the day (a recorder's summary, call notes) read by
+  // AI on the user's own key, approved row by row (docs/DAY_REVIEW.md).
+  const [showDayReview, setShowDayReview] = useState(false);
   const [directorySubmitBusy, setDirectorySubmitBusy] = useState(false);
   // Incremented after the account joins a different practice workspace, which
   // re-homes its rows server-side; bumping it re-runs the hydration effect.
@@ -4616,7 +4621,7 @@ export default function App() {
   latestCasesRef.current = cases;
   const sheetOpenNow = Boolean(
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
-    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory || showPartnerImport
+    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory || showPartnerImport || showDayReview
     || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
     || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible
     || placementSheet || placementCompareId || showHandoffs,
@@ -6845,6 +6850,21 @@ export default function App() {
             </View>
             <Text style={styles.heroSubtitle}>{loadLine}</Text>
           </View>
+          {aiKeysSupported ? (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Review notes from your day"
+              style={styles.globalDirectoryBanner}
+              onPress={() => setShowDayReview(true)}
+            >
+              <AppIcon name="reader-outline" size={20} color={COLORS.forest} />
+              <View style={styles.globalDirectoryCopy}>
+                <Text style={styles.globalDirectoryTitle}>Review notes</Text>
+                <Text style={styles.globalDirectorySubtitle}>Paste a Fieldy or Plaud summary or your call notes; approve the leads, notes and follow-ups it finds</Text>
+              </View>
+              <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
+            </TouchableOpacity>
+          ) : null}
 
           {teamWorkspace ? (
             <View style={styles.todayScopeBlock}>
@@ -10193,6 +10213,18 @@ export default function App() {
           setShowBusinessDashboard(false);
           afterSheetCloses(() => openCase(caseId));
         }}
+      />
+      <DayReviewSheet
+        visible={showDayReview}
+        userId={activeUserId}
+        cases={cases}
+        contacts={allCaseContacts}
+        partners={partners}
+        followUps={followUps}
+        referrals={referrals}
+        directoryEntitled={entitlements.entitlements.directory}
+        onClose={() => setShowDayReview(false)}
+        onSaved={() => refreshAfterServerChange()}
       />
       <PartnerImportSheet
         visible={showPartnerImport}

@@ -106,7 +106,8 @@ export function pickContactsFile(): Promise<PickedFile> {
   });
 }
 
-export type ImportResult = { added: number; linked: number; skipped: number };
+/** ids: the partners added or linked, in the order of the rows sent (import_partners). */
+export type ImportResult = { added: number; linked: number; skipped: number; ids?: string[] };
 
 /** Sends the confirmed rows. The signed-in account must still be the one that chose them. */
 export async function importPartners(rows: ImportRow[], expectedUserId: string): Promise<ImportResult> {
@@ -122,5 +123,6 @@ export async function importPartners(rows: ImportRow[], expectedUserId: string):
   }
   const result = (data || {}) as Record<string, unknown>;
   const count = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
-  return { added: count(result.added), linked: count(result.linked), skipped: count(result.skipped) };
+  const ids = Array.isArray(result.ids) ? result.ids.filter((id): id is string => typeof id === 'string') : [];
+  return { added: count(result.added), linked: count(result.linked), skipped: count(result.skipped), ids };
 }
