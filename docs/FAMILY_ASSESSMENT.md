@@ -15,7 +15,7 @@ their own Anthropic key.
 
 | Question | Answer |
 | --- | --- |
-| Consent | One blanket consent: a checkbox and a typed full name (the signature), with the date |
+| Consent | One blanket consent: a checkbox and a typed full name (the signature), with the date. The wording (version 2026-11-08) approved as written |
 | Length | Full length: section for section like freedominterventions.com/assessment |
 | Identifiers | Like the FI form: full name, date of birth, insurance card photos and typed insurance details |
 | Who sends | Practices (interventionists) first; programs later |
@@ -126,9 +126,9 @@ the photos, then the row.
 4. Publish the privacy policy and terms changes on referralfit.com (branch
    prepared in referralfit-web): the policy today says ReferralFit never
    stores a date of birth or a full member ID, which this changes.
-5. Have the consent text read by counsel before release. It is in
-   `family_assessment_consent_text` (bump `family_assessment_consent_version`
-   with any change).
+5. The consent text (version 2026-11-08) is approved by Matt (2026-11-08).
+   It is in `family_assessment_consent_text`; any change needs a new
+   `family_assessment_consent_version`, so families sign the current words.
 6. App Store: check the App Privacy answers (health, insurance and
    identifiers collected from people who are not app users, through the
    web page) and add a line to the App Review notes.
