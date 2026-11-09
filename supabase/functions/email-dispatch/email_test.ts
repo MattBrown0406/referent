@@ -250,3 +250,12 @@ Deno.test('a finished assessment: to the practitioner, no names or answers; urge
   assertStringIncludes(urgent.text, 'safety concerns');
   assertEquals(urgent.headers, {});
 });
+
+Deno.test('an urgent answer before the family finishes: to the practitioner, no names or answers', () => {
+  const email = renderEmail(row('family_assessment_urgent', { assessment_id: ASSESSMENT.assessment_id, urgent: true }), LINKS, NOW);
+  assertEquals(email.subject, 'A family assessment needs your attention today');
+  assertStringIncludes(email.text, 'still filling out');
+  assertStringIncludes(email.text, '988');
+  assertEquals(email.headers, {});
+  assertEquals(senderFor(row('family_assessment_urgent', {}), 'ReferralFit <n@r.com>', 'm@r.com'), { from: 'ReferralFit <n@r.com>', replyTo: 'm@r.com' });
+});

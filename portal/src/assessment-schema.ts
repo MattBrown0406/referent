@@ -692,6 +692,28 @@ export function missingRequired(section: Section, answers: Answers): string[] {
 
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+/** The field to put the cursor on when a section cannot move on, or null. */
+export function firstProblemField(section: Section, answers: Answers): string | null {
+  const missing = section.fields.find((field) => 'required' in field && field.required && fieldVisible(field, answers) && !text(answers[field.id]));
+  if (missing) return missing.id;
+  const email = section.fields.find((field) => field.kind === 'email' && text(answers[field.id]));
+  return email && !EMAIL.test(text(answers[email.id])) ? email.id : null;
+}
+
+/**
+ * The answers without those to questions now hidden (a detail typed before
+ * its yes/no was changed to no), so nothing is kept that the family took back.
+ */
+export function pruneHidden(answers: Answers): Answers {
+  const out: Answers = { ...answers };
+  for (const section of SECTIONS) {
+    for (const field of section.fields) {
+      if (!fieldVisible(field, answers)) delete out[field.id];
+    }
+  }
+  return out;
+}
+
 /** What stops a section from moving on: a required answer, or an email that is not one. '' when it can. */
 export function sectionProblem(section: Section, answers: Answers): string {
   const missing = missingRequired(section, answers);
@@ -725,8 +747,19 @@ export const DSM_SEVERITY_LABEL: Record<DsmSeverity, string> = {
   severe: 'Severe',
 };
 
-// "None", "n/a", "no concerns" and the like are not a safety concern.
-const NO_CONCERN = /^(none|no|nope|n\/?a|na|not applicable|nothing|no concerns?|none at this time|none currently|not at this time|-+)$/;
+// "None", "n/a", "no concerns at this time", "not that I know of" and the
+// like are not a safety concern. Read after normalizeConcern (lower case,
+// letters, digits, slash, hyphen and single spaces), as the database does.
+const NO_CONCERN = /^(none|no|nope|n\/?a|na|not applicable|nothing|no concerns?|no safety concerns?|no immediate( safety)? concerns?|no concerns? (at this time|right now|currently)|none (at this time|currently|right now|so far|known|that i know of|that im aware of)|not (at this time|right now|currently|that i know of|that im aware of)|nothing (at this time|right now|that i know of|that im aware of)|-+)$/;
+
+/**
+ * The safety-concern text as it is compared: lower case, every run of white
+ * space one space, then only a-z, 0-9, slash, space and hyphen kept
+ * (family_assessment_urgent in the database does exactly this).
+ */
+export function normalizeConcern(value: unknown): string {
+  return text(value).toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9/ -]+/g, '').replace(/ +/g, ' ').trim();
+}
 
 export type SafetyFlag = 'suicidal_thoughts' | 'homicidal_thoughts' | 'crisis' | 'safety_concern';
 
@@ -748,7 +781,7 @@ export function safetyFlags(answers: Answers): SafetyFlag[] {
   if (text(answers.suicideIdeation) === 'yes') flags.push('suicidal_thoughts');
   if (text(answers.homicidalIdeation) === 'yes') flags.push('homicidal_thoughts');
   if (text(answers.urgencyLevel) === 'crisis') flags.push('crisis');
-  const concern = text(answers.immediateSafetyConcerns).toLowerCase().replace(/[.!\s]+$/, '');
+  const concern = normalizeConcern(answers.immediateSafetyConcerns);
   if (concern && !NO_CONCERN.test(concern)) flags.push('safety_concern');
   return flags;
 }

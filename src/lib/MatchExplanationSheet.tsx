@@ -67,6 +67,10 @@ export default function MatchExplanationSheet({ visible, userId, profile, ranked
   const [rewrite, setRewrite] = useState<Rewrite | null>(null);
   const [text, setText] = useState('');
   const [edited, setEdited] = useState(false);
+  // The ranking or its facts changed under the practitioner's own edits.
+  const [stale, setStale] = useState(false);
+  const editedRef = useRef(false);
+  editedRef.current = edited;
   const [busy, setBusy] = useState(false);
   const [hasKey, setHasKey] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
@@ -85,6 +89,7 @@ export default function MatchExplanationSheet({ visible, userId, profile, ranked
     setCount(EXPLAIN_DEFAULT);
     setRewrite(null);
     setEdited(false);
+    setStale(false);
     setBusy(false);
     setMessage(null);
     setHasKey(false);
@@ -96,12 +101,25 @@ export default function MatchExplanationSheet({ visible, userId, profile, ranked
   // The text follows the explanation. It is written again only when its
   // words would change (another program count, a rewrite, a new ranking),
   // not on every refresh of the data behind it.
+  // Edits of the practitioner's own are never replaced without asking: the
+  // sheet says the ranking changed, and offers to write it again.
   const generated = useMemo(() => explanationText(explanation, rewrite), [explanation, rewrite]);
+  const generatedRef = useRef(generated);
   useEffect(() => {
     if (!visible) return;
+    const changed = generatedRef.current !== generated;
+    generatedRef.current = generated;
+    if (editedRef.current && changed) { setStale(true); return; }
     setText(generated);
     setEdited(false);
+    setStale(false);
   }, [visible, generated]);
+
+  function writeAgain() {
+    setText(generatedRef.current);
+    setEdited(false);
+    setStale(false);
+  }
 
   function confirmReplace(proceed: () => void) {
     if (!edited) { proceed(); return; }
@@ -130,11 +148,14 @@ export default function MatchExplanationSheet({ visible, userId, profile, ranked
       }
       const result = await requestExplanationRewrite(facts, key);
       if (opening !== openingRef.current) return;
-      if (!rewriteMatches(explanationRef.current, result)) {
+      const made = { ...result, madeFrom: JSON.stringify(facts) };
+      if (!rewriteMatches(explanationRef.current, made)) {
         setMessage({ ok: false, text: 'The ranking changed while this was being written. Your text is unchanged; try again.' });
         return;
       }
-      setRewrite(result);
+      setEdited(false);
+      editedRef.current = false;
+      setRewrite(made);
       setMessage({ ok: true, text: 'Rewritten from the same facts, in the same order. The cautions, disclosures and how the order was decided are unchanged. Read it before you send it.' });
     } catch (error) {
       if (opening !== openingRef.current) return;
@@ -229,6 +250,14 @@ export default function MatchExplanationSheet({ visible, userId, profile, ranked
                     <Text style={styles.secondaryButtonText}>Use the plain version</Text>
                   </TouchableOpacity>
                 ) : null}
+              </View>
+            ) : null}
+            {stale ? (
+              <View style={styles.notice} accessibilityRole="alert">
+                <Text style={styles.noticeText}>The ranking or its details changed since you edited this, so it may be out of date.</Text>
+                <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => confirmReplace(writeAgain)} style={styles.secondaryButton}>
+                  <Text style={styles.secondaryButtonText}>Write it again from the new ranking</Text>
+                </TouchableOpacity>
               </View>
             ) : null}
             {message ? (

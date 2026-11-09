@@ -216,9 +216,13 @@ How rows are placed (all on the phone, `src/lib/day-review.ts`):
 - **The same caller twice** in one review is one lead; the second item goes
   on the case the first creates, and so does a follow-up or note about a
   caller who is new today. Those rows save only after the lead (leads save
-  first) and wait if the lead is switched off.
-- **Matched by name only** (a case or a partner): the row is picked but asks
-  "Yes, this case" before it can be saved. Organization names match on
+  first) and wait if the lead is switched off. Two callers with the same
+  name but another phone or email are confirmed first. A "call back" for a
+  caller who is new today is the lead's own first call, not a second one.
+- **Matched by name only** (a case or a partner, even a full name): the row
+  is picked but asks "Yes, this case" before it can be saved. A name or
+  organization the notes never mention makes the item unverified (the
+  function checks), so it is never saved without a look. Organization names match on
   distinctive whole words ("Juniper Ridge" / "Juniper Ridge Recovery"), never
   on words like Recovery or Center alone.
 - **A follow-up** goes on one place, its case or else its partner. With

@@ -113,11 +113,21 @@ const COMPONENT_REASON: Record<keyof ScoreComponents, string> = {
 
 const round1 = (value: number) => Math.round(value * 10) / 10;
 
+/** "Disclosure about <program>: our practice has a financial relationship with this program …" */
+export function namedDisclosure(name: string, line: string | null): string {
+  if (!line) return '';
+  return line.startsWith('Disclosure: ') ? `Disclosure about ${name}: ${line.slice('Disclosure: '.length)}` : `${name}: ${line}`;
+}
+
 /** Why `a` is listed before `b`, from the same comparison the ranker made (compareScored). */
 export function orderReason(a: ProgramScore, b: ProgramScore): string {
   const next = programName(b);
+  // A cost that is not on file is listed last, but it is not a higher cost:
+  // say what is known, never "costs less" against a cost nobody has.
+  const costUnknown = a.familyCost != null && b.familyCost == null;
   if (round1(a.total) === round1(b.total)) {
     if (compareBedAvailability(a, b) < 0) return `It ties with ${next} on fit and comes first because it has a confirmed open bed.`;
+    if (costUnknown) return `It ties with ${next} on fit and comes first because its cost to your family is on file and ${next}'s is not yet.`;
     if (compareFamilyCost(a, b) < 0) return `It ties with ${next} on fit and comes first because it is likely to cost your family less.`;
     return `It ties with ${next} on fit; the app sets the order between them fairly.`;
   }
@@ -126,6 +136,8 @@ export function orderReason(a: ProgramScore, b: ProgramScore): string {
     .map((key) => [key, a.components[key] - b.components[key]] as const)
     .sort((left, right) => right[1] - left[1]);
   if (!best || best[1] <= 0.05) return `It ranks above ${next} on overall fit.`;
+  if (best[0] === 'cost' && costUnknown) return `It ranks above ${next} mainly because its cost to your family is on file and ${next}'s is not yet.`;
+  if (best[0] === 'cost' && a.familyCost == null) return `It ranks above ${next} on overall fit.`;
   return `It ranks above ${next} mainly because ${COMPONENT_REASON[best[0]]}.`;
 }
 
@@ -159,7 +171,9 @@ export function explainMatches(profile: ReferralMatch, ranked: ProgramScore[], s
       reasons,
       order: index < list.length - 1 ? orderReason(score, list[index + 1]) : '',
       cautions,
-      disclosure: disclosureLine(partner) || '',
+      // Named, so two programs' disclosures are never the same words and
+      // each one is checked for on its own (withDisclosures).
+      disclosure: namedDisclosure(programName(score), disclosureLine(partner)),
     };
   });
   return {
@@ -179,7 +193,13 @@ export type RewriteFacts = {
   programs: { rank: number; name: string; where: string; fit: number; reasons: string[]; order: string }[];
 };
 
-export type Rewrite = { intro: string; programs: { rank: number; text: string }[] };
+/** `madeFrom`: the facts it was written from (factsKey), so a rewrite is never used once they change. */
+export type Rewrite = { intro: string; programs: { rank: number; text: string }[]; madeFrom?: string };
+
+/** The facts a rewrite is made from, as one string to compare. */
+export function factsKey(explanation: MatchExplanation): string {
+  return JSON.stringify(rewriteFacts(explanation));
+}
 
 export function rewriteFacts(explanation: MatchExplanation): RewriteFacts {
   return {
@@ -191,12 +211,15 @@ export function rewriteFacts(explanation: MatchExplanation): RewriteFacts {
 const loose = (value: string) => ` ${value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()} `;
 
 /**
- * The rewrite fits only the explanation it was made for: the same programs
- * in the same order, each paragraph naming its own program. A rewrite made
- * before the ranking changed is not used.
+ * The rewrite fits only the explanation it was made for: the same facts
+ * (when it says which), the same programs in the same order, each paragraph
+ * naming its own program. A rewrite made before the ranking or its facts
+ * changed is not used.
  */
 export function rewriteMatches(explanation: MatchExplanation, rewrite: Rewrite | null): boolean {
   if (!rewrite || rewrite.programs.length !== explanation.programs.length) return false;
+  // Made from other facts (a fit, a bed or a cost changed since): its words may be wrong now.
+  if (rewrite.madeFrom !== undefined && rewrite.madeFrom !== factsKey(explanation)) return false;
   return rewrite.programs.every((item, index) => {
     const program = explanation.programs[index];
     return item.rank === program.rank && item.text.trim().length > 0 && loose(item.text).includes(loose(program.name));
@@ -237,6 +260,6 @@ export function explanationText(explanation: MatchExplanation, rewrite: Rewrite 
 export function withDisclosures(text: string, explanation: MatchExplanation): { text: string; added: number } {
   const missing = explanation.programs.filter((program) => program.disclosure && !text.includes(program.disclosure));
   if (!missing.length) return { text, added: 0 };
-  const lines = missing.map((program) => `${program.name}: ${program.disclosure}`);
+  const lines = missing.map((program) => program.disclosure);
   return { text: `${text.trimEnd()}\n\n${lines.join('\n\n')}`, added: missing.length };
 }

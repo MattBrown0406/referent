@@ -31,6 +31,7 @@ import {
   oneClickFrom,
   type OutboxRow,
   preparedAt,
+  type RenderedEmail,
   renderEmail,
   RESEND_URL,
   resendBody,
@@ -64,14 +65,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 type SendOutcome = SendResult & { config?: boolean; charge?: boolean };
 
-async function sendOne(row: OutboxRow, apiKey: string, defaultFrom: string, defaultReplyTo: string | undefined, target: Links): Promise<SendOutcome> {
-  const { from, replyTo } = senderFor(row, defaultFrom, defaultReplyTo);
-  let email;
-  try {
-    email = renderEmail(row, target, preparedAt(row));
-  } catch {
-    return { id: row.id, error: 'render_failed', retry: false };
-  }
+async function post(row: OutboxRow, email: RenderedEmail, apiKey: string, from: string, replyTo: string | undefined, target: Links): Promise<SendOutcome> {
   try {
     const key = await idempotencyKey(row, from, replyTo, target);
     const response = await fetch(Deno.env.get('EMAIL_RESEND_URL_FOR_TESTS') || RESEND_URL, {
@@ -101,6 +95,24 @@ async function sendOne(row: OutboxRow, apiKey: string, defaultFrom: string, defa
   } catch {
     return { id: row.id, error: 'network', retry: true };
   }
+}
+
+async function sendOne(row: OutboxRow, apiKey: string, defaultFrom: string, defaultReplyTo: string | undefined, target: Links): Promise<SendOutcome> {
+  const { from, replyTo } = senderFor(row, defaultFrom, defaultReplyTo);
+  let email: RenderedEmail;
+  try {
+    email = renderEmail(row, target, preparedAt(row));
+  } catch {
+    return { id: row.id, error: 'render_failed', retry: false };
+  }
+  const sent = await post(row, email, apiKey, from, replyTo, target);
+  // Resend refused a practice's own sender name or reply-to (a 422): send
+  // that one email from ReferralFit's own sender instead, so one practice's
+  // name can never stop the queue for everyone.
+  if (sent.charge && (from !== defaultFrom || replyTo !== defaultReplyTo)) {
+    return post(row, email, apiKey, defaultFrom, defaultReplyTo, target);
+  }
+  return sent;
 }
 
 async function record(supabase: ReturnType<typeof serviceClient>, result: SendResult): Promise<void> {

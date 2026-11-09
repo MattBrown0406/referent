@@ -293,6 +293,22 @@ function emailFromNotes(value: unknown, emails: Set<string>): string {
 
 // A quote counts only when it is long enough to show something and appears
 // in the notes word for word (ignoring case, punctuation and line breaks).
+// Words an organization's name may gain or lose between the notes and the
+// review ("Juniper Ridge" for "Juniper Ridge Recovery Center").
+const NAME_FILLER = new Set(['the', 'of', 'and', 'for', 'at', 'a', 'an', 'inc', 'llc', 'pc', 'pllc', 'recovery', 'center', 'centre',
+  'treatment', 'program', 'programs', 'services', 'service', 'house', 'behavioral', 'health', 'clinic', 'group', 'counseling']);
+
+/**
+ * A name or organization the review gives is in the notes: every word of it
+ * that is not filler is a word there. A name the notes never mention makes
+ * the item unverified, so it is never saved without the practitioner looking.
+ */
+export function nameInNotes(name: string, notesComparable: string): boolean {
+  const words = comparable(name).split(' ').filter((word) => word.length > 1 && !NAME_FILLER.has(word));
+  if (!words.length) return comparable(name) === '' ? true : notesComparable.includes(` ${comparable(name)} `);
+  return words.every((word) => notesComparable.includes(` ${word} `));
+}
+
 function quoteInNotes(evidence: string, notesComparable: string): boolean {
   const quote = comparable(evidence);
   if (!quote) return false;
@@ -357,8 +373,10 @@ export function parseReviewOutput(raw: string, request: ReviewRequest): FoundIte
       urgent: input.urgent === true,
       missed: kind === 'follow_up' && input.missed === true,
       evidence: clipWords(fullEvidence, LIMITS.evidence),
-      verified: quoteInNotes(fullEvidence, notesComparable),
+      verified: false,
     };
+    item.verified = quoteInNotes(fullEvidence, notesComparable)
+      && [item.personName, item.organization, item.aboutFirstName].every((name) => nameInNotes(name, notesComparable));
     // A promise nobody kept is due now.
     if (item.missed && !item.dueDate) item.dueDate = request.today;
     // A referral whose direction the notes do not make clear stays '': the

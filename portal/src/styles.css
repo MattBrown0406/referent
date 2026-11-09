@@ -276,3 +276,8 @@ button.fa-secondary { background: transparent; color: var(--ink); border: 1px so
   .fa-noprint { display: none; }
   body { background: #fff; }
 }
+/* 16px or more: iPhone Safari zooms into any smaller field when it is tapped. */
+.fa input, .fa select, .fa textarea { font-size: 16px; }
+.fa-notice { margin: 12px 0; padding: 10px 12px; border-radius: 8px; background: var(--blue-soft); color: var(--blue); font-size: 14px; line-height: 1.45; }
+.fa-crisis a, .fa-crisis-inline a { color: inherit; font-weight: 800; text-decoration: underline; }
+.fa [aria-invalid="true"] { border-color: var(--coral); }

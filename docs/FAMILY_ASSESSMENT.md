@@ -42,16 +42,29 @@ questions, options and stored values follow the FI form, with these changes:
 ## The family's page (portal `/f#<token>`)
 
 - **The link:** 256 random bits in the URL fragment (never in a server log),
-  stored only as a sha256. The five newest links of an assessment work; a
+  stored only as a sha256. The ten newest links of an assessment work; a
   link stops when the assessment is stopped, deleted, or after 30 days
-  (each new link gives 30 more days). The token leaves the address bar on
-  open.
-- **Saves as they go:** every change saves after a moment, and on every step
-  (`public_family_assessment_save`). Nothing is kept in the browser.
+  (each new link gives 30 more days). A corrected email address, or sending
+  an expired assessment again, retires the older links (a mistyped address
+  cannot keep reading). An emailed link is made when the email is prepared,
+  so no token waits in the outbox. The token leaves the address bar on open.
+- **Limits a day:** 40 links per practitioner and 3 invites to one address,
+  counted in `family_assessment_sends` (never trimmed by a new link).
+- **Saves as they go:** every change saves after a moment, on every step,
+  when the page is hidden, and as it closes (`public_family_assessment_save`).
+  Every save carries the page's revision: if another tab or family member
+  saved since (`RFA02`), the page shows their answers instead of writing over
+  them. Nothing is kept in the browser.
+- **Danger before they finish:** a yes to suicidal or homicidal thoughts, or
+  "crisis", emails the practitioner once while the family is still filling it
+  in ("needs your attention today", no names or answers), and the case shows
+  the alert. The answers themselves show only once the family sends it.
 - **Card photos:** go straight to the private `assessment-files` bucket
   through a one-time signed URL from the `family-assessment-upload`
-  function, which checks the link and picks the path itself
-  (`<case>/<assessment>/card-front|back`).
+  function, which checks the link and picks a new name for every upload
+  (`<case>/<assessment>/card-front|back-<32 hex>`). The function then records
+  it (only while the assessment is open) and removes the photo it replaced,
+  so a late upload can never change a card the practitioner already has.
 - **Consent:** the last step shows the consent text from the server, with
   the practice's name. The family checks the box and types a full name;
   the server checks both and the consent version, and keeps the words they
@@ -94,8 +107,11 @@ questions, options and stored values follow the FI form, with these changes:
 | Card photos | private `assessment-files` bucket | Members of the case's practice read and delete; no client uploads |
 | Logo | public `org-logos` bucket | The practice owner adds and removes |
 
-Deleting a case deletes its assessments. "Delete this assessment" removes
-the photos, then the row.
+Deleting a case deletes its assessments, and stops their emails not yet
+sent. "Delete this assessment" stops the link, removes every photo in its
+folder, then the row. Deleting the workspace (account deletion, sole owner)
+removes the card photos first. Once an email is sent or will never be, the
+family's address, name, the reply-to and any token leave the outbox row.
 
 ## Pieces
 
@@ -117,11 +133,14 @@ the photos, then the row.
    `supabase/migrations/20261109140000_family_assessment.sql` in the SQL
    editor (ASCII, one BEGIN/COMMIT each, safe to re-run), with their
    `schema_migrations` rows.
-2. Deploy the functions:
+2. Deploy the functions (all three, together with the migration: the page,
+   the upload function and the database change their calls together):
    - `supabase functions deploy ai-assist --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
    - `supabase functions deploy family-assessment-upload --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
    - `supabase functions deploy email-dispatch --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
-     (the invite and "finished" emails; it reads the logo from `SUPABASE_URL`).
+     (the invite, "finished" and "urgent" emails; it reads the logo from `SUPABASE_URL`).
+   - `supabase functions deploy day-review --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
+     (names in a review must be in the notes; the deadline runs from arrival).
 3. Deploy the portal (the `/f` page) with the web app, from main.
 4. Publish the privacy policy and terms changes on referralfit.com (branch
    prepared in referralfit-web): the policy today says ReferralFit never

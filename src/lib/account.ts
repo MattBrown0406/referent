@@ -52,6 +52,32 @@ async function listWorkspaceDocumentPaths(orgId: string): Promise<string[]> {
     .filter(Boolean)));
 }
 
+// The family assessments' insurance card photos (assessment-files,
+// <case>/<assessment>/...). Deleting the cases deletes the assessments, and
+// then nobody could reach these files any more, so they go first. A server
+// without the assessment migration has no such table: nothing to remove.
+async function removeWorkspaceAssessmentFiles(): Promise<void> {
+  let rows: { id: string; case_id: unknown }[];
+  try {
+    rows = await fetchAllPages<{ id: string; case_id: unknown }>((from, to) => supabase.from('family_assessments').select('id, case_id').order('id').range(from, to));
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === '42P01' || code === 'PGRST205') return;
+    if (error instanceof StoreError) throw error;
+    throw new StoreError(`Could not list the family assessments: ${describeError(error)}`, false);
+  }
+  for (const row of rows) {
+    if (typeof row.case_id !== 'string') continue;
+    const folder = `${row.case_id}/${row.id}`;
+    const { data: listed, error: listError } = await supabase.storage.from('assessment-files').list(folder, { limit: 100 });
+    if (listError) throw new StoreError(`Could not list the insurance card photos: ${describeError(listError)}`, false);
+    const files = (listed || []).filter((item) => item.name && item.id).map((item) => `${folder}/${item.name}`);
+    if (!files.length) continue;
+    const { error: removeError } = await supabase.storage.from('assessment-files').remove(files);
+    if (removeError) throw new StoreError(`Could not remove the insurance card photos: ${describeError(removeError)}`, false);
+  }
+}
+
 async function removeWorkspaceCaseFiles(): Promise<void> {
   const orgId = await fetchCurrentOrgId();
   const paths = await listWorkspaceDocumentPaths(orgId);
@@ -59,6 +85,7 @@ async function removeWorkspaceCaseFiles(): Promise<void> {
     const { error: removeError } = await supabase.storage.from(CASE_DOCUMENTS_BUCKET).remove(paths.slice(index, index + 100));
     if (removeError) throw new StoreError(`Could not remove workspace documents: ${describeError(removeError)}`, false);
   }
+  await removeWorkspaceAssessmentFiles();
 }
 
 // The server's own wording for a refusal ("Remove the other members of your

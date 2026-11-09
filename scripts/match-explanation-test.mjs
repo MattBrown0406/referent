@@ -104,8 +104,15 @@ check(() => {
   assert.ok(!third.reasons.some((line) => /verify benefits/i.test(line)), 'a caution is not a reason');
 }, 'cautions');
 check(() => {
-  assert.match(third.disclosure, /^Disclosure: our practice has a financial relationship with this program \(consulting fee: quarterly clinical consulting\)\./);
+  assert.match(third.disclosure, /^Disclosure about Harbor Light: our practice has a financial relationship with this program \(consulting fee: quarterly clinical consulting\)\./);
   assert.equal(first.disclosure, '');
+  // Two programs with the same kind of relationship: each disclosure names
+  // its program, so deleting one is noticed and it is added back.
+  const two = { ...explanation, programs: [{ ...third }, { ...third, name: 'Cedar House', disclosure: x.namedDisclosure('Cedar House', 'Disclosure: our practice has a financial relationship with this program (consulting fee).') }] };
+  const one = { ...two, programs: [{ ...two.programs[0], disclosure: x.namedDisclosure('Harbor Light', 'Disclosure: our practice has a financial relationship with this program (consulting fee).') }, two.programs[1]] };
+  const result = x.withDisclosures(`Edited.\n\n${one.programs[0].disclosure}`, one);
+  assert.equal(result.added, 1, 'the deleted second disclosure is put back');
+  assert.ok(result.text.endsWith(one.programs[1].disclosure));
 }, 'a disclosed relationship is in');
 check(() => {
   const text = x.explanationText(explanation);
@@ -129,6 +136,15 @@ check(() => {
   assert.equal(x.orderReason({ ...base, bedAvailability: true }, next), 'It ties with B Place on fit and comes first because it has a confirmed open bed.');
   assert.equal(x.orderReason(base, { ...next, familyCost: 1 }), 'It ties with B Place on fit and comes first because it is likely to cost your family less.');
   assert.equal(x.orderReason(base, next), 'It ties with B Place on fit; the app sets the order between them fairly.');
+  assert.equal(x.orderReason({ ...base, familyCost: 60000 }, { ...next, familyCost: null }),
+    'It ties with B Place on fit and comes first because its cost to your family is on file and B Place\'s is not yet.', 'never "costs less" than a cost nobody has');
+  assert.equal(x.orderReason({ ...base, familyCost: 60000 }, { ...next, familyCost: null, total: 70, components: { ...base.components, cost: 10 } }),
+    'It ranks above B Place mainly because its cost to your family is on file and B Place\'s is not yet.');
+  const facts = x.rewriteFacts(explanation);
+  const rewrite = { intro: 'Hi.', programs: explanation.programs.map((program) => ({ rank: program.rank, text: `${program.name} fits.` })), madeFrom: JSON.stringify(facts) };
+  assert.equal(x.rewriteMatches(explanation, rewrite), true);
+  const changed = { ...explanation, programs: explanation.programs.map((program, index) => (index ? program : { ...program, fit: program.fit - 40 })) };
+  assert.equal(x.rewriteMatches(changed, rewrite), false, 'a rewrite is not used once a fit, a bed or a cost it described changed');
 }, 'why one comes before the next');
 
 // ─── The rewrite ───────────────────────────────────────────────────────────
@@ -164,7 +180,7 @@ check(() => {
   const edited = text.replace(third.disclosure, '');
   const fixed = x.withDisclosures(edited, explanation);
   assert.equal(fixed.added, 1);
-  assert.ok(fixed.text.endsWith(`Harbor Light: ${third.disclosure}`), 'a removed disclosure is added back');
+  assert.ok(fixed.text.endsWith(third.disclosure), 'a removed disclosure is added back, naming its program');
   assert.deepEqual(x.withDisclosures(text, explanation), { text, added: 0 });
 }, 'a disclosure cannot be edited out');
 
@@ -192,7 +208,7 @@ check(() => {
   const fn = read('supabase/functions/ai-assist/index.ts');
   assert.match(fn, /claim_ai_assist/);
   assert.doesNotMatch(fn, /console\.(log|error|warn)\([^)]*(body|facts|apiKey|prompt|text)\b/, 'the function never logs input or the key');
-  assert.match(fn, /new Anthropic\(\{ apiKey, timeout: DEADLINE_MS, maxRetries: 0 \}\)/);
+  assert.match(fn, /const timeLeft = Math.max\(1_000, DEADLINE_MS - \(Date.now\(\) - startedAt\)\);\n  const anthropic = new Anthropic\(\{ apiKey, timeout: timeLeft, maxRetries: 0 \}\)/);
   assert.match(read('supabase/config.toml'), /\[functions\.ai-assist\]\nverify_jwt = false/, 'the function checks the session itself');
   assert.match(read('.github/workflows/quality.yml'), /supabase\/functions\/ai-assist\//, 'CI runs the function tests');
 }, 'the function');

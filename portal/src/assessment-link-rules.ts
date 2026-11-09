@@ -23,6 +23,8 @@ export type OpenAssessment = {
   consentText: string;
   expiresAt: string;
   lastSavedAt: string | null;
+  /** Bumped by every save: a save from a tab with an older copy is refused. */
+  revision: number;
 };
 
 export type SubmittedAssessment = {
@@ -68,6 +70,7 @@ export function assessmentViewFromJson(value: unknown): AssessmentView | null {
     consentText,
     expiresAt: str(data.expires_at, 40),
     lastSavedAt: typeof data.last_saved_at === 'string' ? data.last_saved_at : null,
+    revision: Number.isInteger(data.revision) ? data.revision as number : 0,
   };
 }
 
@@ -79,12 +82,50 @@ export function savedLine(state: 'idle' | 'saving' | 'saved' | 'failed', savedAt
   return '';
 }
 
+/**
+ * The type a card photo is sent as, or '' when it is not a photo the page
+ * takes. Some browsers give a HEIC photo no type at all; its name says it.
+ */
+export function photoContentType(file: { type: string; name?: string }): string {
+  const type = file.type.toLowerCase();
+  if (/^image\/(jpeg|png|heic|heif|webp)$/.test(type)) return type;
+  if (!type && /\.(heic|heif)$/i.test(file.name || '')) return /\.heif$/i.test(file.name || '') ? 'image/heif' : 'image/heic';
+  return '';
+}
+
 /** A card photo the page can send: an image of at most 10 MB. '' when it can, or why not. */
-export function photoProblem(file: { type: string; size: number }): string {
-  if (!/^image\/(jpeg|png|heic|webp)$/.test(file.type)) return 'Please choose a photo (JPG, PNG, HEIC or WebP).';
+export function photoProblem(file: { type: string; size: number; name?: string }): string {
+  if (!photoContentType(file)) return 'Please choose a photo (JPG, PNG, HEIC or WebP).';
   if (file.size > 10 * 1024 * 1024) return 'That photo is larger than 10 MB. Please choose a smaller one.';
   if (file.size <= 0) return 'That photo is empty. Please choose another.';
   return '';
+}
+
+/** The server's answer to a save or a send, as the page acts on it. */
+export type SaveOutcome = 'saved' | 'changed_elsewhere' | 'already_sent' | 'too_long' | 'link_stopped' | 'retry';
+
+export function saveOutcome(error: { code?: string } | null): SaveOutcome {
+  if (!error) return 'saved';
+  switch (error.code) {
+    case 'RFA02': return 'changed_elsewhere';
+    case 'RFA01': return 'already_sent';
+    case '22023': return 'too_long';
+    case 'P0002': return 'link_stopped';
+    default: return 'retry';
+  }
+}
+
+/** The same answers, whatever order the keys come in (the database reorders them). */
+export function sameAnswers(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((item, index) => sameAnswers(item, b[index]));
+  }
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length && keys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && sameAnswers(left[key], right[key]));
 }
 
 /** "December 8, 2026" for an ISO time, or ''. */

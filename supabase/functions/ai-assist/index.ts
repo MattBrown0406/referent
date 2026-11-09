@@ -129,6 +129,9 @@ function anthropicFailure(error: unknown, deadline: AbortSignal): Response {
 }
 
 Deno.serve(async (request) => {
+  // The deadline runs from when the request arrived, so a slow start or
+  // sign-in check never leaves the phone waiting past its own timeout.
+  const startedAt = Date.now();
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
   if (request.method !== 'POST') return failure(405, 'method_not_allowed', 'Use POST.');
 
@@ -179,8 +182,9 @@ Deno.serve(async (request) => {
     }
   }
 
-  const anthropic = new Anthropic({ apiKey, timeout: DEADLINE_MS, maxRetries: 0 });
-  const deadline = AbortSignal.timeout(DEADLINE_MS);
+  const timeLeft = Math.max(1_000, DEADLINE_MS - (Date.now() - startedAt));
+  const anthropic = new Anthropic({ apiKey, timeout: timeLeft, maxRetries: 0 });
+  const deadline = AbortSignal.timeout(timeLeft);
   let response;
   try {
     response = await anthropic.beta.messages.create({

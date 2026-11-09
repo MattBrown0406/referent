@@ -197,7 +197,9 @@ export function matchCases(item: Pick<FoundItem, 'personName' | 'aboutFirstName'
   for (const contact of workspace.contacts) {
     const words = nameWords(contact.name);
     if (!person.length || !words.length) continue;
-    if (person.length >= 2 && words[0] === person[0] && words[words.length - 1] === person[person.length - 1]) strong.add(contact.caseId);
+    // A full name alone is likely, not sure: two people can share one, so
+    // the practitioner confirms the case ("Yes, this case").
+    if (person.length >= 2 && words[0] === person[0] && words[words.length - 1] === person[person.length - 1]) likely.add(contact.caseId);
     else if (person.length === 1 && words.includes(person[0])) likely.add(contact.caseId);
     else if (person.length >= 2 && words.length >= 2 && words[words.length - 1] === person[person.length - 1]) likely.add(contact.caseId);
   }
@@ -391,6 +393,11 @@ export function withPendingLeads(workspace: Workspace, rows: ReviewRow[]): Works
     ...workspace,
     cases: [...leads.map((row) => ({ id: row.ids.caseId, title: pendingLeadTitle(row), status: PENDING_STATUS, updatedAt: '' })), ...workspace.cases],
     contacts: [...leads.map((row) => ({ caseId: row.ids.caseId, name: row.callerName, phone: row.phone, email: row.email })), ...workspace.contacts],
+    // The first call create_lead makes with each lead, so a "call her back"
+    // below is recognized as that call, not a second one.
+    followUps: [...leads.map((row) => ({
+      caseId: row.ids.caseId, title: `First call with ${row.callerName || 'the new caller'}`, dueOn: row.dueOn, status: 'open', kind: 'first_call',
+    })), ...workspace.followUps],
   };
 }
 
@@ -433,14 +440,15 @@ function addHint(row: ReviewRow, hint: string) {
   row.hint = row.hint ? `${row.hint} ${hint}` : hint;
 }
 
-function sameCaller(a: ReviewRow, b: ReviewRow): boolean {
+/** The same caller as an earlier lead: by phone or email (sure), or by full name alone (to confirm). */
+function sameCaller(a: ReviewRow, b: ReviewRow): 'contact' | 'name' | null {
   const phone = phoneKey(a.phone);
   const email = cleanEmail(a.email);
-  if (phone && phone === phoneKey(b.phone)) return true;
-  if (email && email === cleanEmail(b.email)) return true;
+  if (phone && phone === phoneKey(b.phone)) return 'contact';
+  if (email && email === cleanEmail(b.email)) return 'contact';
   const left = nameWords(a.callerName);
   const right = nameWords(b.callerName);
-  return left.length >= 2 && right.length >= 2 && left[0] === right[0] && left[left.length - 1] === right[right.length - 1];
+  return left.length >= 2 && right.length >= 2 && left[0] === right[0] && left[left.length - 1] === right[right.length - 1] ? 'name' : null;
 }
 
 // A new lead: a note on a case instead only when the caller's phone or
@@ -450,10 +458,16 @@ function sameCaller(a: ReviewRow, b: ReviewRow): boolean {
 function placeLead(row: ReviewRow, workspace: Workspace, earlierLeads: ReviewRow[]) {
   const sameAsEarlier = earlierLeads.find((lead) => sameCaller(row, lead));
   if (sameAsEarlier) {
+    const how = sameCaller(row, sameAsEarlier);
     row.kind = 'case_note';
     row.caseId = sameAsEarlier.ids.caseId;
     row.caseChoices = [sameAsEarlier.ids.caseId];
-    addHint(row, 'The same caller as a new lead above: this goes on that case.');
+    if (how === 'name') {
+      row.caseUnsure = true;
+      addHint(row, 'The same name as a new lead above: check it is the same person before it goes on that case.');
+    } else {
+      addHint(row, 'The same caller as a new lead above: this goes on that case.');
+    }
     return;
   }
   const byContact = casesByContact(row.found, workspace);
@@ -765,6 +779,11 @@ export function rowSignatures(row: ReviewRow): string[] {
   const base = `${row.found.kind}|${target}`;
   const out = [`${base}|t:${comparable(row.text)}`, `${base}|s:${comparable(row.found.summary)}`];
   if (row.found.evidence) out.push(`${base}|q:${comparable(row.found.evidence)}`);
+  // Whatever it is matched to now: a lead saved earlier is a case today, so
+  // the same words from the notes read again become a note on it. Its
+  // quote, word for word from the notes, still says it was saved.
+  const quote = comparable(row.found.evidence);
+  if (row.found.verified && quote.split(' ').length >= 4) out.push(`${row.found.kind}|any|q:${quote}`);
   return out;
 }
 

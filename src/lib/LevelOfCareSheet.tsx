@@ -117,7 +117,9 @@ type ChoiceMode = 'recommended' | 'different';
 export default function LevelOfCareSheet({ caseId, seed = null, names, previous, backRef, onClose, onSaved, onFindPlacement }: Props) {
   const [step, setStep] = useState(INTRO);
   const [draft, setDraft] = useState<AssessmentDraft>(() => (seed?.fromAi
-    ? { ...emptyDraft(), ratings: { ...(seed.ratings || {}) }, notes: { ...(seed.notes || {}) } }
+    // The AI's ratings to start from; its reasons stay in the suggestion box,
+    // never in the practitioner's own notes.
+    ? { ...emptyDraft(), ratings: { ...(seed.ratings || {}) } }
     : emptyDraft()));
   const [mode, setMode] = useState<ChoiceMode>('recommended');
   const [saving, setSaving] = useState(false);
@@ -316,7 +318,7 @@ export default function LevelOfCareSheet({ caseId, seed = null, names, previous,
         {seed?.hints?.[key]?.length ? (
           <View style={styles.seedBox}>
             <Text style={styles.seedTitle}>FROM THE FAMILY ASSESSMENT</Text>
-            {seed.hints[key]!.slice(0, 10).map((line) => <Text key={line} style={styles.seedLine}>{line}</Text>)}
+            {seed.hints[key]!.map((line) => <Text key={line} style={styles.seedLine}>{line}</Text>)}
           </View>
         ) : null}
         <View accessibilityRole="radiogroup" accessibilityLabel={info.title}>
@@ -481,7 +483,7 @@ export default function LevelOfCareSheet({ caseId, seed = null, names, previous,
           <Text style={styles.primaryButtonText}>Find placement with this level</Text>
         </TouchableOpacity>
         <TouchableOpacity accessibilityRole="button" onPress={onClose} style={styles.textButton}>
-          <Text style={styles.textButtonText}>Back to the case file</Text>
+          <Text style={styles.textButtonText}>{seed ? 'Back to the family assessment' : 'Back to the case file'}</Text>
         </TouchableOpacity>
       </>
     );

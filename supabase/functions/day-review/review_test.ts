@@ -6,6 +6,7 @@ import {
   clipWords,
   comparable,
   LIMITS,
+  nameInNotes,
   notesEmails,
   notesPhones,
   outputSchema,
@@ -153,6 +154,23 @@ Deno.test('quotes are checked against the notes', () => {
   assertEquals(found.verified, true);
   assertEquals(paraphrased.verified, false);
   assertEquals(comparable('Didn’t  call — “today”'), 'didn t call today');
+});
+
+Deno.test('a person or organization the notes never name is not verified', () => {
+  const [invented, inventedPerson, shortened, named] = parseReviewOutput(output(
+    item({ kind: 'referral', direction: 'outbound', organization: 'Cedar Hills Treatment', evidence: 'referred the Rivera family to Juniper Ridge Recovery' }),
+    item({ person_name: 'Sarah Whitfield' }),
+    item({ kind: 'referral', direction: 'outbound', organization: 'Juniper Ridge Recovery Center', evidence: 'referred the Rivera family to Juniper Ridge Recovery' }),
+    item({ person_name: 'Sarah Miller', about_first_name: 'Jake' }),
+  ), request());
+  assertEquals(invented.verified, false, 'a real quote does not vouch for a name the notes never gave');
+  assertEquals(inventedPerson.verified, false);
+  assertEquals(shortened.verified, true, '"Center" added to a name in the notes is fine');
+  assertEquals(named.verified, true);
+  const notes = ` ${comparable(NOTES)} `;
+  assertEquals(nameInNotes('', notes), true);
+  assertEquals(nameInNotes('Harbor Light', notes), true);
+  assertEquals(nameInNotes('The Center', notes), false, 'a name of nothing but filler must be there whole');
 });
 
 Deno.test('a quote too short to show anything is not verified', () => {

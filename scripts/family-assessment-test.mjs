@@ -101,7 +101,7 @@ check(() => {
   assert.deepEqual(schema.safetyFlags({}), []);
   assert.deepEqual(schema.safetyFlags({ suicideIdeation: 'yes', homicidalIdeation: 'yes', urgencyLevel: 'crisis', immediateSafetyConcerns: 'He has a gun.' }),
     ['suicidal_thoughts', 'homicidal_thoughts', 'crisis', 'safety_concern']);
-  for (const none of ['None.', 'n/a', 'N/A!', 'no concerns', 'none at this time', '---', '  ']) {
+  for (const none of ['None.', 'n/a', 'N/A!', 'no concerns', 'none at this time', '---', '  ', '\n None.', 'None that I\'m aware of', 'No concerns at this time!', 'none\nat this time', 'Not\u00a0right now']) {
     assert.deepEqual(schema.safetyFlags({ immediateSafetyConcerns: none }), [], `"${none}" is not a concern`);
   }
   assert.deepEqual(schema.safetyFlags({ suicideIdeation: 'unknown', urgencyLevel: 'urgent' }), []);
@@ -110,12 +110,14 @@ check(() => {
 }, 'safety flags');
 check(() => {
   const sql = read('supabase/migrations/20261109140000_family_assessment.sql');
-  assert.match(sql, /'\^\(none\|no\|nope\|n\/\?a\|na\|not applicable\|nothing\|no concerns\?\|none at this time\|none currently\|not at this time\|-\+\)\$'/,
-    'the database uses the same "no concern" words');
+  const ts = read('src/lib/assessment-schema.ts');
+  const words = /const NO_CONCERN = \/(.+)\/;/.exec(ts)[1].replaceAll('\\/', '/');
+  assert.ok(sql.includes(`!~ '${words}'`), 'the database uses the same "no concern" words');
+  assert.ok(sql.includes(`'[[:space:]]+', ' ', 'g'), '[^a-z0-9/ -]+', '', 'g'), ' +', ' ', 'g')`), 'and compares them the same way (normalizeConcern)');
+  assert.match(ts, /replace\(\/\\s\+\/g, ' '\)\.replace\(\/\[\^a-z0-9\/ -\]\+\/g, ''\)\.replace\(\/ \+\/g, ' '\)/);
   for (const [key, flag] of [['suicideIdeation', 'suicidal_thoughts'], ['homicidalIdeation', 'homicidal_thoughts'], ['urgencyLevel', 'crisis']]) {
     assert.match(sql, new RegExp(`p_answers ->> '${key}'[^]*?THEN '${flag}'`), `${flag} in the database`);
   }
-  assert.match(read('src/lib/assessment-schema.ts'), /\^\(none\|no\|nope\|n\\\/\?a\|na\|not applicable\|nothing\|no concerns\?\|none at this time\|none currently\|not at this time\|-\+\)\$/);
 }, 'the database flags danger the same way');
 check(() => {
   const answers = {
@@ -161,7 +163,25 @@ check(() => {
   assert.match(link.photoProblem({ type: 'image/png', size: 11 * 1024 * 1024 }), /10 MB/);
   assert.equal(link.savedLine('saving', null), 'Saving…');
   assert.match(link.savedLine('failed', null), /Not saved yet/);
+  assert.equal(link.photoContentType({ type: '', name: 'IMG_0001.HEIC' }), 'image/heic', 'a HEIC photo some browsers give no type');
+  assert.equal(link.photoContentType({ type: 'image/heif' }), 'image/heif');
+  assert.equal(link.photoContentType({ type: 'image/gif' }), '');
 }, 'photos and saving');
+check(() => {
+  assert.equal(link.saveOutcome(null), 'saved');
+  assert.equal(link.saveOutcome({ code: 'RFA02' }), 'changed_elsewhere');
+  assert.equal(link.saveOutcome({ code: 'RFA01' }), 'already_sent');
+  assert.equal(link.saveOutcome({ code: '22023' }), 'too_long', 'too long is not "already sent": the page stays open');
+  assert.equal(link.saveOutcome({ code: 'P0002' }), 'link_stopped');
+  assert.equal(link.saveOutcome({ code: 'PGRST301' }), 'retry');
+  const sql = read('supabase/migrations/20261109140000_family_assessment.sql');
+  assert.match(sql, /ERRCODE = 'RFA01'/);
+  assert.match(sql, /ERRCODE = 'RFA02'/);
+  assert.equal(link.sameAnswers({ a: 1, b: [{ x: 'y' }] }, { b: [{ x: 'y' }], a: 1 }), true, 'key order does not matter');
+  assert.equal(link.sameAnswers({ a: 1 }, { a: 1, b: 2 }), false);
+  assert.equal(link.sameAnswers({ a: [1, 2] }, { a: [2, 1] }), false);
+  assert.equal(link.assessmentViewFromJson({ status: 'open', practice_name: 'X', consent_text: 'a', consent_version: 'v', revision: 7 }).revision, 7);
+}, 'saving with a revision');
 
 // ─── The practitioner's side ───────────────────────────────────────────────
 const row = {
@@ -175,13 +195,16 @@ const row = {
     dsmBehaviors: { tolerance: true, withdrawal: true, cravings: true, time_spent: true, larger_amounts: true, desire_cut_down: true },
   },
   step: 12, card_front_at: '2026-11-08T01:00:00Z', card_back_at: null, urgent: ['suicidal_thoughts', 'made_up'],
+  card_front_path: `${'1'.repeat(8)}-1111-1111-1111-${'1'.repeat(12)}/${'2'.repeat(8)}-2222-2222-2222-${'2'.repeat(12)}/card-front-${'a'.repeat(32)}`,
+  card_back_path: '../../somewhere-else',
   consent_name: 'Lena Ortiz', consent_version: '2026-11-08', consent_text: 'I agree', consent_at: '2026-11-08T02:00:00Z',
   created_at: '2026-11-07T00:00:00Z', submitted_at: '2026-11-08T18:00:00Z', expires_at: '2026-12-07T00:00:00Z',
 };
 check(() => {
   const assessment = app.assessmentFromRow(row);
   assert.equal(assessment.cardFront, true);
-  assert.equal(assessment.cardBack, false);
+  assert.equal(assessment.cardBack, false, 'a card path that is not one the upload function makes is ignored');
+  assert.equal(assessment.cardBackPath, '');
   assert.deepEqual(assessment.urgent, ['suicidal_thoughts'], 'unknown flags are dropped');
   assert.equal(app.assessmentFromRow({ ...row, status: 'weird' }), null);
   assert.match(app.statusLine(assessment), /^Finished Nov 8 · needs attention today$/);
@@ -192,7 +215,9 @@ check(() => {
   const sent = app.assessmentFromRow({ ...row, status: 'sent', urgent: [], emailed_at: '2026-11-08T00:00:00Z', expires_at: '2026-12-08T00:00:00Z' });
   assert.match(app.statusLine(sent, now), /^Sent to Lena Ortiz Nov \d+ · not started yet$/);
   const started = { ...sent, status: 'started', step: 5, lastSavedAt: '2026-11-09T00:00:00Z' };
-  assert.match(app.statusLine(started, now), /^In progress to Lena Ortiz · section 5 of 12 · saved Nov \d+$/);
+  assert.match(app.statusLine(started, now), /^In progress to Lena Ortiz · section 5 of 12 · saved Nov \d+ · needs attention today$/,
+    'danger in answers saved so far shows before the family finishes');
+  assert.match(app.statusLine({ ...started, answers: { suicideIdeation: 'no' } }, now), /saved Nov \d+$/);
   assert.match(app.statusLine({ ...sent, expiresAt: '2026-11-09T00:00:00Z' }, now), /^The link expired Nov \d+\. Send a new one\.$/);
   assert.equal(app.currentAssessment([sent, { ...sent, id: 'newer', createdAt: '2026-11-09T00:00:00Z' }]).id, 'newer');
 }, 'where it stands');
@@ -258,13 +283,19 @@ check(() => {
 check(() => {
   assert.match(read('portal/src/main.tsx'), /isFamilyAssessment \? <FamilyAssessment \/>/);
   assert.match(page, /window\.history\.replaceState\(null, '', window\.location\.pathname\)/, 'the token leaves the address bar');
-  assert.match(page, /\{flags\.length \? <div className="fa-crisis" role="alert">\{CRISIS_TEXT\}<\/div> : null\}/, '911 and 988 the moment an answer suggests danger');
+  assert.match(page, /\{flags\.length \? <CrisisLine urgent \/> : null\}/, '911 and 988 the moment an answer suggests danger');
+  assert.match(page, /href="tel:911"[^]*href="tel:988"[^]*href="sms:988"/, 'one tap to call 911, or to call or text 988');
+  assert.match(page, /p_revision: revisionRef\.current/, 'every save says which revision it is from');
+  assert.match(page, /keepalive: true/, 'answers are saved as the page goes away');
+  assert.match(page, /pruneHidden\(answersRef\.current\)/, 'answers to hidden questions are not sent');
+  assert.match(page, /withdrawalWarning\(answers\) \? <div className="fa-warning" role="alert">\{WITHDRAWAL_TEXT\}/, 'the withdrawal warning shows where it was asked');
   assert.match(page, /p_consent_version: open\.consentVersion/);
   assert.doesNotMatch(page, /localStorage/, 'answers never stay in the browser');
 }, 'the family page');
 check(() => {
-  assert.match(upload, /createSignedUploadUrl\(path, \{ upsert: true \}\)/);
-  assert.doesNotMatch(upload, /body\.path|input\.path|upload\.path/, 'the path is never the caller\'s');
+  assert.match(upload, /createSignedUploadUrl\(uploadName\(prefix\)\)/, 'every upload gets a new name, never overwriting one');
+  assert.doesNotMatch(upload, /createSignedUploadUrl\(upload\.|upsert: true/, 'the name is never the caller\'s, and nothing is replaced in place');
+  assert.match(upload, /rpc\('family_assessment_photo_done', \{\s+p_token: upload\.token, p_side: upload\.side, p_path: upload\.path,/, 'the database checks the name before it is recorded');
   assert.doesNotMatch(upload, /console\.(log|error)\([^)]*(token|body|upload)\b/, 'never logs the token');
   assert.match(read('supabase/config.toml'), /\[functions\.family-assessment-upload\]\nverify_jwt = false/);
   assert.match(read('.github/workflows/quality.yml'), /supabase\/functions\/family-assessment-upload\//);
@@ -272,7 +303,7 @@ check(() => {
 check(() => {
   const email = read('supabase/functions/email-dispatch/email.ts');
   assert.match(email, /'family_assessment_invite' \| 'family_assessment_submitted'/);
-  assert.match(read('supabase/migrations/20261109140000_family_assessment.sql'), /'family_assessment_invite', 'family_assessment_submitted'\)\)/);
+  assert.match(read('supabase/migrations/20261109140000_family_assessment.sql'), /'family_assessment_invite', 'family_assessment_submitted', 'family_assessment_urgent'\)\)/);
 }, 'the emails');
 
 console.log(`family-assessment-test: ${checks} checks passed`);

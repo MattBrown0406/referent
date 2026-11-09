@@ -20,8 +20,10 @@ import { timingSafeEqual } from '../_shared/webhooks.ts';
 export type PreferenceKind = 'placement_response' | 'daily_summary' | 'bed_reminder';
 // Account emails a person asked for by acting (a claim request and its
 // answer, a family assessment sent and finished): no preference, no
-// unsubscribe link (20261108150000, 20261109140000).
-export type AccountKind = 'claim_request' | 'claim_decision' | 'family_assessment_invite' | 'family_assessment_submitted';
+// unsubscribe link (20261108150000, 20261109140000). family_assessment_urgent:
+// an answer in an assessment still being filled in suggests danger.
+export type AccountKind = 'claim_request' | 'claim_decision' | 'family_assessment_invite' | 'family_assessment_submitted'
+  | 'family_assessment_urgent';
 export type EmailKind = PreferenceKind | AccountKind;
 
 export const EMAIL_KINDS: PreferenceKind[] = ['placement_response', 'daily_summary', 'bed_reminder'];
@@ -179,6 +181,19 @@ function content(row: OutboxRow, links: Links, now: Date): Content {
       button: { label: 'Open the assessment', url: `${links.portalUrl}/f#${token}` },
       afterButton: `This link is private to you${until ? ` and works until ${until}` : ''}. Please do not forward this email.`,
       why: `You get this because ${practice} sent it to you through ReferralFit. Reply to this email to reach ${practice}.`,
+    };
+  }
+  if (row.kind === 'family_assessment_urgent') {
+    return {
+      subject: 'A family assessment needs your attention today',
+      preheader: 'An answer mentions a safety concern.',
+      heading: 'A family assessment needs your attention today',
+      paragraphs: [
+        'A family is still filling out the assessment you sent, and an answer they saved suggests someone may be in danger. Open the case in ReferralFit and reach out today.',
+        'If someone may be in danger, call 911. For a mental health crisis, the family can call or text 988.',
+      ],
+      button: { label: 'Open ReferralFit', url: links.appUrl },
+      why: 'You get this because you sent a family assessment in ReferralFit. Names and answers never appear in email.',
     };
   }
   if (row.kind === 'family_assessment_submitted') {

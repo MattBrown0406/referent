@@ -88,7 +88,11 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
   const [openSection, setOpenSection] = useState<string | null>(null);
   const [showConsent, setShowConsent] = useState(false);
   const [hasKey, setHasKey] = useState(false);
+  // An earlier assessment the practitioner opened (the newest is shown otherwise).
+  const [shownId, setShownId] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  // One action at a time, even with two quick taps before a re-render.
+  const busyRef = useRef(false);
   useEffect(() => () => { mountedRef.current = false; }, []);
 
   const load = useCallback(async () => {
@@ -109,9 +113,13 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
     void getAnthropicKey(userId).then((key) => { if (mountedRef.current) setHasKey(Boolean(key)); });
   }, [userId]);
 
-  const current = useMemo(() => (list ? currentAssessment(list) : null), [list]);
+  const newest = useMemo(() => (list ? currentAssessment(list) : null), [list]);
+  const current = useMemo(() => (list && shownId ? list.find((item) => item.id === shownId) ?? newest : newest), [list, shownId, newest]);
+  const earlier = useMemo(() => (list && newest ? list.filter((item) => item.id !== newest.id) : []), [list, newest]);
   const finished = current?.status === 'submitted' ? current : null;
-  const live = current && isOpen(current) ? current : null;
+  const live = current && current.id === newest?.id && isOpen(current) ? current : null;
+  // Danger in answers saved before the family finished: the alerts show (the answers do not, until they send it).
+  const earlyAlerts = current && !finished && Object.keys(current.answers).length ? assessmentAlerts(current) : [];
 
   // Card photos: short-lived links, fetched when a finished assessment has them.
   useEffect(() => {
@@ -121,31 +129,41 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
     return () => { active = false; };
   }, [finished]);
 
-  async function send(how: 'email' | 'share', to = email) {
-    if (busy) return;
-    const address = to.trim();
+  // From the form: the name and address typed. Again for a live link: the
+  // family member it was sent to (the form is hidden then), so sending
+  // again never switches who it is for; a link to text keeps the address.
+  async function send(how: 'email' | 'share', again: FamilyAssessment | null = null) {
+    if (busyRef.current) return;
+    const typed = email.trim();
+    // A link to text from the form keeps a valid typed address for later; a mistyped one never blocks the text.
+    const address = how === 'share' ? (again || !EMAIL.test(typed) ? '' : typed) : (again ? again.recipientEmail : typed).trim();
+    const who = again ? again.recipientName : name;
     if (how === 'email' && !EMAIL.test(address)) { setMessage({ ok: false, text: 'Add the family member’s email address.' }); return; }
+    busyRef.current = true;
     setBusy(how);
     setMessage(null);
     try {
-      const sent = await sendFamilyAssessment(caseId, name, address, how === 'email');
-      if (how === 'share') {
-        await Share.share({ message: linkMessage(practiceName, sent.link) });
-        setMessage({ ok: true, text: 'The link is ready to send. It works for 30 days; only the five newest links work.' });
+      const sent = await sendFamilyAssessment(caseId, who, address, how === 'email');
+      setShownId(null);
+      if (how === 'share' && sent.link) {
+        const shared = await Share.share({ message: linkMessage(practiceName, sent.link) });
+        setMessage(shared?.action === Share.dismissedAction
+          ? { ok: true, text: 'Not sent. The new link was made anyway; only the ten newest links work.' }
+          : { ok: true, text: 'The link is ready to send. It works for 30 days; only the ten newest links work.' });
       } else {
         setMessage({ ok: true, text: `Emailed to ${address} in your practice’s name. Replies come to you.` });
       }
-      await load();
     } catch (error) {
       setMessage({ ok: false, text: error instanceof Error ? error.message : 'The assessment could not be sent.' });
     } finally {
-      if (mountedRef.current) setBusy('');
+      busyRef.current = false;
+      if (mountedRef.current) { setBusy(''); void load(); }
     }
   }
 
   function stop() {
     if (!live || busy) return;
-    Alert.alert('Stop this link?', 'The family can no longer open or finish it. What they saved stays on the case.', [
+    Alert.alert('Stop this link?', 'The family can no longer open or finish it. Their unfinished answers are kept but not shown here; you can delete them.', [
       { text: 'Keep it', style: 'cancel' },
       {
         text: 'Stop the link',
@@ -171,7 +189,7 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
         onPress: () => {
           setBusy('delete');
           void deleteFamilyAssessment(current)
-            .then(() => { setMessage({ ok: true, text: 'Deleted.' }); return load(); })
+            .then(() => { setShownId(null); setMessage({ ok: true, text: 'Deleted.' }); return load(); })
             .catch((error) => setMessage({ ok: false, text: error instanceof Error ? error.message : 'It could not be deleted.' }))
             .finally(() => { if (mountedRef.current) setBusy(''); });
         },
@@ -266,15 +284,20 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
 
           {list && current ? (
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>Status</Text>
+              <Text style={styles.cardTitle}>{current.id === newest?.id ? 'Status' : 'An earlier assessment'}</Text>
               <Text style={styles.body}>{statusLine(current)}</Text>
+              {current.id !== newest?.id ? (
+                <TouchableOpacity accessibilityRole="button" disabled={Boolean(busy)} onPress={() => setShownId(null)} style={styles.textButton}>
+                  <Text style={styles.textButtonText}>Back to the newest assessment</Text>
+                </TouchableOpacity>
+              ) : null}
               {live ? (
                 <>
-                  <TouchableOpacity accessibilityRole="button" disabled={Boolean(busy)} onPress={() => { void send('share'); }} style={[styles.secondaryButton, busy && styles.off]}>
+                  <TouchableOpacity accessibilityRole="button" disabled={Boolean(busy)} onPress={() => { void send('share', live); }} style={[styles.secondaryButton, busy && styles.off]}>
                     <Text style={styles.secondaryButtonText}>Text or copy a new link</Text>
                   </TouchableOpacity>
                   {live.recipientEmail ? (
-                    <TouchableOpacity accessibilityRole="button" disabled={Boolean(busy)} onPress={() => { void send('email', live.recipientEmail); }} style={[styles.secondaryButton, busy && styles.off]}>
+                    <TouchableOpacity accessibilityRole="button" disabled={Boolean(busy)} onPress={() => { void send('email', live); }} style={[styles.secondaryButton, busy && styles.off]}>
                       <Text style={styles.secondaryButtonText}>Email it again to {live.recipientEmail}</Text>
                     </TouchableOpacity>
                   ) : null}
@@ -284,6 +307,19 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
                 </>
               ) : null}
             </View>
+          ) : null}
+
+          {earlyAlerts.length ? (
+            <>
+              {earlyAlerts.map((alert) => (
+                <View key={alert.text} style={[styles.alert, alert.severity === 'medical' && styles.alertMedical]} accessibilityRole="alert">
+                  <Text style={[styles.alertText, alert.severity === 'medical' && styles.alertTextMedical]}>{alert.text}</Text>
+                </View>
+              ))}
+              {earlyAlerts.some((alert) => alert.severity === 'urgent') ? (
+                <Text style={styles.urgentNote}>The family has not finished, but an answer they saved suggests someone may be in danger. Reach out today. If someone may be in danger, call 911; for a mental health crisis, call or text 988.</Text>
+              ) : null}
+            </>
           ) : null}
 
           {finished ? (
@@ -351,12 +387,23 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
             </>
           ) : null}
 
-          {list && !live ? sendForm : null}
+          {list && !live && current?.id === newest?.id ? sendForm : null}
 
           {current ? (
             <TouchableOpacity accessibilityRole="button" disabled={Boolean(busy)} onPress={remove} style={styles.textButton}>
               <Text style={styles.dangerText}>{busy === 'delete' ? 'Deleting…' : 'Delete this assessment'}</Text>
             </TouchableOpacity>
+          ) : null}
+
+          {earlier.length && current?.id === newest?.id ? (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Earlier assessments</Text>
+              {earlier.map((item) => (
+                <TouchableOpacity key={item.id} accessibilityRole="button" disabled={Boolean(busy)} onPress={() => { setOpenSection(null); setShowConsent(false); setShownId(item.id); }} style={styles.textButton}>
+                  <Text style={styles.textButtonText}>{statusLine(item)} · Open</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
           ) : null}
         </ScrollView>
       </KeyboardAvoidingView>

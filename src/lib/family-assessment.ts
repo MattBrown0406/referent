@@ -36,6 +36,9 @@ export type FamilyAssessment = {
   step: number;
   cardFront: boolean;
   cardBack: boolean;
+  /** The card photos' names in assessment-files (each upload gets its own). */
+  cardFrontPath: string;
+  cardBackPath: string;
   urgent: SafetyFlag[];
   consentName: string;
   consentVersion: string;
@@ -52,6 +55,8 @@ export type FamilyAssessment = {
 
 const STATUSES: FamilyAssessmentStatus[] = ['sent', 'started', 'submitted', 'revoked'];
 const FLAGS = Object.keys(SAFETY_FLAG_LABEL) as SafetyFlag[];
+
+const CARD_PATH = /^[0-9a-f-]{36}\/[0-9a-f-]{36}\/card-(front|back)-[0-9a-f]{32}$/;
 
 function str(value: unknown): string {
   return typeof value === 'string' ? value : '';
@@ -72,8 +77,10 @@ export function assessmentFromRow(value: unknown): FamilyAssessment | null {
     recipientEmail: str(row.recipient_email),
     answers,
     step: typeof row.step === 'number' ? row.step : 0,
-    cardFront: Boolean(row.card_front_at),
-    cardBack: Boolean(row.card_back_at),
+    cardFront: CARD_PATH.test(str(row.card_front_path)),
+    cardBack: CARD_PATH.test(str(row.card_back_path)),
+    cardFrontPath: CARD_PATH.test(str(row.card_front_path)) ? str(row.card_front_path) : '',
+    cardBackPath: CARD_PATH.test(str(row.card_back_path)) ? str(row.card_back_path) : '',
     urgent: Array.isArray(row.urgent) ? row.urgent.filter((flag): flag is SafetyFlag => FLAGS.includes(flag as SafetyFlag)) : [],
     consentName: str(row.consent_name),
     consentVersion: str(row.consent_version),
@@ -114,12 +121,13 @@ export function statusLine(assessment: FamilyAssessment, now = new Date()): stri
   const to = assessment.recipientName ? ` to ${assessment.recipientName}` : '';
   if (assessment.status === 'started') {
     const section = Math.min(Math.max(assessment.step, 1), SECTIONS.length);
-    return `In progress${to} · section ${section} of ${SECTIONS.length} · saved ${shortDate(assessment.lastSavedAt)}`;
+    const attention = safetyFlags(assessment.answers).length ? ' · needs attention today' : '';
+    return `In progress${to} · section ${section} of ${SECTIONS.length} · saved ${shortDate(assessment.lastSavedAt)}${attention}`;
   }
   return `Sent${to} ${shortDate(assessment.emailedAt || assessment.createdAt)} · not started yet`;
 }
 
-/** The private link for a token (only the newest five links of an assessment work). */
+/** The private link for a token (only the newest ten links of an assessment work). */
 export function assessmentLink(token: string): string {
   return `${FAMILY_ASSESSMENT_PAGE}#${token}`;
 }
@@ -218,8 +226,23 @@ export function levelOfCareFacts(answers: Answers): { section: string; lines: st
         : row))
       : value;
   }
-  return answerSections(safe).map((section) => ({
-    section: section.title,
-    lines: section.lines.map((line) => `${line.label}: ${line.value}`),
-  }));
+  // Within what the ai-assist function reads at once (LEVEL_LIMITS in
+  // supabase/functions/ai-assist/level.ts: 1,200 a line, 30,000 in all):
+  // long written answers are cut, and once the total is reached the rest
+  // is left out rather than the whole suggestion refused.
+  let room = FACTS_BUDGET;
+  return answerSections(safe).map((section) => {
+    const lines: string[] = [];
+    for (const line of section.lines) {
+      const full = `${line.label}: ${line.value}`;
+      const cut = full.length > FACT_LINE_MAX ? `${full.slice(0, FACT_LINE_MAX - 1).trimEnd()}…` : full;
+      if (cut.length > room) break;
+      room -= cut.length;
+      lines.push(cut);
+    }
+    return { section: section.title, lines };
+  }).filter((section) => section.lines.length);
 }
+
+const FACT_LINE_MAX = 1_000;
+const FACTS_BUDGET = 28_000;

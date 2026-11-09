@@ -215,7 +215,7 @@ export type DimensionKey = (typeof SCALE)[number]['key'];
 export const DIMENSION_KEYS = SCALE.map((area) => area.key) as DimensionKey[];
 
 export const LEVEL_LIMITS = {
-  facts: 12_000,
+  facts: 30_000,
   section: 120,
   line: 1_200,
   lines: 400,
@@ -300,6 +300,16 @@ function clip(value: string, max: number): string {
   return (space > max / 2 ? cut.slice(0, space) : value.slice(0, max)).trim();
 }
 
+const NAMES_A_LEVEL = /\b(needs?|requires?|recommend\w*|should (go|enter|attend|start|be (in|at|admitted|placed))|warrants?|calls? for|appropriate for|best suited (for|to)|suited for)\b[^.]{0,40}\b(inpatient|residential|detox\w*|outpatient|iop|php|partial hospitali[sz]ation|sober living|hospitali[sz]\w*|level of care)\b/i;
+
+/** The answers alone ("Question: answer" lines without their questions). */
+export function answerValues(request: LevelRequest): string {
+  return request.facts.flatMap((item) => item.lines.map((line) => {
+    const at = line.indexOf(': ');
+    return at >= 0 ? line.slice(at + 2) : line;
+  })).join('\n');
+}
+
 /** The model's ratings, checked: all six areas once each, ratings 0-4, evidence found in the answers. */
 export function parseLevelOutput(raw: string, request: LevelRequest): LevelSuggestion[] {
   let parsed: unknown;
@@ -309,7 +319,8 @@ export function parseLevelOutput(raw: string, request: LevelRequest): LevelSugge
     throw new AssistOutputError('The suggestion came back unreadable.');
   }
   const list = Array.isArray(record(parsed).ratings) ? record(parsed).ratings as unknown[] : [];
-  const answers = ` ${comparable(request.text)} `;
+  // Evidence must be the family's words: the answers, never the questions.
+  const answers = ` ${comparable(answerValues(request))} `;
   const byKey = new Map<DimensionKey, LevelSuggestion>();
   for (const raw of list) {
     const item = record(raw);
@@ -320,11 +331,14 @@ export function parseLevelOutput(raw: string, request: LevelRequest): LevelSugge
     }
     const evidence = clean(item.evidence, LEVEL_LIMITS.evidence * 4);
     const quote = comparable(evidence);
-    const found = quote.split(' ').length >= 2 && answers.includes(` ${quote} `);
+    const found = quote.split(' ').length >= 3 && answers.includes(` ${quote} `);
+    const reason = clip(clean(item.reason, LEVEL_LIMITS.reason * 2), LEVEL_LIMITS.reason);
     byKey.set(dimension, {
       dimension,
       rating: rating as LevelSuggestion['rating'],
-      reason: clip(clean(item.reason, LEVEL_LIMITS.reason * 2), LEVEL_LIMITS.reason),
+      // The app's rules recommend the level, never the AI: a reason that
+      // prescribes one is dropped (the rating stays, for the practitioner to check).
+      reason: NAMES_A_LEVEL.test(reason) ? '' : reason,
       evidence: found ? clip(evidence, LEVEL_LIMITS.evidence) : '',
     });
   }

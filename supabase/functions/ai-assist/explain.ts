@@ -103,14 +103,42 @@ export function explainSchema(): Record<string, unknown> {
   };
 }
 
-// Words a rewrite may use only when its facts already do.
-const UNSAID = ['best', 'guarantee', 'guaranteed', 'guarantees', 'cure', 'cured', 'cures', 'promise', 'promises', 'promised', 'definitely', 'certainly', 'always', 'never'];
+// Words and phrases a rewrite may use only when its facts already do:
+// promises, rankings, outcomes, beds and admission, and money ties (the app
+// adds the disclosures itself, below the text).
+const UNSAID = [
+  'best', 'guarantee', 'guaranteed', 'guarantees', 'cure', 'cured', 'cures', 'promise', 'promises', 'promised', 'definitely', 'certainly',
+  'recommend', 'recommends', 'recommended', 'recommendation', 'top', 'strongest', 'ideal', 'perfect', 'excellent', 'superior', 'leading',
+  'proven', 'success', 'successful', 'outcome', 'outcomes', 'results', 'bed', 'beds', 'admit', 'admits', 'admitted', 'admission', 'waiting',
+  'financial', 'fee', 'fees', 'paid', 'pays', 'ties', 'commission', 'sponsor', 'sponsored', 'partner', 'partnered',
+];
+const UNSAID_PHRASES = ['right choice', 'right fit', 'first choice', 'no connection', 'not connected', 'no relationship'];
 
 function addsWords(text: string, facts: string): string | null {
-  const said = new Set(comparable(facts).split(' '));
+  const factWords = ` ${comparable(facts)} `;
+  const said = new Set(factWords.trim().split(' '));
   const words = new Set(comparable(text).split(' '));
-  return UNSAID.find((word) => words.has(word) && !said.has(word)) ?? null;
+  const textWords = ` ${comparable(text)} `;
+  return UNSAID.find((word) => words.has(word) && !said.has(word))
+    ?? UNSAID_PHRASES.find((phrase) => textWords.includes(` ${phrase} `) && !factWords.includes(` ${phrase} `))
+    ?? null;
 }
+
+/**
+ * A name the facts never give (another program, a person, a place): a word
+ * with a capital letter that does not start a sentence and is not in the
+ * facts. The app then shows its own wording instead.
+ */
+function addsNames(text: string, facts: string): boolean {
+  const known = ` ${comparable(facts)} `;
+  for (const match of text.matchAll(/(?<=[^.!?:;\s"“(]\s+)[A-Z][a-zA-Z'’-]*/g)) {
+    const word = comparable(match[0]);
+    if (word && !known.includes(` ${word} `) && !ALWAYS_CAPITALIZED.has(word)) return true;
+  }
+  return false;
+}
+
+const ALWAYS_CAPITALIZED = new Set(['i', 'referralfit', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']);
 
 function addsNumbers(text: string, facts: string): boolean {
   const allowed = numbersIn(facts);
@@ -136,7 +164,9 @@ export function parseExplainOutput(raw: string, request: ExplainRequest): Explai
   const intro = clean(answer.intro, EXPLAIN_LIMITS.outIntro * 2);
   const list = Array.isArray(answer.programs) ? answer.programs : [];
   if (!intro || intro.length > EXPLAIN_LIMITS.outIntro) throw new AssistOutputError('The rewrite’s introduction did not fit.');
-  if (addsNumbers(intro, request.intro) || addsWords(intro, request.intro)) throw new AssistOutputError('The rewrite added to the facts.');
+  if (addsNumbers(intro, request.intro) || addsWords(intro, request.intro) || addsNames(intro, request.intro)) {
+    throw new AssistOutputError('The rewrite added to the facts.');
+  }
   if (list.length !== request.programs.length) throw new AssistOutputError('The rewrite left out or added a program.');
   const names = request.programs.map((program) => comparable(program.name));
   const programs = list.map((raw, index) => {
@@ -156,6 +186,7 @@ export function parseExplainOutput(raw: string, request: ExplainRequest): Explai
     }
     if (addsNumbers(text, facts)) throw new AssistOutputError('The rewrite added a number.');
     if (addsWords(text, facts)) throw new AssistOutputError('The rewrite added a claim.');
+    if (addsNames(text, facts)) throw new AssistOutputError('The rewrite named something the facts did not.');
     return { rank: program.rank, text };
   });
   return { intro, programs };

@@ -125,6 +125,25 @@ export type SaveOptions = {
  * Saves one approved row under the ids it was given when the review was
  * built, so trying again writes the same records, never second copies.
  */
+const likeExactly = (value: string) => value.replace(/[\\%_]/g, (match) => `\\${match}`);
+
+/** The partner an import skipped as already there: by directory listing, email, or organization. */
+async function existingPartnerId(importRow: NonNullable<ReturnType<typeof newPartnerWrite>>): Promise<string | null> {
+  const attempts = 'global_id' in importRow
+    ? [supabase.from('partners').select('id').eq('global_partner_id', importRow.global_id).limit(1)]
+    : [
+      importRow.email ? supabase.from('partners').select('id').ilike('email', likeExactly(importRow.email)).limit(1) : null,
+      importRow.organization ? supabase.from('partners').select('id').ilike('organization', likeExactly(importRow.organization)).limit(1) : null,
+    ];
+  for (const attempt of attempts) {
+    if (!attempt) continue;
+    const { data, error } = await attempt;
+    const id = !error && Array.isArray(data) ? (data[0] as { id?: unknown } | undefined)?.id : null;
+    if (typeof id === 'string') return id;
+  }
+  return null;
+}
+
 export async function saveReviewRow(row: ReviewRow, userId: string, options: SaveOptions): Promise<SaveResult> {
   const now = new Date().toISOString();
   const { today } = options;
@@ -173,9 +192,19 @@ export async function saveReviewRow(row: ReviewRow, userId: string, options: Sav
         const importRow = newPartnerWrite(row);
         if (!importRow) return { saved: false, message: 'Nothing to add.' };
         const result = await importPartners([importRow], userId);
-        const partnerId = result.ids?.[0];
+        let partnerId = result.ids?.[0];
         if (!result.added && !result.linked && !partnerId) {
-          return { saved: true, message: 'Already in your network: nothing was added.' };
+          // Already in the network (or imported by a try that lost its
+          // answer): the note still belongs on that partner.
+          const existing = row.text.trim() ? await existingPartnerId(importRow) : null;
+          if (!existing) return { saved: true, message: 'Already in your network: nothing was added.' };
+          partnerId = existing;
+          try {
+            await logContactActivity(null, partnerTouchWrite(row, now, partnerId), userId);
+          } catch {
+            return { saved: true, message: 'Already in your network, but the note could not be saved. Add it from the partner.' };
+          }
+          return { saved: true, message: 'Already in your network: the note was added to it.' };
         }
         // What was said about them is the new partner's first touch. The
         // partner is in either way: a failed note is saved with a message,

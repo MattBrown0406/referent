@@ -7,7 +7,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 import { readAsBase64 } from './cases';
-import { LOGO_TYPES, logoPublicUrl, removePracticeLogo, uploadPracticeLogo } from './family-assessment-api';
+import { logoPublicUrl, logoTypeFor, removePracticeLogo, uploadPracticeLogo } from './family-assessment-api';
 import { supabase } from './supabase';
 
 type Props = { orgId: string; isOwner: boolean };
@@ -34,7 +34,7 @@ export default function PracticeLogoCard({ orgId, isOwner }: Props) {
     const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.9, allowsMultipleSelection: false });
     if (result.canceled || !result.assets?.length) return;
     const asset = result.assets[0];
-    const type = asset.mimeType && LOGO_TYPES[asset.mimeType] ? asset.mimeType : '';
+    const type = logoTypeFor(asset.mimeType, asset.fileName || asset.uri);
     if (!type) { setMessage('Choose a PNG, JPEG or WebP image.'); return; }
     setBusy(true);
     try {
@@ -53,7 +53,7 @@ export default function PracticeLogoCard({ orgId, isOwner }: Props) {
     setBusy(true);
     setMessage('');
     try {
-      await removePracticeLogo(path);
+      await removePracticeLogo(orgId);
       setPath(null);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'The logo could not be removed.');

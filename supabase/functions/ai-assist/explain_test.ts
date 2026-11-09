@@ -110,3 +110,21 @@ Deno.test('numbers and comparison helpers', () => {
   assertEquals([...numbersIn('$4,500 and 87 of 100, 2.5')].sort(), ['100', '2.5', '4500', '87']);
   assertEquals(comparable('Cedar  House — Bend'), 'cedar house bend');
 });
+
+Deno.test('rankings, outcomes, beds, money ties and outside names are refused; plain words are fine', () => {
+  const second = 'Cedar House costs $4,500 a month, within your $6,000 budget.';
+  const first = (text: string) => answer({ programs: [{ rank: 1, text }, { rank: 2, text: second }] });
+  const base = 'Juniper Ridge Recovery offers inpatient care and works with Aetna.';
+  for (const claim of [
+    `${base} It is our top recommendation and the right choice.`,
+    `${base} It has a bed waiting and will admit your loved one this week.`,
+    `${base} It has an excellent success rate and proven results.`,
+    `${base} We have no financial ties to it.`,
+    `${base} Families often compare it with Hazelden.`,
+  ]) {
+    assertThrows(() => parseExplainOutput(first(claim), request()), AssistOutputError, undefined, claim);
+  }
+  assertThrows(() => parseExplainOutput(answer({ intro: 'Here are two programs; the strongest match comes first.' }), request()), AssistOutputError);
+  const fine = parseExplainOutput(first(`${base} You can always ask them questions. Their team speaks with families before Monday.`), request());
+  assertStringIncludes(fine.programs[0].text, 'always ask');
+});
