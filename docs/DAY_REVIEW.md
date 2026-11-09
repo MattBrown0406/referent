@@ -1,9 +1,9 @@
 # Day review: your recorder fills in ReferralFit
 
 **Status: Phase 1 built (2026-11-08, branch feat/day-review): paste notes,
-review, approve. Phase 2, Fieldy connected, built 2026-11-08 on the same
-branch** (see "Fieldy, as built" below). The share extension, background
-refresh and push are still the plan. For practitioners who
+review, approve. Phase 2, Fieldy and Plaud connected, built 2026-11-08 on
+the same branch** (see "Recorders, as built" below). The share extension,
+background refresh and push are still the plan. For practitioners who
 have added their own Anthropic key (AI drafts). Goal from Matt: "as
 automated as possible, the fewer steps for the user the better."
 
@@ -46,13 +46,25 @@ or a packet that was promised and never sent.
    to a private ReferralFit link). Both land on ReferralFit's server, so they
    belong to the real-time option under "Decisions".
 
-## Fieldy, as built (2026-11-08)
+## Recorders, as built (2026-11-08)
 
-- **Registration:** ReferralFit registered itself with Fieldy once, by
-  dynamic client registration (Fieldy's guide for apps used by other
-  people): a native public client (no secret), redirect
-  `com.mattbrown.referralfit:/oauth/fieldy`, client id in
-  `src/lib/fieldy.ts`. Nobody registers anything per user.
+Fieldy and Plaud work the same way, through each one's MCP server with
+OAuth (`src/lib/fieldy.ts` has both; `src/lib/fieldy-api.ts` the calls).
+
+| | Fieldy | Plaud |
+| --- | --- | --- |
+| MCP server | `https://api.fieldy.ai/mcp` | `https://mcp.plaud.ai/mcp` (launched 2026-09) |
+| Sign-in | `api.fieldy.ai/api/auth/oauth2/*` | `mcp.plaud.ai/authorize`, `/token` |
+| Scopes | `openid email offline_access conversations:read transcripts:read` | none named |
+| Recordings | `list_conversations` style tool, with summaries | `list_files` (date_from, date_to), then `get_note` per recording for its summary (8 per review) |
+| Account shown | userinfo endpoint | `get_current_user` tool |
+| Disconnect | revocation endpoint | `logout` tool |
+
+- **Registration:** ReferralFit registered itself once with each, by
+  dynamic client registration (both allow it for apps used by other
+  people): native public clients (no secret), redirects
+  `com.mattbrown.referralfit:/oauth/fieldy` and `…/oauth/plaud`, client ids
+  in `src/lib/fieldy.ts`. Nobody registers anything per user.
 - **Connect Fieldy** (Review notes): the practitioner signs in to their own
   Fieldy account in the system sheet (PKCE S256, state and issuer checked)
   and approves only `openid email offline_access conversations:read
@@ -74,10 +86,11 @@ or a packet that was promised and never sent.
   moves on only once something from it is saved (or nothing was found), so
   conversations read but not reviewed come back next time.
 - **Automatic:** when the app opens or comes back (at most every 15
-  minutes) it counts new conversations, never reviewing them. Today shows
-  "From your day: N new Fieldy conversations to review"; one tap opens the
-  review and reads them. While some wait, one local reminder at 6 PM:
-  "Your Fieldy conversations from today are ready to review." (no names).
+  minutes) it counts new recordings in each connected recorder, never
+  reviewing them. Today shows "From your day: N new Fieldy conversations
+  (or Plaud recordings) to review"; one tap opens the review and reads the
+  one with the most waiting. While some wait, one local reminder at 6 PM:
+  "Your recorded conversations from today are ready to review." (no names).
   Background refresh while the app is closed is not built yet.
 
 ## What the AI finds, and what approving does

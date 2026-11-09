@@ -49,15 +49,15 @@ import {
 } from './day-review';
 import { requestDayReview, ReviewUnavailableError, saveReviewRow, type SaveResult } from './day-review-api';
 import { fetchGlobalDirectory } from './directory';
-import { sourceFor, type FieldyBlock } from './fieldy';
+import { RECORDERS, sourceFor, type FieldyBlock, type Recorder, type RecorderId } from './fieldy';
 import {
-  commitFieldyRead,
-  connectFieldy,
-  disconnectFieldy,
+  commitRecorderRead,
+  connectRecorder,
+  disconnectRecorder,
   FieldyError,
-  fieldyStatus,
   fieldySupported,
-  readNewFieldyConversations,
+  readNewRecordings,
+  recorderStatus,
 } from './fieldy-api';
 import { licenseConcernAlert, licenseOverrideNote, type LicenseConcern } from './integrity';
 import { aiKeysSupported, getAnthropicKey } from './outreach-api';
@@ -101,13 +101,16 @@ type Props = {
   onClose: () => void;
   /** Something was saved: the app reloads. */
   onSaved: () => void;
-  /** Opened from "From your day" (the Today card or the evening reminder): read Fieldy at once. */
-  startWithFieldy?: boolean;
-  /** Fieldy was read, connected or disconnected: the Today card counts again. */
-  onFieldyChanged?: () => void;
+  /** Opened from "From your day" (the Today card or the evening reminder): read this recorder at once. */
+  startWithRecorder?: RecorderId | null;
+  /** A recorder was read, connected or disconnected: the Today card counts again. */
+  onRecordersChanged?: () => void;
 };
 
 type Phase = 'paste' | 'finding' | 'review' | 'saving' | 'done';
+
+type RecorderState = { state: 'checking' | 'off' | 'on' | 'busy'; email: string };
+const RECORDERS_CHECKING: Record<RecorderId, RecorderState> = { fieldy: { state: 'checking', email: '' }, plaud: { state: 'checking', email: '' } };
 
 function localDay(date = new Date()): string {
   const pad = (value: number) => String(value).padStart(2, '0');
@@ -131,7 +134,7 @@ const SWITCH_LABEL: Partial<Record<ReviewRow['kind'], string>> = {
 
 export default function DayReviewSheet({
   visible, userId, cases, contacts, partners, followUps, referrals, directoryEntitled, leadResponseMinutes, licenseConcernFor, onClose, onSaved,
-  startWithFieldy = false, onFieldyChanged,
+  startWithRecorder = null, onRecordersChanged,
 }: Props) {
   const [phase, setPhase] = useState<Phase>('paste');
   const [notes, setNotes] = useState('');
@@ -149,10 +152,13 @@ export default function DayReviewSheet({
   // What this opening has saved, so reading the same notes again does not offer it twice.
   const savedSignaturesRef = useRef<Set<string>>(new Set());
   const savedCountRef = useRef(0);
-  // Fieldy: connected or not, and the conversations this review was read from
-  // (committed as read once something from them is saved, or nothing was found).
-  const [fieldy, setFieldy] = useState<{ state: 'checking' | 'off' | 'on' | 'busy'; email: string }>({ state: 'checking', email: '' });
-  const fieldyReadRef = useRef<{ blocks: FieldyBlock[]; through: string | null } | null>(null);
+  // Each recorder (Fieldy, Plaud): connected or not; and the recordings this
+  // review was read from (committed as read once something from them is
+  // saved, or nothing was found).
+  const [recorders, setRecorders] = useState<Record<RecorderId, RecorderState>>(RECORDERS_CHECKING);
+  const recorderReadRef = useRef<{ recorder: Recorder; blocks: FieldyBlock[]; through: string | null } | null>(null);
+  const setRecorder = (id: RecorderId, value: RecorderState | ((current: RecorderState) => RecorderState)) =>
+    setRecorders((current) => ({ ...current, [id]: typeof value === 'function' ? value(current[id]) : value }));
 
   const workspace: Workspace = useMemo(() => ({
     cases, contacts, partners, followUps, referrals, directory: index,
@@ -172,7 +178,7 @@ export default function DayReviewSheet({
     savedSignaturesRef.current = new Set();
     savedCountRef.current = 0;
     savingRef.current = false;
-    fieldyReadRef.current = null;
+    recorderReadRef.current = null;
   }
 
   // A fresh sheet each time it opens, and for each account; nothing from a
@@ -184,14 +190,20 @@ export default function DayReviewSheet({
     setToday(localDay());
     setKeyState('checking');
     const opening = openingRef.current;
-    setFieldy({ state: 'checking', email: '' });
-    void Promise.all([getAnthropicKey(userId), fieldyStatus(userId)]).then(([key, status]) => {
+    setRecorders(RECORDERS_CHECKING);
+    void Promise.all([getAnthropicKey(userId), ...RECORDERS.map((recorder) => recorderStatus(recorder, userId))]).then(([key, ...statuses]) => {
       if (opening !== openingRef.current) return;
       setKeyState(key ? 'ready' : 'missing');
-      setFieldy({ state: status.connected ? 'on' : 'off', email: status.email });
-      if (startWithFieldy && status.connected && key) void readFieldy(opening);
+      const next = { ...RECORDERS_CHECKING };
+      RECORDERS.forEach((recorder, index) => {
+        const status = statuses[index] as { connected: boolean; email: string };
+        next[recorder.id] = { state: status.connected ? 'on' : 'off', email: status.email };
+      });
+      setRecorders(next);
+      const start = RECORDERS.find((recorder) => recorder.id === startWithRecorder);
+      if (start && next[start.id].state === 'on' && key) void readRecorder(start, opening);
     });
-    // readFieldy is this opening's own; startWithFieldy is read once, as the sheet opens.
+    // readRecorder is this opening's own; startWithRecorder is read once, as the sheet opens.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, userId]);
 
@@ -251,10 +263,10 @@ export default function DayReviewSheet({
     }
   }
 
-  async function find(fromFieldy: { text: string; blocks: FieldyBlock[]; through: string | null } | null = null) {
-    if (busy && !fromFieldy) return;
-    const text = (fromFieldy ? fromFieldy.text : notes).trim();
-    if (!fromFieldy) fieldyReadRef.current = null;
+  async function find(fromRecorder: { recorder: Recorder; text: string; blocks: FieldyBlock[]; through: string | null } | null = null) {
+    if (busy && !fromRecorder) return;
+    const text = (fromRecorder ? fromRecorder.text : notes).trim();
+    if (!fromRecorder) recorderReadRef.current = null;
     if (text.length < 20) { setMessage({ ok: false, text: 'Paste a little more: there is not enough here to review.' }); return; }
     const opening = openingRef.current;
     const day = localDay();
@@ -269,7 +281,7 @@ export default function DayReviewSheet({
       }
       const { items } = await requestDayReview(text, day, key);
       if (opening !== openingRef.current) return;
-      const blocks = fromFieldy?.blocks ?? null;
+      const blocks = fromRecorder?.blocks ?? null;
       const built = markSavedBefore(
         buildRows(items, workspaceRef.current, day, newUuid, blocks ? (found) => sourceFor(found.evidence, blocks) : undefined),
         savedSignaturesRef.current,
@@ -278,11 +290,16 @@ export default function DayReviewSheet({
       setSaved({});
       setPicker(null);
       setPhase('review');
-      if (fromFieldy) fieldyReadRef.current = { blocks: fromFieldy.blocks, through: fromFieldy.through };
+      if (fromRecorder) recorderReadRef.current = { recorder: fromRecorder.recorder, blocks: fromRecorder.blocks, through: fromRecorder.through };
       if (!items.length) {
-        setMessage({ ok: true, text: fromFieldy ? 'Nothing in your new Fieldy conversations needs to go into ReferralFit.' : 'Nothing in these notes needs to go into ReferralFit.' });
-        // Nothing to approve: these conversations are done.
-        if (fromFieldy) void commitFieldyRead(userId, fromFieldy.through).then(() => onFieldyChanged?.());
+        setMessage({
+          ok: true,
+          text: fromRecorder
+            ? `Nothing in your new ${fromRecorder.recorder.name} ${fromRecorder.recorder.noun}s needs to go into ReferralFit.`
+            : 'Nothing in these notes needs to go into ReferralFit.',
+        });
+        // Nothing to approve: these recordings are done.
+        if (fromRecorder) void commitRecorderRead(fromRecorder.recorder, userId, fromRecorder.through).then(() => onRecordersChanged?.());
       }
     } catch (error) {
       if (opening !== openingRef.current) return;
@@ -292,59 +309,59 @@ export default function DayReviewSheet({
     }
   }
 
-  // ─── Fieldy ──────────────────────────────────────────────────────────────
+  // ─── Recorders (Fieldy, Plaud) ───────────────────────────────────────────
 
-  async function connect() {
-    if (busy || fieldy.state === 'busy') return;
+  async function connect(recorder: Recorder) {
+    if (busy || recorders[recorder.id].state === 'busy') return;
     const opening = openingRef.current;
-    setFieldy((current) => ({ ...current, state: 'busy' }));
+    setRecorder(recorder.id, (current) => ({ ...current, state: 'busy' }));
     setMessage(null);
     try {
-      const status = await connectFieldy(userId);
+      const status = await connectRecorder(recorder, userId);
       if (opening !== openingRef.current) return;
-      setFieldy({ state: 'on', email: status.email });
-      onFieldyChanged?.();
-      setMessage({ ok: true, text: status.email ? `Fieldy is connected (${status.email}).` : 'Fieldy is connected.' });
+      setRecorder(recorder.id, { state: 'on', email: status.email });
+      onRecordersChanged?.();
+      setMessage({ ok: true, text: status.email ? `${recorder.name} is connected (${status.email}).` : `${recorder.name} is connected.` });
     } catch (error) {
       if (opening !== openingRef.current) return;
-      setFieldy({ state: 'off', email: '' });
+      setRecorder(recorder.id, { state: 'off', email: '' });
       if (!(error instanceof FieldyError && error.reason === 'cancelled')) {
-        setMessage({ ok: false, text: error instanceof Error ? error.message : 'Fieldy could not connect right now.' });
+        setMessage({ ok: false, text: error instanceof Error ? error.message : `${recorder.name} could not connect right now.` });
       }
     }
   }
 
-  function disconnect() {
-    if (busy || fieldy.state === 'busy') return;
-    Alert.alert('Disconnect Fieldy?', 'ReferralFit stops reading your Fieldy conversations, and its access is removed at Fieldy. Nothing already saved in ReferralFit changes.', [
+  function disconnect(recorder: Recorder) {
+    if (busy || recorders[recorder.id].state === 'busy') return;
+    Alert.alert(`Disconnect ${recorder.name}?`, `ReferralFit stops reading your ${recorder.name} ${recorder.noun}s, and its access is removed at ${recorder.name}. Nothing already saved in ReferralFit changes.`, [
       { text: 'Keep it', style: 'cancel' },
       {
         text: 'Disconnect',
         style: 'destructive',
         onPress: () => {
-          setFieldy((current) => ({ ...current, state: 'busy' }));
-          void disconnectFieldy(userId).finally(() => {
-            setFieldy({ state: 'off', email: '' });
-            onFieldyChanged?.();
+          setRecorder(recorder.id, (current) => ({ ...current, state: 'busy' }));
+          void disconnectRecorder(recorder, userId).finally(() => {
+            setRecorder(recorder.id, { state: 'off', email: '' });
+            onRecordersChanged?.();
           });
         },
       },
     ]);
   }
 
-  /** The conversations since the last read, straight into the review. */
-  async function readFieldy(opening = openingRef.current) {
-    if (fieldy.state === 'busy' || savingRef.current) return;
+  /** The recordings since the last read, straight into the review. */
+  async function readRecorder(recorder: Recorder, opening = openingRef.current) {
+    if (savingRef.current) return;
     setMessage(null);
     setPhase('finding');
     let read;
     try {
-      read = await readNewFieldyConversations(userId);
+      read = await readNewRecordings(recorder, userId);
     } catch (error) {
       if (opening !== openingRef.current) return;
       setPhase('paste');
-      if (error instanceof FieldyError && error.reason === 'disconnected') setFieldy({ state: 'off', email: '' });
-      setMessage({ ok: false, text: error instanceof Error ? error.message : 'Fieldy could not be read right now.' });
+      if (error instanceof FieldyError && error.reason === 'disconnected') setRecorder(recorder.id, { state: 'off', email: '' });
+      setMessage({ ok: false, text: error instanceof Error ? error.message : `${recorder.name} could not be read right now.` });
       return;
     }
     if (opening !== openingRef.current) return;
@@ -353,16 +370,16 @@ export default function DayReviewSheet({
       setMessage({
         ok: true,
         text: read.later
-          ? 'Fieldy is still writing the summary of your latest conversation. Try again in a little while.'
-          : 'No new Fieldy conversations since the last review.',
+          ? `${recorder.name} is still writing the summary of your latest ${recorder.noun}. Try again in a little while.`
+          : `No new ${recorder.name} ${recorder.noun}s since the last review.`,
       });
-      if (read.through) void commitFieldyRead(userId, read.through).then(() => onFieldyChanged?.());
+      if (read.through) void commitRecorderRead(recorder, userId, read.through).then(() => onRecordersChanged?.());
       return;
     }
     setNotes(read.text);
-    await find({ text: read.text, blocks: read.blocks, through: read.through });
+    await find({ recorder, text: read.text, blocks: read.blocks, through: read.through });
     if (opening === openingRef.current && read.later) {
-      setMessage((current) => current ?? { ok: true, text: `${read.later} more ${read.later === 1 ? 'conversation waits' : 'conversations wait'} for the next review.` });
+      setMessage((current) => current ?? { ok: true, text: `${read.later} more ${read.later === 1 ? `${recorder.noun} waits` : `${recorder.noun}s wait`} for the next review.` });
     }
   }
 
@@ -424,10 +441,10 @@ export default function DayReviewSheet({
       savingRef.current = false;
     }
     if (any) onSaved();
-    // Something from these Fieldy conversations is saved: the next read starts after them.
-    if (any && fieldyReadRef.current) {
-      const through = fieldyReadRef.current.through;
-      void commitFieldyRead(userId, through).then(() => onFieldyChanged?.());
+    // Something from these recordings is saved: the next read starts after them.
+    if (any && recorderReadRef.current) {
+      const { recorder, through } = recorderReadRef.current;
+      void commitRecorderRead(recorder, userId, through).then(() => onRecordersChanged?.());
     }
     if (opening !== openingRef.current) return;
     setSaved(results);
@@ -739,31 +756,34 @@ export default function DayReviewSheet({
       <Text style={styles.intro}>
         Paste notes from your day: a summary from Fieldy or Plaud, or your own call notes. ReferralFit finds new leads, notes, follow-ups and referrals, and you approve each one before anything is saved.
       </Text>
-      {fieldySupported && !keyMissing ? (
-        <View style={styles.fieldyCard}>
-          <Text style={styles.label}>FIELDY</Text>
-          {fieldy.state === 'on' ? (
-            <>
-              <Text style={styles.hint}>Connected{fieldy.email ? ` as ${fieldy.email}` : ''}. ReferralFit reads your new conversations here; you approve each item.</Text>
-              <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void readFieldy(); }} style={[styles.primaryButton, busy && styles.off]}>
-                <Text style={styles.primaryButtonText}>Read new Fieldy conversations</Text>
-              </TouchableOpacity>
-              <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={disconnect} style={styles.textButton}>
-                <Text style={styles.hint}>Disconnect Fieldy</Text>
-              </TouchableOpacity>
-            </>
-          ) : fieldy.state === 'checking' ? (
-            <ActivityIndicator color={COLORS.forest} accessibilityLabel="Checking Fieldy" />
-          ) : (
-            <>
-              <Text style={styles.hint}>Wear Fieldy? Connect it once and ReferralFit reads your conversations for you: no copying or pasting. You sign in to Fieldy; your sign-in stays on this phone.</Text>
-              <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: fieldy.state === 'busy' }} disabled={busy || fieldy.state === 'busy'} onPress={() => { void connect(); }} style={[styles.secondaryButton, (busy || fieldy.state === 'busy') && styles.off]}>
-                {fieldy.state === 'busy' ? <ActivityIndicator color={COLORS.forest} accessibilityLabel="Connecting" /> : <Text style={styles.secondaryButtonText}>Connect Fieldy</Text>}
-              </TouchableOpacity>
-            </>
-          )}
-        </View>
-      ) : null}
+      {fieldySupported && !keyMissing ? RECORDERS.map((recorder) => {
+        const status = recorders[recorder.id];
+        return (
+          <View key={recorder.id} style={styles.fieldyCard}>
+            <Text style={styles.label}>{recorder.name.toUpperCase()}</Text>
+            {status.state === 'on' ? (
+              <>
+                <Text style={styles.hint}>Connected{status.email ? ` as ${status.email}` : ''}. ReferralFit reads your new {recorder.noun}s here; you approve each item.</Text>
+                <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void readRecorder(recorder); }} style={[styles.primaryButton, busy && styles.off]}>
+                  <Text style={styles.primaryButtonText}>Read new {recorder.name} {recorder.noun}s</Text>
+                </TouchableOpacity>
+                <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => disconnect(recorder)} style={styles.textButton}>
+                  <Text style={styles.hint}>Disconnect {recorder.name}</Text>
+                </TouchableOpacity>
+              </>
+            ) : status.state === 'checking' ? (
+              <ActivityIndicator color={COLORS.forest} accessibilityLabel={`Checking ${recorder.name}`} />
+            ) : (
+              <>
+                <Text style={styles.hint}>Use {recorder.name}? Connect it once and ReferralFit reads your {recorder.noun}s for you: no copying or pasting. You sign in to {recorder.name}; your sign-in stays on this phone.</Text>
+                <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: status.state === 'busy' }} disabled={busy || status.state === 'busy'} onPress={() => { void connect(recorder); }} style={[styles.secondaryButton, (busy || status.state === 'busy') && styles.off]}>
+                  {status.state === 'busy' ? <ActivityIndicator color={COLORS.forest} accessibilityLabel="Connecting" /> : <Text style={styles.secondaryButtonText}>Connect {recorder.name}</Text>}
+                </TouchableOpacity>
+              </>
+            )}
+          </View>
+        );
+      }) : null}
       {keyMissing ? (
         <View style={styles.notice} accessibilityRole="alert">
           <Text style={styles.noticeText}>

@@ -146,6 +146,53 @@ check(() => {
   assert.equal(plan.through, plan.blocks[plan.blocks.length - 1] && many[plan.blocks.length - 1].startTime);
 }, 'too much for one review: the rest wait');
 
+// ─── Plaud ─────────────────────────────────────────────────────────────────
+check(() => {
+  const url = f.authorizeUrl('CHALLENGE', 'STATE', f.PLAUD);
+  assert.ok(url.startsWith('https://mcp.plaud.ai/authorize?response_type=code&client_id='));
+  assert.ok(url.includes(`redirect_uri=${encodeURIComponent('com.mattbrown.referralfit:/oauth/plaud')}`));
+  assert.ok(url.includes(`resource=${encodeURIComponent('https://mcp.plaud.ai/mcp')}`));
+  assert.ok(!url.includes('scope=') && !url.includes('prompt='), 'Plaud names no scopes');
+  const back = 'com.mattbrown.referralfit:/oauth/plaud?code=pc1&state=S&iss=https%3A%2F%2Fmcp.plaud.ai%2F';
+  assert.equal(f.codeFromCallback(back, 'S', f.PLAUD), 'pc1');
+  assert.throws(() => f.codeFromCallback(back, 'S', f.FIELDY), /wrong place/, 'a Plaud return is never taken for Fieldy\'s');
+  assert.throws(() => f.codeFromCallback('com.mattbrown.referralfit:/oauth/plaud?code=x&state=S&iss=https%3A%2F%2Fapi.fieldy.ai%2Fapi%2Fauth', 'S', f.PLAUD), /did not come from Plaud/);
+}, 'Plaud: the sign-in link and the way back');
+check(() => {
+  const tools = [
+    { name: 'login' }, { name: 'logout' }, { name: 'get_current_user' },
+    { name: 'list_files', inputSchema: { properties: { query: {}, date_from: {}, date_to: {}, page: {}, page_size: {} } } },
+    { name: 'get_file', inputSchema: { properties: { file_id: {} }, required: ['file_id'] } },
+    { name: 'get_note', inputSchema: { properties: { file_id: {} }, required: ['file_id'] } },
+    { name: 'get_transcript', inputSchema: { properties: { file_id: {} }, required: ['file_id'] } },
+  ];
+  const plan = f.listPlan(tools);
+  assert.deepEqual(plan, { name: 'list_files', start: 'date_from', end: 'date_to', size: 'page_size', cursor: null });
+  assert.deepEqual(f.listArguments(plan, '2026-11-09T07:00:00.000Z', '2026-11-09T23:00:00.000Z', null),
+    { date_from: '2026-11-08', date_to: '2026-11-10', page_size: 50 }, 'a date-only window is widened a day each way');
+  assert.deepEqual(f.notePlan(tools), { name: 'get_note', id: 'file_id' });
+  assert.deepEqual(f.transcriptPlan(tools), { name: 'get_transcript', id: 'file_id' });
+  assert.equal(f.userPlan(tools), 'get_current_user');
+  assert.equal(f.logoutPlan(tools), 'logout');
+  assert.equal(f.notePlan(f.listPlan ? [{ name: 'list_files', inputSchema: { properties: {} } }] : []), null);
+}, 'Plaud: its tools are read from tools/list');
+check(() => {
+  const { conversations } = f.conversationsFrom({ files: [
+    { id: 'p1', name: 'Call with Ana', start_at: '2026-11-09T17:00:00Z', duration: 600000, serial_number: 'x' },
+    { id: 'p2', name: '', created_at: '2026-11-09T18:00:00Z' },
+  ] });
+  assert.equal(conversations[0].title, 'Call with Ana');
+  assert.equal(conversations[0].endTime, '2026-11-09T17:10:00.000Z', 'its length is in milliseconds');
+  assert.equal(conversations[1].startTime, '2026-11-09T18:00:00Z');
+  assert.match(f.noteText({ note_list: ['## Summary\nAna asked about detox.', '## Next\nCall back Friday.'] }), /Ana asked about detox\.\n## Next/);
+  assert.equal(f.noteText({ summary: 'Ana asked about detox.', action_items: ['Call back Friday'], key_topics: ['detox', 'insurance'] }),
+    'Ana asked about detox.\nAction items:\nCall back Friday\nKey topics: detox\ninsurance');
+  assert.equal(f.emailFrom({ user: { email: 'matt@example.test' } }), 'matt@example.test');
+  assert.equal(f.emailFrom({ name: 'no email' }), '');
+  const plan = f.reviewPlan([{ ...conversations[0], summary: 'Ana asked about detox.' }], '2026-11-09T00:00:00Z', Date.parse('2026-11-09T23:00:00Z'), {}, 'Plaud');
+  assert.match(plan.text, /^\[From Plaud, Nov 9, \d+:00 (AM|PM) · Call with Ana\]/);
+}, 'Plaud: recordings, notes and the account');
+
 // ─── Wiring ────────────────────────────────────────────────────────────────
 const api = read('src/lib/fieldy-api.ts');
 const sheet = read('src/lib/DayReviewSheet.tsx');
@@ -155,17 +202,18 @@ check(() => {
   assert.match(api, /keychainAccessible: SecureStore\.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY/, 'the sign-in stays on this phone, never synced or backed up');
   assert.doesNotMatch(api, /supabase/, 'nothing about Fieldy goes to ReferralFit\'s server');
   assert.doesNotMatch(api, /console\.(log|error|warn)\([^)]*(token|refresh|summary|text)\b/i, 'no token or conversation is logged');
-  assert.match(api, /refreshing\.set\(userId, refresh\)/, 'one refresh at a time (Fieldy rotates refresh tokens)');
-  assert.match(api, /await writeStored\(userId, \{ \.\.\.stored, refreshToken: tokens\.refreshToken \}\)/, 'the new refresh token is kept at once');
-  assert.match(api, /FIELDY\.revokeUrl/, 'disconnecting revokes the token at Fieldy');
-  assert.match(api, /WebBrowser\.openAuthSessionAsync\(authorizeUrl\(challenge, state\), FIELDY\.redirectUri\)/);
+  assert.match(api, /refreshing\.set\(key, refresh\)/, 'one refresh at a time per recorder and account (refresh tokens rotate)');
+  assert.match(api, /const slot = \(recorder: Recorder, userId: string\) => `\$\{recorder\.id\}:\$\{userId\}`/, 'tokens are kept per recorder and per account');
+  assert.match(api, /await writeStored\(recorder, userId, \{ \.\.\.stored, refreshToken: tokens\.refreshToken \}\)/, 'the new refresh token is kept at once');
+  assert.match(api, /recorder\.revokeUrl[^]*logoutPlan/, 'disconnecting revokes the access at the recorder (Fieldy: revocation; Plaud: logout)');
+  assert.match(api, /WebBrowser\.openAuthSessionAsync\(authorizeUrl\(challenge, state, recorder\), recorder\.redirectUri\)/);
 }, 'the connection');
 check(() => {
-  assert.match(sheet, /commitFieldyRead\(userId, through\)/, 'a read moves on only once something from it is saved');
+  assert.match(sheet, /commitRecorderRead\(recorder, userId, through\)/, 'a read moves on only once something from it is saved');
   assert.match(sheet, /sourceFor\(found\.evidence, blocks\)/);
   assert.ok(appJson.expo.scheme.includes('com.mattbrown.referralfit'), 'the app opens for Fieldy\'s return');
   assert.ok(appJson.expo.plugins.includes('expo-web-browser'));
-  assert.match(app, /countNewFieldyConversations\(userId\)/, 'the Today card counts, it does not review');
+  assert.match(app, /countNewRecordings\(recorder, userId\)/, 'the Today card counts, it does not review');
   assert.match(app, /if \(target === 'day_review'\)/, 'the 6 PM reminder opens the review');
 }, 'the review and the app');
 

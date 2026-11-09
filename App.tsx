@@ -84,7 +84,7 @@ import DayReviewSheet from './src/lib/DayReviewSheet';
 import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
 import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
 import type { LevelOfCareSeed } from './src/lib/LevelOfCareSheet';
-import { countNewFieldyConversations, fieldySupported } from './src/lib/fieldy-api';
+import { countNewRecordings, fieldySupported, RECORDERS, type RecorderId } from './src/lib/fieldy-api';
 import { aiKeysSupported } from './src/lib/outreach-api';
 import {
   caseRecipients,
@@ -1305,10 +1305,11 @@ export default function App() {
   // Day review: notes from the day (a recorder's summary, call notes) read by
   // AI on the user's own key, approved row by row (docs/DAY_REVIEW.md).
   const [showDayReview, setShowDayReview] = useState(false);
-  // Fieldy, connected: new conversations waiting (counted, never reviewed
-  // until the user opens them), and whether the review opened to read them.
-  const [fieldyWaiting, setFieldyWaiting] = useState(0);
-  const [dayReviewFromFieldy, setDayReviewFromFieldy] = useState(false);
+  // Recorders connected (Fieldy, Plaud): new recordings waiting (counted,
+  // never reviewed until the user opens them), and which one the review
+  // opened to read.
+  const [recordingsWaiting, setRecordingsWaiting] = useState<Record<RecorderId, number>>({ fieldy: 0, plaud: 0 });
+  const [dayReviewRecorder, setDayReviewRecorder] = useState<RecorderId | null>(null);
   const [showMatchExplanation, setShowMatchExplanation] = useState(false);
   const [directorySubmitBusy, setDirectorySubmitBusy] = useState(false);
   // Incremented after the account joins a different practice workspace, which
@@ -1377,9 +1378,9 @@ export default function App() {
   const activeUserId = session?.user?.id || '';
   const activeUserIdRef = useRef(activeUserId);
   const activeOrgIdRef = useRef('');
-  // Fieldy, connected: new conversations are counted when the app opens and
-  // comes back (at most every 15 minutes), on this phone, straight from
-  // Fieldy; the Today card and the 6 PM reminder follow the count.
+  // Recorders connected: new recordings are counted when the app opens and
+  // comes back (at most every 15 minutes), on this phone, straight from each
+  // recorder; the Today card and the 6 PM reminder follow the count.
   const fieldyCountRef = useRef({ at: 0, userId: '' });
   const refreshFieldyWaiting = useCallback(async (force = false) => {
     const userId = activeUserIdRef.current;
@@ -1387,11 +1388,25 @@ export default function App() {
     const last = fieldyCountRef.current;
     if (!force && last.userId === userId && Date.now() - last.at < 15 * 60_000) return;
     fieldyCountRef.current = { at: Date.now(), userId };
-    const count = await countNewFieldyConversations(userId);
+    const counts = await Promise.all(RECORDERS.map((recorder) => countNewRecordings(recorder, userId)));
     if (activeUserIdRef.current !== userId) return;
-    setFieldyWaiting(count);
-    void setDayReviewWaiting(count, userId).catch(() => undefined);
+    const next = { fieldy: 0, plaud: 0 } as Record<RecorderId, number>;
+    RECORDERS.forEach((recorder, index) => { next[recorder.id] = counts[index]; });
+    setRecordingsWaiting(next);
+    void setDayReviewWaiting(counts.reduce((sum, count) => sum + count, 0), userId).catch(() => undefined);
   }, []);
+  const fieldyWaiting = recordingsWaiting.fieldy + recordingsWaiting.plaud;
+  const waitingRecorderRef = useRef<RecorderId | null>(null);
+  // The recorder a "From your day" tap reads first: the one with the most waiting.
+  const waitingRecorder: RecorderId | null = fieldyWaiting
+    ? (recordingsWaiting.plaud > recordingsWaiting.fieldy ? 'plaud' : 'fieldy')
+    : null;
+  waitingRecorderRef.current = waitingRecorder;
+  const waitingLine = recordingsWaiting.fieldy && recordingsWaiting.plaud
+    ? `${fieldyWaiting} new recordings from Fieldy and Plaud`
+    : recordingsWaiting.plaud
+      ? `${recordingsWaiting.plaud} new Plaud ${recordingsWaiting.plaud === 1 ? 'recording' : 'recordings'}`
+      : `${recordingsWaiting.fieldy} new Fieldy ${recordingsWaiting.fieldy === 1 ? 'conversation' : 'conversations'}`;
   useEffect(() => {
     if (!activeUserId) return undefined;
     void refreshFieldyWaiting(true);
@@ -1586,8 +1601,8 @@ export default function App() {
     clearPlacementAnswerLinks();
     // A review open for the account that signed out closes (it is cleared as it closes).
     setShowDayReview(false);
-    setDayReviewFromFieldy(false);
-    setFieldyWaiting(0);
+    setDayReviewRecorder(null);
+    setRecordingsWaiting({ fieldy: 0, plaud: 0 });
     setShowMatchExplanation(false);
     setOutreach(null);
     setAssessmentCaseId(null);
@@ -2510,9 +2525,9 @@ export default function App() {
           return;
         }
         if (target === 'day_review') {
-          // The 6 PM reminder: the review opens and reads Fieldy at once.
+          // The 6 PM reminder: the review opens and reads the recorder with the most waiting.
           setTab('home');
-          setDayReviewFromFieldy(true);
+          setDayReviewRecorder(waitingRecorderRef.current ?? 'fieldy');
           setShowDayReview(true);
           return;
         }
@@ -6906,15 +6921,15 @@ export default function App() {
           {aiKeysSupported && fieldyWaiting > 0 ? (
             <TouchableOpacity
               accessibilityRole="button"
-              accessibilityLabel={`From your day: ${fieldyWaiting} new Fieldy ${fieldyWaiting === 1 ? 'conversation' : 'conversations'} to review`}
+              accessibilityLabel={`From your day: ${waitingLine} to review`}
               style={[styles.globalDirectoryBanner, styles.fieldyBanner]}
-              onPress={() => { setDayReviewFromFieldy(true); setShowDayReview(true); }}
+              onPress={() => { setDayReviewRecorder(waitingRecorder); setShowDayReview(true); }}
             >
               <AppIcon name="mic-outline" size={20} color={COLORS.forest} />
               <View style={styles.globalDirectoryCopy}>
                 <Text style={styles.globalDirectoryTitle}>From your day</Text>
                 <Text style={styles.globalDirectorySubtitle}>
-                  {fieldyWaiting} new Fieldy {fieldyWaiting === 1 ? 'conversation' : 'conversations'} to review. Tap to read {fieldyWaiting === 1 ? 'it' : 'them'}; you approve what is saved.
+                  {waitingLine} to review. Tap to read {fieldyWaiting === 1 ? 'it' : 'them'}; you approve what is saved.
                 </Text>
               </View>
               <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
@@ -6925,12 +6940,12 @@ export default function App() {
               accessibilityRole="button"
               accessibilityLabel="Review notes from your day"
               style={styles.globalDirectoryBanner}
-              onPress={() => { setDayReviewFromFieldy(false); setShowDayReview(true); }}
+              onPress={() => { setDayReviewRecorder(null); setShowDayReview(true); }}
             >
               <AppIcon name="reader-outline" size={20} color={COLORS.forest} />
               <View style={styles.globalDirectoryCopy}>
                 <Text style={styles.globalDirectoryTitle}>Review notes</Text>
-                <Text style={styles.globalDirectorySubtitle}>Read your Fieldy conversations, or paste a Plaud summary or your call notes; approve the leads, notes and follow-ups it finds</Text>
+                <Text style={styles.globalDirectorySubtitle}>Read your Fieldy or Plaud recordings, or paste your call notes; approve the leads, notes and follow-ups it finds</Text>
               </View>
               <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
             </TouchableOpacity>
@@ -10352,10 +10367,10 @@ export default function App() {
         directoryEntitled={entitlements.entitlements.directory}
         leadResponseMinutes={leadSettings.leadResponseTargetMinutes}
         licenseConcernFor={(partnerId) => integrityByPartner.get(partnerId)?.licenseConcern ?? null}
-        onClose={() => { setShowDayReview(false); setDayReviewFromFieldy(false); }}
+        onClose={() => { setShowDayReview(false); setDayReviewRecorder(null); }}
         onSaved={() => refreshAfterServerChange()}
-        startWithFieldy={dayReviewFromFieldy}
-        onFieldyChanged={() => { void refreshFieldyWaiting(true); }}
+        startWithRecorder={dayReviewRecorder}
+        onRecordersChanged={() => { void refreshFieldyWaiting(true); }}
       />
       <PartnerImportSheet
         visible={showPartnerImport}

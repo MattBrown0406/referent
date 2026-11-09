@@ -252,13 +252,13 @@ function isScheduleCurrent(generation: number, ownerId: string): boolean {
 // are not re-applied. Forgotten whenever the system's copy is cleared.
 let lastAppliedSchedule: { ownerId: string; signature: string } | null = null;
 
-// New Fieldy conversations waiting for the day review (src/lib/fieldy-api.ts
-// countNewFieldyConversations): one reminder at 6 PM, only while some wait.
+// New Fieldy or Plaud recordings waiting for the day review (src/lib/fieldy-api.ts
+// countNewRecordings): one reminder at 6 PM, only while some wait.
 let dayReviewWaiting = 0;
 let lastInput: NotificationInput | null = null;
 const DAY_REVIEW_HOUR = 18;
 
-/** How many Fieldy conversations wait for review; the 6 PM reminder follows it. */
+/** How many recordings wait for review; the 6 PM reminder follows it. */
 export function setDayReviewWaiting(count: number, ownerId: string): Promise<void> {
   const next = Math.max(0, Math.floor(count) || 0);
   if (next === dayReviewWaiting) return Promise.resolve();
@@ -308,7 +308,7 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   if (reviewAt && remaining > 0 && plan({
     content: {
       title: 'ReferralFit',
-      body: 'Your Fieldy conversations from today are ready to review.',
+      body: 'Your recorded conversations from today are ready to review.',
       data: { target: 'day_review', ownerId },
       ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
     },

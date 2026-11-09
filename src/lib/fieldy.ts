@@ -1,17 +1,43 @@
-// Fieldy, connected (docs/DAY_REVIEW.md, Phase 2): the pure rules. The
-// practitioner signs in to their own Fieldy account once (OAuth with PKCE,
-// as Fieldy's guide for apps used by other people says); ReferralFit then
-// reads their new conversations through Fieldy's MCP server and puts them
-// into the day review, where nothing is saved until they approve it.
+// Recorders, connected (docs/DAY_REVIEW.md, Phase 2): the pure rules, for
+// Fieldy and Plaud alike. The practitioner signs in to their own recorder
+// account once (OAuth with PKCE, through the recorder's MCP server);
+// ReferralFit then reads their new recordings and puts them into the day
+// review, where nothing is saved until they approve it.
 //
-// ReferralFit registered itself with Fieldy once (dynamic client
-// registration, 2026-11-08) as a native app with no secret: the client id
-// below is public. The sign-in, the tokens and the conversations stay on
-// the phone (src/lib/fieldy-api.ts); ReferralFit's server never sees them.
+// ReferralFit registered itself once with each (dynamic client
+// registration, 2026-11-08) as a native app with no secret: the client ids
+// below are public. The sign-in, the tokens and the recordings stay on the
+// phone (src/lib/fieldy-api.ts); ReferralFit's server never sees them.
 //
 // No React, no network: scripts/fieldy-test.mjs covers this file.
 
-export const FIELDY = {
+export type RecorderId = 'fieldy' | 'plaud';
+
+export type Recorder = {
+  id: RecorderId;
+  name: string;
+  /** What one recording is called in the app ("conversation", "recording"). */
+  noun: string;
+  clientId: string;
+  redirectUri: string;
+  issuer: string;
+  authorizeUrl: string;
+  tokenUrl: string;
+  /** null: the recorder revokes through its MCP server's logout tool. */
+  revokeUrl: string | null;
+  /** null: the account is read through its MCP server's current-user tool. */
+  userinfoUrl: string | null;
+  mcpUrl: string;
+  /** null: the recorder names no scopes; its MCP access is the whole grant. */
+  scope: string | null;
+  /** Ask the recorder to show its consent screen. */
+  promptConsent: boolean;
+};
+
+export const FIELDY: Recorder = {
+  id: 'fieldy',
+  name: 'Fieldy',
+  noun: 'conversation',
   clientId: 'RdoydnooybKJJtqRukAYFyhwkWhrXBwK',
   redirectUri: 'com.mattbrown.referralfit:/oauth/fieldy',
   issuer: 'https://api.fieldy.ai/api/auth',
@@ -23,7 +49,29 @@ export const FIELDY = {
   // Only what the day review needs: who it is (to show which account), a
   // refresh token (so it keeps working), and reading conversations.
   scope: 'openid email offline_access conversations:read transcripts:read',
-} as const;
+  promptConsent: true,
+};
+
+// Plaud's MCP server (mcp.plaud.ai, docs.plaud.ai/plaud-mcp-cli/mcp):
+// list_files, get_note (the AI summary), get_transcript, get_current_user,
+// logout. It names no scopes and has no revocation endpoint.
+export const PLAUD: Recorder = {
+  id: 'plaud',
+  name: 'Plaud',
+  noun: 'recording',
+  clientId: 'eyJ2IjoyLCJuIjoiUmVmZXJyYWxGaXQiLCJoIjpbXSwiciI6IkQ2eGVJRjRxT3lBIn0.dJufrVA4MeLnBeCnK8G3QA',
+  redirectUri: 'com.mattbrown.referralfit:/oauth/plaud',
+  issuer: 'https://mcp.plaud.ai/',
+  authorizeUrl: 'https://mcp.plaud.ai/authorize',
+  tokenUrl: 'https://mcp.plaud.ai/token',
+  revokeUrl: null,
+  userinfoUrl: null,
+  mcpUrl: 'https://mcp.plaud.ai/mcp',
+  scope: null,
+  promptConsent: false,
+};
+
+export const RECORDERS: Recorder[] = [FIELDY, PLAUD];
 
 export class FieldyError extends Error {
   constructor(message: string, readonly reason: 'cancelled' | 'disconnected' | 'unavailable' | 'denied' = 'unavailable') {
@@ -38,21 +86,21 @@ export function base64Url(base64: string): string {
   return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-/** Fieldy's sign-in page for this app, with the PKCE challenge and a state to check on the way back. */
-export function authorizeUrl(challenge: string, state: string): string {
+/** The recorder's sign-in page for this app, with the PKCE challenge and a state to check on the way back. */
+export function authorizeUrl(challenge: string, state: string, recorder: Recorder = FIELDY): string {
   const params: [string, string][] = [
     ['response_type', 'code'],
-    ['client_id', FIELDY.clientId],
-    ['redirect_uri', FIELDY.redirectUri],
-    ['scope', FIELDY.scope],
+    ['client_id', recorder.clientId],
+    ['redirect_uri', recorder.redirectUri],
+    ...(recorder.scope ? [['scope', recorder.scope] as [string, string]] : []),
     ['state', state],
     ['code_challenge', challenge],
     ['code_challenge_method', 'S256'],
-    ['resource', FIELDY.mcpUrl],
-    // Ask Fieldy to show the consent screen, so the practitioner sees what is shared.
-    ['prompt', 'consent'],
+    ['resource', recorder.mcpUrl],
+    // Show the consent screen, so the practitioner sees what is shared.
+    ...(recorder.promptConsent ? [['prompt', 'consent'] as [string, string]] : []),
   ];
-  return `${FIELDY.authorizeUrl}?${params.map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join('&')}`;
+  return `${recorder.authorizeUrl}?${params.map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join('&')}`;
 }
 
 function queryOf(url: string): Record<string, string> {
@@ -71,33 +119,34 @@ function queryOf(url: string): Record<string, string> {
  * The code from Fieldy's return to the app, checked: the same state this
  * sign-in sent, and (when Fieldy names it) Fieldy as the issuer.
  */
-export function codeFromCallback(url: string, state: string): string {
-  if (!url.startsWith(FIELDY.redirectUri)) throw new FieldyError('Fieldy sent you back to the wrong place. Try connecting again.');
+export function codeFromCallback(url: string, state: string, recorder: Recorder = FIELDY): string {
+  const name = recorder.name;
+  if (!url.startsWith(recorder.redirectUri)) throw new FieldyError(`${name} sent you back to the wrong place. Try connecting again.`);
   const query = queryOf(url);
   if (query.error) {
     throw query.error === 'access_denied'
-      ? new FieldyError('Fieldy was not connected: the request was declined.', 'denied')
-      : new FieldyError('Fieldy could not connect right now. Try again.');
+      ? new FieldyError(`${name} was not connected: the request was declined.`, 'denied')
+      : new FieldyError(`${name} could not connect right now. Try again.`);
   }
   if (!state || query.state !== state) throw new FieldyError('That sign-in did not match. Try connecting again.');
-  if (query.iss && query.iss !== FIELDY.issuer) throw new FieldyError('That sign-in did not come from Fieldy. Try connecting again.');
-  if (!query.code) throw new FieldyError('Fieldy did not finish the sign-in. Try again.');
+  if (query.iss && query.iss !== recorder.issuer) throw new FieldyError(`That sign-in did not come from ${name}. Try connecting again.`);
+  if (!query.code) throw new FieldyError(`${name} did not finish the sign-in. Try again.`);
   return query.code;
 }
 
 export type FieldyTokens = { accessToken: string; refreshToken: string; expiresAt: number };
 
 /** Fieldy's token answer, read defensively. A refresh token is required: without one the connection would stop in an hour. */
-export function tokensFrom(json: unknown, now = Date.now()): FieldyTokens {
+export function tokensFrom(json: unknown, now = Date.now(), name = 'Fieldy'): FieldyTokens {
   const data = json && typeof json === 'object' ? json as Record<string, unknown> : {};
   if (typeof data.error === 'string') {
     throw data.error === 'invalid_grant'
-      ? new FieldyError('Your Fieldy connection ended. Connect Fieldy again.', 'disconnected')
-      : new FieldyError('Fieldy could not connect right now. Try again.');
+      ? new FieldyError(`Your ${name} connection ended. Connect ${name} again.`, 'disconnected')
+      : new FieldyError(`${name} could not connect right now. Try again.`);
   }
   const accessToken = typeof data.access_token === 'string' ? data.access_token : '';
   const refreshToken = typeof data.refresh_token === 'string' ? data.refresh_token : '';
-  if (!accessToken || !refreshToken) throw new FieldyError('Fieldy did not give ReferralFit lasting access. Try connecting again.');
+  if (!accessToken || !refreshToken) throw new FieldyError(`${name} did not give ReferralFit lasting access. Try connecting again.`);
   const seconds = Number(data.expires_in);
   // A minute early, so a call never starts with a token about to end.
   const expiresAt = now + (Number.isFinite(seconds) && seconds > 120 ? seconds : 3600) * 1000 - 60_000;
@@ -163,7 +212,7 @@ const START_KEYS = ['startTime', 'start_time', 'startDate', 'start_date', 'from'
 const END_KEYS = ['endTime', 'end_time', 'endDate', 'end_date', 'to', 'until', 'before', 'end', 'dateTo', 'date_to'];
 const SIZE_KEYS = ['pageSize', 'page_size', 'limit', 'maxResults', 'max_results', 'count'];
 const CURSOR_KEYS = ['cursor', 'pageToken', 'page_token', 'nextCursor'];
-const ID_KEYS = ['conversationId', 'conversation_id', 'id'];
+const ID_KEYS = ['conversationId', 'conversation_id', 'fileId', 'file_id', 'recordingId', 'recording_id', 'id'];
 
 function keyIn(properties: Record<string, unknown>, keys: string[]): string | null {
   return keys.find((key) => Object.prototype.hasOwnProperty.call(properties, key)) ?? null;
@@ -182,11 +231,12 @@ export function listPlan(tools: McpTool[]): ListPlan | null {
       const name = tool.name.toLowerCase();
       const properties = tool.inputSchema?.properties || {};
       const required = (tool.inputSchema?.required || []).filter((key) => ![...START_KEYS, ...END_KEYS, ...SIZE_KEYS, ...CURSOR_KEYS].includes(key));
-      if (!/conversation/.test(name) || /transcript|share|sharable|update|delete|create|patch/.test(name) || required.length) return null;
+      if (!/conversation|file|recording/.test(name) || /transcript|share|sharable|update|delete|create|patch|note|upload|login|logout/.test(name)
+        || required.length) return null;
       const start = keyIn(properties, START_KEYS);
       const end = keyIn(properties, END_KEYS);
-      const score = (/list|recent|get_conversations|conversations$/.test(name) ? 4 : 0) + (start ? 2 : 0) + (end ? 1 : 0) - (/search/.test(name) ? 1 : 0)
-        - (/(^|_)get_conversation$|by_id/.test(name) ? 5 : 0);
+      const score = (/list|recent|get_conversations|conversations$|files$|recordings$/.test(name) ? 4 : 0) + (start ? 2 : 0) + (end ? 1 : 0)
+        - (/search/.test(name) ? 1 : 0) - (/(^|_)get_(conversation|file|recording)$|by_id/.test(name) ? 5 : 0);
       return { score, plan: { name: tool.name, start, end, size: keyIn(properties, SIZE_KEYS), cursor: keyIn(properties, CURSOR_KEYS) } };
     })
     .filter((item): item is { score: number; plan: ListPlan } => Boolean(item) && item!.score > 0)
@@ -194,10 +244,19 @@ export function listPlan(tools: McpTool[]): ListPlan | null {
   return scored[0]?.plan ?? null;
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The list call's arguments. A window by date only (Plaud's date_from and
+ * date_to, YYYY-MM-DD) is widened by a day each way: which day a time falls
+ * on depends on the time zone, and anything before `since` is left out
+ * afterwards (reviewPlan).
+ */
 export function listArguments(plan: ListPlan, since: string, until: string, cursor: string | null): Record<string, unknown> {
   const args: Record<string, unknown> = {};
-  if (plan.start) args[plan.start] = since;
-  if (plan.end) args[plan.end] = until;
+  const day = (iso: string, shift: number) => new Date(Date.parse(iso) + shift * DAY_MS).toISOString().slice(0, 10);
+  if (plan.start) args[plan.start] = /date/i.test(plan.start) ? day(since, -1) : since;
+  if (plan.end) args[plan.end] = /date/i.test(plan.end) ? day(until, 1) : until;
   if (plan.size) args[plan.size] = 50;
   if (plan.cursor && cursor) args[plan.cursor] = cursor;
   return args;
@@ -205,14 +264,56 @@ export function listArguments(plan: ListPlan, since: string, until: string, curs
 
 export type TranscriptPlan = { name: string; id: string };
 
-/** The tool that reads one conversation's transcript, for a conversation Fieldy has not summarized. */
-export function transcriptPlan(tools: McpTool[]): TranscriptPlan | null {
+function toolWithId(tools: McpTool[], pattern: RegExp): TranscriptPlan | null {
   for (const tool of tools) {
-    if (!/transcript/i.test(tool.name)) continue;
+    if (!pattern.test(tool.name)) continue;
     const id = keyIn(tool.inputSchema?.properties || {}, ID_KEYS);
     if (id) return { name: tool.name, id };
   }
   return null;
+}
+
+/** The tool that reads one recording's transcript, for one the recorder has not summarized. */
+export function transcriptPlan(tools: McpTool[]): TranscriptPlan | null {
+  return toolWithId(tools, /transcript/i);
+}
+
+/** The tool that reads one recording's AI summary, when the list gives none (Plaud's get_note). */
+export function notePlan(tools: McpTool[]): TranscriptPlan | null {
+  return toolWithId(tools, /(^|_)(get_)?(note|notes|summary)$/i);
+}
+
+/** The tool that names the signed-in account (Plaud's get_current_user). */
+export function userPlan(tools: McpTool[]): string | null {
+  return tools.find((tool) => /current_user|whoami|get_user|^me$|user_info/i.test(tool.name) && !(tool.inputSchema?.required || []).length)?.name ?? null;
+}
+
+/** The tool that signs out and revokes this app's access (Plaud's logout). */
+export function logoutPlan(tools: McpTool[]): string | null {
+  return tools.find((tool) => /^(logout|sign_out|revoke)$/i.test(tool.name))?.name ?? null;
+}
+
+/** An account's email from a current-user answer, or ''. */
+export function emailFrom(payload: unknown): string {
+  const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+  const inner = data.user && typeof data.user === 'object' ? data.user as Record<string, unknown> : data;
+  const value = [inner.email, data.email, inner.mail].find((item) => typeof item === 'string' && /@/.test(item)) as string | undefined;
+  return (value || '').slice(0, 254);
+}
+
+/** A note answer as text: the summary, action items and key topics, however they come. */
+export function noteText(payload: unknown, depth = 0): string {
+  if (typeof payload === 'string') return payload.trim();
+  if (depth > 3 || !payload || typeof payload !== 'object') return '';
+  if (Array.isArray(payload)) return payload.map((item) => noteText(item, depth + 1)).filter(Boolean).join('\n');
+  const data = payload as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const key of ['title', 'summary', 'content', 'markdown', 'text', 'note', 'notes', 'note_list', 'noteList', 'action_items', 'actionItems', 'key_topics', 'keyTopics']) {
+    if (data[key] === undefined) continue;
+    const text = noteText(data[key], depth + 1);
+    if (text) parts.push(/action/i.test(key) ? `Action items:\n${text}` : /topic/i.test(key) ? `Key topics: ${text}` : text);
+  }
+  return parts.join('\n').trim();
 }
 
 /** What a tool call returned: its structured content, else the JSON in its text, else the text itself. */
@@ -250,20 +351,36 @@ function summaryOf(item: Record<string, unknown>): string {
   return '';
 }
 
-/** The conversations in a list answer, wherever the list is (an array, or under conversations, items or data). */
+// When a recording ended: its end time, or its start plus its length
+// (Plaud's duration is in milliseconds, Fieldy's durationSeconds in seconds).
+function endOf(item: Record<string, unknown>, start: string): string {
+  const end = str(item.endTime ?? item.end_time ?? item.endAt ?? item.end_at, 40);
+  if (end && !Number.isNaN(Date.parse(end))) return end;
+  const at = Date.parse(start);
+  if (Number.isNaN(at)) return start;
+  const seconds = Number(item.durationSeconds ?? item.duration_seconds);
+  const millis = Number(item.duration);
+  const length = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : Number.isFinite(millis) && millis > 0 ? millis : 0;
+  return new Date(at + length).toISOString();
+}
+
+/** The recordings in a list answer, wherever the list is (an array, or under conversations, files, items or data). */
 export function conversationsFrom(payload: unknown): { conversations: FieldyConversation[]; nextCursor: string | null; text: string } {
   const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
   const list = Array.isArray(payload) ? payload
-    : [data.conversations, data.items, data.data, data.results].find(Array.isArray) as unknown[] | undefined;
+    : [data.conversations, data.files, data.recordings, data.items, data.data, data.results].find(Array.isArray) as unknown[] | undefined;
   const conversations = (list || [])
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
-    .map((item) => ({
-      id: str(item.id ?? item.conversationId ?? item.conversation_id, 200),
-      title: str(item.title, 300),
-      summary: summaryOf(item),
-      startTime: str(item.startTime ?? item.start_time ?? item.createdAt ?? item.created_at, 40),
-      endTime: str(item.endTime ?? item.end_time ?? item.startTime ?? item.start_time, 40),
-    }))
+    .map((item) => {
+      const startTime = str(item.startTime ?? item.start_time ?? item.startAt ?? item.start_at ?? item.createdAt ?? item.created_at, 40);
+      return {
+        id: str(item.id ?? item.conversationId ?? item.conversation_id ?? item.file_id ?? item.fileId, 200),
+        title: str(item.title ?? item.name, 300),
+        summary: summaryOf(item),
+        startTime,
+        endTime: endOf(item, startTime),
+      };
+    })
     .filter((item) => item.id && !Number.isNaN(Date.parse(item.startTime)));
   const cursor = [data.nextCursor, data.next_cursor, data.cursor, (data.pagination as Record<string, unknown> | undefined)?.nextCursor]
     .find((value) => typeof value === 'string' && value) as string | undefined;
@@ -320,7 +437,8 @@ export type ReviewPlan = {
  * an item found in it can say where it came from. `transcripts` holds the
  * text for conversations without a summary.
  */
-export function reviewPlan(conversations: FieldyConversation[], since: string, now = Date.now(), transcripts: Record<string, string> = {}): ReviewPlan {
+export function reviewPlan(conversations: FieldyConversation[], since: string, now = Date.now(), transcripts: Record<string, string> = {},
+  recorderName = 'Fieldy'): ReviewPlan {
   const after = Date.parse(since);
   const fresh = conversations
     .filter((item) => Date.parse(item.startTime) > after)
@@ -342,7 +460,7 @@ export function reviewPlan(conversations: FieldyConversation[], since: string, n
       break;
     }
     if (!body) { through = item.startTime; continue; }
-    const label = `From Fieldy, ${shortTime(item.startTime)}${item.title ? ` · ${item.title.slice(0, 80)}` : ''}`;
+    const label = `From ${recorderName}, ${shortTime(item.startTime)}${item.title ? ` · ${item.title.slice(0, 80)}` : ''}`;
     const text = `[${label}]\n${body}`;
     if (blocks.length && length + text.length + 2 > REVIEW_MAX) {
       later = fresh.length - index;
