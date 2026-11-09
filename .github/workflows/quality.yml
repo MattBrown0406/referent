@@ -51,7 +51,7 @@ jobs:
           supabase/functions/email-dispatch/index.ts
           supabase/functions/draft-follow-up/index.ts
       - name: Test Edge Functions
-        run: deno test --node-modules-dir=none supabase/functions/intake/ supabase/functions/push-dispatch/ supabase/functions/email-dispatch/ supabase/functions/draft-follow-up/ supabase/functions/day-review/ supabase/functions/ai-assist/
+        run: deno test --node-modules-dir=none supabase/functions/intake/ supabase/functions/push-dispatch/ supabase/functions/email-dispatch/ supabase/functions/draft-follow-up/ supabase/functions/day-review/ supabase/functions/ai-assist/ supabase/functions/family-assessment-upload/
       - uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520 # v3.0.0
         with:
           version: 2.110.0

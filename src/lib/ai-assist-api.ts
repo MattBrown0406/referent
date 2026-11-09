@@ -3,6 +3,7 @@
 // and the function checks the answer before it comes back.
 
 import { supabase } from './supabase';
+import type { DimensionKey, Rating } from './level-of-care';
 import type { Rewrite, RewriteFacts } from './match-explanation';
 
 export type AssistFailureReason =
@@ -93,4 +94,38 @@ export async function requestExplanationRewrite(facts: RewriteFacts, apiKey: str
   const rewrite = readRewrite(await invokeAssist('explain_matches', { facts }, apiKey));
   if (!rewrite) throw new AssistUnavailableError('The answer came back unreadable. Try again.', 'unavailable');
   return rewrite;
+}
+
+export type LevelSuggestion = { dimension: DimensionKey; rating: Rating; reason: string; evidence: string };
+
+const DIMENSIONS: DimensionKey[] = ['withdrawal', 'physical', 'emotional', 'readiness', 'relapse', 'environment'];
+
+/** The function's six suggested ratings, read defensively; null unless all six are there. */
+export function readLevelSuggestion(value: unknown): LevelSuggestion[] | null {
+  const list = value && typeof value === 'object' ? (value as { ratings?: unknown }).ratings : null;
+  if (!Array.isArray(list)) return null;
+  const out: LevelSuggestion[] = [];
+  for (const key of DIMENSIONS) {
+    const item = list.find((entry) => entry && typeof entry === 'object' && (entry as { dimension?: unknown }).dimension === key) as Record<string, unknown> | undefined;
+    const rating = Number(item?.rating);
+    if (!item || !Number.isInteger(rating) || rating < 0 || rating > 4) return null;
+    out.push({
+      dimension: key,
+      rating: rating as Rating,
+      reason: typeof item.reason === 'string' ? item.reason.trim().slice(0, 200) : '',
+      evidence: typeof item.evidence === 'string' ? item.evidence.trim().slice(0, 200) : '',
+    });
+  }
+  return out;
+}
+
+/**
+ * Suggested level-of-care ratings from a family assessment. Sends the
+ * answers without who anyone is (levelOfCareFacts); the practitioner
+ * confirms every rating in the level-of-care sheet.
+ */
+export async function requestLevelSuggestion(facts: { section: string; lines: string[] }[], apiKey: string): Promise<LevelSuggestion[]> {
+  const suggestion = readLevelSuggestion(await invokeAssist('level_of_care', { facts }, apiKey));
+  if (!suggestion) throw new AssistUnavailableError('The suggestion came back unreadable. Try again.', 'unavailable');
+  return suggestion;
 }

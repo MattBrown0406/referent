@@ -34,6 +34,7 @@ import {
   renderEmail,
   RESEND_URL,
   resendBody,
+  senderFor,
   type SendResult,
 } from './email.ts';
 
@@ -55,6 +56,7 @@ function links(): Links {
     // The public address mail clients POST to; SUPABASE_URL is it in production.
     functionUrl: (Deno.env.get('EMAIL_FUNCTION_URL') || `${requiredEnv('SUPABASE_URL').replace(/\/+$/, '')}/functions/v1/email-dispatch`)
       .replace(/\/+$/, ''),
+    storageUrl: (Deno.env.get('EMAIL_STORAGE_URL') || requiredEnv('SUPABASE_URL')).replace(/\/+$/, ''),
   };
 }
 
@@ -62,7 +64,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 type SendOutcome = SendResult & { config?: boolean; charge?: boolean };
 
-async function sendOne(row: OutboxRow, apiKey: string, from: string, replyTo: string | undefined, target: Links): Promise<SendOutcome> {
+async function sendOne(row: OutboxRow, apiKey: string, defaultFrom: string, defaultReplyTo: string | undefined, target: Links): Promise<SendOutcome> {
+  const { from, replyTo } = senderFor(row, defaultFrom, defaultReplyTo);
   let email;
   try {
     email = renderEmail(row, target, preparedAt(row));

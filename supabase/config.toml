@@ -427,6 +427,11 @@ verify_jwt = false
 [functions.ai-assist]
 verify_jwt = false
 
+# The family assessment page uploads card photos signed out: the link token
+# is the key, checked by the database (docs/FAMILY_ASSESSMENT.md).
+[functions.family-assessment-upload]
+verify_jwt = false
+
 [analytics]
 enabled = true
 port = 55427

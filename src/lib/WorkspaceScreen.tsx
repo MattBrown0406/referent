@@ -67,6 +67,7 @@ import {
   type PreferencesState,
 } from './push';
 import { WEB_PAGE } from './web-layout';
+import PracticeLogoCard from './PracticeLogoCard';
 import {
   EMAIL_PREFERENCE_ROWS,
   type EmailPreferences,
@@ -578,6 +579,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 </View>
               )}
             </View>
+
+            <PracticeLogoCard orgId={workspace.orgId} isOwner={isOwner} />
 
             <View style={styles.card}>
               <Text style={styles.cardLabel}>{INTAKE_LINK_ENABLED ? 'Your intake link' : 'New leads'}</Text>

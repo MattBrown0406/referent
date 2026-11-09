@@ -82,6 +82,8 @@ import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
 import OutreachSheet, { type OutreachSent, type OutreachSheetRequest } from './src/lib/OutreachSheet';
 import DayReviewSheet from './src/lib/DayReviewSheet';
 import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
+import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
+import type { LevelOfCareSeed } from './src/lib/LevelOfCareSheet';
 import { aiKeysSupported } from './src/lib/outreach-api';
 import {
   caseRecipients,
@@ -1353,6 +1355,10 @@ export default function App() {
   // inside the case file's own sheet (CaseDetailModal swaps its contents).
   // The sheet's guarded "back" for the Modal's onRequestClose.
   const [assessmentCaseId, setAssessmentCaseId] = useState<string | null>(null);
+  // The family assessment on a case (src/lib/FamilyAssessmentSheet.tsx), and
+  // the head start it gives the level-of-care sheet when opened from it.
+  const [familyAssessmentCaseId, setFamilyAssessmentCaseId] = useState<string | null>(null);
+  const [levelOfCareSeed, setLevelOfCareSeed] = useState<LevelOfCareSeed | null>(null);
   const assessmentBackRef = useRef<() => void>(() => setAssessmentCaseId(null));
   // The shortlist the clinician saw when they started an assignment, so the
   // placement record can say what was shown and at what rank the pick sat.
@@ -1556,6 +1562,8 @@ export default function App() {
     setShowMatchExplanation(false);
     setOutreach(null);
     setAssessmentCaseId(null);
+    setFamilyAssessmentCaseId(null);
+    setLevelOfCareSeed(null);
     setPlacementSheet(null);
     setPlacementCompareId(null);
     setPendingPlacementChoice(null);
@@ -3563,6 +3571,8 @@ export default function App() {
     setDocView(null);
     // An editor left over from another case file (a late rollback) must
     // never open over this one: it would save to this case.
+    setFamilyAssessmentCaseId(null);
+    setLevelOfCareSeed(null);
     setCaseContactForm(null);
     setCaseEditForm(null);
     setCaseBusinessForm(null);
@@ -3670,6 +3680,8 @@ export default function App() {
     setVobForm(null);
     setVobAnswerForm(null);
     setAssessmentCaseId(null);
+    setFamilyAssessmentCaseId(null);
+    setLevelOfCareSeed(null);
   }
 
   // ─── Insurance workflow: the Benefits card ──────────────────────────────
@@ -7788,6 +7800,7 @@ export default function App() {
     if (vobForm) return VobRequestModal(activeCase);
     if (vobAnswerForm) return VobAnswerModal(activeCase);
     if (assessmentCaseId === activeCase.id) return LevelOfCareModal(activeCase);
+    if (familyAssessmentCaseId === activeCase.id) return FamilyAssessmentModal(activeCase);
     const record = activeCase;
     const colors = CASE_STATUS_COLORS[record.status];
     const linkedMatch = referralMatches.find((item) => item.id === record.matchProfileId)
@@ -8008,9 +8021,25 @@ export default function App() {
               <LevelOfCareCard
                 entry={caseAssessments.entryFor(record.id)}
                 nameFor={(userId) => (userId && userId === activeUserId.toLowerCase() ? 'you' : memberDisplayName(members, userId))}
-                onStart={() => { flushPendingCaseFields(); setAssessmentCaseId(record.id); }}
+                onStart={() => { flushPendingCaseFields(); setLevelOfCareSeed(null); setAssessmentCaseId(record.id); }}
                 onFindPlacement={(level) => startMatchForCase(record, level)}
               />
+
+              {/* Family assessment: a private, branded intake link for the family (src/lib/FamilyAssessmentSheet.tsx) */}
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel="Family assessment: send the family a private intake link, or read their answers"
+                onPress={() => { flushPendingCaseFields(); setFamilyAssessmentCaseId(record.id); }}
+                style={styles.infoCard}
+              >
+                <View style={styles.caseSectionHeader}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.infoTitle}>Family assessment</Text>
+                    <Text style={styles.caseSectionHint}>A private link for the family: a full intake in your practice’s name, with one consent to share with other ethical providers. Their answers come back here.</Text>
+                  </View>
+                  <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+                </View>
+              </TouchableOpacity>
 
               {/* Benefits: the family's plan and the VOB requests */}
               {(() => {
@@ -9653,11 +9682,13 @@ export default function App() {
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => assessmentBackRef.current()}>
         <LevelOfCareSheet
           caseId={record.id}
+          seed={levelOfCareSeed}
           names={reasonNames({ caseTitle: record.title, contactNames: caseContactNames(record.id) })}
           previous={caseAssessments.currentFor(record.id)}
           backRef={assessmentBackRef}
-          onClose={() => setAssessmentCaseId(null)}
+          onClose={() => { setAssessmentCaseId(null); setLevelOfCareSeed(null); }}
           onSaved={(saved) => {
+            setLevelOfCareSeed(null);
             caseAssessments.saved(saved.assessment);
             // The server wrote the timeline entry under the assessment's id.
             applyCaseEvent({ id: saved.assessment.id, caseId: record.id, kind: 'system', body: saved.eventBody, occurredAt: saved.assessment.assessedAt, actorId: activeUserId.toLowerCase() });
@@ -9722,6 +9753,25 @@ export default function App() {
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  // The family assessment, inside the case file's own native Modal like the
+  // level-of-care sheet. Rating the level of care from it opens that sheet
+  // with the family's answers (and an AI suggestion, when asked); closing it
+  // comes back here.
+  function FamilyAssessmentModal(record: CaseRecord) {
+    const primary = primaryContactByCase.get(record.id);
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setFamilyAssessmentCaseId(null)}>
+        <FamilyAssessmentSheet
+          caseId={record.id}
+          userId={activeUserId}
+          recipient={{ name: primary?.name || '', email: primary?.email || '' }}
+          onClose={() => setFamilyAssessmentCaseId(null)}
+          onRateLevel={(seed) => { setLevelOfCareSeed(seed); setAssessmentCaseId(record.id); }}
+        />
       </Modal>
     );
   }

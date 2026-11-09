@@ -6,16 +6,22 @@
 //   * an answer email and the morning summary carry counts only, never a
 //     client, family, caller, case or program name (like push);
 //   * the bed check-in names the program's own listing, to that program;
-//   * every email says why it was sent and links to a page that turns that
-//     email off without a sign-in, plus RFC 8058 one-click unsubscribe.
+//   * the family assessment invite (docs/FAMILY_ASSESSMENT.md) goes to the
+//     family a practitioner chose, in the practice's name, and says nothing
+//     about the client; the "submitted" email to the practitioner carries no
+//     name or answer;
+//   * every preference email says why it was sent and links to a page that
+//     turns that email off without a sign-in, plus RFC 8058 one-click
+//     unsubscribe.
 
 import { timingSafeEqual } from '../_shared/webhooks.ts';
 
 // Emails a person chooses (and can turn off from any of them).
 export type PreferenceKind = 'placement_response' | 'daily_summary' | 'bed_reminder';
 // Account emails a person asked for by acting (a claim request and its
-// answer): no preference, no unsubscribe link (20261108150000).
-export type AccountKind = 'claim_request' | 'claim_decision';
+// answer, a family assessment sent and finished): no preference, no
+// unsubscribe link (20261108150000, 20261109140000).
+export type AccountKind = 'claim_request' | 'claim_decision' | 'family_assessment_invite' | 'family_assessment_submitted';
 export type EmailKind = PreferenceKind | AccountKind;
 
 export const EMAIL_KINDS: PreferenceKind[] = ['placement_response', 'daily_summary', 'bed_reminder'];
@@ -37,6 +43,8 @@ export type Links = {
   portalUrl: string;
   // The dispatcher's own URL, for one-click unsubscribe (a POST from the mail client).
   functionUrl: string;
+  // The project URL, for a practice's logo in the public org-logos bucket.
+  storageUrl?: string;
 };
 
 export type RenderedEmail = {
@@ -118,6 +126,8 @@ export function unsubscribeLinks(row: OutboxRow, links: Links): { page: string; 
 }
 
 type Content = {
+  // A practice's own email (the family assessment invite): its name, and its logo when it has one.
+  brand?: { name: string; logoUrl: string | null };
   subject: string;
   preheader: string;
   heading: string;
@@ -130,8 +140,70 @@ type Content = {
   offLabel?: string;
 };
 
+const LOGO_PATH = /^[0-9a-f-]{36}\/logo-[0-9]{10,16}\.(png|jpg|webp)$/;
+const EMAIL_PATTERN = /^[^@\s"<>,;]+@[^@\s"<>,;]+\.[^@\s"<>,;]+$/;
+
+/** A practice's logo, from the public org-logos bucket, or null. */
+export function logoUrl(path: unknown, links: Links): string | null {
+  if (typeof path !== 'string' || !LOGO_PATH.test(path) || !links.storageUrl) return null;
+  return `${links.storageUrl.replace(/\/+$/, '')}/storage/v1/object/public/org-logos/${path}`;
+}
+
+/** "November 12, 2026" for an ISO date, or ''. */
+function longDate(iso: unknown): string {
+  if (typeof iso !== 'string') return '';
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return '';
+  return at.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'America/Los_Angeles' });
+}
+
 function content(row: OutboxRow, links: Links, now: Date): Content {
   const data = row.data || {};
+  if (row.kind === 'family_assessment_invite') {
+    const practice = plain(data.practice_name, 80) || 'Your practitioner';
+    const name = plain(data.recipient_name, 60).split(' ')[0];
+    const token = plain(data.link_token, 64);
+    if (!/^[0-9a-f]{64}$/.test(token)) throw new Error('family assessment invite without a link');
+    const until = longDate(data.expires_at);
+    return {
+      brand: { name: practice, logoUrl: logoUrl(data.logo_path, links) },
+      subject: `${practice}: your private family assessment`,
+      preheader: 'A private form to help plan care. Your answers save as you go.',
+      heading: `${practice} sent you a family assessment`,
+      paragraphs: [
+        name ? `Hi ${name},` : '',
+        `${practice} asked you to fill out a confidential assessment about your loved one. Your answers help them understand what is happening and find the right care.`,
+        'It takes about 30 to 45 minutes. Your answers save as you go, so you can stop and come back with this same link.',
+        'If anyone may be in danger right now, call 911. For a mental health crisis, call or text 988.',
+      ].filter(Boolean),
+      button: { label: 'Open the assessment', url: `${links.portalUrl}/f#${token}` },
+      afterButton: `This link is private to you${until ? ` and works until ${until}` : ''}. Please do not forward this email.`,
+      why: `You get this because ${practice} sent it to you through ReferralFit. Reply to this email to reach ${practice}.`,
+    };
+  }
+  if (row.kind === 'family_assessment_submitted') {
+    const urgent = data.urgent === true;
+    return urgent
+      ? {
+        subject: 'A family assessment needs your attention today',
+        preheader: 'Some answers mention safety concerns.',
+        heading: 'A family assessment needs your attention today',
+        paragraphs: [
+          'A family finished the assessment you sent, and some answers mention safety concerns. Open the case in ReferralFit and reach out today.',
+          'If someone may be in danger, call 911. For a mental health crisis, the family can call or text 988.',
+        ],
+        button: { label: 'Open ReferralFit', url: links.appUrl },
+        why: 'You get this because you sent a family assessment in ReferralFit. Names and answers never appear in email.',
+      }
+      : {
+        subject: 'A family finished their assessment',
+        preheader: 'Open the case to read the answers.',
+        heading: 'A family finished their assessment',
+        paragraphs: ['A family finished the assessment you sent. Open the case in ReferralFit to read the answers and rate the level of care.'],
+        button: { label: 'Open ReferralFit', url: links.appUrl },
+        why: 'You get this because you sent a family assessment in ReferralFit. Names and answers never appear in email.',
+      };
+  }
   if (row.kind === 'placement_response') {
     const asked = count(data.asked);
     const answered = count(data.answered);
@@ -263,7 +335,11 @@ function html(c: Content, offUrl: string | null): string {
     + `<div style="display:none;max-height:0;overflow:hidden;opacity:0">${escapeHtml(c.preheader)}</div>`
     + `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#EDF4EF"><tr><td align="center" style="padding:28px 16px">`
     + `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#FFFFFF;border-radius:14px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif">`
-    + `<tr><td style="padding:28px 28px 8px;font-size:15px;font-weight:800;color:${GREEN}">ReferralFit</td></tr>`
+    + (c.brand
+      ? `<tr><td style="padding:28px 28px 8px;font-size:17px;font-weight:800;color:${INK}">${
+        c.brand.logoUrl ? `<img src="${escapeHtml(c.brand.logoUrl)}" alt="" height="48" style="display:block;height:48px;max-width:220px;margin:0 0 10px;border:0">` : ''
+      }${escapeHtml(c.brand.name)}</td></tr>`
+      : `<tr><td style="padding:28px 28px 8px;font-size:15px;font-weight:800;color:${GREEN}">ReferralFit</td></tr>`)
     + `<tr><td style="padding:8px 28px 28px">`
     + `<h1 style="margin:0 0 14px;font-size:22px;line-height:1.3;color:${INK}">${escapeHtml(c.heading)}</h1>`
     + paragraphs + bullets
@@ -274,6 +350,7 @@ function html(c: Content, offUrl: string | null): string {
     + `</td></tr>`
     + `<tr><td style="padding:18px 28px 26px;border-top:1px solid #DDE4DF;font-size:13px;line-height:1.5;color:${SOFT}">${escapeHtml(c.why)}<br>`
     + (offUrl && c.offLabel ? `<a href="${escapeHtml(offUrl)}" style="color:${GREEN}">${escapeHtml(c.offLabel)}</a> &middot; ` : '')
+    + (c.brand ? `Sent for ${escapeHtml(c.brand.name)} by ` : '')
     + `<a href="https://referralfit.com" style="color:${GREEN}">referralfit.com</a></td></tr>`
     + `</table></td></tr></table></body></html>`;
 }
@@ -323,6 +400,24 @@ export async function idempotencyKey(row: OutboxRow, from: string, replyTo: stri
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(basis)));
   const hex = Array.from(digest.slice(0, 8), (byte) => byte.toString(16).padStart(2, '0')).join('');
   return `${row.id}-${hex}`;
+}
+
+/**
+ * Who an email is from and where replies go. A practice's own email (the
+ * family assessment invite) is from "<practice> via ReferralFit" at the
+ * same address, and replies go to the practitioner who sent it. Anything
+ * unusable falls back to the defaults, so one row's sender can never stop
+ * the queue.
+ */
+export function senderFor(row: OutboxRow, from: string, replyTo: string | undefined): { from: string; replyTo?: string } {
+  if (row.kind !== 'family_assessment_invite') return { from, replyTo };
+  const address = /<([^<>]+)>\s*$/.exec(from)?.[1] || from;
+  const practice = plain(row.data?.practice_name, 60).replace(/[^A-Za-z0-9 .&'-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const reply = typeof row.data?.reply_to === 'string' ? row.data.reply_to.trim().toLowerCase() : '';
+  return {
+    from: practice ? `${practice} via ReferralFit <${address}>` : from,
+    replyTo: EMAIL_PATTERN.test(reply) && reply.length <= 254 ? reply : replyTo,
+  };
 }
 
 /** The request body for Resend's POST /emails. */

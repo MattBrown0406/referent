@@ -4,6 +4,10 @@
 //   * explain_matches: the family's "why these programs", rewritten in
 //     warmer words from the app's own ranking (explain.ts). It explains the
 //     order; it cannot change it.
+//   * level_of_care: a suggested rating for each of the six level-of-care
+//     areas from a family assessment's answers, sent without names or
+//     contact details (level.ts). The practitioner confirms every rating;
+//     the app's own rules recommend the level.
 //
 // Bring your own key, exactly like AI drafts (draft-follow-up) and day
 // review: the user's Anthropic key arrives in the request body
@@ -30,6 +34,7 @@ import {
   parseExplainOutput,
   parseExplainRequest,
 } from './explain.ts';
+import { buildLevelPrompt, LEVEL_SYSTEM_PROMPT, levelSchema, parseLevelOutput, parseLevelRequest } from './level.ts';
 
 // The same model as AI drafts and day review.
 const MODEL = 'claude-opus-5-5';
@@ -54,6 +59,15 @@ const ACTIONS: Record<string, Action> = {
     parse: (body) => {
       const request = parseExplainRequest(body);
       return { prompt: buildExplainPrompt(request), schema: explainSchema(), check: (raw) => parseExplainOutput(raw, request) };
+    },
+  },
+  level_of_care: {
+    kind: 'level_of_care',
+    system: LEVEL_SYSTEM_PROMPT,
+    maxTokens: 8000,
+    parse: (body) => {
+      const request = parseLevelRequest(body);
+      return { prompt: buildLevelPrompt(request), schema: levelSchema(), check: (raw) => ({ ratings: parseLevelOutput(raw, request) }) };
     },
   },
 };

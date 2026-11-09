@@ -1312,7 +1312,7 @@ export function newUuid(): string {
 // expo-file-system File API isn't needed for a straight upload) and upload to
 // the PRIVATE bucket. Never uses public URLs. Web fallback: fetch the blob
 // URL the picker returns and read it as base64 (no FileSystem on web).
-async function readAsBase64(localUri: string): Promise<string> {
+export async function readAsBase64(localUri: string): Promise<string> {
   if (localUri.startsWith('blob:') || localUri.startsWith('data:')) {
     const response = await fetch(localUri);
     const buffer = await response.arrayBuffer();
