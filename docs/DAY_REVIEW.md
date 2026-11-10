@@ -105,8 +105,11 @@ OAuth (`src/lib/fieldy.ts` has both; `src/lib/fieldy-api.ts` the calls).
   minutes) it counts new recordings in each connected recorder, never
   reviewing them. Today shows "From your day: N new Fieldy conversations
   (or Plaud recordings) to review"; one tap opens the review and reads the
-  one with the most waiting. While some wait, one local reminder: "Your
-  recorded conversations are ready to review." (no names). It is sent at
+  one with the most waiting. While some wait, a local reminder, at most one
+  a day: "Your recorded conversations are ready to review." (no names). The
+  count drops on the phone as soon as recordings are marked reviewed, and
+  goes to none when the Anthropic key is removed, so no reminder is left
+  behind for recordings already dealt with. It is sent at
   6 PM unless the user picks another time, or turns it off, on the review
   screen (the REMINDER card, shown once a recorder is connected: Earlier and
   Later move it half an hour; Turn off). The choice is kept on the phone per

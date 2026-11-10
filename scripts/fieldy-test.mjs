@@ -330,7 +330,17 @@ check(() => {
   assert.match(app, /const key = await getAnthropicKey\(userId\)/, 'without a key nothing is counted, so no card and no reminder');
   assert.match(app, /counts\[index\] \?\? previous\[recorder\.id\]/, 'a count that could not be read keeps the last one');
   assert.match(app, /generation !== fieldyCountGenerationRef\.current\) return;/, 'a stale count never replaces a newer one');
-  assert.match(app, /if \(target === 'day_review'\)/, 'the 6 PM reminder opens the review');
+  assert.match(app, /if \(target === 'day_review'\)/, 'the day review reminder opens the review');
+  // The reminder never outlives what it is about.
+  assert.ok(app.indexOf('await loadDayReviewReminder(userId);') > 0 && app.indexOf('await loadDayReviewReminder(userId);') < app.indexOf('await activateReferralFitNotificationOwner(userId);'), 'the picked time (or "off") is loaded before the account can schedule');
+  assert.match(app, /if \(reviewed\) lowerRecordingsWaiting\(reviewed\.recorder, reviewed\.count\);\s+void refreshFieldyWaiting\(true\);/, 'recordings marked reviewed lower the count at once; the recount only confirms');
+  assert.match(app, /onAnthropicKeyChange\(\(userId\) => \{ if \(userId === activeUserIdRef\.current\) void refreshFieldyWaiting\(true\); \}\)/, 'the key removed or added: counted again at once');
+  assert.match(sheet, /\.then\(\(count\) => onRecordersChanged\?\.\(\{ recorder: recorder\.id, count \}\)\)/, 'the review says how many it marked');
+  assert.equal((sheet.match(/markRecordingsReviewed\(/g) || []).length, 1, 'every mark goes through markReviewed');
+  const api = read('src/lib/fieldy-api.ts');
+  assert.match(api, /if \(!state\.reviewed\[id\]\) marked \+= 1;/, 'only recordings not marked before are counted');
+  const keys = read('src/lib/outreach-api.ts');
+  assert.equal((keys.match(/keyChanged\(userId\);/g) || []).length, 2, 'saving and removing the key both tell listeners');
 }, 'the review and the app');
 
 console.log(`fieldy-test: ${checks} checks passed`);

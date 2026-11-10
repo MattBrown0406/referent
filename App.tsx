@@ -86,7 +86,7 @@ import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
 import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
 import type { LevelOfCareSeed } from './src/lib/LevelOfCareSheet';
 import { countNewRecordings, fieldySupported, RECORDERS, type RecorderId } from './src/lib/fieldy-api';
-import { aiKeysSupported, getAnthropicKey } from './src/lib/outreach-api';
+import { aiKeysSupported, getAnthropicKey, onAnthropicKeyChange } from './src/lib/outreach-api';
 import {
   caseRecipients,
   caseTarget,
@@ -1406,6 +1406,18 @@ export default function App() {
     setRecordingsWaiting(next);
     void setDayReviewWaiting(RECORDERS.reduce((sum, recorder) => sum + next[recorder.id], 0), userId).catch(() => undefined);
   }, []);
+  // Recordings just marked reviewed on this phone: the count (and with it the
+  // reminder) drops at once. The recount that follows only confirms it, and
+  // may fail or never answer.
+  const lowerRecordingsWaiting = useCallback((recorder: RecorderId, reviewed: number) => {
+    const userId = activeUserIdRef.current;
+    if (!userId || reviewed <= 0 || recordingsWaitingRef.current.userId !== userId) return;
+    const counts = { ...recordingsWaitingRef.current.counts };
+    counts[recorder] = Math.max(0, counts[recorder] - reviewed);
+    recordingsWaitingRef.current = { userId, counts };
+    setRecordingsWaiting(counts);
+    void setDayReviewWaiting(RECORDERS.reduce((sum, item) => sum + counts[item.id], 0), userId).catch(() => undefined);
+  }, []);
   const fieldyWaiting = recordingsWaiting.fieldy + recordingsWaiting.plaud;
   const waitingRecorderRef = useRef<RecorderId | null>(null);
   // The recorder a "From your day" tap reads first: the one with the most waiting.
@@ -1422,7 +1434,10 @@ export default function App() {
     if (!activeUserId) return undefined;
     void refreshFieldyWaiting(true);
     const subscription = AppState.addEventListener('change', (state) => { if (state === 'active') void refreshFieldyWaiting(); });
-    return () => subscription.remove();
+    // The key added or removed: with none nothing can be reviewed, so the
+    // card and the reminder go at once (and come back with a key).
+    const unsubscribeKey = onAnthropicKeyChange((userId) => { if (userId === activeUserIdRef.current) void refreshFieldyWaiting(true); });
+    return () => { subscription.remove(); unsubscribeKey(); };
   }, [activeUserId, refreshFieldyWaiting]);
   const businessLoadGenerationRef = useRef(0);
   const caseLoadGenerationRef = useRef(0);
@@ -2035,6 +2050,11 @@ export default function App() {
         await bindLocalWorkspace(userId, orgId);
         if (!active || generation !== authGenerationRef.current) return;
         activeOrgIdRef.current = orgId;
+        // The time this account picked for the day review reminder (or
+        // "off"), before its schedule can be made: a save during the rest of
+        // launch already schedules.
+        await loadDayReviewReminder(userId);
+        if (!active || generation !== authGenerationRef.current) return;
         await activateReferralFitNotificationOwner(userId);
         if (!active || generation !== authGenerationRef.current) return;
 
@@ -2185,10 +2205,6 @@ export default function App() {
         notifPromptDeferredRef.current = false;
         if (showWelcome) whenScreenClear(() => setWelcomeVisible(true));
 
-        // The time this account picked for the day review reminder, before
-        // the first schedule is made.
-        await loadDayReviewReminder(userId);
-        if (!active || generation !== authGenerationRef.current) return;
         const permission = await getNotificationPermissionState();
         if (!active || generation !== authGenerationRef.current) return;
         setNotificationPermissionState(permission);
@@ -10386,7 +10402,10 @@ export default function App() {
         onClose={() => { setShowDayReview(false); setDayReviewRecorder(null); }}
         onSaved={() => refreshAfterServerChange()}
         startWithRecorder={dayReviewRecorder}
-        onRecordersChanged={() => { void refreshFieldyWaiting(true); }}
+        onRecordersChanged={(reviewed) => {
+          if (reviewed) lowerRecordingsWaiting(reviewed.recorder, reviewed.count);
+          void refreshFieldyWaiting(true);
+        }}
       />
       <PartnerImportSheet
         visible={showPartnerImport}

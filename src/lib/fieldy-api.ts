@@ -603,17 +603,25 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
   return { ...plan, later: plan.later + (fresh.length - read.length), recorder };
 }
 
-/** These recordings are done: their items were saved or set aside, or there was nothing in them. */
-export async function markRecordingsReviewed(recorder: Recorder, userId: string, ids: string[]): Promise<void> {
-  if (!ids.length) return;
+/**
+ * These recordings are done: their items were saved or set aside, or there was
+ * nothing in them. Answers how many were not marked before, so the count of
+ * recordings waiting can drop at once, without asking the recorder again.
+ */
+export async function markRecordingsReviewed(recorder: Recorder, userId: string, ids: string[]): Promise<number> {
+  if (!ids.length) return 0;
   const at = new Date().toISOString();
+  let marked = 0;
   await changeState(recorder, userId, (state) => {
-    for (const id of ids) {
+    marked = 0;
+    for (const id of new Set(ids)) {
+      if (!state.reviewed[id]) marked += 1;
       state.reviewed[id] = at;
       delete state.failing[id];
       delete state.saved[id];
     }
   });
+  return marked;
 }
 
 /** Fingerprints of items saved from these recordings, kept until each is reviewed. */

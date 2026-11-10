@@ -7,6 +7,7 @@
 import * as Clipboard from 'expo-clipboard';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AppState,
   ActivityIndicator,
   Alert,
   KeyboardAvoidingView,
@@ -110,8 +111,12 @@ type Props = {
   onSaved: () => void;
   /** Opened from "From your day" (the Today card or the evening reminder): read this recorder at once. */
   startWithRecorder?: RecorderId | null;
-  /** A recorder was read, connected or disconnected: the Today card counts again. */
-  onRecordersChanged?: () => void;
+  /**
+   * A recorder was read, connected or disconnected: the Today card counts
+   * again. With `reviewed`, that many of the recorder's recordings were just
+   * marked done: the count drops by them at once, before the recount answers.
+   */
+  onRecordersChanged?: (reviewed?: { recorder: RecorderId; count: number }) => void;
 };
 
 type Phase = 'paste' | 'finding' | 'review' | 'saving' | 'done';
@@ -211,7 +216,6 @@ export default function DayReviewSheet({
     const opening = openingRef.current;
     setRecorders(RECORDERS_CHECKING);
     void reminderSaveRef.current.then(() => loadDayReviewReminder(userId)).then((time) => { if (opening === openingRef.current) setReminder(time); });
-    void getNotificationPermissionState().then((permission) => { if (opening === openingRef.current) setRemindersAllowed(permission === 'authorized'); });
     void Promise.all([getAnthropicKey(userId), ...RECORDERS.map((recorder) => recorderStatus(recorder, userId))]).then(([key, ...statuses]) => {
       if (opening !== openingRef.current) return;
       setKeyState(key ? 'ready' : 'missing');
@@ -283,11 +287,19 @@ export default function DayReviewSheet({
       .filter((id) => current.filter((row) => (read.rowIds.get(row.key) ?? []).includes(id)).every((row) => rowDecided(row, results)));
   }
 
+  // Marked on this phone first; the Today card and the reminder drop by
+  // that many at once (a recount may fail, or never come back).
+  function markReviewed(recorder: Recorder, ids: string[]) {
+    void markRecordingsReviewed(recorder, userId, ids)
+      .then((count) => onRecordersChanged?.({ recorder: recorder.id, count }))
+      .catch(() => undefined);
+  }
+
   function settleRecordings(results: Record<string, SaveResult>, current: ReviewRow[]) {
     const read = recorderReadRef.current;
     if (!read || !current.length) return;
     const done = recordingsDone(results, current);
-    if (done.length) void markRecordingsReviewed(read.recorder, userId, done).then(() => onRecordersChanged?.());
+    if (done.length) markReviewed(read.recorder, done);
   }
 
   function finish(hold = false) {
@@ -322,7 +334,7 @@ export default function DayReviewSheet({
           {
             text: `Done with ${undecided === 1 ? 'it' : 'them'}`,
             onPress: () => {
-              void markRecordingsReviewed(read.recorder, userId, read.blocks.map((block) => block.id)).then(() => onRecordersChanged?.());
+              markReviewed(read.recorder, read.blocks.map((block) => block.id));
               finish();
             },
           },
@@ -408,7 +420,7 @@ export default function DayReviewSheet({
         const withRows = new Set([...rowIds.values()].flat());
         const unmatched = [...rowIds.values()].some((ids) => !ids.length);
         const done = (unmatched ? [] : fromRecorder.blocks.map((block) => block.id).filter((id) => !withRows.has(id))).concat(skipped);
-        if (done.length) void markRecordingsReviewed(fromRecorder.recorder, userId, done).then(() => onRecordersChanged?.());
+        if (done.length) markReviewed(fromRecorder.recorder, done);
       }
       if (!items.length) {
         setMessage({
@@ -429,6 +441,17 @@ export default function DayReviewSheet({
   }
 
   // ─── The reminder's time ────────────────────────────────────────────────
+
+  // Whether this phone lets ReferralFit send it: asked as the sheet opens and
+  // each time the app comes back (from Settings, where it is turned on).
+  useEffect(() => {
+    if (!visible) return undefined;
+    let current = true;
+    const check = () => { void getNotificationPermissionState().then((permission) => { if (current) setRemindersAllowed(permission === 'authorized'); }); };
+    check();
+    const subscription = AppState.addEventListener('change', (state) => { if (state === 'active') check(); });
+    return () => { current = false; subscription.remove(); };
+  }, [visible]);
 
   function changeReminder(next: string) {
     const opening = openingRef.current;
@@ -504,7 +527,7 @@ export default function DayReviewSheet({
     if (opening !== openingRef.current) return;
     if (!read.blocks.length) {
       setPhase('paste');
-      if (read.skipped.length) void markRecordingsReviewed(recorder, userId, read.skipped).then(() => onRecordersChanged?.());
+      if (read.skipped.length) markReviewed(recorder, read.skipped);
       if (otherwise && !read.later) { await readRecorder(otherwise, opening); return; }
       setMessage({
         ok: true,
@@ -544,7 +567,7 @@ export default function DayReviewSheet({
       {
         text: 'Done with them',
         onPress: () => {
-          void markRecordingsReviewed(recorder, userId, blocks.map((block) => block.id)).then(() => onRecordersChanged?.());
+          markReviewed(recorder, blocks.map((block) => block.id));
           finish();
         },
       },
@@ -970,7 +993,7 @@ export default function DayReviewSheet({
           <Text style={styles.hint}>
             {reminder === DAY_REVIEW_REMINDER_OFF
               ? 'No reminder. New recordings still show on Today when you open ReferralFit.'
-              : `While recordings wait for your review, ReferralFit reminds you once, at ${dayReviewReminderLabel(reminder)}.`}
+              : `While recordings wait for your review, ReferralFit reminds you at ${dayReviewReminderLabel(reminder)}.`}
           </Text>
           {reminder !== DAY_REVIEW_REMINDER_OFF && !remindersAllowed ? (
             <Text style={styles.problem}>Notifications are off for ReferralFit on this phone, so no reminder is sent.</Text>
