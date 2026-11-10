@@ -253,30 +253,87 @@ function isScheduleCurrent(generation: number, ownerId: string): boolean {
 let lastAppliedSchedule: { ownerId: string; signature: string } | null = null;
 
 // New Fieldy or Plaud recordings waiting for the day review (src/lib/fieldy-api.ts
-// countNewRecordings): one reminder at 6 PM, only while some wait. Kept per
-// account: a count that arrives before the account's schedule is active is
-// still there when it is, and one account's count never shows for another.
+// countNewRecordings): one reminder at the time the user picked (6 PM unless
+// changed, or none when turned off), only while some wait. Kept per account:
+// a count or a time that arrives before the account's schedule is active is
+// still there when it is, and one account's never shows for another.
 const dayReviewWaiting = new Map<string, number>();
+const dayReviewTimes = new Map<string, string>();
 let lastInput: NotificationInput | null = null;
-const DAY_REVIEW_HOUR = 18;
 
-/** How many recordings wait for review; the 6 PM reminder follows it. */
-export function setDayReviewWaiting(count: number, ownerId: string): Promise<void> {
-  if (!ownerId) return Promise.resolve();
-  const next = Math.max(0, Math.floor(count) || 0);
-  if (next === (dayReviewWaiting.get(ownerId) ?? 0)) return Promise.resolve();
-  dayReviewWaiting.set(ownerId, next);
+/** The day review reminder's time when the user has not picked one. */
+export const DAY_REVIEW_DEFAULT_TIME = '18:00';
+/** The stored value for "no reminder". */
+export const DAY_REVIEW_REMINDER_OFF = 'off';
+const DAY_REVIEW_STEP_MINUTES = 30;
+
+/** A stored reminder time made safe: 'off', or HH:MM on a half hour; anything else is 6 PM. */
+export function dayReviewReminderTime(value: unknown): string {
+  if (value === DAY_REVIEW_REMINDER_OFF) return DAY_REVIEW_REMINDER_OFF;
+  const match = typeof value === 'string' ? /^(\d{2}):(\d{2})$/.exec(value) : null;
+  if (!match) return DAY_REVIEW_DEFAULT_TIME;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59 || minute % DAY_REVIEW_STEP_MINUTES !== 0) return DAY_REVIEW_DEFAULT_TIME;
+  return value as string;
+}
+
+/** Half an hour earlier (-1) or later (+1), around the clock. */
+export function stepDayReviewReminderTime(time: string, direction: 1 | -1): string {
+  const safe = dayReviewReminderTime(time);
+  const [hour, minute] = (safe === DAY_REVIEW_REMINDER_OFF ? DAY_REVIEW_DEFAULT_TIME : safe).split(':').map(Number);
+  const day = 24 * 60;
+  const next = (((hour * 60 + minute + direction * DAY_REVIEW_STEP_MINUTES) % day) + day) % day;
+  return `${String(Math.floor(next / 60)).padStart(2, '0')}:${String(next % 60).padStart(2, '0')}`;
+}
+
+/** "6:00 PM" for a stored time; '' when the reminder is off. */
+export function dayReviewReminderLabel(time: string): string {
+  const safe = dayReviewReminderTime(time);
+  return safe === DAY_REVIEW_REMINDER_OFF ? '' : clockLabel(safe);
+}
+
+function rescheduleFor(ownerId: string): Promise<void> {
   if (!lastInput || ownerId !== scheduleOwnerId) return Promise.resolve();
   const input = lastInput;
   const generation = ++scheduleGeneration;
   return queueScheduleWork(() => replaceSchedule(input, generation, ownerId));
 }
 
-/** The 6 PM day review reminder for today, or null (nothing waits, or it is past 6 PM). */
-export function dayReviewReminderAt(waiting: number, now = new Date()): Date | null {
+/** How many recordings wait for review; the day review reminder follows it. */
+export function setDayReviewWaiting(count: number, ownerId: string): Promise<void> {
+  if (!ownerId) return Promise.resolve();
+  const next = Math.max(0, Math.floor(count) || 0);
+  if (next === (dayReviewWaiting.get(ownerId) ?? 0)) return Promise.resolve();
+  dayReviewWaiting.set(ownerId, next);
+  return rescheduleFor(ownerId);
+}
+
+/** The time this account picked for the day review reminder ('off' for none); the reminder moves at once. */
+export function setDayReviewReminderTime(time: string, ownerId: string): Promise<void> {
+  if (!ownerId) return Promise.resolve();
+  const next = dayReviewReminderTime(time);
+  if (next === (dayReviewTimes.get(ownerId) ?? DAY_REVIEW_DEFAULT_TIME)) return Promise.resolve();
+  dayReviewTimes.set(ownerId, next);
+  return rescheduleFor(ownerId);
+}
+
+/**
+ * When the day review reminder is next due, or null (nothing waits, or it is
+ * turned off): today at the chosen time, or tomorrow when that has passed.
+ * Recordings are only counted while the app is open, so a time already past
+ * today (a morning time, or the app opened in the evening) waits for its
+ * next turn rather than never being sent.
+ */
+export function dayReviewReminderAt(waiting: number, now = new Date(), time = DAY_REVIEW_DEFAULT_TIME): Date | null {
   if (waiting <= 0) return null;
-  const at = new Date(now.getFullYear(), now.getMonth(), now.getDate(), DAY_REVIEW_HOUR, 0, 0);
-  return at.getTime() > now.getTime() + 60_000 ? at : null;
+  const safe = dayReviewReminderTime(time);
+  if (safe === DAY_REVIEW_REMINDER_OFF) return null;
+  const [hour, minute] = safe.split(':').map(Number);
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0);
+  if (today.getTime() > now.getTime() + 60_000) return today;
+  // The Date constructor keeps the wall-clock time across a clock change.
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, hour, minute, 0);
 }
 
 async function replaceSchedule(input: NotificationInput, generation: number, ownerId: string): Promise<void> {
@@ -307,11 +364,11 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   const now = new Date();
 
   // Generic words on the lock screen: never a name or what was said.
-  const reviewAt = dayReviewReminderAt(dayReviewWaiting.get(ownerId) ?? 0, now);
+  const reviewAt = dayReviewReminderAt(dayReviewWaiting.get(ownerId) ?? 0, now, dayReviewTimes.get(ownerId) ?? DAY_REVIEW_DEFAULT_TIME);
   if (reviewAt && remaining > 0 && plan({
     content: {
       title: 'ReferralFit',
-      body: 'Your recorded conversations from today are ready to review.',
+      body: 'Your recorded conversations are ready to review.',
       data: { target: 'day_review', ownerId },
       ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
     },
@@ -505,6 +562,7 @@ export function rescheduleNotifications(input: NotificationInput, ownerId: strin
 export function cancelReferralFitNotifications(): Promise<void> {
   scheduleOwnerId = null;
   dayReviewWaiting.clear();
+  dayReviewTimes.clear();
   lastInput = null;
   ++scheduleGeneration;
   return queueScheduleWork(clearSystemNotifications);

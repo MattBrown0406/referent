@@ -64,6 +64,8 @@ import {
   rememberSaved,
   savedFrom,
 } from './fieldy-api';
+import { loadDayReviewReminder, saveDayReviewReminder } from './day-review-reminder';
+import { DAY_REVIEW_DEFAULT_TIME, DAY_REVIEW_REMINDER_OFF, dayReviewReminderLabel, getNotificationPermissionState, stepDayReviewReminderTime } from './notifications';
 import { licenseConcernAlert, licenseOverrideNote, type LicenseConcern } from './integrity';
 import { aiKeysSupported, getAnthropicKey } from './outreach-api';
 import { directoryIndex, IMPORT_TYPES, type DirectoryIndex, type ImportType } from './partner-import';
@@ -161,6 +163,13 @@ export default function DayReviewSheet({
   // review was read from (committed as read once something from them is
   // saved, or nothing was found).
   const [recorders, setRecorders] = useState<Record<RecorderId, RecorderState>>(RECORDERS_CHECKING);
+  // The day review reminder: the time this account picked ('off' for none),
+  // and whether this phone lets ReferralFit send one at all.
+  const [reminder, setReminder] = useState(DAY_REVIEW_DEFAULT_TIME);
+  const [remindersAllowed, setRemindersAllowed] = useState(true);
+  // One save at a time, in the order tapped: the last tap is the one kept.
+  const reminderSaveRef = useRef<Promise<unknown>>(Promise.resolve());
+  const reminderChangeRef = useRef(0);
   // The recordings this review was read from, which recording each row came
   // from, and those skipped for having no text.
   const recorderReadRef = useRef<{ recorder: Recorder; text: string; blocks: FieldyBlock[]; rowIds: Map<string, string[]>; skipped: string[] } | null>(null);
@@ -201,6 +210,8 @@ export default function DayReviewSheet({
     setKeyState('checking');
     const opening = openingRef.current;
     setRecorders(RECORDERS_CHECKING);
+    void reminderSaveRef.current.then(() => loadDayReviewReminder(userId)).then((time) => { if (opening === openingRef.current) setReminder(time); });
+    void getNotificationPermissionState().then((permission) => { if (opening === openingRef.current) setRemindersAllowed(permission === 'authorized'); });
     void Promise.all([getAnthropicKey(userId), ...RECORDERS.map((recorder) => recorderStatus(recorder, userId))]).then(([key, ...statuses]) => {
       if (opening !== openingRef.current) return;
       setKeyState(key ? 'ready' : 'missing');
@@ -415,6 +426,24 @@ export default function DayReviewSheet({
       setMessage({ ok: false, text: error instanceof Error ? error.message : 'Review is unavailable right now.' });
       setPhase('paste');
     }
+  }
+
+  // ─── The reminder's time ────────────────────────────────────────────────
+
+  function changeReminder(next: string) {
+    const opening = openingRef.current;
+    const change = ++reminderChangeRef.current;
+    setReminder(next);
+    reminderSaveRef.current = reminderSaveRef.current
+      .then(() => saveDayReviewReminder(userId, next))
+      .catch(async () => {
+        // Not saved: show what is really stored, and say so (unless a later
+        // tap is still being saved; its own result is the one shown).
+        const stored = await loadDayReviewReminder(userId);
+        if (opening !== openingRef.current || change !== reminderChangeRef.current) return;
+        setReminder(stored);
+        setMessage({ ok: false, text: 'The reminder time could not be saved on this phone. Try again.' });
+      });
   }
 
   // ─── Recorders (Fieldy, Plaud) ───────────────────────────────────────────
@@ -935,6 +964,38 @@ export default function DayReviewSheet({
           </View>
         );
       }) : null}
+      {fieldySupported && !keyMissing && RECORDERS.some((recorder) => recorders[recorder.id].state === 'on') ? (
+        <View style={styles.fieldyCard}>
+          <Text style={styles.label}>REMINDER</Text>
+          <Text style={styles.hint}>
+            {reminder === DAY_REVIEW_REMINDER_OFF
+              ? 'No reminder. New recordings still show on Today when you open ReferralFit.'
+              : `While recordings wait for your review, ReferralFit reminds you once, at ${dayReviewReminderLabel(reminder)}.`}
+          </Text>
+          {reminder !== DAY_REVIEW_REMINDER_OFF && !remindersAllowed ? (
+            <Text style={styles.problem}>Notifications are off for ReferralFit on this phone, so no reminder is sent.</Text>
+          ) : null}
+          <View style={styles.reminderRow}>
+            {reminder === DAY_REVIEW_REMINDER_OFF ? (
+              <TouchableOpacity accessibilityRole="button" onPress={() => changeReminder(DAY_REVIEW_DEFAULT_TIME)} style={styles.secondaryButton}>
+                <Text style={styles.secondaryButtonText}>Turn on the reminder</Text>
+              </TouchableOpacity>
+            ) : (
+              <>
+                <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Remind me earlier, at ${dayReviewReminderLabel(stepDayReviewReminderTime(reminder, -1))}`} onPress={() => changeReminder(stepDayReviewReminderTime(reminder, -1))} style={styles.secondaryButton}>
+                  <Text style={styles.secondaryButtonText}>Earlier</Text>
+                </TouchableOpacity>
+                <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Remind me later, at ${dayReviewReminderLabel(stepDayReviewReminderTime(reminder, 1))}`} onPress={() => changeReminder(stepDayReviewReminderTime(reminder, 1))} style={styles.secondaryButton}>
+                  <Text style={styles.secondaryButtonText}>Later</Text>
+                </TouchableOpacity>
+                <TouchableOpacity accessibilityRole="button" accessibilityLabel="Turn off the reminder" onPress={() => changeReminder(DAY_REVIEW_REMINDER_OFF)} style={styles.secondaryButton}>
+                  <Text style={styles.secondaryButtonText}>Turn off</Text>
+                </TouchableOpacity>
+              </>
+            )}
+          </View>
+        </View>
+      ) : null}
       {keyMissing ? (
         <View style={styles.notice} accessibilityRole="alert">
           <Text style={styles.noticeText}>
@@ -1060,6 +1121,7 @@ const styles = StyleSheet.create({
   hint: { fontSize: 12, lineHeight: 17, color: COLORS.muted, marginTop: 4 },
   label: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, color: COLORS.muted, marginTop: 14, marginBottom: 8 },
   sourceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
+  reminderRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
   notice: { backgroundColor: COLORS.coralPale, borderRadius: 12, padding: 12, marginTop: 12 },
   fieldyCard: { backgroundColor: COLORS.white, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, padding: 14, marginTop: 12, gap: 8 },
   textButton: { paddingVertical: 8, alignItems: 'center' },

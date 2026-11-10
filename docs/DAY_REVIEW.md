@@ -105,8 +105,14 @@ OAuth (`src/lib/fieldy.ts` has both; `src/lib/fieldy-api.ts` the calls).
   minutes) it counts new recordings in each connected recorder, never
   reviewing them. Today shows "From your day: N new Fieldy conversations
   (or Plaud recordings) to review"; one tap opens the review and reads the
-  one with the most waiting. While some wait, one local reminder at 6 PM:
-  "Your recorded conversations from today are ready to review." (no names).
+  one with the most waiting. While some wait, one local reminder: "Your
+  recorded conversations are ready to review." (no names). It is sent at
+  6 PM unless the user picks another time, or turns it off, on the review
+  screen (the REMINDER card, shown once a recorder is connected: Earlier and
+  Later move it half an hour; Turn off). The choice is kept on the phone per
+  account (`src/lib/day-review-reminder.ts`). The reminder is set for the
+  next time that hour comes round: today, or tomorrow when it has already
+  passed, because recordings are only counted while the app is open.
   Background refresh while the app is closed is not built yet.
 
 ## What the AI finds, and what approving does
@@ -196,10 +202,11 @@ queue, and is labeled with its source ("From Fieldy, 2:15 PM").
   items become ordinary workspace data. Which conversations were already
   read is kept as ids only, no content.
 - **Before release:**
-  - a new section in the privacy policy ("Conversation recorders and notes
-    you share");
-  - a line in the App Review notes;
-  - a check of the App Privacy answers in App Store Connect.
+  - a new section in the privacy policy: written 2026-11-10 ("Conversation
+    recorders (Fieldy and Plaud)", referralfit-web branch feat/day-review);
+  - the App Review notes: written 2026-11-10 (`APP_REVIEW.md`, section 3a);
+  - a check of the App Privacy answers in App Store Connect (Matt;
+    `APP_REVIEW.md`, section 3a).
 
 ## Model and cost
 

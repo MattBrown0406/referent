@@ -81,6 +81,7 @@ import BusinessDashboard from './src/lib/BusinessDashboard';
 import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
 import OutreachSheet, { type OutreachSent, type OutreachSheetRequest } from './src/lib/OutreachSheet';
 import DayReviewSheet from './src/lib/DayReviewSheet';
+import { loadDayReviewReminder } from './src/lib/day-review-reminder';
 import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
 import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
 import type { LevelOfCareSeed } from './src/lib/LevelOfCareSheet';
@@ -1380,7 +1381,7 @@ export default function App() {
   const activeOrgIdRef = useRef('');
   // Recorders connected: new recordings are counted when the app opens and
   // comes back (at most every 15 minutes), on this phone, straight from each
-  // recorder; the Today card and the 6 PM reminder follow the count.
+  // recorder; the Today card and the day review reminder follow the count.
   const fieldyCountRef = useRef({ at: 0, userId: '' });
   const fieldyCountGenerationRef = useRef(0);
   const recordingsWaitingRef = useRef<{ userId: string; counts: Record<RecorderId, number> }>({ userId: '', counts: { fieldy: 0, plaud: 0 } });
@@ -2184,6 +2185,10 @@ export default function App() {
         notifPromptDeferredRef.current = false;
         if (showWelcome) whenScreenClear(() => setWelcomeVisible(true));
 
+        // The time this account picked for the day review reminder, before
+        // the first schedule is made.
+        await loadDayReviewReminder(userId);
+        if (!active || generation !== authGenerationRef.current) return;
         const permission = await getNotificationPermissionState();
         if (!active || generation !== authGenerationRef.current) return;
         setNotificationPermissionState(permission);
@@ -2536,7 +2541,7 @@ export default function App() {
           return;
         }
         if (target === 'day_review') {
-          // The 6 PM reminder: the review opens and reads the recorder with the most waiting.
+          // The day review reminder: the review opens and reads the recorder with the most waiting.
           setTab('home');
           setDayReviewRecorder(waitingRecorderRef.current ?? 'fieldy');
           setShowDayReview(true);
