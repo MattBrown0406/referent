@@ -80,6 +80,13 @@ import LoginScreen from './src/lib/LoginScreen';
 import BusinessDashboard from './src/lib/BusinessDashboard';
 import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
 import OutreachSheet, { type OutreachSent, type OutreachSheetRequest } from './src/lib/OutreachSheet';
+import DayReviewSheet from './src/lib/DayReviewSheet';
+import { loadDayReviewReminder } from './src/lib/day-review-reminder';
+import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
+import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
+import type { LevelOfCareSeed } from './src/lib/LevelOfCareSheet';
+import { countNewRecordings, fieldySupported, RECORDERS, type RecorderId } from './src/lib/fieldy-api';
+import { aiKeysSupported, getAnthropicKey, onAnthropicKeyChange } from './src/lib/outreach-api';
 import {
   caseRecipients,
   caseTarget,
@@ -231,6 +238,7 @@ import {
   getNotificationPermissionState,
   requestNotificationPermission,
   rescheduleNotifications,
+  setDayReviewWaiting,
   subscribeToNotificationResponses,
   todayLoad,
 } from './src/lib/notifications';
@@ -1295,6 +1303,15 @@ export default function App() {
   const [showGlobalDirectory, setShowGlobalDirectory] = useState(false);
   // Import partners from the iPhone's contacts or (web) a .csv / .vcf file.
   const [showPartnerImport, setShowPartnerImport] = useState(false);
+  // Day review: notes from the day (a recorder's summary, call notes) read by
+  // AI on the user's own key, approved row by row (docs/DAY_REVIEW.md).
+  const [showDayReview, setShowDayReview] = useState(false);
+  // Recorders connected (Fieldy, Plaud): new recordings waiting (counted,
+  // never reviewed until the user opens them), and which one the review
+  // opened to read.
+  const [recordingsWaiting, setRecordingsWaiting] = useState<Record<RecorderId, number>>({ fieldy: 0, plaud: 0 });
+  const [dayReviewRecorder, setDayReviewRecorder] = useState<RecorderId | null>(null);
+  const [showMatchExplanation, setShowMatchExplanation] = useState(false);
   const [directorySubmitBusy, setDirectorySubmitBusy] = useState(false);
   // Incremented after the account joins a different practice workspace, which
   // re-homes its rows server-side; bumping it re-runs the hydration effect.
@@ -1346,6 +1363,10 @@ export default function App() {
   // inside the case file's own sheet (CaseDetailModal swaps its contents).
   // The sheet's guarded "back" for the Modal's onRequestClose.
   const [assessmentCaseId, setAssessmentCaseId] = useState<string | null>(null);
+  // The family assessment on a case (src/lib/FamilyAssessmentSheet.tsx), and
+  // the head start it gives the level-of-care sheet when opened from it.
+  const [familyAssessmentCaseId, setFamilyAssessmentCaseId] = useState<string | null>(null);
+  const [levelOfCareSeed, setLevelOfCareSeed] = useState<LevelOfCareSeed | null>(null);
   const assessmentBackRef = useRef<() => void>(() => setAssessmentCaseId(null));
   // The shortlist the clinician saw when they started an assignment, so the
   // placement record can say what was shown and at what rank the pick sat.
@@ -1358,6 +1379,66 @@ export default function App() {
   const activeUserId = session?.user?.id || '';
   const activeUserIdRef = useRef(activeUserId);
   const activeOrgIdRef = useRef('');
+  // Recorders connected: new recordings are counted when the app opens and
+  // comes back (at most every 15 minutes), on this phone, straight from each
+  // recorder; the Today card and the day review reminder follow the count.
+  const fieldyCountRef = useRef({ at: 0, userId: '' });
+  const fieldyCountGenerationRef = useRef(0);
+  const recordingsWaitingRef = useRef<{ userId: string; counts: Record<RecorderId, number> }>({ userId: '', counts: { fieldy: 0, plaud: 0 } });
+  const refreshFieldyWaiting = useCallback(async (force = false) => {
+    const userId = activeUserIdRef.current;
+    if (!userId || !fieldySupported || !aiKeysSupported) return;
+    const last = fieldyCountRef.current;
+    if (!force && last.userId === userId && Date.now() - last.at < 15 * 60_000) return;
+    fieldyCountRef.current = { at: Date.now(), userId };
+    // Only the latest count counts: one started earlier that finishes later is dropped.
+    const generation = ++fieldyCountGenerationRef.current;
+    // Without an Anthropic key nothing can be reviewed: no card, no reminder.
+    const key = await getAnthropicKey(userId).catch(() => null);
+    const counts = key ? await Promise.all(RECORDERS.map((recorder) => countNewRecordings(recorder, userId))) : RECORDERS.map(() => 0);
+    if (activeUserIdRef.current !== userId || generation !== fieldyCountGenerationRef.current) return;
+    // A count that could not be read (offline, recorder down) keeps the last one
+    // rather than saying nothing waits.
+    const previous: Record<RecorderId, number> = recordingsWaitingRef.current.userId === userId ? recordingsWaitingRef.current.counts : { fieldy: 0, plaud: 0 };
+    const next = { ...previous };
+    RECORDERS.forEach((recorder, index) => { next[recorder.id] = counts[index] ?? previous[recorder.id]; });
+    recordingsWaitingRef.current = { userId, counts: next };
+    setRecordingsWaiting(next);
+    void setDayReviewWaiting(RECORDERS.reduce((sum, recorder) => sum + next[recorder.id], 0), userId).catch(() => undefined);
+  }, []);
+  // Recordings just marked reviewed on this phone: the count (and with it the
+  // reminder) drops at once. The recount that follows only confirms it, and
+  // may fail or never answer.
+  const lowerRecordingsWaiting = useCallback((recorder: RecorderId, reviewed: number) => {
+    const userId = activeUserIdRef.current;
+    if (!userId || reviewed <= 0 || recordingsWaitingRef.current.userId !== userId) return;
+    const counts = { ...recordingsWaitingRef.current.counts };
+    counts[recorder] = Math.max(0, counts[recorder] - reviewed);
+    recordingsWaitingRef.current = { userId, counts };
+    setRecordingsWaiting(counts);
+    void setDayReviewWaiting(RECORDERS.reduce((sum, item) => sum + counts[item.id], 0), userId).catch(() => undefined);
+  }, []);
+  const fieldyWaiting = recordingsWaiting.fieldy + recordingsWaiting.plaud;
+  const waitingRecorderRef = useRef<RecorderId | null>(null);
+  // The recorder a "From your day" tap reads first: the one with the most waiting.
+  const waitingRecorder: RecorderId | null = fieldyWaiting
+    ? (recordingsWaiting.plaud > recordingsWaiting.fieldy ? 'plaud' : 'fieldy')
+    : null;
+  waitingRecorderRef.current = waitingRecorder;
+  const waitingLine = recordingsWaiting.fieldy && recordingsWaiting.plaud
+    ? `${fieldyWaiting} new recordings from Fieldy and Plaud`
+    : recordingsWaiting.plaud
+      ? `${recordingsWaiting.plaud} new Plaud ${recordingsWaiting.plaud === 1 ? 'recording' : 'recordings'}`
+      : `${recordingsWaiting.fieldy} new Fieldy ${recordingsWaiting.fieldy === 1 ? 'conversation' : 'conversations'}`;
+  useEffect(() => {
+    if (!activeUserId) return undefined;
+    void refreshFieldyWaiting(true);
+    const subscription = AppState.addEventListener('change', (state) => { if (state === 'active') void refreshFieldyWaiting(); });
+    // The key added or removed: with none nothing can be reviewed, so the
+    // card and the reminder go at once (and come back with a key).
+    const unsubscribeKey = onAnthropicKeyChange((userId) => { if (userId === activeUserIdRef.current) void refreshFieldyWaiting(true); });
+    return () => { subscription.remove(); unsubscribeKey(); };
+  }, [activeUserId, refreshFieldyWaiting]);
   const businessLoadGenerationRef = useRef(0);
   const caseLoadGenerationRef = useRef(0);
   // Bumped by every local change (an optimistic write or a timeline entry). A
@@ -1544,8 +1625,16 @@ export default function App() {
   const resetAccountState = useCallback(() => {
     clearUnansweredSendKeys();
     clearPlacementAnswerLinks();
+    // A review open for the account that signed out closes (it is cleared as it closes).
+    setShowDayReview(false);
+    setDayReviewRecorder(null);
+    setRecordingsWaiting({ fieldy: 0, plaud: 0 });
+    recordingsWaitingRef.current = { userId: '', counts: { fieldy: 0, plaud: 0 } };
+    setShowMatchExplanation(false);
     setOutreach(null);
     setAssessmentCaseId(null);
+    setFamilyAssessmentCaseId(null);
+    setLevelOfCareSeed(null);
     setPlacementSheet(null);
     setPlacementCompareId(null);
     setPendingPlacementChoice(null);
@@ -1961,6 +2050,11 @@ export default function App() {
         await bindLocalWorkspace(userId, orgId);
         if (!active || generation !== authGenerationRef.current) return;
         activeOrgIdRef.current = orgId;
+        // The time this account picked for the day review reminder (or
+        // "off"), before its schedule can be made: a save during the rest of
+        // launch already schedules.
+        await loadDayReviewReminder(userId);
+        if (!active || generation !== authGenerationRef.current) return;
         await activateReferralFitNotificationOwner(userId);
         if (!active || generation !== authGenerationRef.current) return;
 
@@ -2460,6 +2554,13 @@ export default function App() {
         if (target === 'workspace') {
           setTab('home');
           setShowWorkspace(true);
+          return;
+        }
+        if (target === 'day_review') {
+          // The day review reminder: the review opens and reads the recorder with the most waiting.
+          setTab('home');
+          setDayReviewRecorder(waitingRecorderRef.current ?? 'fieldy');
+          setShowDayReview(true);
           return;
         }
         setTab(target);
@@ -3553,6 +3654,8 @@ export default function App() {
     setDocView(null);
     // An editor left over from another case file (a late rollback) must
     // never open over this one: it would save to this case.
+    setFamilyAssessmentCaseId(null);
+    setLevelOfCareSeed(null);
     setCaseContactForm(null);
     setCaseEditForm(null);
     setCaseBusinessForm(null);
@@ -3660,6 +3763,8 @@ export default function App() {
     setVobForm(null);
     setVobAnswerForm(null);
     setAssessmentCaseId(null);
+    setFamilyAssessmentCaseId(null);
+    setLevelOfCareSeed(null);
   }
 
   // ─── Insurance workflow: the Benefits card ──────────────────────────────
@@ -4616,7 +4721,7 @@ export default function App() {
   latestCasesRef.current = cases;
   const sheetOpenNow = Boolean(
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
-    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory || showPartnerImport
+    || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory || showPartnerImport || showDayReview || showMatchExplanation
     || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
     || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible
     || placementSheet || placementCompareId || showHandoffs,
@@ -6845,6 +6950,38 @@ export default function App() {
             </View>
             <Text style={styles.heroSubtitle}>{loadLine}</Text>
           </View>
+          {aiKeysSupported && fieldyWaiting > 0 ? (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel={`From your day: ${waitingLine} to review`}
+              style={[styles.globalDirectoryBanner, styles.fieldyBanner]}
+              onPress={() => { setDayReviewRecorder(waitingRecorder); setShowDayReview(true); }}
+            >
+              <AppIcon name="mic-outline" size={20} color={COLORS.forest} />
+              <View style={styles.globalDirectoryCopy}>
+                <Text style={styles.globalDirectoryTitle}>From your day</Text>
+                <Text style={styles.globalDirectorySubtitle}>
+                  {waitingLine} to review. Tap to read {fieldyWaiting === 1 ? 'it' : 'them'}; you approve what is saved.
+                </Text>
+              </View>
+              <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
+            </TouchableOpacity>
+          ) : null}
+          {aiKeysSupported ? (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Review notes from your day"
+              style={styles.globalDirectoryBanner}
+              onPress={() => { setDayReviewRecorder(null); setShowDayReview(true); }}
+            >
+              <AppIcon name="reader-outline" size={20} color={COLORS.forest} />
+              <View style={styles.globalDirectoryCopy}>
+                <Text style={styles.globalDirectoryTitle}>Review notes</Text>
+                <Text style={styles.globalDirectorySubtitle}>Read your Fieldy or Plaud recordings, or paste your call notes; approve the leads, notes and follow-ups it finds</Text>
+              </View>
+              <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
+            </TouchableOpacity>
+          ) : null}
 
           {teamWorkspace ? (
             <View style={styles.todayScopeBlock}>
@@ -7238,6 +7375,18 @@ export default function App() {
             <View style={{ flex: 1 }}>
               <Text style={styles.askProgramsTitle}>Ask programs</Text>
               <Text style={styles.askProgramsBody}>One de-identified request to up to 8 of these programs. Compare their answers side by side.</Text>
+            </View>
+            <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+          </TouchableOpacity>
+        ) : null}
+
+        {/* Why these programs: the ranking in plain words for the family. Explains the order, never changes it. */}
+        {matches.length ? (
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Explain these programs to the family" onPress={() => setShowMatchExplanation(true)} style={styles.askProgramsButton}>
+            <AppIcon name="chatbubbles-outline" size={18} color={COLORS.forest} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.askProgramsTitle}>Explain to the family</Text>
+              <Text style={styles.askProgramsBody}>Why these programs, in plain words and in this order, ready to send by text or email.</Text>
             </View>
             <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
           </TouchableOpacity>
@@ -7751,6 +7900,7 @@ export default function App() {
     if (vobForm) return VobRequestModal(activeCase);
     if (vobAnswerForm) return VobAnswerModal(activeCase);
     if (assessmentCaseId === activeCase.id) return LevelOfCareModal(activeCase);
+    if (familyAssessmentCaseId === activeCase.id) return FamilyAssessmentModal(activeCase);
     const record = activeCase;
     const colors = CASE_STATUS_COLORS[record.status];
     const linkedMatch = referralMatches.find((item) => item.id === record.matchProfileId)
@@ -7971,9 +8121,25 @@ export default function App() {
               <LevelOfCareCard
                 entry={caseAssessments.entryFor(record.id)}
                 nameFor={(userId) => (userId && userId === activeUserId.toLowerCase() ? 'you' : memberDisplayName(members, userId))}
-                onStart={() => { flushPendingCaseFields(); setAssessmentCaseId(record.id); }}
+                onStart={() => { flushPendingCaseFields(); setLevelOfCareSeed(null); setAssessmentCaseId(record.id); }}
                 onFindPlacement={(level) => startMatchForCase(record, level)}
               />
+
+              {/* Family assessment: a private, branded intake link for the family (src/lib/FamilyAssessmentSheet.tsx) */}
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel="Family assessment: send the family a private intake link, or read their answers"
+                onPress={() => { flushPendingCaseFields(); setFamilyAssessmentCaseId(record.id); }}
+                style={styles.infoCard}
+              >
+                <View style={styles.caseSectionHeader}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.infoTitle}>Family assessment</Text>
+                    <Text style={styles.caseSectionHint}>A private link for the family: a full intake in your practice’s name, with one consent to share with other ethical providers. Their answers come back here.</Text>
+                  </View>
+                  <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+                </View>
+              </TouchableOpacity>
 
               {/* Benefits: the family's plan and the VOB requests */}
               {(() => {
@@ -9616,11 +9782,13 @@ export default function App() {
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => assessmentBackRef.current()}>
         <LevelOfCareSheet
           caseId={record.id}
+          seed={levelOfCareSeed}
           names={reasonNames({ caseTitle: record.title, contactNames: caseContactNames(record.id) })}
           previous={caseAssessments.currentFor(record.id)}
           backRef={assessmentBackRef}
-          onClose={() => setAssessmentCaseId(null)}
+          onClose={() => { setAssessmentCaseId(null); setLevelOfCareSeed(null); }}
           onSaved={(saved) => {
+            setLevelOfCareSeed(null);
             caseAssessments.saved(saved.assessment);
             // The server wrote the timeline entry under the assessment's id.
             applyCaseEvent({ id: saved.assessment.id, caseId: record.id, kind: 'system', body: saved.eventBody, occurredAt: saved.assessment.assessedAt, actorId: activeUserId.toLowerCase() });
@@ -9685,6 +9853,25 @@ export default function App() {
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
+      </Modal>
+    );
+  }
+
+  // The family assessment, inside the case file's own native Modal like the
+  // level-of-care sheet. Rating the level of care from it opens that sheet
+  // with the family's answers (and an AI suggestion, when asked); closing it
+  // comes back here.
+  function FamilyAssessmentModal(record: CaseRecord) {
+    const primary = primaryContactByCase.get(record.id);
+    return (
+      <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setFamilyAssessmentCaseId(null)}>
+        <FamilyAssessmentSheet
+          caseId={record.id}
+          userId={activeUserId}
+          recipient={{ name: primary?.name || '', email: primary?.email || '' }}
+          onClose={() => setFamilyAssessmentCaseId(null)}
+          onRateLevel={(seed) => { setLevelOfCareSeed(seed); setAssessmentCaseId(record.id); }}
+        />
       </Modal>
     );
   }
@@ -10194,6 +10381,32 @@ export default function App() {
           afterSheetCloses(() => openCase(caseId));
         }}
       />
+      <MatchExplanationSheet
+        visible={showMatchExplanation}
+        userId={activeUserId}
+        profile={draftMatchProfile}
+        ranked={matches}
+        onClose={() => setShowMatchExplanation(false)}
+      />
+      <DayReviewSheet
+        visible={showDayReview}
+        userId={activeUserId}
+        cases={cases}
+        contacts={allCaseContacts}
+        partners={partners}
+        followUps={followUps}
+        referrals={referrals}
+        directoryEntitled={entitlements.entitlements.directory}
+        leadResponseMinutes={leadSettings.leadResponseTargetMinutes}
+        licenseConcernFor={(partnerId) => integrityByPartner.get(partnerId)?.licenseConcern ?? null}
+        onClose={() => { setShowDayReview(false); setDayReviewRecorder(null); }}
+        onSaved={() => refreshAfterServerChange()}
+        startWithRecorder={dayReviewRecorder}
+        onRecordersChanged={(reviewed) => {
+          if (reviewed) lowerRecordingsWaiting(reviewed.recorder, reviewed.count);
+          void refreshFieldyWaiting(true);
+        }}
+      />
       <PartnerImportSheet
         visible={showPartnerImport}
         userId={activeUserId}
@@ -10488,6 +10701,7 @@ const styles = StyleSheet.create({
   assignReferralButtonText: { color: COLORS.white, fontSize: 11, fontWeight: '800', flexShrink: 1, minWidth: 0 },
   directoryTitleRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 18 },
   globalDirectoryBanner: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#EFF4FF', borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14, marginBottom: 16 },
+  fieldyBanner: { backgroundColor: '#EDF4EF', borderWidth: 1, borderColor: '#BFD8C8' },
   globalDirectoryCopy: { flex: 1 },
   globalDirectoryTitle: { fontSize: 15, fontWeight: '700', color: '#175CD3' },
   globalDirectorySubtitle: { fontSize: 12.5, color: '#667085', marginTop: 1 },

@@ -569,6 +569,8 @@ export type NewLeadInput = {
   urgency: LeadUrgency;
   dueOn: string; // YYYY-MM-DD, device-local
   dueTime: string | null; // HH:MM 24h, device-local
+  /** Optional: what the lead said, kept as the case summary (day review). */
+  note?: string;
 };
 
 // Mirrors lead_case_title() in the migration so the optimistic case card
@@ -632,6 +634,7 @@ export async function createLead(input: NewLeadInput, expectedUserId: string): P
       urgency: input.urgency,
       due_on: input.dueOn,
       due_time: input.dueTime ?? '',
+      ...(input.note ? { note: input.note.slice(0, 2000) } : {}),
     },
   }));
   // Until 20261024120000 is applied, the server saves "Calling about: son" as
@@ -1309,7 +1312,7 @@ export function newUuid(): string {
 // expo-file-system File API isn't needed for a straight upload) and upload to
 // the PRIVATE bucket. Never uses public URLs. Web fallback: fetch the blob
 // URL the picker returns and read it as base64 (no FileSystem on web).
-async function readAsBase64(localUri: string): Promise<string> {
+export async function readAsBase64(localUri: string): Promise<string> {
   if (localUri.startsWith('blob:') || localUri.startsWith('data:')) {
     const response = await fetch(localUri);
     const buffer = await response.arrayBuffer();

@@ -39,6 +39,7 @@ import {
   type AssessmentDraft,
   type CaseAssessment,
   type PlacementLevel,
+  type DimensionKey,
   type Rating,
   type SafetyFlag,
 } from './level-of-care';
@@ -60,8 +61,24 @@ import { WEB_PAGE } from './web-layout';
 // answers stay on screen and "Try again" reuses the same id, so the server
 // never saves twice.
 
+/**
+ * A head start from the family assessment (src/lib/FamilyAssessmentSheet.tsx):
+ * what the family said about each area, and, from an AI suggestion on the
+ * practitioner's own key, a rating, a reason and the words it rests on. The
+ * practitioner still goes through every area and confirms or changes it.
+ */
+export type LevelOfCareSeed = {
+  fromAi: boolean;
+  ratings?: Partial<Record<DimensionKey, Rating>>;
+  notes?: Partial<Record<DimensionKey, string>>;
+  evidence?: Partial<Record<DimensionKey, string>>;
+  hints?: Partial<Record<DimensionKey, string[]>>;
+};
+
 type Props = {
   caseId: string;
+  /** Starting ratings and the family's answers, from the family assessment. */
+  seed?: LevelOfCareSeed | null;
   /** The case's title and contact names: the override reason, which the program reads, may not carry them. */
   names: string[];
   /** The case's current assessment, for "Last time" hints. */
@@ -97,9 +114,16 @@ const SAVED = DIMENSION_KEYS.length + 1;
 
 type ChoiceMode = 'recommended' | 'different';
 
-export default function LevelOfCareSheet({ caseId, names, previous, backRef, onClose, onSaved, onFindPlacement }: Props) {
+export default function LevelOfCareSheet({ caseId, seed = null, names, previous, backRef, onClose, onSaved, onFindPlacement }: Props) {
+  // Opened from the family assessment (the seed is cleared once it is saved,
+  // so it is remembered from the start): "Back" returns there.
+  const [fromAssessment] = useState(Boolean(seed));
   const [step, setStep] = useState(INTRO);
-  const [draft, setDraft] = useState<AssessmentDraft>(emptyDraft);
+  const [draft, setDraft] = useState<AssessmentDraft>(() => (seed?.fromAi
+    // The AI's ratings to start from; its reasons stay in the suggestion box,
+    // never in the practitioner's own notes.
+    ? { ...emptyDraft(), ratings: { ...(seed.ratings || {}) } }
+    : emptyDraft()));
   const [mode, setMode] = useState<ChoiceMode>('recommended');
   const [saving, setSaving] = useState(false);
   const [saveNotice, setSaveNotice] = useState('');
@@ -260,6 +284,15 @@ export default function LevelOfCareSheet({ caseId, names, previous, backRef, onC
         >
           <Text style={styles.primaryButtonText}>{draft.imminentDanger ? 'Continue the assessment' : 'Start'}</Text>
         </TouchableOpacity>
+        {seed ? (
+          <View style={styles.seedBox}>
+            <Text style={styles.seedText}>
+              {seed.fromAi
+                ? 'AI suggested a rating for each area from the family assessment, on your own key. Check every one: tap another rating to change it. Nothing is saved until you save.'
+                : 'What the family said in their assessment is shown under each area.'}
+            </Text>
+          </View>
+        ) : null}
         <Text style={styles.fine}>The six areas follow the widely used six-dimension framework. The questions, descriptions and rules here are ReferralFit's own.</Text>
       </>
     );
@@ -278,6 +311,19 @@ export default function LevelOfCareSheet({ caseId, names, previous, backRef, onC
         <Text style={styles.title}>{info.title}</Text>
         <Text style={styles.lead}>{info.covers}</Text>
         {last !== null ? <Text style={styles.hint}>Last time: {last} · {info.ratings[last].label}. Rate what you see now.</Text> : null}
+        {seed?.fromAi && seed.ratings?.[key] !== undefined ? (
+          <View style={styles.seedBox}>
+            <Text style={styles.seedTitle}>AI SUGGESTED {seed.ratings[key]} · {info.ratings[seed.ratings[key]!].label.toUpperCase()}</Text>
+            {seed.notes?.[key] ? <Text style={styles.seedText}>{seed.notes[key]}</Text> : null}
+            {seed.evidence?.[key] ? <Text style={styles.seedQuote}>“{seed.evidence[key]}”</Text> : null}
+          </View>
+        ) : null}
+        {seed?.hints?.[key]?.length ? (
+          <View style={styles.seedBox}>
+            <Text style={styles.seedTitle}>FROM THE FAMILY ASSESSMENT</Text>
+            {seed.hints[key]!.map((line) => <Text key={line} style={styles.seedLine}>{line}</Text>)}
+          </View>
+        ) : null}
         <View accessibilityRole="radiogroup" accessibilityLabel={info.title}>
           {RATINGS.map((rating) => {
             const active = chosen === rating;
@@ -440,7 +486,7 @@ export default function LevelOfCareSheet({ caseId, names, previous, backRef, onC
           <Text style={styles.primaryButtonText}>Find placement with this level</Text>
         </TouchableOpacity>
         <TouchableOpacity accessibilityRole="button" onPress={onClose} style={styles.textButton}>
-          <Text style={styles.textButtonText}>Back to the case file</Text>
+          <Text style={styles.textButtonText}>{fromAssessment ? 'Back to the family assessment' : 'Back to the case file'}</Text>
         </TouchableOpacity>
       </>
     );
@@ -470,6 +516,11 @@ export default function LevelOfCareSheet({ caseId, names, previous, backRef, onC
 }
 
 const styles = StyleSheet.create({
+  seedBox: { backgroundColor: '#EDF4EF', borderRadius: 12, padding: 12, marginTop: 10, gap: 4 },
+  seedTitle: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, color: '#1F5A49' },
+  seedText: { fontSize: 13, lineHeight: 19, color: '#16352E' },
+  seedLine: { fontSize: 13, lineHeight: 19, color: '#38564F' },
+  seedQuote: { fontSize: 12, lineHeight: 17, color: '#55645F', fontStyle: 'italic' },
   page: { flex: 1, backgroundColor: COLORS.cream, ...WEB_PAGE },
   flex: { flex: 1 },
   handle: { width: 42, height: 5, borderRadius: 3, backgroundColor: '#C8D0CC', alignSelf: 'center', marginTop: 8 },

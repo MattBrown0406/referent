@@ -140,16 +140,34 @@ export async function getAnthropicKey(userId: string): Promise<string | null> {
   }
 }
 
+// Whoever depends on there being a key (the recordings count behind the Today
+// card and the day review reminder) hears when one is saved or removed.
+const keyListeners = new Set<(userId: string) => void>();
+
+/** Calls back after this phone's Anthropic key is saved or removed. Returns the unsubscribe. */
+export function onAnthropicKeyChange(listener: (userId: string) => void): () => void {
+  keyListeners.add(listener);
+  return () => { keyListeners.delete(listener); };
+}
+
+function keyChanged(userId: string): void {
+  for (const listener of [...keyListeners]) {
+    try { listener(userId); } catch { /* a listener's failure is its own */ }
+  }
+}
+
 export async function saveAnthropicKey(userId: string, apiKey: string): Promise<void> {
   if (!aiKeysSupported) throw new Error('AI drafts need the iPhone app.');
   // Never a key with no account in its name: nothing could read it back or remove it.
   if (!userId) throw new Error('Sign in again, then add your key.');
   await SecureStore.setItemAsync(keyName(userId), apiKey, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
+  keyChanged(userId);
 }
 
 export async function removeAnthropicKey(userId: string): Promise<void> {
   if (!aiKeysSupported || !userId) return;
   await SecureStore.deleteItemAsync(keyName(userId)).catch(() => undefined);
+  keyChanged(userId);
 }
 
 // ─── Sending from the phone's own apps ──────────────────────────────────────

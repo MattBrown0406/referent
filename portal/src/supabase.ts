@@ -15,6 +15,11 @@ const useLocal = Boolean(LOCAL_URL && LOCAL_KEY);
 const url = useLocal ? LOCAL_URL as string : SUPABASE_URL;
 const key = useLocal ? LOCAL_KEY as string : SUPABASE_PUBLISHABLE_KEY;
 
+// For a save that must outlive the page (fetch keepalive, on pagehide),
+// which supabase-js cannot make.
+export const projectUrl = url;
+export const publishableKey = key;
+
 export const supabase = createClient(url, key);
 
 // The handoff page (/h) is signed out by design: its calls carry the token

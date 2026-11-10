@@ -1,6 +1,6 @@
 {
   "name": "referralfit",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "packageManager": "npm@10.9.8",
   "main": "index.ts",
   "dependencies": {
@@ -22,6 +22,7 @@
     "expo-sms": "57.0.1",
     "expo-status-bar": "~57.0.1",
     "expo-updates": "~57.0.10",
+    "expo-web-browser": "~57.0.3",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-native": "0.86.0",
@@ -34,11 +35,11 @@
   },
   "scripts": {
     "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
     "web": "expo start --web",
     "typecheck": "tsc --noEmit --pretty false",
-    "test": "node scripts/native-compat-test.mjs && node scripts/store-account-test.mjs && node scripts/notifications-test.mjs && node scripts/mutation-test.mjs && node scripts/phone-test.mjs && node scripts/packet-test.mjs && node scripts/matching-test.mjs && node scripts/business-test.mjs && node scripts/contract-revenue-test.mjs && node scripts/today-test.mjs && node scripts/self-serve-accounts-test.mjs && node scripts/directory-submission-test.mjs && node scripts/bed-availability-test.mjs && node scripts/outcomes-test.mjs && node scripts/insurance-test.mjs && node scripts/family-cost-test.mjs && node scripts/integrity-test.mjs && node scripts/placement-request-test.mjs && node scripts/level-of-care-test.mjs && node scripts/outreach-test.mjs && node scripts/identifying-text-test.mjs && node scripts/web-app-test.mjs && node scripts/app-lock-test.mjs && node scripts/large-practice-test.mjs && node scripts/handoff-test.mjs && node scripts/email-test.mjs && node scripts/program-referral-test.mjs && node scripts/claim-test.mjs && node scripts/coaching-test.mjs && node scripts/partner-import-test.mjs && node scripts/offline-sync-test.mjs",
+    "test": "node scripts/native-compat-test.mjs && node scripts/store-account-test.mjs && node scripts/notifications-test.mjs && node scripts/mutation-test.mjs && node scripts/phone-test.mjs && node scripts/packet-test.mjs && node scripts/matching-test.mjs && node scripts/business-test.mjs && node scripts/contract-revenue-test.mjs && node scripts/today-test.mjs && node scripts/self-serve-accounts-test.mjs && node scripts/directory-submission-test.mjs && node scripts/bed-availability-test.mjs && node scripts/outcomes-test.mjs && node scripts/insurance-test.mjs && node scripts/family-cost-test.mjs && node scripts/integrity-test.mjs && node scripts/placement-request-test.mjs && node scripts/level-of-care-test.mjs && node scripts/outreach-test.mjs && node scripts/identifying-text-test.mjs && node scripts/web-app-test.mjs && node scripts/app-lock-test.mjs && node scripts/large-practice-test.mjs && node scripts/handoff-test.mjs && node scripts/email-test.mjs && node scripts/program-referral-test.mjs && node scripts/claim-test.mjs && node scripts/coaching-test.mjs && node scripts/partner-import-test.mjs && node scripts/day-review-test.mjs && node scripts/fieldy-test.mjs && node scripts/match-explanation-test.mjs && node scripts/family-assessment-test.mjs && node scripts/offline-sync-test.mjs",
     "quality": "npm run typecheck && npm test",
     "eas-build-pre-install": "npm install --global npm@10.9.8"
   },

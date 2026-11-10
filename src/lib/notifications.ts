@@ -252,6 +252,90 @@ function isScheduleCurrent(generation: number, ownerId: string): boolean {
 // are not re-applied. Forgotten whenever the system's copy is cleared.
 let lastAppliedSchedule: { ownerId: string; signature: string } | null = null;
 
+// New Fieldy or Plaud recordings waiting for the day review (src/lib/fieldy-api.ts
+// countNewRecordings): one reminder at the time the user picked (6 PM unless
+// changed, or none when turned off), only while some wait. Kept per account:
+// a count or a time that arrives before the account's schedule is active is
+// still there when it is, and one account's never shows for another.
+const dayReviewWaiting = new Map<string, number>();
+const dayReviewTimes = new Map<string, string>();
+let lastInput: NotificationInput | null = null;
+
+/** The day review reminder's time when the user has not picked one. */
+export const DAY_REVIEW_DEFAULT_TIME = '18:00';
+/** The stored value for "no reminder". */
+export const DAY_REVIEW_REMINDER_OFF = 'off';
+const DAY_REVIEW_STEP_MINUTES = 30;
+
+/** A stored reminder time made safe: 'off', or HH:MM on a half hour; anything else is 6 PM. */
+export function dayReviewReminderTime(value: unknown): string {
+  if (value === DAY_REVIEW_REMINDER_OFF) return DAY_REVIEW_REMINDER_OFF;
+  const match = typeof value === 'string' ? /^(\d{2}):(\d{2})$/.exec(value) : null;
+  if (!match) return DAY_REVIEW_DEFAULT_TIME;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59 || minute % DAY_REVIEW_STEP_MINUTES !== 0) return DAY_REVIEW_DEFAULT_TIME;
+  return value as string;
+}
+
+/** Half an hour earlier (-1) or later (+1), around the clock. */
+export function stepDayReviewReminderTime(time: string, direction: 1 | -1): string {
+  const safe = dayReviewReminderTime(time);
+  const [hour, minute] = (safe === DAY_REVIEW_REMINDER_OFF ? DAY_REVIEW_DEFAULT_TIME : safe).split(':').map(Number);
+  const day = 24 * 60;
+  const next = (((hour * 60 + minute + direction * DAY_REVIEW_STEP_MINUTES) % day) + day) % day;
+  return `${String(Math.floor(next / 60)).padStart(2, '0')}:${String(next % 60).padStart(2, '0')}`;
+}
+
+/** "6:00 PM" for a stored time; '' when the reminder is off. */
+export function dayReviewReminderLabel(time: string): string {
+  const safe = dayReviewReminderTime(time);
+  return safe === DAY_REVIEW_REMINDER_OFF ? '' : clockLabel(safe);
+}
+
+function rescheduleFor(ownerId: string): Promise<void> {
+  if (!lastInput || ownerId !== scheduleOwnerId) return Promise.resolve();
+  const input = lastInput;
+  const generation = ++scheduleGeneration;
+  return queueScheduleWork(() => replaceSchedule(input, generation, ownerId));
+}
+
+/** How many recordings wait for review; the day review reminder follows it. */
+export function setDayReviewWaiting(count: number, ownerId: string): Promise<void> {
+  if (!ownerId) return Promise.resolve();
+  const next = Math.max(0, Math.floor(count) || 0);
+  if (next === (dayReviewWaiting.get(ownerId) ?? 0)) return Promise.resolve();
+  dayReviewWaiting.set(ownerId, next);
+  return rescheduleFor(ownerId);
+}
+
+/** The time this account picked for the day review reminder ('off' for none); the reminder moves at once. */
+export function setDayReviewReminderTime(time: string, ownerId: string): Promise<void> {
+  if (!ownerId) return Promise.resolve();
+  const next = dayReviewReminderTime(time);
+  if (next === (dayReviewTimes.get(ownerId) ?? DAY_REVIEW_DEFAULT_TIME)) return Promise.resolve();
+  dayReviewTimes.set(ownerId, next);
+  return rescheduleFor(ownerId);
+}
+
+/**
+ * When the day review reminder is next due, or null (nothing waits, or it is
+ * turned off): today at the chosen time, or tomorrow when that has passed.
+ * Recordings are only counted while the app is open, so a time already past
+ * today (a morning time, or the app opened in the evening) waits for its
+ * next turn rather than never being sent.
+ */
+export function dayReviewReminderAt(waiting: number, now = new Date(), time = DAY_REVIEW_DEFAULT_TIME): Date | null {
+  if (waiting <= 0) return null;
+  const safe = dayReviewReminderTime(time);
+  if (safe === DAY_REVIEW_REMINDER_OFF) return null;
+  const [hour, minute] = safe.split(':').map(Number);
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0);
+  if (today.getTime() > now.getTime() + 60_000) return today;
+  // The Date constructor keeps the wall-clock time across a clock change.
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, hour, minute, 0);
+}
+
 async function replaceSchedule(input: NotificationInput, generation: number, ownerId: string): Promise<void> {
   const permission = await getNotificationPermissionState();
   if (!isScheduleCurrent(generation, ownerId)) return;
@@ -278,6 +362,22 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
   const followUps = reminderFollowUps(input, ownerId);
   let remaining = MAX_SCHEDULED;
   const now = new Date();
+
+  // Generic words on the lock screen: never a name or what was said.
+  const reviewAt = dayReviewReminderAt(dayReviewWaiting.get(ownerId) ?? 0, now, dayReviewTimes.get(ownerId) ?? DAY_REVIEW_DEFAULT_TIME);
+  if (reviewAt && remaining > 0 && plan({
+    content: {
+      title: 'ReferralFit',
+      body: 'Your recorded conversations are ready to review.',
+      data: { target: 'day_review', ownerId },
+      ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+    },
+    trigger: {
+      type: Notifications.SchedulableTriggerInputTypes.DATE,
+      date: reviewAt,
+      ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+    },
+  })) remaining -= 1;
 
   // Static copy is intentional: a repeating notification cannot carry a live
   // count. The current count is shown after the user opens the app.
@@ -440,6 +540,10 @@ async function clearSystemNotifications(): Promise<void> {
 }
 
 export function activateReferralFitNotificationOwner(ownerId: string): Promise<void> {
+  if (scheduleOwnerId !== ownerId) {
+    // Another account's schedule never carries over (counts are per account).
+    lastInput = null;
+  }
   scheduleOwnerId = ownerId;
   ++scheduleGeneration;
   // A tap that launched the app arrived before anyone was signed in: hand it
@@ -450,12 +554,16 @@ export function activateReferralFitNotificationOwner(ownerId: string): Promise<v
 
 export function rescheduleNotifications(input: NotificationInput, ownerId: string): Promise<void> {
   if (!ownerId || ownerId !== scheduleOwnerId) return Promise.resolve();
+  lastInput = input;
   const generation = ++scheduleGeneration;
   return queueScheduleWork(() => replaceSchedule(input, generation, ownerId));
 }
 
 export function cancelReferralFitNotifications(): Promise<void> {
   scheduleOwnerId = null;
+  dayReviewWaiting.clear();
+  dayReviewTimes.clear();
+  lastInput = null;
   ++scheduleGeneration;
   return queueScheduleWork(clearSystemNotifications);
 }
@@ -466,7 +574,7 @@ export function cancelReferralFitNotifications(): Promise<void> {
 // (see docs/NOTIFICATIONS.md) carry { kind, user_id, case_id, ... } and
 // nothing private: the app resolves the item after sign-in. Either way a tap
 // is honored only for the account the notification was addressed to.
-export type NotificationTarget = 'home' | 'directory' | 'case' | 'workspace' | 'placement';
+export type NotificationTarget = 'home' | 'directory' | 'case' | 'workspace' | 'placement' | 'day_review';
 
 export type RemotePushData = {
   kind?: string;
@@ -526,7 +634,7 @@ function tapOf(response: Notifications.NotificationResponse | null): Tap | null 
     return { requestId, ownerId: data.user_id.toLowerCase(), target: remote.target, caseId: remote.caseId, placementRequestId: remote.placementRequestId };
   }
   if (typeof data.ownerId !== 'string' || !data.ownerId) return null;
-  if (data.target !== 'home' && data.target !== 'directory') return null;
+  if (data.target !== 'home' && data.target !== 'directory' && data.target !== 'day_review') return null;
   return { requestId, ownerId: data.ownerId.toLowerCase(), target: data.target, partnerId: typeof data.partnerId === 'string' ? data.partnerId : undefined };
 }
 

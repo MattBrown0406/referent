@@ -9,8 +9,10 @@ import {
   type Links,
   oneClickFrom,
   type OutboxRow,
+  logoUrl,
   renderEmail,
   resendBody,
+  senderFor,
 } from './email.ts';
 
 const LINKS: Links = {
@@ -191,4 +193,69 @@ Deno.test('an unknown kind is never rendered as a bed check-in', () => {
     threw = true;
   }
   assert(threw);
+});
+
+
+const ASSESSMENT = {
+  assessment_id: '22222222-2222-2222-2222-222222222222',
+  link_token: LINK,
+  practice_name: 'Okafor Family Interventions',
+  logo_path: '33333333-3333-3333-3333-333333333333/logo-1731000000000.png',
+  reply_to: 'Grace@Okafor.example.test',
+  recipient_name: 'Maria Lopez',
+  expires_at: '2026-12-08T16:00:00Z',
+};
+
+Deno.test('the family assessment invite: the practice\'s name and logo, the private link, nothing about the client', () => {
+  const links = { ...LINKS, storageUrl: 'https://ref.supabase.co' };
+  const email = renderEmail(row('family_assessment_invite', ASSESSMENT), links, NOW);
+  assertEquals(email.subject, 'Okafor Family Interventions: your private family assessment');
+  assertStringIncludes(email.text, `https://portal.referralfit.com/f#${LINK}`);
+  assertStringIncludes(email.text, 'Hi Maria,');
+  assertStringIncludes(email.text, 'call 911');
+  assertStringIncludes(email.text, 'call or text 988');
+  assertStringIncludes(email.text, 'works until December 8, 2026');
+  assertStringIncludes(email.html, 'https://ref.supabase.co/storage/v1/object/public/org-logos/33333333-3333-3333-3333-333333333333/logo-1731000000000.png');
+  assertStringIncludes(email.html, 'Sent for Okafor Family Interventions by');
+  assertEquals(email.headers, {}, 'no unsubscribe: the family asked for nothing else');
+  assertFalse(email.text.includes('Lopez'), 'only a first name');
+});
+
+Deno.test('the invite never goes out without a link, and a bad logo path is left out', () => {
+  let threw = false;
+  try { renderEmail(row('family_assessment_invite', { ...ASSESSMENT, link_token: 'short' }), LINKS, NOW); } catch { threw = true; }
+  assert(threw);
+  assertEquals(logoUrl('../../secret.png', { ...LINKS, storageUrl: 'https://ref.supabase.co' }), null);
+  assertEquals(logoUrl(ASSESSMENT.logo_path, LINKS), null, 'no project URL, no logo');
+  const email = renderEmail(row('family_assessment_invite', { ...ASSESSMENT, logo_path: 'x' }), { ...LINKS, storageUrl: 'https://ref.supabase.co' }, NOW);
+  assertFalse(email.html.includes('<img'));
+});
+
+Deno.test('the invite is from the practice via ReferralFit, and replies reach the practitioner', () => {
+  const sender = senderFor(row('family_assessment_invite', ASSESSMENT), 'ReferralFit <notifications@referralfit.com>', DEFAULT_REPLY_TO);
+  assertEquals(sender, { from: '"Okafor Family Interventions via ReferralFit" <notifications@referralfit.com>', replyTo: 'grace@okafor.example.test' });
+  const odd = senderFor(row('family_assessment_invite', { ...ASSESSMENT, practice_name: 'Evil <x@y.z>, "Inc"', reply_to: 'not an email' }), 'ReferralFit <notifications@referralfit.com>', DEFAULT_REPLY_TO);
+  assertEquals(odd.from, '"Evil x y.z Inc via ReferralFit" <notifications@referralfit.com>');
+  assertEquals(odd.replyTo, undefined, 'an unusable reply-to sends replies nowhere else, never to a default address');
+  assertEquals(senderFor(row('daily_summary', {}), 'ReferralFit <n@r.com>', 'm@r.com'), { from: 'ReferralFit <n@r.com>', replyTo: 'm@r.com' });
+  const body = resendBody(row('family_assessment_invite', ASSESSMENT), renderEmail(row('family_assessment_invite', ASSESSMENT), LINKS, NOW), sender.from, sender.replyTo);
+  assertEquals(body.reply_to, 'grace@okafor.example.test');
+});
+
+Deno.test('a finished assessment: to the practitioner, no names or answers; urgent says so', () => {
+  const plainEmail = renderEmail(row('family_assessment_submitted', { assessment_id: ASSESSMENT.assessment_id, urgent: false }), LINKS, NOW);
+  assertEquals(plainEmail.subject, 'A family finished their assessment');
+  const urgent = renderEmail(row('family_assessment_submitted', { assessment_id: ASSESSMENT.assessment_id, urgent: true }), LINKS, NOW);
+  assertEquals(urgent.subject, 'A family assessment needs your attention today');
+  assertStringIncludes(urgent.text, 'safety concerns');
+  assertEquals(urgent.headers, {});
+});
+
+Deno.test('an urgent answer before the family finishes: to the practitioner, no names or answers', () => {
+  const email = renderEmail(row('family_assessment_urgent', { assessment_id: ASSESSMENT.assessment_id, urgent: true }), LINKS, NOW);
+  assertEquals(email.subject, 'A family assessment needs your attention today');
+  assertStringIncludes(email.text, 'still filling out');
+  assertStringIncludes(email.text, '988');
+  assertEquals(email.headers, {});
+  assertEquals(senderFor(row('family_assessment_urgent', {}), 'ReferralFit <n@r.com>', 'm@r.com'), { from: 'ReferralFit <n@r.com>', replyTo: 'm@r.com' });
 });

@@ -55,6 +55,7 @@ import {
   type AppLockStatus,
 } from './app-lock';
 import { removeAnthropicKey } from './outreach-api';
+import { forgetRecorders } from './fieldy-api';
 import {
   enablePush,
   fetchNotificationPreferences,
@@ -67,6 +68,7 @@ import {
   type PreferencesState,
 } from './push';
 import { WEB_PAGE } from './web-layout';
+import PracticeLogoCard from './PracticeLogoCard';
 import {
   EMAIL_PREFERENCE_ROWS,
   type EmailPreferences,
@@ -309,6 +311,9 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
               throw error;
             }
             await removeAnthropicKey(userId); // the account's AI key leaves this phone with it
+            // Fieldy and Plaud are revoked and forgotten too; a slow recorder
+            // finishes in the background rather than holding the screen.
+            await Promise.race([forgetRecorders(userId).catch(() => undefined), new Promise((done) => setTimeout(done, 8000))]);
             onAccountDeleted();
           }, 'Could not delete the account') },
         ]);
@@ -578,6 +583,8 @@ export default function WorkspaceScreen({ visible, userId, entitlements, onClose
                 </View>
               )}
             </View>
+
+            <PracticeLogoCard orgId={workspace.orgId} isOwner={isOwner} />
 
             <View style={styles.card}>
               <Text style={styles.cardLabel}>{INTAKE_LINK_ENABLED ? 'Your intake link' : 'New leads'}</Text>

@@ -186,6 +186,69 @@ never write it here.
 > under NEW LEADS with a clock until the practice calls back. It involves no
 > payment and no account.
 
+### 3a. Additions for 1.3.0 (day review, recorders, family assessment)
+
+Add these paragraphs to the Notes for 1.3.0, after the FOLLOW UP / AI DRAFTS
+paragraph:
+
+> REVIEW NOTES / FIELDY AND PLAUD (optional): "Review notes" on the Home tab
+> lets a practitioner paste their own call notes; the app lists the leads,
+> notes and follow-ups it finds, and nothing is saved until the user approves
+> each item. Like "Draft with AI", it uses the practice's own Anthropic API
+> key and needs one to try; ReferralFit sells nothing and receives no payment
+> for it. With a key added, the same screen offers "Connect Fieldy" and
+> "Connect Plaud". These are third-party voice recorders some practitioners
+> already own. Connecting is optional and uses the recorder's own sign-in
+> page (OAuth, in the system browser sheet); the app then reads the user's
+> own recordings so they do not have to paste them. The sign-in is stored
+> only in the iPhone's keychain and is removed with "Disconnect" or when the
+> account is deleted. A Fieldy or Plaud account is needed to try it; every
+> other part of the app works without one. ReferralFit does not record audio
+> and does not use the microphone.
+>
+> EXPLAIN TO THE FAMILY: on the Match tab, after running a match, "Explain to
+> the family" writes why the programs fit, in the app's own order, to send by
+> text or email. It works without any setup.
+>
+> FAMILY ASSESSMENT: on a case, "Family assessment" sends the family a
+> private link to an intake form on portal.referralfit.com. The family
+> reads and signs a consent statement before sending, and their answers
+> appear on the case. To try it, enter an email address you can open.
+
+**App Privacy answers (App Store Connect → App Privacy) to check for 1.3.0.**
+What changed in what the app handles:
+
+- **Audio Data: still not collected.** The app never records and never
+  reads audio; it reads text (summaries and transcripts) from the user's own
+  recorder account, on the device.
+- **Other User Content** (already declared for case notes): recordings' text
+  is sent to Anthropic for one review through our server and is not stored.
+  It is covered by the same answer as AI drafts; no new data type, and it is
+  not used for tracking.
+- **Health and sensitive information:** the family assessment collects
+  health information, insurance member ID and date of birth from families
+  through the portal, stored for the practice. If "Health" and "Sensitive
+  Info" are not yet declared as collected (linked to the user, App
+  Functionality, not for tracking), add them.
+- **Photos:** insurance card photos are uploaded by families in the portal
+  (a web page), not by the app. No change for the app.
+- **Email Address:** the recorder account's email is kept on the device only
+  (not collected). The family's email for the assessment invite is "Other
+  contact info" entered by the practitioner, as case contacts already are.
+
+**What's New in This Version (1.3.0):**
+
+```
+New in 1.3
+
+- Review notes from your day. Paste your call notes, or connect a Fieldy or Plaud recorder, and ReferralFit lists the new leads, notes, follow-ups and referrals it finds. You approve each one before anything is saved. Uses your own Anthropic key.
+- A reminder when recordings are waiting for your review, at the time you choose.
+- Explain to the family. After a match, get a plain-language note on why these programs fit, ready to send by text or email.
+- Family assessment. Send a family a private intake link; their answers appear on the case. With your Anthropic key, ReferralFit can suggest level-of-care ratings from their answers for you to confirm.
+- Practice logo. Add your logo and families see it on the assessment.
+- Fixes and improvements.
+```
+
 If email confirmation is turned on in Supabase before the review, add:
 
 > Creating an account sends a confirmation email; the demo account is already

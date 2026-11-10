@@ -334,6 +334,75 @@ assert.equal(nativeState.scheduled.some((item) => /Teammate/.test(item.content.b
   unsubscribeWrong();
 }
 
+// ─── The day review reminder (6 PM unless the user picks another time) ────
+{
+  const morning = new Date(2026, 10, 9, 9, 0, 0);
+  const at = (date) => date && [date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes()].join(' ');
+  assert.equal(notifications.dayReviewReminderAt(0, morning), null, 'nothing waits: no reminder');
+  assert.equal(at(notifications.dayReviewReminderAt(3, morning)), '11 9 18 0', 'recordings wait: one at 6 PM today');
+  assert.equal(at(notifications.dayReviewReminderAt(3, new Date(2026, 10, 9, 18, 30, 0))), '11 10 18 0', 'past 6 PM: tomorrow at 6 PM, never a time already past');
+  assert.equal(at(notifications.dayReviewReminderAt(3, new Date(2026, 10, 9, 17, 59, 30))), '11 10 18 0', 'less than a minute away counts as past');
+  assert.equal(at(notifications.dayReviewReminderAt(3, morning, '20:30')), '11 9 20 30', 'the time the user picked');
+  assert.equal(at(notifications.dayReviewReminderAt(3, morning, '08:00')), '11 10 8 0', 'a morning time already past waits for tomorrow morning');
+  assert.equal(at(notifications.dayReviewReminderAt(3, new Date(2026, 10, 30, 21, 0, 0), '08:00')), '12 1 8 0', 'tomorrow across a month end');
+  assert.equal(notifications.dayReviewReminderAt(3, morning, 'off'), null, 'turned off: no reminder');
+  assert.equal(at(notifications.dayReviewReminderAt(3, morning, 'nonsense')), '11 9 18 0', 'an unreadable time is 6 PM');
+  // Stored values are made safe.
+  assert.equal(notifications.dayReviewReminderTime('off'), 'off');
+  assert.equal(notifications.dayReviewReminderTime('07:30'), '07:30');
+  for (const bad of [null, undefined, '', '7:30', '25:00', '12:60', '12:15', '18:00:00', 18, 'OFF']) {
+    assert.equal(notifications.dayReviewReminderTime(bad), '18:00', `unsafe stored time ${String(bad)} is 6 PM`);
+  }
+  // Earlier and later, half an hour at a time, around the clock.
+  assert.equal(notifications.stepDayReviewReminderTime('18:00', 1), '18:30');
+  assert.equal(notifications.stepDayReviewReminderTime('18:00', -1), '17:30');
+  assert.equal(notifications.stepDayReviewReminderTime('23:30', 1), '00:00');
+  assert.equal(notifications.stepDayReviewReminderTime('00:00', -1), '23:30');
+  assert.equal(notifications.stepDayReviewReminderTime('off', 1), '18:30', 'a step from off starts at 6 PM');
+  assert.equal(notifications.dayReviewReminderLabel('18:00'), '6:00 PM');
+  assert.equal(notifications.dayReviewReminderLabel('00:30'), '12:30 AM');
+  assert.equal(notifications.dayReviewReminderLabel('12:00'), '12:00 PM');
+  assert.equal(notifications.dayReviewReminderLabel('off'), '');
+  const empty = { partners: [], referrals: [], referralMatches: [], followUps: [] };
+  const reviewReminders = () => nativeState.scheduled.filter((item) => item.content.data.target === 'day_review');
+  // A count that arrives before the account's schedule is active is kept for it.
+  await notifications.cancelReferralFitNotifications();
+  await notifications.setDayReviewWaiting(2, 'user-r');
+  await notifications.activateReferralFitNotificationOwner('user-r');
+  await notifications.rescheduleNotifications(empty, 'user-r');
+  assert.equal(reviewReminders().length, 1, 'a count set before activation still schedules the reminder');
+  assert.equal(reviewReminders()[0].content.body, 'Your recorded conversations are ready to review.', 'no name or detail on the lock screen');
+  assert.equal(reviewReminders()[0].content.data.ownerId, 'user-r');
+  assert.equal(new Date(reviewReminders()[0].trigger.date).getHours(), 18, '6 PM until the user picks a time');
+  assert.ok(new Date(reviewReminders()[0].trigger.date).getTime() > Date.now(), 'always in the future');
+  // The user picks a time: the reminder moves at once, with no other save needed.
+  await notifications.setDayReviewReminderTime('20:30', 'user-r');
+  assert.equal(reviewReminders().length, 1);
+  assert.deepEqual([new Date(reviewReminders()[0].trigger.date).getHours(), new Date(reviewReminders()[0].trigger.date).getMinutes()], [20, 30], 'the reminder moves to the picked time');
+  // Turned off: none, though recordings wait; turned back on: it returns.
+  await notifications.setDayReviewReminderTime('off', 'user-r');
+  assert.equal(reviewReminders().length, 0, 'turned off: no reminder');
+  await notifications.rescheduleNotifications(empty, 'user-r');
+  assert.equal(reviewReminders().length, 0, 'still none after another save');
+  await notifications.setDayReviewReminderTime('07:00', 'user-r');
+  assert.equal(new Date(reviewReminders()[0].trigger.date).getHours(), 7, 'turned back on at the new time');
+  // Another account's count and time never reach this account's reminder.
+  await notifications.setDayReviewWaiting(5, 'user-s');
+  await notifications.setDayReviewReminderTime('09:00', 'user-s');
+  await notifications.rescheduleNotifications(empty, 'user-r');
+  assert.equal(reviewReminders().length, 1);
+  assert.equal(new Date(reviewReminders()[0].trigger.date).getHours(), 7, "another account's time changes nothing here");
+  await notifications.activateReferralFitNotificationOwner('user-q');
+  await notifications.rescheduleNotifications(empty, 'user-q');
+  assert.equal(reviewReminders().length, 0, 'an account with nothing waiting has no reminder');
+  // A time picked before the account's schedule is active is kept for it.
+  await notifications.activateReferralFitNotificationOwner('user-s');
+  await notifications.rescheduleNotifications(empty, 'user-s');
+  assert.equal(new Date(reviewReminders()[0].trigger.date).getHours(), 9, 'a time set before activation is used');
+  await notifications.setDayReviewWaiting(0, 'user-r');
+  await notifications.cancelReferralFitNotifications();
+}
+
 // ─── Cadence counts calendar days in the device's time zone ────────────────
 {
   const previousTz = process.env.TZ;
