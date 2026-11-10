@@ -15,7 +15,11 @@ const NOT_READY = new Set(['PGRST205', 'PGRST202', '42P01', '42883']);
 
 function fail(error: unknown, fallback: string): never {
   const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code ?? '') : '';
-  if (NOT_READY.has(code)) throw new AssessmentError('Family assessments are not available yet. Try again a little later.');
+  if (NOT_READY.has(code)) {
+    // The detail stays findable (a half-applied server change reads the same).
+    console.warn('family assessment: the server is not ready', code, fallback);
+    throw new AssessmentError('Family assessments are not available yet. Try again a little later.');
+  }
   throw new AssessmentError(describeError(error, fallback));
 }
 

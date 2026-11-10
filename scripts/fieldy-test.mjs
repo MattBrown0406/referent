@@ -2,6 +2,9 @@
 // MCP answers, turning conversations into the day review's text, and the
 // wiring that keeps tokens on the phone. Run with: node scripts/fieldy-test.mjs
 
+// Clock labels below are written for one zone: the same answer on any machine.
+process.env.TZ = 'UTC';
+
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';

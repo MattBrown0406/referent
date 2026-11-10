@@ -517,6 +517,10 @@ export default function DayReviewSheet({
     let read;
     try {
       read = await readNewRecordings(recorder, userId);
+      // Counted afresh as they are read: the count this review lowers is
+      // then the one that matches what it read (a recording may have
+      // arrived since the last count).
+      onRecordersChanged?.();
     } catch (error) {
       if (opening !== openingRef.current) return;
       setPhase('paste');
