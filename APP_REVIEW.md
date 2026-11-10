@@ -212,8 +212,8 @@ paragraph:
 >
 > FAMILY ASSESSMENT: on a case, "Family assessment" sends the family a
 > private link to an intake form on portal.referralfit.com. The family
-> agrees to a consent statement before answering, and their answers appear
-> on the case. To try it, enter an email address you can open.
+> reads and signs a consent statement before sending, and their answers
+> appear on the case. To try it, enter an email address you can open.
 
 **App Privacy answers (App Store Connect → App Privacy) to check for 1.3.0.**
 What changed in what the app handles:

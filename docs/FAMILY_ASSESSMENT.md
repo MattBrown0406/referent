@@ -133,27 +133,43 @@ family's address, name, the reply-to and any token leave the outbox row.
 | Database | `supabase/migrations/20261109140000_family_assessment.sql`, `supabase/tests/family_assessment_test.sql` |
 | Tests | `scripts/family-assessment-test.mjs` |
 
-## Deploy (Matt, at build time)
+## Deploy (at build time): the whole 1.3.0 release, in this order
 
-1. Paste `supabase/migrations/20261109130000_ai_assist.sql`, then
-   `supabase/migrations/20261109140000_family_assessment.sql` in the SQL
-   editor (ASCII, one BEGIN/COMMIT each, safe to re-run), with their
-   `schema_migrations` rows.
-2. Deploy the functions (all three, together with the migration: the page,
-   the upload function and the database change their calls together):
-   - `supabase functions deploy ai-assist --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
-   - `supabase functions deploy family-assessment-upload --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
+This is the one list for everything on the 1.3.0 build (day review, match
+explanation, family assessment). The order matters: the new functions all
+run on the old database, but the old `email-dispatch` cannot send the
+assessment emails, and an email it cannot write is dropped, not retried.
+
+1. **Functions first** (each runs on the database as it is today):
    - `supabase functions deploy email-dispatch --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
      (the invite, "finished" and "urgent" emails; it reads the logo from `SUPABASE_URL`).
    - `supabase functions deploy day-review --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
-     (names in a review must be in the notes; the deadline runs from arrival).
-3. Deploy the portal (the `/f` page) with the web app, from main.
-4. Publish the privacy policy and terms changes on referralfit.com (branch
-   prepared in referralfit-web): the policy today says ReferralFit never
+   - `supabase functions deploy ai-assist --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
+2. **Then the database**, pasted in the SQL editor one at a time, in this
+   order (ASCII, one BEGIN/COMMIT each, safe to re-run). Each pasted copy
+   needs its own record added as the last line before `COMMIT;` (the files
+   in the repo do not carry it; an INSERT after COMMIT is ignored by the
+   editor):
+   - `20261109120000_day_review.sql`, with
+     `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20261109120000', 'day_review') ON CONFLICT (version) DO NOTHING;`
+   - `20261109130000_ai_assist.sql`, with
+     `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20261109130000', 'ai_assist') ON CONFLICT (version) DO NOTHING;`
+   - `20261109140000_family_assessment.sql`, with
+     `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20261109140000', 'family_assessment') ON CONFLICT (version) DO NOTHING;`
+3. `supabase functions deploy family-assessment-upload --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
+   (card photos; it needs the tables from step 2).
+4. Deploy the portal (the `/f` page), then the web app, from main. Until
+   the portal is live an invite link opens the program sign-in page, so do
+   not send a real family a link before this step.
+5. Publish the privacy policy change on referralfit.com (branch
+   feat/day-review in referralfit-web; bump `PRIVACY_UPDATED`): the policy
+   today says ReferralFit never
    stores a date of birth or a full member ID, which this changes.
-5. The consent text (version 2026-11-08) is approved by Matt (2026-11-08).
+6. Check: send an assessment to your own email, open the link, add a card
+   photo, send it, and see the "finished" email arrive.
+7. The consent text (version 2026-11-08) is approved by Matt (2026-11-08).
    It is in `family_assessment_consent_text`; any change needs a new
    `family_assessment_consent_version`, so families sign the current words.
-6. App Store: check the App Privacy answers (health, insurance and
+8. App Store: check the App Privacy answers (health, insurance and
    identifiers collected from people who are not app users, through the
    web page) and add a line to the App Review notes.

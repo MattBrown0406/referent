@@ -9,7 +9,13 @@ import { supabase } from './supabase';
 
 export class AssessmentError extends Error {}
 
+// The app can reach a phone before the server change it needs (a table or a
+// function PostgREST does not know yet): said plainly, never as a raw error.
+const NOT_READY = new Set(['PGRST205', 'PGRST202', '42P01', '42883']);
+
 function fail(error: unknown, fallback: string): never {
+  const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code ?? '') : '';
+  if (NOT_READY.has(code)) throw new AssessmentError('Family assessments are not available yet. Try again a little later.');
   throw new AssessmentError(describeError(error, fallback));
 }
 

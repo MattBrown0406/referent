@@ -327,6 +327,10 @@ row's note becomes its first touch.
 
 ### Deploy (Matt)
 
+For the 1.3.0 release, follow the one ordered list in
+`docs/FAMILY_ASSESSMENT.md` ("Deploy"): functions first, then the database.
+This feature's own parts:
+
 1. Paste `supabase/migrations/20261109120000_day_review.sql` in the SQL
    editor (ASCII, one BEGIN/COMMIT, safe to re-run), with its
    `schema_migrations` row.

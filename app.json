@@ -54,7 +54,7 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "ReferralFit opens your photo library only when you choose to attach a photo, such as an insurance card or a signed agreement, to a private case file.",
+          "photosPermission": "ReferralFit opens your photo library only when you choose a photo: one to attach to a private case file, such as an insurance card or a signed agreement, or your practice logo.",
           "cameraPermission": false,
           "microphonePermission": false
         }
