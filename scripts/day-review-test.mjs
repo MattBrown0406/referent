@@ -521,6 +521,9 @@ check(() => {
   const late = (today) => build(found({ kind: 'follow_up', personName: 'Ana Rivera', summary: 'Call Ana back.', regarding: 'family', dueDate: today, missed: true }))[0];
   const [lateAgain] = rules.markSavedBefore([late('2026-11-14')], new Set(rules.laterSignatures(late('2026-11-13')).map(rules.signatureHash)));
   assert.equal(lateAgain.include, false, 'a saved late promise is not offered again on a later day');
+  const dated = build(found({ kind: 'follow_up', personName: 'Ana Rivera', summary: 'Call Ana back.', regarding: 'family', dueDate: '2026-11-13' }))[0];
+  const [pastDate] = rules.markSavedBefore([late('2026-11-15')], new Set(rules.laterSignatures(dated).map(rules.signatureHash)));
+  assert.equal(pastDate.include, false, 'a follow-up saved with its date is still known once that date has passed');
   assert.equal(rules.signatureHash('abc'), rules.signatureHash('abc'));
   assert.notEqual(rules.signatureHash('abc'), rules.signatureHash('abd'));
 }, 'saved leads are matched by who called');

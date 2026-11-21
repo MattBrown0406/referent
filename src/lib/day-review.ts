@@ -823,6 +823,12 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
   // read, so its day never tells it apart: it is known as missed.
   const base = `${row.found.kind}|${target}${row.kind === 'follow_up' ? `|d:${row.found.missed ? 'missed' : row.found.dueDate}` : ''}`;
   const out = [`${base}|t:${comparable(row.text)}`, `${base}|s:${comparable(row.found.summary)}`];
+  // A follow-up saved with its date, read again once that date has passed,
+  // comes back as a late promise ("missed"): it is still this one.
+  if (saved && row.kind === 'follow_up' && !row.found.missed) {
+    const late = `${row.found.kind}|${target}|d:missed`;
+    out.push(`${late}|t:${comparable(row.text)}`, `${late}|s:${comparable(row.found.summary)}`);
+  }
   if (row.found.evidence) out.push(`${base}|q:${comparable(row.found.evidence)}`);
   // Whatever it is matched to now: a lead saved earlier is a case today, so
   // the same words from the notes read again become a note on it. Its

@@ -146,7 +146,11 @@ Deno.serve(async (request) => {
   }
   if (stale.length) {
     const { error: removeError } = await supabase.storage.from('assessment-files').remove(stale);
-    if (removeError) console.error('removing stale card photo uploads failed');
+    if (removeError) {
+      // Not cleared: they still count, so a folder cannot grow without end.
+      console.error('removing stale card photo uploads failed');
+      count += stale.length;
+    }
   }
   if (count >= MAX_FILES_PER_ASSESSMENT) {
     return failure(429, 'too_many', 'Too many photos were sent for this assessment. Wait a few minutes and try again, or ask the practice for help.');
