@@ -285,6 +285,8 @@ check(() => {
   assert.match(api, /fromNote\.length < SHORT_NOTE && transcript/, 'a note too short to be one is checked against the transcript');
   assert.match(api, /const shortNoteOk = fromNote\.length >= SHORT_NOTE \|\| !transcript;/, 'and used only when there is no transcript to read');
   assert.doesNotMatch(api, /FAILING_GIVE_UP_MS\) \{ read\.push/, 'a failing recording is always tried again before it is given up');
+  assert.match(api, /if \(!ownFault && !anyDetailRead\) continue;/, 'on a weak connection (every read failing) no recording is held to the one-day clock');
+  assert.match(api, /error instanceof FieldyError && error\.reason === 'tool'/, 'a failure the recorder reports about the recording itself counts');
   assert.match(api, /export async function rememberSaved[^]*export async function savedFrom/, 'items saved from a recording are remembered with it');
   assert.match(api, /delete state\.saved\[id\];/, 'and forgotten once it is reviewed');
   assert.match(api, /\.sort\(\(a, b\) => Date\.parse\(a\.startTime\) - Date\.parse\(b\.startTime\)/, 'detail reads go oldest first');

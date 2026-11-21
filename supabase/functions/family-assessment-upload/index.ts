@@ -43,6 +43,8 @@ function failure(status: number, code: string, message: string): Response {
   return reply({ error: { code, message } }, status);
 }
 
+const MAX_FILES_PER_ASSESSMENT = 12;
+
 Deno.serve(async (request) => {
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
   if (request.method !== 'POST') return failure(405, 'method_not_allowed', 'Use POST.');
@@ -120,6 +122,17 @@ Deno.serve(async (request) => {
     return failure(500, 'server_error', 'The photo could not be sent right now. Try again.');
   }
   if (typeof prefix !== 'string' || !prefix) return failure(404, 'not_active', 'This link is not active.');
+  // A link holder cannot fill storage: an assessment holds two card photos,
+  // and a few replaced or abandoned uploads waiting to be cleaned up.
+  const folder = prefix.slice(0, prefix.lastIndexOf('/'));
+  const { data: present, error: listError } = await supabase.storage.from('assessment-files').list(folder, { limit: MAX_FILES_PER_ASSESSMENT + 1 });
+  if (listError) {
+    console.error('listing card photos failed');
+    return failure(500, 'server_error', 'The photo could not be sent right now. Try again.');
+  }
+  if ((present || []).length >= MAX_FILES_PER_ASSESSMENT) {
+    return failure(429, 'too_many', 'Too many photos were sent for this assessment. Wait a few minutes and try again, or ask the practice for help.');
+  }
 
   const { data: signed, error: signError } = await supabase.storage
     .from('assessment-files')

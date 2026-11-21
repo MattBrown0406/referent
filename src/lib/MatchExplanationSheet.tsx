@@ -140,9 +140,19 @@ export default function MatchExplanationSheet({ visible, userId, profile, ranked
     ]);
   }
 
+  // "Replace" means the practitioner's edits go: the text is written again
+  // from the ranking as it will be after `change`, not kept and marked stale.
+  function replaceEdits(change: () => void) {
+    setEdited(false);
+    editedRef.current = false;
+    setStale(false);
+    setText(generatedRef.current);
+    change();
+  }
+
   function chooseCount(next: number) {
     if (next === count || busy) return;
-    confirmReplace(() => { setRewrite(null); setMessage(null); setCount(next); });
+    confirmReplace(() => replaceEdits(() => { setRewrite(null); setMessage(null); setCount(next); }));
   }
 
   async function rewriteWarmer() {
@@ -257,7 +267,7 @@ export default function MatchExplanationSheet({ visible, userId, profile, ranked
                   {busy ? <ActivityIndicator color={COLORS.forest} accessibilityLabel="Rewriting" /> : <Text style={styles.secondaryButtonText}>Rewrite in warmer words</Text>}
                 </TouchableOpacity>
                 {rewrite ? (
-                  <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => confirmReplace(() => { setRewrite(null); setMessage(null); })} style={styles.secondaryButton}>
+                  <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => confirmReplace(() => replaceEdits(() => { setRewrite(null); setMessage(null); }))} style={styles.secondaryButton}>
                     <Text style={styles.secondaryButtonText}>Use the plain version</Text>
                   </TouchableOpacity>
                 ) : null}

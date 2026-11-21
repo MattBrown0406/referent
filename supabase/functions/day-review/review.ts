@@ -415,11 +415,21 @@ function quoteInNotes(evidence: string, notesComparable: string): boolean {
   return notesComparable.includes(` ${quote} `);
 }
 
-// A due date from yesterday to a year out; anything else is cleared.
+// A due date from today to a year out; anything else is cleared.
 function dueDateWithin(value: unknown, today: string): string {
   const day = clean(value, 10);
   if (!dateParts(day)) return '';
-  return day >= addDays(today, -1) && day <= addDays(today, 365) ? day : '';
+  return day >= today && day <= addDays(today, 365) ? day : '';
+}
+
+// Recordings are read up to a week late: "I'll call her back tomorrow" in
+// Monday's recording, read on Thursday, was due Tuesday. A date that has
+// passed within that window is a promise now late: due today, marked as
+// possibly missed (never quietly moved to tomorrow, never dropped).
+const LATE_WINDOW_DAYS = 8;
+function dueDatePassed(value: unknown, today: string): boolean {
+  const day = clean(value, 10);
+  return Boolean(dateParts(day)) && day < today && day >= addDays(today, -LATE_WINDOW_DAYS);
 }
 
 // What each kind needs to be worth showing.
@@ -471,7 +481,7 @@ export function parseReviewOutput(raw: string, request: ReviewRequest): FoundIte
       partnerType: oneOf(input.partner_type, PARTNER_TYPES, ''),
       regarding: oneOf(input.regarding, REGARDING, 'none'),
       urgent: input.urgent === true,
-      missed: kind === 'follow_up' && input.missed === true,
+      missed: kind === 'follow_up' && (input.missed === true || dueDatePassed(input.due_date, request.today)),
       evidence: clipWords(fullEvidence, LIMITS.evidence),
       verified: false,
       namesFound: true,

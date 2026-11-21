@@ -1626,6 +1626,8 @@ export default function App() {
     clearUnansweredSendKeys();
     clearPlacementAnswerLinks();
     // A review open for the account that signed out closes (it is cleared as it closes).
+    setShowHandoffs(false);
+    setShowPartnerImport(false);
     setShowDayReview(false);
     setDayReviewRecorder(null);
     setRecordingsWaiting({ fieldy: 0, plaud: 0 });

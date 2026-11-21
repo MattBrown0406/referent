@@ -380,10 +380,22 @@ async function withQueueLock<T>(work: () => Promise<T>): Promise<T> {
   queueMutex = new Promise<void>((resolve) => { release = resolve; });
   await previous;
   try {
-    return await work();
+    return await acrossTabs(work);
   } finally {
     release();
   }
+}
+
+// In a browser, every tab of the web app shares one stored queue
+// (localStorage), but the lock above only holds within its own tab: a flush
+// in one tab would write back its own copy over an edit queued meanwhile in
+// another. The browser's Web Locks hold across tabs. Not on the phone, where
+// there is one app and the lock above is enough.
+type WebLocks = { request: <R>(name: string, callback: () => Promise<R>) => Promise<R> };
+function acrossTabs<T>(work: () => Promise<T>): Promise<T> {
+  const locks = typeof navigator !== 'undefined' ? (navigator as unknown as { locks?: WebLocks }).locks : undefined;
+  if (!locks || typeof locks.request !== 'function') return work();
+  return locks.request('referralfit-offline-queue', work);
 }
 
 function isQueueOp(value: unknown): value is QueueOp {

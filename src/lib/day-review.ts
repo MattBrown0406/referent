@@ -862,7 +862,16 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
  * phone alone (a caller calling again about something new is shown).
  */
 export function laterSignatures(row: ReviewRow): string[] {
-  return rowSignatures(row, true).filter((signature) => !signature.includes('|q:') || signature.startsWith('new_lead|any|'));
+  // A note or a referral is also known by its quote with its kind and its
+  // case or partner (never a quote alone): read again, the model words the
+  // same note a little differently, and it must not be saved twice. Not a
+  // follow-up: one sentence often holds two ("call Ana and Sarah back
+  // tomorrow", both on one case); those are known by their wording and date.
+  const quoted = new Set<string>(['case_note', 'partner_note', 'referral']);
+  const targeted = Boolean(row.caseId || row.partnerId);
+  return rowSignatures(row, true).filter((signature) => !signature.includes('|q:')
+    || signature.startsWith('new_lead|any|')
+    || (targeted && quoted.has(row.found.kind) && signature.startsWith(`${row.found.kind}|`)));
 }
 
 /**
@@ -953,13 +962,22 @@ export function followUpWrite(row: ReviewRow) {
 }
 
 /** `licenseNote`: the line kept when the practitioner went ahead despite a license concern. */
+// The local day of a recording's time ('' when there is none).
+function localDayOf(iso: string): string {
+  const at = new Date(iso);
+  if (!iso || Number.isNaN(at.getTime())) return '';
+  return `${at.getFullYear()}-${String(at.getMonth() + 1).padStart(2, '0')}-${String(at.getDate()).padStart(2, '0')}`;
+}
+
 export function referralWrite(row: ReviewRow, today: string, licenseNote = '') {
   const note = row.text.trim();
+  // Dated the day it happened (the recording's day), as notes are; pasted notes, today.
+  const happened = localDayOf(row.occurredAt);
   return {
     id: row.ids.write,
     partnerId: row.partnerId!,
     direction: row.direction === 'received' ? 'Inbound' as const : 'Outbound' as const,
-    date: today,
+    date: happened && happened <= today ? happened : today,
     clientLabel: row.clientLabel.trim().slice(0, 120),
     outcome: 'Pending' as const,
     note: licenseNote ? `${note}\n\n${licenseNote}` : note,

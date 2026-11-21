@@ -103,6 +103,22 @@ async function removeWorkspaceCaseFiles(): Promise<void> {
     if (removeError) throw new StoreError(`Could not remove workspace documents: ${describeError(removeError)}`, false);
   }
   await removeWorkspaceAssessmentFiles(orgId);
+  await removeWorkspaceLogos(orgId);
+}
+
+// The practice logo is in a public bucket: it goes with the workspace, or it
+// would stay reachable after the account is deleted.
+// Best effort: a logo that cannot be removed never blocks deleting the account.
+async function removeWorkspaceLogos(orgId: string): Promise<void> {
+  try {
+    const bucket = supabase.storage.from('org-logos');
+    const { data, error } = await bucket.list(orgId, { limit: 100 });
+    if (error) return;
+    const paths = (data || []).filter((item) => item.id).map((item) => `${orgId}/${item.name}`);
+    if (paths.length) await bucket.remove(paths);
+  } catch {
+    // Nothing to do: the account deletion goes on.
+  }
 }
 
 // The server's own wording for a refusal ("Remove the other members of your

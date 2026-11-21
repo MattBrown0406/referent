@@ -523,9 +523,10 @@ async function detail(recorder: Recorder, session: Session, plan: TranscriptPlan
 // A note this short may be the recorder saying it has none ("No note has
 // been generated"): the transcript is read too, and used when it has words.
 const SHORT_NOTE = 120;
-// A recording whose summary and transcript keep failing (an error, or too
-// slow) is taken as having no text after a day of failures; until then it
-// waits, behind those not failing.
+// A recording whose summary and transcript keep failing for itself (the
+// recorder answers with an error, or it is too slow while other reads work)
+// is taken as having no text after a day of failures; until then it waits,
+// behind those not failing. A weak connection never counts.
 const FAILING_GIVE_UP_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -556,21 +557,40 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
   const recovered: string[] = [];
   const started = Date.now();
   let reads = 0;
+  // A detail read that worked: the connection was fine, so another item's
+  // failure in this read is that item's own.
+  let anyDetailRead = false;
+  // Items whose read failed, decided after the loop: a failure is only held
+  // against an item (its one-day clock started or run on) when the recorder
+  // answered with an error about it, or when other reads in this same review
+  // worked. On poor signal every read fails; the items then simply wait, and
+  // no clock starts, so they are never given up for a weak connection.
+  const failedItems: { item: FieldyConversation; ownFault: boolean }[] = [];
+  const isOwnFault = (error: unknown) => error instanceof FieldyError && error.reason === 'tool';
   for (const item of order) {
     if (reads >= DETAIL_READS || Date.now() - started > DETAIL_TIME_MS) continue;
     reads += 1;
     let failed = false;
+    let ownFault = false;
     let fromNote = '';
     let fromTranscript = '';
     if (note) {
-      try { fromNote = await detail(recorder, session, note, item, now.getTime(), noteText); } catch { failed = true; }
+      try {
+        fromNote = await detail(recorder, session, note, item, now.getTime(), noteText);
+        anyDetailRead = true;
+      } catch (error) {
+        failed = true;
+        ownFault = ownFault || isOwnFault(error);
+      }
     }
     const ended = Date.parse(item.endTime || item.startTime);
     if (fromNote.length < SHORT_NOTE && transcript && !Number.isNaN(ended) && now.getTime() - ended >= SUMMARY_WAIT_MS) {
       try {
         fromTranscript = await detail(recorder, session, transcript, item, now.getTime(), (payload) => transcriptText(payload, item.id));
-      } catch {
+        anyDetailRead = true;
+      } catch (error) {
         failed = true;
+        ownFault = ownFault || isOwnFault(error);
       }
     }
     // A short note ("No note has been generated…") is used only when there
@@ -584,13 +604,20 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
       continue;
     }
     if (failed) {
-      // Not read this time (never taken for "no text" at once): tried again
-      // next time; given up only when it fails again a day after it first did.
-      const since = state.failing[item.id] ?? now.toISOString();
-      failing[item.id] = since;
-      if (now.getTime() - Date.parse(since) < FAILING_GIVE_UP_MS) continue;
+      failedItems.push({ item, ownFault });
+      continue;
     }
-    // Read, and no text (or failing for a day): reviewPlan waits for it, or skips it a day after it ended.
+    // Read, and no text: reviewPlan waits for it, or skips it a day after it ended.
+    read.push(item);
+  }
+  for (const { item, ownFault } of failedItems) {
+    // Not read this time (never taken for "no text" at once): tried again
+    // next time. Given up only when it fails again, for itself, a day after
+    // it first did; a weak connection neither starts nor runs that clock.
+    if (!ownFault && !anyDetailRead) continue;
+    const since = state.failing[item.id] ?? now.toISOString();
+    failing[item.id] = since;
+    if (now.getTime() - Date.parse(since) < FAILING_GIVE_UP_MS) continue;
     read.push(item);
   }
   if (Object.keys(failing).length || recovered.length) {

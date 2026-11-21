@@ -28,6 +28,8 @@ export type FamilyAssessmentStatus = 'sent' | 'started' | 'submitted' | 'revoked
 
 export type FamilyAssessment = {
   id: string;
+  /** Its latest invite email could not be delivered (the server gave up on it). */
+  inviteFailed?: boolean;
   caseId: string;
   status: FamilyAssessmentStatus;
   recipientName: string;
@@ -123,6 +125,9 @@ export function statusLine(assessment: FamilyAssessment, now = new Date()): stri
     const section = Math.min(Math.max(assessment.step, 1), SECTIONS.length);
     const attention = safetyFlags(assessment.answers).length ? ' · needs attention today' : '';
     return `In progress${to} · section ${section} of ${SECTIONS.length} · saved ${shortDate(assessment.lastSavedAt)}${attention}`;
+  }
+  if (assessment.inviteFailed) {
+    return `The email${assessment.recipientEmail ? ` to ${assessment.recipientEmail}` : ''} did not go out. Check the address, or text or copy the link instead.`;
   }
   return `Sent${to} ${shortDate(assessment.emailedAt || assessment.createdAt)} · not started yet`;
 }
