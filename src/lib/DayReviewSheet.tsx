@@ -127,6 +127,7 @@ type Props = {
 type Phase = 'paste' | 'finding' | 'review' | 'saving' | 'done';
 
 type RecorderState = { state: 'checking' | 'off' | 'on' | 'busy' | 'leaving'; email: string };
+const CLOSED_STATUSES = new Set(['closed', 'lost']);
 const RECORDERS_CHECKING: Record<RecorderId, RecorderState> = { fieldy: { state: 'checking', email: '' }, plaud: { state: 'checking', email: '' } };
 
 function localDay(date = new Date()): string {
@@ -732,7 +733,12 @@ export default function DayReviewSheet({
     const name = title.trim().slice(0, 120);
     if (!name) return;
     // A case of that name already in ReferralFit (or a new lead's above): that one, not a second.
-    const existing = view.cases.find((record) => record.status !== NEW_CASE_STATUS && comparable(record.title) === comparable(name));
+    const existing = view.cases.find((record) => record.status !== NEW_CASE_STATUS && !CLOSED_STATUSES.has(record.status) && comparable(record.title) === comparable(name));
+    const closed = view.cases.find((record) => CLOSED_STATUSES.has(record.status) && comparable(record.title) === comparable(name));
+    if (!existing && closed) {
+      setMessage({ ok: false, text: `“${closed.title}” is a closed case. Reopen it on Cases, or give the new case another name.` });
+      return;
+    }
     if (existing) {
       updateRow(key, (current) => chooseCase(current, existing.id, view));
       setCaseDraft(null);
@@ -742,7 +748,10 @@ export default function DayReviewSheet({
     const same = newCases.find((item) => comparable(item.title) === comparable(name));
     // The person the notes name (with their phone or email) becomes the
     // case's contact, as a new lead's caller does.
-    const source = rows.find((item) => item.key === key)?.found;
+    // Only when that person is the family: a follow-up about a professional,
+    // or a referral (whose phone is often the program's), gives none.
+    const row = rows.find((item) => item.key === key);
+    const source = row && (row.kind === 'case_note' || (row.kind === 'follow_up' && row.found.regarding === 'family' && !row.found.organization)) ? row.found : undefined;
     const contact = source && source.personName.trim() && (source.phone || source.email)
       ? { name: source.personName.trim(), phone: source.phone, email: source.email, about: source.aboutRelationship }
       : undefined;

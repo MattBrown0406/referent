@@ -694,7 +694,8 @@ check(() => {
   assert.match(sheet, /await createCaseBundle\(record, contact, nextStep, userId\);/, 'created at Approve');
   assert.match(sheet, /const nextStep = hasNextStep \? null : initialCaseFollowUp\(/, 'with a follow-up in 48 hours unless the review gives it one (never no next step)');
   assert.match(sheet, /isPrimary: true/, 'the person the notes name, with their phone or email, is its contact');
-  assert.match(sheet, /const existing = view\.cases\.find\(\(record\) => record\.status !== NEW_CASE_STATUS && comparable\(record\.title\) === comparable\(name\)\);/, 'a name already in ReferralFit is that case, not a second one');
+  assert.match(sheet, /row\.kind === 'case_note' \|\| \(row\.kind === 'follow_up' && row\.found\.regarding === 'family' && !row\.found\.organization\)/, 'only when that person is the family (never a professional or a program\'s phone)');
+  assert.match(sheet, /const existing = view\.cases\.find\(\(record\) => record\.status !== NEW_CASE_STATUS && !CLOSED_STATUSES\.has\(record\.status\) && comparable\(record\.title\) === comparable\(name\)\);/, 'a name already in ReferralFit is that case, not a second one');
   assert.match(sheet, /if \(known\.has\(pending\.id\) \|\| !order\.some\(\(row\) => row\.caseId === pending\.id\)\) continue;/, 'only a new case a saved row is on is created');
   assert.match(sheet, /results\[row\.key\] = \{ saved: false, message: caseProblem \};/, 'a row on a case that could not be created is not saved');
 }, 'New case: a note for a family not in ReferralFit yet');
