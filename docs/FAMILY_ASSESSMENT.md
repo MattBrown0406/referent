@@ -128,6 +128,27 @@ family" on the ranked list. When the case already has a saved match, the app
 asks first and keeps every field the answers do not speak to. Nothing is
 saved until the practitioner saves the match.
 
+## Case brief for programs (2026-11-21, Matt)
+
+A finished assessment shows **Case brief for programs**: a short summary for
+a program's admissions team (`src/lib/case-brief.ts`, tests in
+`scripts/case-brief-test.mjs`). Client (age and gender only; 90 or older is
+grouped), substances (from the structured rows: frequency, route, current),
+use, withdrawal, medical, mental health, safety, readiness, earlier
+treatment (count, types, how many completed), home, payment (the carrier
+only, or State Medicaid or self-pay: never a number or the budget), the
+practitioner's level-of-care rating, and urgency.
+
+It is built only from the answers' choices, never their free-text boxes,
+so it carries no names, contact details, birth date, member or group
+numbers, program names or dollar amounts. The practitioner can edit it;
+**Share the brief** and **Copy the brief** check the text line by line with
+the same rules as every text programs read (`identifying-text.ts`), with
+the case's title, its contacts and the names typed in the assessment.
+Nothing is sent by ReferralFit: it goes only where the practitioner shares
+it. In a referral packet **Sending to partner**, **Add the case brief**
+appends it to the program's copy, which stays editable before sharing.
+
 ## Data and access
 
 | Data | Where | Who |

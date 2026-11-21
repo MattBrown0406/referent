@@ -22,7 +22,10 @@ import {
   View,
 } from 'react-native';
 
+import * as Clipboard from 'expo-clipboard';
+
 import { AssistUnavailableError, requestLevelSuggestion } from './ai-assist-api';
+import { assessmentNames, caseBriefText, shareBriefProblem, type BriefInput } from './case-brief';
 import {
   answerSections,
   assessmentAlerts,
@@ -74,11 +77,16 @@ type Props = {
   onRateLevel: (seed: LevelOfCareSeed) => void;
   /** Open Match filled in from the family's answers (src/lib/assessment-match.ts). */
   onMatch?: (answers: FamilyAssessment['answers']) => void;
+  /** For the case brief (src/lib/case-brief.ts): the carrier on Benefits and the level-of-care rating. */
+  planCarrier?: string;
+  rated?: BriefInput['rated'];
+  /** The case's title and contact names: an edited brief may not mention them. */
+  caseNames?: string[];
 };
 
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClose, onRateLevel, onMatch }: Props) {
+export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClose, onRateLevel, onMatch, planCarrier, rated, caseNames }: Props) {
   const [practiceName, setPracticeName] = useState('Your practice');
   const [list, setList] = useState<FamilyAssessment[] | null>(null);
   const [loadError, setLoadError] = useState('');
@@ -120,6 +128,11 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
   const earlier = useMemo(() => (list && newest ? list.filter((item) => item.id !== newest.id) : []), [list, newest]);
   const finished = current?.status === 'submitted' ? current : null;
   const live = current && current.id === newest?.id && isOpen(current) ? current : null;
+  // The case brief for programs, as built from the answers; the practitioner's edits replace it until another assessment shows.
+  const builtBrief = useMemo(() => (finished ? caseBriefText({ answers: finished.answers, planCarrier, rated }) : ''), [finished, planCarrier, rated]);
+  const [briefEdit, setBriefEdit] = useState<{ id: string; text: string } | null>(null);
+  const brief = briefEdit && finished && briefEdit.id === finished.id ? briefEdit.text : builtBrief;
+
   // Danger in answers saved before the family finished: the alerts show (the answers do not, until they send it).
   // Only on the newest assessment: an old stopped or expired one is history, not "reach out today".
   const earlyAlerts = current && current.id === newest?.id && !finished && current.status !== 'revoked' && Object.keys(current.answers).length ? assessmentAlerts(current) : [];
@@ -242,6 +255,38 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
     }
   }
 
+  // The brief goes only where the practitioner sends it (the share sheet or
+  // a copy). The same check as every text programs read, line by line.
+  function briefReady(): string | null {
+    if (!finished) return null;
+    const body = brief.trim();
+    if (!body) { setMessage({ ok: false, text: 'The brief is empty. Use “Start over” to build it again.' }); return null; }
+    const problem = shareBriefProblem(body, [...(caseNames || []), recipient.name, ...assessmentNames(finished.answers)]);
+    if (problem) { Alert.alert('Check the brief', problem); return null; }
+    return body;
+  }
+
+  async function shareBrief() {
+    const body = briefReady();
+    if (!body) return;
+    try {
+      await Share.share({ message: body });
+    } catch {
+      setMessage({ ok: false, text: 'The brief could not be shared. Copy it instead.' });
+    }
+  }
+
+  async function copyBrief() {
+    const body = briefReady();
+    if (!body) return;
+    try {
+      await Clipboard.setStringAsync(body);
+      setMessage({ ok: true, text: 'Brief copied. Paste it into your message to the program.' });
+    } catch {
+      setMessage({ ok: false, text: 'The brief could not be copied. Select the text and copy it.' });
+    }
+  }
+
   const sendForm = (
     <View style={styles.card}>
       <Text style={styles.cardTitle}>{current ? 'Send a new assessment' : 'Send the family assessment'}</Text>
@@ -360,6 +405,33 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
                 </View>
               ) : null}
 
+              {builtBrief ? (
+                <View style={styles.card}>
+                  <Text style={styles.cardTitle}>Case brief for programs</Text>
+                  <Text style={styles.body}>A short summary for a program’s admissions team, from the family’s choices and your level-of-care rating. It leaves out names, contact details, dates, numbers and anything the family typed in their own words. Read it, change what you like, then send it with a referral.</Text>
+                  <TextInput
+                    value={brief}
+                    onChangeText={(value) => finished && setBriefEdit({ id: finished.id, text: value })}
+                    multiline
+                    maxLength={3000}
+                    accessibilityLabel="The case brief"
+                    style={[styles.input, styles.briefInput]}
+                  />
+                  <TouchableOpacity accessibilityRole="button" disabled={Boolean(busy)} onPress={() => { void shareBrief(); }} style={[styles.primaryButton, busy && styles.off]}>
+                    <Text style={styles.primaryButtonText}>Share the brief</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity accessibilityRole="button" disabled={Boolean(busy)} onPress={() => { void copyBrief(); }} style={[styles.secondaryButton, busy && styles.off]}>
+                    <Text style={styles.secondaryButtonText}>Copy the brief</Text>
+                  </TouchableOpacity>
+                  {briefEdit && finished && briefEdit.id === finished.id ? (
+                    <TouchableOpacity accessibilityRole="button" onPress={() => setBriefEdit(null)} style={styles.textButton}>
+                      <Text style={styles.textButtonText}>Start over from the answers</Text>
+                    </TouchableOpacity>
+                  ) : null}
+                  <Text style={styles.hint}>Sending to a partner from Match? “Add the case brief” puts it in the program’s copy of the packet.</Text>
+                </View>
+              ) : null}
+
               {photos.front || photos.back ? (
                 <View style={styles.card}>
                   <Text style={styles.cardTitle}>Insurance card</Text>
@@ -441,6 +513,7 @@ const styles = StyleSheet.create({
   label: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, color: COLORS.muted, marginTop: 8 },
   sectionLabel: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, color: COLORS.muted, marginTop: 6 },
   input: { minHeight: 44, borderWidth: 1, borderColor: COLORS.line, borderRadius: 10, backgroundColor: COLORS.white, paddingHorizontal: 12, paddingVertical: 10, fontSize: 15, color: COLORS.ink },
+  briefInput: { minHeight: 220, maxHeight: 420, textAlignVertical: 'top', fontSize: 14, lineHeight: 20, marginTop: 10 },
   primaryButton: { minHeight: 50, borderRadius: 14, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', marginTop: 10 },
   primaryButtonText: { color: COLORS.white, fontSize: 16, fontWeight: '800' },
   secondaryButton: { minHeight: 46, borderRadius: 12, borderWidth: 1, borderColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', marginTop: 8, paddingHorizontal: 14 },

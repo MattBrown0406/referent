@@ -178,8 +178,11 @@ import ProgramReferralCard from './src/lib/ProgramReferralCard';
 import PartnerImportSheet from './src/lib/PartnerImportSheet';
 import { contactFilesAvailable, deviceContactsAvailable } from './src/lib/partner-import-api';
 import { useCaseAssessments } from './src/lib/level-of-care-api';
-import { levelOfCarePacketLines, reasonNames, type PlacementLevel } from './src/lib/level-of-care';
+import { levelOfCarePacketLines, pathLabel, reasonNames, type PlacementLevel } from './src/lib/level-of-care';
 import { matchFromAssessment } from './src/lib/assessment-match';
+import { assessmentNames, BRIEF_HEADER, caseBriefText, shareBriefProblem } from './src/lib/case-brief';
+import { currentAssessment as currentFamilyAssessment } from './src/lib/family-assessment';
+import { listFamilyAssessments } from './src/lib/family-assessment-api';
 import type { Answers } from './src/lib/assessment-schema';
 import {
   assignMatchReferral,
@@ -1206,6 +1209,8 @@ export default function App() {
   const [packetTarget, setPacketTarget] = useState<{ partner: Partner; match: ReferralMatch; assignOnSend: boolean; licenseOverride?: LicenseConcern | null } | null>(null);
   const [packetAudience, setPacketAudience] = useState<PacketAudience>('family');
   const [packetText, setPacketText] = useState('');
+  // "Add the case brief" (src/lib/case-brief.ts) is reading the case's family assessment.
+  const [packetBriefBusy, setPacketBriefBusy] = useState(false);
   // The financial-relationship disclosure was missing from the edited packet
   // and was put back on the end before sharing; the composer says so.
   const [packetDisclosureRestored, setPacketDisclosureRestored] = useState(false);
@@ -3343,6 +3348,40 @@ export default function App() {
     // The level-of-care rationale: the program's copy only (buildPacket drops it from the family's).
     const rationaleLines = audience === 'partner' ? levelOfCarePacketLines(caseAssessments.currentFor(packetTarget.match.caseId), packetTarget.match.levelOfCare) : [];
     setPacketText(buildPacket(packetTarget.match, packetTarget.partner, buildFitReasons(packetTarget.match, packetTarget.partner, fitInput, audience), audience, costLines, rationaleLines));
+  }
+
+  // "Add the case brief": the program's copy of the packet gets the brief
+  // built from the case's finished family assessment, appended to the text
+  // the practitioner can still edit before sharing.
+  const packetTargetRef = useRef(packetTarget);
+  packetTargetRef.current = packetTarget;
+  async function addCaseBriefToPacket() {
+    const target = packetTarget;
+    const caseId = target?.match.caseId;
+    if (!target || !caseId || packetBriefBusy) return;
+    if (packetText.includes(BRIEF_HEADER)) { Alert.alert('Already in the packet', 'The case brief is already in this packet.'); return; }
+    setPacketBriefBusy(true);
+    try {
+      const list = await listFamilyAssessments(caseId);
+      if (packetTargetRef.current !== target) return;
+      const newest = currentFamilyAssessment(list);
+      const finished = newest?.status === 'submitted' ? newest : list.find((item) => item.status === 'submitted') ?? null;
+      if (!finished) { Alert.alert('No case brief yet', 'The case brief comes from a finished family assessment. Send the family the assessment from the case file.'); return; }
+      const rating = caseAssessments.currentFor(caseId);
+      const brief = caseBriefText({
+        answers: finished.answers,
+        planCarrier: benefitsByCase[caseId]?.carrier || '',
+        rated: rating ? { chosenLevel: rating.chosenLevel, recommended: pathLabel(rating.recommendation) } : null,
+      });
+      if (!brief) { Alert.alert('Nothing to add', 'The family’s answers do not have enough for a brief.'); return; }
+      const problem = shareBriefProblem(brief, [...handoffCaseNames(caseId), ...assessmentNames(finished.answers)]);
+      if (problem) { Alert.alert('Check the brief', `${problem} Open the family assessment to edit and share the brief from there.`); return; }
+      setPacketText((current) => (current.includes(BRIEF_HEADER) ? current : `${current.replace(/\s+$/, '')}\n\n${brief}`));
+    } catch (error) {
+      if (packetTargetRef.current === target) Alert.alert('Could not add the brief', describeError(error));
+    } finally {
+      setPacketBriefBusy(false);
+    }
   }
 
   // The placement record for an assignment made from a match: what was
@@ -9589,6 +9628,11 @@ export default function App() {
                 placeholderTextColor="#99A6A1"
                 style={[styles.formInput, styles.packetEditor]}
               />
+              {packetAudience === 'partner' && packetTarget.match.caseId ? (
+                <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: packetBriefBusy }} disabled={packetBriefBusy} onPress={() => { void addCaseBriefToPacket(); }} style={styles.sheetSecondaryButton}>
+                  {packetBriefBusy ? <ActivityIndicator color={COLORS.forest} accessibilityLabel="Reading the assessment" /> : <Text style={styles.sheetSecondaryButtonText}>Add the case brief</Text>}
+                </TouchableOpacity>
+              ) : null}
               {packetDisclosureRestored ? (
                 <Text accessibilityRole="alert" style={styles.packetReminder}><AppIcon name="information-circle-outline" size={13} color={COLORS.coral} /> The financial-relationship disclosure was missing, so it was added back to the end of the packet. Every packet for this program carries it.</Text>
               ) : null}
@@ -9949,6 +9993,12 @@ export default function App() {
           onClose={() => setFamilyAssessmentCaseId(null)}
           onRateLevel={(seed) => { setLevelOfCareSeed(seed); setAssessmentCaseId(record.id); }}
           onMatch={(answers) => startMatchFromAssessment(record, answers)}
+          planCarrier={benefitsByCase[record.id]?.carrier || ''}
+          rated={(() => {
+            const rating = caseAssessments.currentFor(record.id);
+            return rating ? { chosenLevel: rating.chosenLevel, recommended: pathLabel(rating.recommendation) } : null;
+          })()}
+          caseNames={handoffCaseNames(record.id)}
         />
       </Modal>
     );
