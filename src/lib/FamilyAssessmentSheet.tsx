@@ -4,6 +4,8 @@
 // read the answers by section, see the card photos and the signed consent,
 // and rate the level of care: by hand with the family's answers under each
 // area, or starting from an AI suggestion on the practitioner's own key.
+// With a key, the card photos can also be read into the case's Benefits
+// (read_card): the Benefits form opens filled in, to check before saving.
 // Shown inside the case file's own modal (App.tsx CaseDetailModal swaps it in).
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -24,7 +26,8 @@ import {
 
 import * as Clipboard from 'expo-clipboard';
 
-import { AssistUnavailableError, requestLevelSuggestion } from './ai-assist-api';
+import { AssistUnavailableError, requestCardReading, requestLevelSuggestion } from './ai-assist-api';
+import { cardSides, type CardReading } from './card-reading';
 import { assessmentNames, caseBriefText, shareBriefProblem, type BriefInput } from './case-brief';
 import {
   answerSections,
@@ -82,19 +85,26 @@ type Props = {
   rated?: BriefInput['rated'];
   /** The case's title and contact names: an edited brief may not mention them. */
   caseNames?: string[];
+  /** The app's carrier names for this case (the Benefits form's list), for the card reading. */
+  carriers: string[];
+  /** Why the Benefits form cannot open right now (still loading, offline), or null. */
+  benefitsBlock: { title: string; message: string } | null;
+  /** The card was read: open this case's Benefits form with it. */
+  onCardRead: (caseId: string, reading: CardReading) => void;
 };
 
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClose, onRateLevel, onMatch, planCarrier, rated, caseNames }: Props) {
+export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClose, onRateLevel, onMatch, planCarrier, rated, caseNames, carriers, benefitsBlock, onCardRead }: Props) {
   const [practiceName, setPracticeName] = useState('Your practice');
   const [list, setList] = useState<FamilyAssessment[] | null>(null);
   const [loadError, setLoadError] = useState('');
   const [name, setName] = useState(recipient.name);
   const [email, setEmail] = useState(recipient.email);
-  const [busy, setBusy] = useState<'' | 'email' | 'share' | 'stop' | 'delete' | 'ai'>('');
+  const [busy, setBusy] = useState<'' | 'email' | 'share' | 'stop' | 'delete' | 'ai' | 'card'>('');
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
-  const [photos, setPhotos] = useState<{ front: string | null; back: string | null }>({ front: null, back: null });
+  // `ready`: the links were asked for (so "cannot be shown" never flashes while they load).
+  const [photos, setPhotos] = useState<{ front: string | null; back: string | null; ready?: boolean }>({ front: null, back: null });
   const [openSection, setOpenSection] = useState<string | null>(null);
   const [showConsent, setShowConsent] = useState(false);
   const [hasKey, setHasKey] = useState(false);
@@ -141,7 +151,7 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
   useEffect(() => {
     if (!finished || (!finished.cardFront && !finished.cardBack)) { setPhotos({ front: null, back: null }); return; }
     let active = true;
-    void cardPhotoUrls(finished).then((urls) => { if (active) setPhotos(urls); });
+    void cardPhotoUrls(finished).then((urls) => { if (active) setPhotos({ ...urls, ready: true }); });
     return () => { active = false; };
   }, [finished]);
 
@@ -230,6 +240,57 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
     );
   }
 
+  function readCard() {
+    if (!finished || busy || busyRef.current || !cardSides(finished).length) return;
+    // A reading the form could not take is a call paid for nothing: say so first.
+    if (benefitsBlock) { Alert.alert(benefitsBlock.title, benefitsBlock.message); return; }
+    Alert.alert(
+      'Read the card into Benefits?',
+      'The card photos go to Anthropic on your own key to be read. ReferralFit keeps nothing from the reading. The Benefits form then opens filled in, and nothing is saved until you check it and tap Save.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Read the card', onPress: () => { void runCardReading(finished); } },
+      ],
+    );
+  }
+
+  async function runCardReading(assessment: FamilyAssessment) {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy('card');
+    setMessage(null);
+    try {
+      const key = await getAnthropicKey(userId);
+      if (!key) { setHasKey(false); setMessage({ ok: false, text: 'Add your Anthropic key in Workspace and settings, AI drafts.' }); return; }
+      const reading = await requestCardReading(assessment.id, cardSides(assessment), carriers, key);
+      if (!mountedRef.current) return;
+      // Deleted while it was being read (here or on another phone): nothing is filled in.
+      // Offline now: the reading stands, and the practitioner checks every field anyway.
+      try {
+        const rows = await listFamilyAssessments(caseId);
+        if (!mountedRef.current) return;
+        setList(rows);
+        if (!rows.some((item) => item.id === assessment.id)) {
+          setShownId(null);
+          setMessage({ ok: false, text: 'This assessment was deleted while the card was being read, so nothing was filled in.' });
+          return;
+        }
+      } catch {
+        // keep going
+      }
+      if (!mountedRef.current) return;
+      onCardRead(assessment.caseId, reading);
+    } catch (error) {
+      if (!mountedRef.current) return;
+      if (error instanceof AssistUnavailableError && error.reason === 'key') setHasKey(false);
+      if (error instanceof AssistUnavailableError && error.reason === 'gone') { setShownId(null); void load(); }
+      setMessage({ ok: false, text: error instanceof Error ? error.message : 'The card could not be read right now.' });
+    } finally {
+      busyRef.current = false;
+      if (mountedRef.current) setBusy('');
+    }
+  }
+
   async function runSuggestion(assessment: FamilyAssessment) {
     setBusy('ai');
     setMessage(null);
@@ -309,7 +370,7 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
   return (
     <SafeAreaView style={styles.page}>
       <View style={styles.header}>
-        <TouchableOpacity accessibilityRole="button" accessibilityLabel="Back to case file" disabled={busy === 'ai'} onPress={onClose} style={styles.headerButton}>
+        <TouchableOpacity accessibilityRole="button" accessibilityLabel="Back to case file" disabled={busy === 'ai' || busy === 'card'} onPress={onClose} style={styles.headerButton}>
           <Text style={styles.headerButtonText}>Back</Text>
         </TouchableOpacity>
         <Text style={styles.headerTitle} accessibilityRole="header">Family assessment</Text>
@@ -432,12 +493,22 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
                 </View>
               ) : null}
 
-              {photos.front || photos.back ? (
+              {finished.cardFront || finished.cardBack ? (
                 <View style={styles.card}>
                   <Text style={styles.cardTitle}>Insurance card</Text>
                   {photos.front ? <Image source={{ uri: photos.front }} style={styles.photo} resizeMode="contain" accessibilityLabel="Front of the insurance card" /> : null}
                   {photos.back ? <Image source={{ uri: photos.back }} style={styles.photo} resizeMode="contain" accessibilityLabel="Back of the insurance card" /> : null}
-                  <Text style={styles.hint}>Private: these links stop working after five minutes.</Text>
+                  <Text style={styles.hint}>{photos.front || photos.back ? 'Private: these links stop working after five minutes.' : photos.ready ? 'The photos cannot be shown right now. Open this again to try once more.' : 'Loading the photos…'}</Text>
+                  {aiKeysSupported && hasKey ? (
+                    <>
+                      <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: busy === 'card' }} disabled={Boolean(busy)} onPress={readCard} style={[styles.secondaryButton, busy && styles.off]}>
+                        {busy === 'card' ? <ActivityIndicator color={COLORS.forest} accessibilityLabel="Reading the card" /> : <Text style={styles.secondaryButtonText}>Read the card into Benefits</Text>}
+                      </TouchableOpacity>
+                      <Text style={styles.hint}>Fills in the carrier, plan name and last four of the member ID for you to check. Only empty fields are filled.</Text>
+                    </>
+                  ) : aiKeysSupported ? (
+                    <Text style={styles.hint}>Add your Anthropic key (Workspace and settings, AI drafts) and the app can read this card into Benefits for you.</Text>
+                  ) : null}
                 </View>
               ) : null}
 

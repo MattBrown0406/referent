@@ -2,6 +2,7 @@
 // key (supabase/functions/ai-assist). Each help sends only what it needs,
 // and the function checks the answer before it comes back.
 
+import { readCardReading, type CardReading } from './card-reading';
 import { supabase } from './supabase';
 import type { DimensionKey, Rating } from './level-of-care';
 import type { Rewrite, RewriteFacts } from './match-explanation';
@@ -12,6 +13,7 @@ export type AssistFailureReason =
   | 'limit' // the daily cap
   | 'refused' // the model declined
   | 'checked' // the answer did not keep to the facts; the app's own version stands
+  | 'gone' // read_card: the assessment or its photos were deleted
   | 'unavailable'; // anything else, usually passing
 
 export class AssistUnavailableError extends Error {
@@ -62,6 +64,7 @@ async function invokeAssist(action: string, payload: Record<string, unknown>, ap
     if (KEY_CODES.includes(code)) throw new AssistUnavailableError(message, 'key');
     if (code === 'daily_limit') throw new AssistUnavailableError(message, 'limit');
     if (code === 'refused') throw new AssistUnavailableError(message, 'refused');
+    if (code === 'not_found') throw new AssistUnavailableError(message, 'gone');
     if (code === 'bad_output') throw new AssistUnavailableError(`${message} Your own version is unchanged.`, 'checked');
     throw new AssistUnavailableError(message, 'unavailable');
   }
@@ -128,4 +131,23 @@ export async function requestLevelSuggestion(facts: { section: string; lines: st
   const suggestion = readLevelSuggestion(await invokeAssist('level_of_care', { facts }, apiKey));
   if (!suggestion) throw new AssistUnavailableError('The suggestion came back unreadable. Try again.', 'unavailable');
   return suggestion;
+}
+
+/**
+ * The insurance card photos of a finished family assessment, read into
+ * Benefits. Sends only the assessment's id, the sides with a photo and the
+ * app's carrier names: the function reads the photos itself with the
+ * practitioner's session and sends them to Anthropic on their own key.
+ * What comes back is the carrier, the plan name and the last four of the
+ * member ID, for the practitioner to check before saving.
+ */
+export async function requestCardReading(
+  assessmentId: string,
+  sides: ('front' | 'back')[],
+  carriers: string[],
+  apiKey: string,
+): Promise<CardReading> {
+  const reading = readCardReading(await invokeAssist('read_card', { assessmentId, sides, carriers }, apiKey));
+  if (!reading) throw new AssistUnavailableError('Nothing could be read from the card photos. Look at the photos and type the details into Benefits instead.', 'unavailable');
+  return reading;
 }

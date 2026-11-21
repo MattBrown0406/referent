@@ -85,6 +85,7 @@ import { loadDayReviewReminder } from './src/lib/day-review-reminder';
 import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
 import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
 import type { LevelOfCareSeed } from './src/lib/LevelOfCareSheet';
+import { cardFill, cardReadingLine, type CardDifference, type CardReading } from './src/lib/card-reading';
 import { countNewRecordings, fieldySupported, RECORDERS, type RecorderId } from './src/lib/fieldy-api';
 import { aiKeysSupported, getAnthropicKey, onAnthropicKeyChange } from './src/lib/outreach-api';
 import {
@@ -487,6 +488,10 @@ type CaseBenefitsFormState = {
   // The cost sharing the editor opened with: only amounts changed from it
   // are saved, so a teammate's update meanwhile is never sent back over.
   openedCosts: PlanCosts | null;
+  // Opened from "Read the card into Benefits" (src/lib/card-reading.ts):
+  // which fields the card filled, and where the card reads something other
+  // than what the case already had (kept, and shown beside the reading).
+  fromCard?: { filled: string[]; differences: CardDifference[]; cardCarrier: string; note: string };
 };
 
 type VobRequestFormState = {
@@ -1377,6 +1382,10 @@ export default function App() {
   // What "See matches from these answers" filled in on the Match form, shown above it until another match loads.
   const [matchFromAnswers, setMatchFromAnswers] = useState<{ caseId: string; used: string[]; toCheck: string[] } | null>(null);
   const assessmentBackRef = useRef<() => void>(() => setAssessmentCaseId(null));
+  // The family assessment sheet's card reading arrives after a wait: it is
+  // handed to the newest render's handler, which checks the case is still
+  // the one open and reads the plan as it is now.
+  const cardReadRef = useRef<(caseId: string, reading: CardReading) => void>(() => undefined);
   // The shortlist the clinician saw when they started an assignment, so the
   // placement record can say what was shown and at what rank the pick sat.
   const [pendingPlacement, setPendingPlacement] = useState<{ matchProfileId: string; rankedIds: string[]; candidates: PlacementCandidate[] } | null>(null);
@@ -3891,6 +3900,49 @@ export default function App() {
       subscriberRelationship: plan?.subscriberRelationship || '',
       costs: planCostsDraft(plan),
       openedCosts: plan ? { inNetwork: plan.inNetwork, outOfNetwork: plan.outOfNetwork, oonBenefits: plan.oonBenefits } : null,
+    });
+  }
+
+  // "Read the card into Benefits" from the family assessment: the plan
+  // editor opens on what the case holds now, with only the empty fields
+  // filled from the card and every difference shown. Saving is the normal
+  // save. A reading for a case that is no longer open is dropped.
+  function openBenefitsFromCard(caseId: string, reading: CardReading) {
+    const record = cases.find((item) => item.id === caseId);
+    if (!record || activeCaseIdRef.current !== caseId || familyAssessmentCaseId !== caseId || benefitsForm) return;
+    const blocked = benefitsEditorBlock(caseId);
+    if (blocked) {
+      Alert.alert(blocked.title, `${blocked.message}\n\nRead from the card: ${cardReadingLine(reading)}.`);
+      if (benefitsLoadedFor[caseId] === 'unavailable') void loadCaseBenefits(caseId);
+      return;
+    }
+    const plan = benefitsByCase[caseId];
+    const fill = cardFill({ carrier: plan?.carrier || '', planName: plan?.planName || '', memberIdLast4: plan?.memberIdLast4 || '' }, reading);
+    setBenefitsForm({
+      carrier: fill.fields.carrier,
+      planName: fill.fields.planName,
+      memberIdLast4: fill.fields.memberIdLast4,
+      subscriberRelationship: plan?.subscriberRelationship || '',
+      costs: planCostsDraft(plan),
+      openedCosts: plan ? { inNetwork: plan.inNetwork, outOfNetwork: plan.outOfNetwork, oonBenefits: plan.oonBenefits } : null,
+      fromCard: { filled: fill.filled, differences: fill.differences, cardCarrier: reading.cardCarrier, note: reading.note },
+    });
+  }
+  cardReadRef.current = openBenefitsFromCard;
+
+  // The plan editor's "Use the card's" on one difference: that field takes the card's reading.
+  function takeCardReading(difference: CardDifference) {
+    setBenefitsForm((current) => {
+      if (!current?.fromCard) return current;
+      return {
+        ...current,
+        [difference.field]: difference.read,
+        fromCard: {
+          ...current.fromCard,
+          filled: [...current.fromCard.filled, difference.label],
+          differences: current.fromCard.differences.filter((item) => item.field !== difference.field),
+        },
+      };
     });
   }
 
@@ -9942,6 +9994,26 @@ export default function App() {
             </View>
             <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
               <Text style={styles.formIntro}>Just enough to ask a program for a VOB{benefitCostsAvailable ? ', and the plan’s numbers for an estimate of what the family would pay' : ''}. Only the last four of the member id are kept; no date of birth, no SSN. Keep the card photo under Documents.</Text>
+              {benefitsForm.fromCard ? (
+                <View style={styles.cardReadNotice} accessibilityRole="summary">
+                  <Text style={styles.cardReadTitle}>Read from the card: check each field before saving.</Text>
+                  <Text style={styles.cardReadText}>
+                    {benefitsForm.fromCard.filled.length ? `Filled in: ${benefitsForm.fromCard.filled.join(', ')}.` : benefitsForm.fromCard.differences.length ? 'Nothing was filled in: these fields already had something.' : 'The card matches what this case already has.'}
+                  </Text>
+                  {benefitsForm.fromCard.cardCarrier && benefitsForm.fromCard.cardCarrier !== benefitsForm.carrier && !benefitsForm.fromCard.differences.some((item) => item.read === benefitsForm.fromCard?.cardCarrier) ? (
+                    <Text style={styles.cardReadText}>The card says “{benefitsForm.fromCard.cardCarrier}”.</Text>
+                  ) : null}
+                  {benefitsForm.fromCard.differences.map((difference) => (
+                    <View key={difference.field} style={styles.cardReadDifference}>
+                      <Text style={styles.cardReadText}>{difference.label}: you have “{difference.current}”; the card reads “{difference.read}”.</Text>
+                      <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Use the card's ${difference.label.toLowerCase()}`} onPress={() => takeCardReading(difference)} style={styles.cardReadButton}>
+                        <Text style={styles.cardReadButtonText}>Use the card’s</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                  {benefitsForm.fromCard.note ? <Text style={styles.cardReadText}>Unclear: {benefitsForm.fromCard.note}</Text> : null}
+                </View>
+              ) : null}
               <DropdownField label="CARRIER" value={benefitsForm.carrier} icon="shield-checkmark-outline" onChange={(carrier) => setBenefitsForm((current) => (current ? { ...current, carrier } : current))} options={carrierOptions} />
               <FormField label="PLAN NAME (OPTIONAL)" value={benefitsForm.planName} onChangeText={(planName) => setBenefitsForm((current) => (current ? { ...current, planName } : current))} placeholder="PPO Choice, HMO, Medicaid plan name" />
               <FormField label="MEMBER ID, LAST FOUR ONLY" value={benefitsForm.memberIdLast4} onChangeText={(value) => setBenefitsForm((current) => (current ? { ...current, memberIdLast4: memberIdLast4(value) } : current))} placeholder="1234" />
@@ -9984,6 +10056,9 @@ export default function App() {
   // comes back here.
   function FamilyAssessmentModal(record: CaseRecord) {
     const primary = primaryContactByCase.get(record.id);
+    // The Benefits form's carrier list for this case, for reading the card.
+    const linked = referralMatches.find((item) => item.id === record.matchProfileId) || referralMatches.find((item) => item.caseId === record.id);
+    const carriers = insuranceProvidersForState(linked?.state || 'ANY').filter((plan) => plan !== 'Cash pay');
     return (
       <Modal visible animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setFamilyAssessmentCaseId(null)}>
         <FamilyAssessmentSheet
@@ -9999,6 +10074,9 @@ export default function App() {
             return rating ? { chosenLevel: rating.chosenLevel, recommended: pathLabel(rating.recommendation) } : null;
           })()}
           caseNames={handoffCaseNames(record.id)}
+          carriers={carriers}
+          benefitsBlock={benefitsEditorBlock(record.id)}
+          onCardRead={(caseId, reading) => cardReadRef.current(caseId, reading)}
         />
       </Modal>
     );
@@ -10978,6 +11056,12 @@ const styles = StyleSheet.create({
   offlineBadge: { maxWidth: '58%', flexShrink: 1, flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: COLORS.mintPale, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 5, borderWidth: 1, borderColor: COLORS.line },
   offlineBadgeText: { flexShrink: 1, color: COLORS.gray, fontSize: 9, lineHeight: 12, fontWeight: '700' },
   rejectedNotice: { backgroundColor: '#F7E7E1', borderColor: '#E9C5B8' },
+  cardReadNotice: { backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.sage, padding: 12, gap: 6, marginBottom: 16 },
+  cardReadTitle: { color: COLORS.forest, fontSize: 14, lineHeight: 19, fontWeight: '800' },
+  cardReadText: { color: COLORS.inkSoft, fontSize: 13, lineHeight: 18 },
+  cardReadDifference: { borderTopWidth: 1, borderTopColor: COLORS.line, paddingTop: 6, gap: 4 },
+  cardReadButton: { alignSelf: 'flex-start', minHeight: 40, justifyContent: 'center', paddingHorizontal: 12, borderRadius: 10, borderWidth: 1, borderColor: COLORS.forest },
+  cardReadButtonText: { color: COLORS.forest, fontSize: 13, fontWeight: '800' },
   textButtonCenter: { minHeight: 44, alignItems: 'center', justifyContent: 'center', marginTop: 8 },
   refreshNotice: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: COLORS.mintPale, borderRadius: 12, borderWidth: 1, borderColor: COLORS.line, paddingHorizontal: 12, paddingVertical: 9, marginBottom: 12 },
   refreshNoticeText: { flex: 1, color: COLORS.gray, fontSize: 12, lineHeight: 16, fontWeight: '600' },

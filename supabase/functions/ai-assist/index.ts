@@ -8,6 +8,12 @@
 //     areas from a family assessment's answers, sent without names or
 //     contact details (level.ts). The practitioner confirms every rating;
 //     the app's own rules recommend the level.
+//   * read_card: the insurance card photos of a family assessment, read
+//     into the case's Benefits (read_card.ts). The photos are downloaded
+//     with the CALLER's own session, so storage row-level security decides
+//     access (never the service role); only the carrier, plan name, last
+//     four of the member ID and a short note come back, for the
+//     practitioner to check before anything is saved.
 //
 // Bring your own key, exactly like AI drafts (draft-follow-up) and day
 // review: the user's Anthropic key arrives in the request body
@@ -19,14 +25,15 @@
 //     against Supabase Auth before anything else happens;
 //   * claim_ai_assist (service-role only) confirms workspace membership and
 //     enforces a daily cap per kind before the model is called;
-//   * the model sees only what the action sends (no names of people);
+//   * the model sees only what the action sends (no names of people; the
+//     card photos for read_card, which the practitioner chose to send);
 //   * neither the input nor the result is logged or stored here.
 
 import Anthropic from 'npm:@anthropic-ai/sdk@1.1.0';
 import { createClient } from 'npm:@supabase/supabase-js@2.110.8';
 
 import { requiredEnv } from '../_shared/webhooks.ts';
-import { AssistOutputError, AssistRequestError, parseApiKey, record } from './common.ts';
+import { AssistFailure, AssistOutputError, AssistRequestError, parseApiKey, record } from './common.ts';
 import {
   buildExplainPrompt,
   EXPLAIN_SYSTEM_PROMPT,
@@ -35,6 +42,16 @@ import {
   parseExplainRequest,
 } from './explain.ts';
 import { buildLevelPrompt, LEVEL_SYSTEM_PROMPT, levelSchema, parseLevelOutput, parseLevelRequest } from './level.ts';
+import {
+  CARD_SYSTEM_PROMPT,
+  cardPrompt,
+  cardSchema,
+  type CardAssessmentRow,
+  type CardStore,
+  loadCardFiles,
+  parseCardOutput,
+  parseCardRequest,
+} from './read_card.ts';
 
 // The same model as AI drafts and day review.
 const MODEL = 'claude-opus-5-5';
@@ -43,12 +60,22 @@ const MODEL = 'claude-opus-5-5';
 // the model call ends inside this, with no SDK retry that could not finish.
 const DEADLINE_MS = 45_000;
 
+type Job = {
+  /** The user turn: text, or content blocks (read_card's photos). */
+  prompt: string | Record<string, unknown>[];
+  schema: Record<string, unknown>;
+  check: (raw: string) => unknown;
+};
+
 type Action = {
   /** claim_ai_assist's kind. */
   kind: string;
   system: string;
   maxTokens: number;
-  parse: (body: unknown) => { prompt: string; schema: Record<string, unknown>; check: (raw: string) => unknown };
+  /** What the phone shows when the model declines. */
+  refused?: string;
+  /** Runs before the daily cap is claimed, so a refusal here costs nothing. */
+  parse: (body: unknown, caller: { token: string }) => Job | Promise<Job>;
 };
 
 const ACTIONS: Record<string, Action> = {
@@ -68,6 +95,17 @@ const ACTIONS: Record<string, Action> = {
     parse: (body) => {
       const request = parseLevelRequest(body);
       return { prompt: buildLevelPrompt(request), schema: levelSchema(), check: (raw) => ({ ratings: parseLevelOutput(raw, request) }) };
+    },
+  },
+  read_card: {
+    kind: 'read_card',
+    system: CARD_SYSTEM_PROMPT,
+    maxTokens: 8000,
+    refused: 'The card could not be read. Type the details into Benefits from the photo instead.',
+    parse: async (body, caller) => {
+      const request = parseCardRequest(body);
+      const { files, skipped } = await loadCardFiles(callerCardStore(caller.token), request);
+      return { prompt: cardPrompt(request, files), schema: cardSchema(request), check: (raw) => parseCardOutput(raw, request, skipped) };
     },
   },
 };
@@ -93,6 +131,59 @@ function serviceClient() {
   return createClient(requiredEnv('SUPABASE_URL'), requiredEnv('SUPABASE_SERVICE_ROLE_KEY'), {
     auth: { persistSession: false, autoRefreshToken: false },
   });
+}
+
+// The project's public (anon) key: with the caller's access token on top,
+// every read below runs as that user, under row-level security.
+function publicKey(): string {
+  const anon = Deno.env.get('SUPABASE_ANON_KEY');
+  if (anon) return anon;
+  try {
+    const keys = JSON.parse(Deno.env.get('SUPABASE_PUBLISHABLE_KEYS') || '{}') as Record<string, unknown>;
+    const key = keys.default ?? Object.values(keys)[0];
+    if (typeof key === 'string' && key) return key;
+  } catch {
+    // fall through
+  }
+  throw new AssistFailure(503, 'not_configured', 'This is not set up yet.');
+}
+
+// The insurance card photos, read as the caller: the assessment row through
+// its RLS (members of the case's practice) and the files through the
+// assessment-files storage policy. Never the service role. All the reads of
+// one request share 20 seconds, so the model keeps most of the deadline.
+const CARD_READ_MS = 20_000;
+const CARD_SHRINK = { width: 2000, height: 2000, resize: 'contain' as const, quality: 80 };
+
+function callerCardStore(token: string): CardStore {
+  const client = createClient(requiredEnv('SUPABASE_URL'), publicKey(), {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { Authorization: `Bearer ${token}` } },
+  });
+  const signal = AbortSignal.timeout(CARD_READ_MS);
+  return {
+    async assessment(id) {
+      const { data, error } = await client
+        .from('family_assessments')
+        .select('id, case_id, card_front_path, card_back_path')
+        .eq('id', id)
+        .abortSignal(signal)
+        .maybeSingle();
+      if (error) return { row: null, failed: true };
+      return { row: (data as CardAssessmentRow | null) ?? null, failed: false };
+    },
+    async download(path, shrink) {
+      const { data, error } = await client.storage
+        .from('assessment-files')
+        .download(path, shrink ? { transform: CARD_SHRINK } : {}, { signal });
+      if (error || !data) {
+        // Storage answers 400/404 for a file that is gone or not the caller's to read.
+        const status = (error as { status?: number } | null)?.status;
+        return { bytes: null, missing: status === 400 || status === 404 };
+      }
+      return { bytes: new Uint8Array(await data.arrayBuffer()), missing: false };
+    },
+  };
 }
 
 function bearerToken(request: Request): string | null {
@@ -163,20 +254,27 @@ Deno.serve(async (request) => {
   const apiKey = parseApiKey(record(body).anthropicKey);
   if (!apiKey) return failure(400, 'key_required', 'Add your Anthropic API key first. It starts with sk-ant-.');
 
-  let job: ReturnType<Action['parse']>;
+  let job: Job;
   try {
-    job = action.parse(body);
+    job = await action.parse(body, { token });
   } catch (error) {
-    const message = error instanceof AssistRequestError ? error.message : 'The request could not be read.';
-    return failure(400, 'bad_request', message);
+    if (error instanceof AssistFailure) return failure(error.status, error.code, error.message);
+    if (error instanceof AssistRequestError) return failure(400, 'bad_request', error.message);
+    if (action.kind === 'read_card') {
+      console.error('read_card: the photos could not be loaded');
+      return failure(503, 'busy', 'The card photos could not be loaded. Try again in a minute.');
+    }
+    return failure(400, 'bad_request', 'The request could not be read.');
   }
 
   const { data: remaining, error: claimError } = await supabase.rpc('claim_ai_assist', { p_user_id: userId, p_kind: action.kind });
   if (claimError) {
     if (claimError.code === '54000') return failure(429, 'daily_limit', 'You have reached today’s limit for this. Try again tomorrow.');
     if (claimError.code === '42501') return failure(403, 'forbidden', 'Join a workspace first.');
-    // Not set up yet (20261109130000_ai_assist.sql not applied): run without the cap.
-    if (claimError.code !== 'PGRST202' && claimError.code !== '42883') {
+    // Not set up yet: 20261109130000_ai_assist.sql not applied (no function),
+    // or a kind added later whose migration is not applied yet (22023,
+    // "Unknown kind of help": 20261121120000_read_card.sql). Run without the cap.
+    if (claimError.code !== 'PGRST202' && claimError.code !== '42883' && claimError.code !== '22023') {
       console.error('claim_ai_assist failed', claimError.code);
       return failure(500, 'server_error', 'This is unavailable right now.');
     }
@@ -197,13 +295,13 @@ Deno.serve(async (request) => {
         format: { type: 'json_schema', schema: job.schema },
       },
       system: action.system,
-      messages: [{ role: 'user', content: job.prompt }],
+      messages: [{ role: 'user', content: job.prompt as string | Anthropic.Beta.Messages.BetaContentBlockParam[] }],
     }, { signal: deadline });
   } catch (error) {
     return anthropicFailure(error, deadline);
   }
 
-  if (response.stop_reason === 'refusal') return failure(422, 'refused', 'This could not be done. The app’s own version is shown.');
+  if (response.stop_reason === 'refusal') return failure(422, 'refused', action.refused ?? 'This could not be done. The app’s own version is shown.');
   if (response.stop_reason === 'max_tokens') return failure(502, 'incomplete', 'The answer came back incomplete. Try again.');
   const text = response.content.map((block) => (block.type === 'text' ? block.text : '')).join('');
 
@@ -211,6 +309,7 @@ Deno.serve(async (request) => {
     const result = job.check(text);
     return reply({ result, remaining: typeof remaining === 'number' ? remaining : null });
   } catch (error) {
+    if (error instanceof AssistFailure) return failure(error.status, error.code, error.message);
     const message = error instanceof AssistOutputError ? error.message : 'The answer came back unreadable.';
     return failure(502, 'bad_output', message);
   }

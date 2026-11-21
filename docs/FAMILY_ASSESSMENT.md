@@ -173,6 +173,7 @@ family's address, name, the reply-to and any token leave the outbox row.
 | Practitioner rules and calls | `src/lib/family-assessment.ts`, `src/lib/family-assessment-api.ts` |
 | Screens | `src/lib/FamilyAssessmentSheet.tsx` (inside the case file), `src/lib/LevelOfCareSheet.tsx` (`seed`), `src/lib/PracticeLogoCard.tsx` |
 | AI suggestion | `supabase/functions/ai-assist/level.ts` (+ `level_test.ts`), `src/lib/ai-assist-api.ts` |
+| Reading the card | `supabase/functions/ai-assist/read_card.ts` (+ `read_card_test.ts`), `src/lib/card-reading.ts`, `requestCardReading` in `src/lib/ai-assist-api.ts`, `openBenefitsFromCard` in `App.tsx`, `supabase/migrations/20261121120000_read_card.sql` |
 | Photo uploads | `supabase/functions/family-assessment-upload/` |
 | Emails | `supabase/functions/email-dispatch/email.ts` (`family_assessment_invite`, `family_assessment_submitted`) |
 | Database | `supabase/migrations/20261109140000_family_assessment.sql`, `supabase/tests/family_assessment_test.sql` |
@@ -241,3 +242,91 @@ function:
 - **Uploads**: a link can hold at most 12 photo files at once (two card
   photos plus replaced or abandoned uploads awaiting clean-up).
 - **Account deletion** also removes the practice logo (public bucket).
+
+## Reading the card, 2026-11-21
+
+**Approved by Matt 2026-11-21. Built on branch feat/card-reading (from
+feat/next-build); ships with the next build.**
+
+When the family added insurance card photos, the practitioner can have the
+AI read them into the case's Benefits, on their own Anthropic key like every
+other AI help. That fills "True cost to the family" without typing.
+
+**What the practitioner sees**
+
+1. Case file > Family assessment, a finished assessment with card photos:
+   the Insurance card section shows the photos and, with a key, **Read the
+   card into Benefits** (without a key: a line saying where to add one).
+2. A confirm: the card photos go to Anthropic on their own key to be read;
+   ReferralFit keeps nothing from the reading; nothing is saved until they
+   check the Benefits form and tap Save. If the plan has not loaded (still
+   loading, offline) the app says so first and sends nothing.
+3. The **Insurance plan** form opens on what the case holds now, marked
+   "Read from the card: check each field before saving." Only empty fields
+   are filled (carrier, plan name, member ID last four). A field that
+   already has something keeps it; the card's reading is shown beside it
+   with **Use the card's**. The insurer as printed is shown when the app's
+   carrier name differs ("Blue Cross" for "Blue Cross Blue Shield of
+   Texas"), and anything unclear (glare, cut off) is listed.
+4. **Save plan** is the normal Benefits save (last four only, the timeline
+   entry, the cost amounts untouched). Back closes the form without saving
+   and returns to the assessment.
+
+**How it works**
+
+- The phone sends `ai-assist` (`read_card`) only the assessment id, the
+  sides that have a photo and the Benefits form's carrier names.
+- The function reads the assessment row and the photos **with the caller's
+  own session** (anon key plus their access token), so the existing RLS on
+  `family_assessments` and the `assessment-files` storage policy decide
+  access; the service role is used only for sign-in and the daily cap, as
+  before. A photo path is used only when it sits in that assessment's own
+  folder.
+- Types are read from the file's bytes. JPEG, PNG, WebP, GIF (up to 5 MB,
+  Anthropic's limit per image) and PDF (up to 10 MB) are sent as they are.
+  A larger photo or an iPhone HEIC photo is asked from storage as a smaller
+  copy (image transformation); if the project does not have that, the side
+  is skipped and named in the note. All the reads share 20 seconds.
+- The model returns the insurer as printed, the matching app carrier (or
+  none), the plan name, the member ID and a note. The function works out
+  the **last four** of the member ID itself and returns only that (four
+  letters or digits with at least one digit in the ID, else nothing).
+  Numbers of five digits or more and dates are taken out of the free text.
+  Never a name, date of birth or group number (Benefits has nowhere to keep
+  a group number).
+- Refusals: no photo recorded (`no_photo`), assessment or photos deleted or
+  not the caller's (`not_found`), nothing readable (`unreadable`), plus the
+  usual key, cap, timeout and offline answers. A refusal before the model
+  call does not count against the cap.
+- The phone drops a reading when the case was closed or another case opened
+  meanwhile (the sheet unmounts, and `openBenefitsFromCard` checks the open
+  case), and fills nothing when the assessment was deleted while it was
+  read (it checks the list again before opening the form).
+- Daily cap: 30 readings per user (`claim_ai_assist` kind `read_card`). Until
+  the migration is applied, the older `claim_ai_assist` refuses the unknown
+  kind (`22023`) and the function reads the card without the cap.
+
+**Deploy (Matt)**
+
+1. `supabase functions deploy ai-assist --no-verify-jwt --project-ref ovfafffvcpaahktvlsdm`
+   (works on the database as it is: no cap for card reading until step 2).
+   It uses `SUPABASE_ANON_KEY` (or `SUPABASE_PUBLISHABLE_KEYS`), which
+   Supabase sets for every function; nothing to add.
+2. Paste `supabase/migrations/20261121120000_read_card.sql` in the SQL
+   editor (ASCII, one BEGIN/COMMIT, safe to re-run) with this as the last
+   line before `COMMIT;`:
+   `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20261121120000', 'read_card') ON CONFLICT (version) DO NOTHING;`
+3. The phone side ships with the next build (no web change).
+4. Check on a device: a finished test assessment with a card photo, Read
+   the card into Benefits, check the form, Save.
+
+**Privacy policy:** referralfit.com/privacy may need a line that insurance
+card photos are sent to Anthropic, on the practitioner's own key, when the
+practitioner chooses to read a card (and that ReferralFit keeps only what
+they save: carrier, plan name, last four). Not changed here (the website is
+its own repo). Worth a look at the App Store privacy answers too
+(insurance details are already collected through the family's page).
+
+**Left out:** the group number and member services phone (Benefits has no
+field for them); comparing the card with the family's typed insurance
+answers; reading the card before the family finishes.

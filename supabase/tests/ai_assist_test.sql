@@ -1,10 +1,10 @@
--- Focused coverage for 20261109130000_ai_assist.sql.
+-- Focused coverage for 20261109130000_ai_assist.sql and 20261121120000_read_card.sql.
 -- Run after a local migration reset with: supabase test db
 --
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(11);
+SELECT plan(14);
 
 -- a1 has a workspace (created on sign-up); a2's membership is removed below.
 INSERT INTO auth.users (id, email)
@@ -73,6 +73,24 @@ SELECT is(
   public.claim_ai_assist('a1000000-0000-0000-0000-0000000000a5', 'level_of_care'),
   59,
   'yesterday''s calls do not count against today'
+);
+
+-- Reading the insurance card (20261121120000): its own cap of 30 a day.
+SELECT is(
+  public.claim_ai_assist('a1000000-0000-0000-0000-0000000000a5', 'read_card'),
+  29,
+  'the first card reading of the day leaves 29'
+);
+SELECT public.claim_ai_assist('a1000000-0000-0000-0000-0000000000a5', 'read_card') FROM generate_series(1, 29);
+SELECT throws_ok(
+  $$ SELECT public.claim_ai_assist('a1000000-0000-0000-0000-0000000000a5', 'read_card') $$,
+  '54000', NULL,
+  'the 31st card reading in a day is refused'
+);
+SELECT throws_ok(
+  $$ SELECT public.claim_ai_assist('a2000000-0000-0000-0000-0000000000a5', 'read_card') $$,
+  '42501', NULL,
+  'a user with no workspace cannot read a card'
 );
 
 SELECT * FROM finish();

@@ -5,6 +5,13 @@
 export class AssistRequestError extends Error {}
 export class AssistOutputError extends Error {}
 
+/** A refusal with its own status and code for the phone (read_card: no photo, deleted, unreadable). */
+export class AssistFailure extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(message);
+  }
+}
+
 // Each practitioner brings their own Anthropic API key, exactly as for AI
 // drafts and day review: it arrives in the request body, is used for that
 // one call, and is never stored or logged.
