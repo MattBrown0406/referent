@@ -56,7 +56,7 @@
         {
           "photosPermission": "ReferralFit opens your photo library only when you choose a photo: one to attach to a private case file, such as an insurance card or a signed agreement, or your practice logo.",
           "cameraPermission": false,
-          "microphonePermission": false
+          "microphonePermission": "ReferralFit uses the microphone only while you record a voice note in Review notes. What you say becomes text in the notes box. The sound is not saved."
         }
       ],
       [
@@ -65,7 +65,30 @@
           "contactsPermission": "ReferralFit uses only the contacts you pick, one at a time, to add them as referral partners. It never reads the rest of your address book."
         }
       ],
-      "expo-web-browser"
+      "expo-web-browser",
+      [
+        "expo-share-intent",
+        {
+          "iosActivationRules": {
+            "NSExtensionActivationSupportsText": true,
+            "NSExtensionActivationSupportsWebURLWithMaxCount": 1
+          },
+          "disableAndroid": true
+        }
+      ],
+      [
+        "./plugins/share-extension-name",
+        {
+          "displayName": "ReferralFit"
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "ReferralFit uses the microphone only while you record a voice note in Review notes. What you say becomes text in the notes box. The sound is not saved.",
+          "speechRecognitionPermission": "ReferralFit turns your voice note into text in the notes box. On most iPhones this happens on the phone. If your iPhone cannot do it on the phone, Apple turns the sound into text on its servers. ReferralFit never saves the sound."
+        }
+      ]
     ],
     "extra": {
       "eas": {

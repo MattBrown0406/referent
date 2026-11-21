@@ -72,7 +72,8 @@ for (const [packageName, expectedVersion] of [
 // a newer prebuild can reference expo-modules-core symbols the pinned core
 // does not have, and iOS kills the app at launch (expo-contacts 57.0.8 did).
 const bundled = JSON.parse(await readFile(new URL('../node_modules/expo/bundledNativeModules.json', import.meta.url), 'utf8'));
-for (const name of ['expo-contacts']) {
+// expo-linking and expo-constants (Share to ReferralFit) are held there too.
+for (const name of ['expo-contacts', 'expo-constants', 'expo-linking']) {
   const range = bundled[name] || '';
   const base = range.replace(/^[~^]/, '');
   assert.equal(packageJson.dependencies[name], base, `${name} must be the version expo bundles (${range}), not a later prebuild`);

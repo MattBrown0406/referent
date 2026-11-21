@@ -254,6 +254,40 @@ If email confirmation is turned on in Supabase before the review, add:
 > Creating an account sends a confirmation email; the demo account is already
 > confirmed and needs no email step.
 
+### 3b. Additions for the next build (share to ReferralFit, voice notes)
+
+Change the last sentence of the REVIEW NOTES paragraph in 3a ("ReferralFit
+does not record audio and does not use the microphone.") to the paragraph
+below, and add it to the Notes:
+
+> SHARE TO REFERRALFIT AND VOICE NOTES (optional): ReferralFit now appears in
+> the iOS share sheet. Select text in Notes, Messages or Mail, tap Share, then
+> ReferralFit: the app opens on "Review notes" with the text in the box, and
+> nothing is sent anywhere until the user taps "Find what's in it" (which,
+> like the rest of Review notes, needs the practice's own Anthropic key). On
+> the same screen, "Voice note" types what the user says into the box using
+> iOS speech recognition, on the device when the iPhone supports it. The
+> microphone is used only while a voice note is being recorded, and the audio
+> is never saved or sent by ReferralFit. Both work without a key: the text
+> lands in the box either way.
+
+**App Privacy answers to check (App Store Connect > App Privacy):**
+
+- **Audio Data: still not collected.** The microphone turns speech into text
+  on the iPhone (or, on an iPhone that cannot do that, by Apple's speech
+  service, which Apple runs under its own terms); ReferralFit never receives,
+  stores or sends the sound.
+- **Other User Content:** shared text and voice-note text are notes like
+  pasted ones: sent to Anthropic for one review only when the user taps Find,
+  not stored. Covered by the existing answer; no new data type.
+
+**What's New in This Version (add):**
+
+```
+- Share to ReferralFit. Share a text thread, an email, a Voice Memos transcript or a note from any app, and it opens in Review notes, ready to review.
+- Voice notes. Right after a call, say what happened and ReferralFit types it into Review notes for you to check.
+```
+
 ## 4. What changed in the app for the resubmission
 
 - The app is free: a database switch (`free_launch_period()`) opens every

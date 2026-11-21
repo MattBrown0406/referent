@@ -81,6 +81,8 @@ import BusinessDashboard from './src/lib/BusinessDashboard';
 import NewLeadSheet, { type NewLeadDraft } from './src/lib/NewLeadSheet';
 import OutreachSheet, { type OutreachSent, type OutreachSheetRequest } from './src/lib/OutreachSheet';
 import DayReviewSheet from './src/lib/DayReviewSheet';
+import { readSharedNote, useIncomingShare } from './src/lib/share-receiver';
+import { shareKey, SHARE_UNREADABLE_MESSAGE, type SharedNote, type SharedPayload } from './src/lib/share-intake';
 import { loadDayReviewReminder } from './src/lib/day-review-reminder';
 import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
 import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
@@ -2603,6 +2605,82 @@ export default function App() {
     // subscription itself lives for the whole sign-in).
     return subscribeToNotificationResponses((target, partnerId, caseId, placementRequestId) => notificationTapRef.current(target, partnerId, caseId, placementRequestId));
   }, [session?.user?.id]);
+
+  // Share to ReferralFit (docs/DAY_REVIEW.md): text or a link shared from
+  // another app opens Review notes with it in the notes box, never sent to
+  // the AI on its own. Kept here, in memory only, until the sheet takes it:
+  // through sign-in (nobody signed in when it came: whoever signs in next),
+  // the Face ID lock (the lock's cover hides the sheet until it opens), or an
+  // open sheet (it waits until that one is closed, as a notification tap
+  // does). A share that came for one account never opens in another. Two
+  // shares before the first is taken wait in turn, each going into the box.
+  const [pendingShares, setPendingShares] = useState<(SharedNote & { id: string; userId: string | null })[]>([]);
+  const pendingShare = pendingShares[0] ?? null;
+  const shareSignInAskedRef = useRef<string | null>(null);
+  const shareAccountRef = useRef<{ resolved: boolean; userId: string | null }>({ resolved: false, userId: null });
+  shareAccountRef.current = { resolved: authResolved, userId: session?.user?.id ?? null };
+  const lastShareRef = useRef<{ key: string; at: number } | null>(null);
+  const shareCountRef = useRef(0);
+  const showDayReviewRef = useRef(false);
+  showDayReviewRef.current = showDayReview;
+  useIncomingShare((payload: SharedPayload) => {
+    const key = shareKey(payload);
+    const now = Date.now();
+    // iOS can hand the same share over twice (as the app opens and as it comes to the front).
+    if (lastShareRef.current && lastShareRef.current.key === key && now - lastShareRef.current.at < 60_000) return;
+    lastShareRef.current = { key, at: now };
+    const account = shareAccountRef.current;
+    void readSharedNote(payload).then((note) => {
+      if (!note) {
+        Alert.alert('Nothing to add', SHARE_UNREADABLE_MESSAGE);
+        return;
+      }
+      shareCountRef.current += 1;
+      const id = `share-${now}-${shareCountRef.current}`;
+      const userId = account.resolved ? account.userId : null;
+      setPendingShares((current) => [...current, { ...note, id, userId }]);
+      if (account.resolved && account.userId && anySheetOpenRef.current && !showDayReviewRef.current) {
+        Alert.alert('Shared to ReferralFit', 'It opens in Review notes when you close this screen.');
+      }
+    }).catch(() => Alert.alert('Nothing to add', SHARE_UNREADABLE_MESSAGE));
+  });
+  useEffect(() => {
+    if (!pendingShare) return undefined;
+    const userId = session?.user?.id ?? null;
+    if (!authResolved || !loaded) return undefined;
+    if (!userId) {
+      // One that came for an account that has since signed out waits for it, without a word.
+      if (!pendingShare.userId && shareSignInAskedRef.current !== pendingShare.id) {
+        shareSignInAskedRef.current = pendingShare.id;
+        Alert.alert('Sign in to review it', 'What you shared opens in Review notes once you sign in. It is kept only while ReferralFit stays open.');
+      }
+      return undefined;
+    }
+    if (pendingShare.userId && pendingShare.userId !== userId) {
+      // Shared while another account was signed in here: never shown to this one.
+      setPendingShares((current) => current.filter((share) => !share.userId || share.userId === userId));
+      return undefined;
+    }
+    // The review sheet takes it itself (DayReviewSheet incomingShare).
+    if (passwordRecovery || showDayReview) return undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let clearSince = 0;
+    const check = () => {
+      if (anySheetOpenRef.current || overlayOpen()) {
+        clearSince = 0;
+      } else if (!clearSince) {
+        // The screen just cleared; let any closing sheet finish animating.
+        clearSince = Date.now();
+      } else if (Date.now() - clearSince >= SHEET_SWAP_MS) {
+        setDayReviewRecorder(null);
+        setShowDayReview(true);
+        return;
+      }
+      timer = setTimeout(check, 300);
+    };
+    check();
+    return () => { if (timer) clearTimeout(timer); };
+  }, [pendingShare, session?.user?.id, authResolved, loaded, passwordRecovery, showDayReview]);
 
   useEffect(() => {
     if (!pendingNotificationCaseId) return;
@@ -10608,6 +10686,8 @@ export default function App() {
         onClose={() => { setShowDayReview(false); setDayReviewRecorder(null); }}
         onSaved={() => refreshAfterServerChange()}
         startWithRecorder={dayReviewRecorder}
+        incomingShare={pendingShare && pendingShare.userId !== null && pendingShare.userId !== activeUserId ? null : pendingShare}
+        onIncomingShareTaken={(id) => setPendingShares((current) => current.filter((share) => share.id !== id))}
         onRecordersChanged={(reviewed) => {
           if (reviewed) lowerRecordingsWaiting(reviewed.recorder, reviewed.count);
           void refreshFieldyWaiting(true);
