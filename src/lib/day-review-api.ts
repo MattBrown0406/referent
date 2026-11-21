@@ -59,7 +59,7 @@ const DAY_REVIEW_CLIENT_TIMEOUT_MS = 58_000;
  * returns what the function found. The key rides in the request body, never
  * a header, and is never stored by the function.
  */
-export async function requestDayReview(notes: string, today: string, apiKey: string): Promise<{ items: FoundItem[]; remaining: number | null }> {
+export async function requestDayReview(notes: string, today: string, apiKey: string): Promise<{ items: FoundItem[]; remaining: number | null; truncated: boolean }> {
   let result: Awaited<ReturnType<typeof supabase.functions.invoke>>;
   try {
     result = await supabase.functions.invoke('day-review', {
@@ -84,11 +84,13 @@ export async function requestDayReview(notes: string, today: string, apiKey: str
     if (code === 'refused') throw new ReviewUnavailableError(message, 'refused');
     throw new ReviewUnavailableError(message, 'unavailable');
   }
-  const data = result.data as { items?: unknown; remaining?: unknown } | null;
+  const data = result.data as { items?: unknown; remaining?: unknown; truncated?: unknown } | null;
   if (!data || !Array.isArray(data.items)) {
     throw new ReviewUnavailableError('The review came back unreadable. Try again.', 'unavailable');
   }
-  return { items: readFoundItems(data.items), remaining: typeof data.remaining === 'number' ? data.remaining : null };
+  // truncated: the review stopped at its cap (20 items). A function deployed
+  // before it said so sends no such field: taken as not truncated.
+  return { items: readFoundItems(data.items), remaining: typeof data.remaining === 'number' ? data.remaining : null, truncated: data.truncated === true };
 }
 
 export type SaveResult = {

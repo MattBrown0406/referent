@@ -25,7 +25,7 @@ import {
   buildUserPrompt,
   outputSchema,
   parseApiKey,
-  parseReviewOutput,
+  parseReviewAnswer,
   parseReviewRequest,
   type ReviewRequest,
   ReviewOutputError,
@@ -182,8 +182,9 @@ Deno.serve(async (request) => {
     .join('');
 
   try {
-    const items = parseReviewOutput(text, reviewRequest);
-    return reply({ items, remaining: typeof remaining === 'number' ? remaining : null });
+    // truncated: the review stopped at its cap; the phone reads again what it left out.
+    const { items, truncated } = parseReviewAnswer(text, reviewRequest);
+    return reply({ items, truncated, remaining: typeof remaining === 'number' ? remaining : null });
   } catch (error) {
     const message = error instanceof ReviewOutputError ? error.message : 'The review came back unreadable.';
     return failure(502, 'bad_output', `${message} Try again.`);

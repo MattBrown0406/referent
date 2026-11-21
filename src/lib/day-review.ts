@@ -926,19 +926,140 @@ export function signatureHash(value: string): string {
   return `h:${(4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)}`;
 }
 
-/** This row was saved before: in this review (its signature), or from the same recording in an earlier one (its fingerprint). */
-export function savedBefore(row: ReviewRow, saved: Set<string>): boolean {
-  return rowSignatures(row).some((signature) => saved.has(signature) || saved.has(signatureHash(signature)));
+type Target = { caseId: string | null; partnerId: string | null };
+
+// The places a row read again may have been saved on. Its own pick when it
+// is sure; with no pick, or one made by name only, also each case or
+// partner it could be: a note saved on a case picked by hand comes back
+// with no case picked, and is still that note.
+function possibleTargets(row: ReviewRow): Target[] {
+  if (row.kind !== 'case_note' && row.kind !== 'partner_note' && row.kind !== 'follow_up' && row.kind !== 'referral') {
+    return [{ caseId: row.caseId, partnerId: row.partnerId }];
+  }
+  const options = (picked: string | null, unsure: boolean, choices: string[]) =>
+    (picked && !unsure ? [picked] : [...new Set([picked, null, ...choices])]);
+  const cases = row.kind === 'partner_note' ? [row.caseId] : options(row.caseId, row.caseUnsure, row.caseChoices);
+  const partners = row.kind === 'case_note' ? [row.partnerId] : options(row.partnerId, row.partnerUnsure, row.partnerChoices);
+  const out: Target[] = [{ caseId: row.caseId, partnerId: row.partnerId }];
+  for (const caseId of cases) {
+    for (const partnerId of partners) {
+      // A follow-up is saved on one place only.
+      if (row.kind === 'follow_up' && caseId && partnerId) continue;
+      if (!out.some((target) => target.caseId === caseId && target.partnerId === partnerId)) out.push({ caseId, partnerId });
+    }
+  }
+  return out;
 }
 
-/** Rows that were saved earlier in this review start switched off. */
+const knownBy = (saved: Set<string>, signature: string) => saved.has(signature) || saved.has(signatureHash(signature));
+
+/**
+ * Where this row was saved before (none when it was not): in this review
+ * (its signature), or from the same recording in an earlier one (its
+ * fingerprint). The row's own place first, then each case or partner it
+ * could be (possibleTargets).
+ */
+export function savedTargets(row: ReviewRow, saved: Set<string>): Target[] {
+  if (!saved.size) return [];
+  return possibleTargets(row).filter((target) => rowSignatures({ ...row, ...target }).some((signature) => knownBy(saved, signature)));
+}
+
+/** This row was saved before: in this review (its signature), or from the same recording in an earlier one (its fingerprint). */
+export function savedBefore(row: ReviewRow, saved: Set<string>): boolean {
+  return savedTargets(row, saved).length > 0;
+}
+
+/**
+ * Rows that were saved before start switched off. One saved on a case or
+ * partner it could be (picked by hand then) shows that place again, when it
+ * is the only one.
+ */
 export function markSavedBefore(rows: ReviewRow[], saved: Set<string>): ReviewRow[] {
   if (!saved.size) return rows;
   return rows.map((row) => {
-    if (!savedBefore(row, saved)) return row;
-    const when = rowSignatures(row).some((signature) => saved.has(signature)) ? 'Saved earlier in this review.' : 'Saved in an earlier review.';
-    return { ...row, include: false, hint: row.hint ? `${when} ${row.hint}` : when };
+    const targets = savedTargets(row, saved);
+    if (!targets.length) return row;
+    const own = targets.find((target) => target.caseId === row.caseId && target.partnerId === row.partnerId);
+    const place = own ?? (targets.length === 1 ? targets[0] : null);
+    const next: ReviewRow = place && !own
+      ? { ...row, caseId: place.caseId, partnerId: place.partnerId, caseUnsure: false, partnerUnsure: false, noLink: false }
+      : row;
+    const signatures = place ? rowSignatures({ ...row, ...place }) : targets.flatMap((target) => rowSignatures({ ...row, ...target }));
+    const when = signatures.some((signature) => saved.has(signature)) ? 'Saved earlier in this review.' : 'Saved in an earlier review.';
+    return { ...next, include: false, hint: row.hint ? `${when} ${row.hint}` : when };
   });
+}
+
+/**
+ * Fingerprints kept with a recording: those it had and those just saved,
+ * each once, the newest `max` kept (the oldest drop first).
+ */
+export function mergeFingerprints(before: string[], added: string[], max = 200): string[] {
+  const fresh = new Set(added);
+  return [...new Set([...before.filter((hash) => !fresh.has(hash)), ...added])].filter(Boolean).slice(-max);
+}
+
+// ─── Recordings in the box ─────────────────────────────────────────────────
+
+type BlockLike = { id: string; text: string };
+const spaced = (value: string) => value.replace(/\s+/g, ' ').trim();
+
+/**
+ * The recordings (each under its header) still written in the notes box,
+ * word for word apart from spacing: the review stays linked to them when
+ * text is typed, shared or spoken beside them, and lets go of one edited or
+ * deleted.
+ */
+export function blocksInNotes<T extends BlockLike>(notes: string, blocks: T[]): T[] {
+  const box = spaced(notes);
+  return blocks.filter((block) => spaced(block.text) && box.includes(spaced(block.text)));
+}
+
+/** What the box holds besides those recordings: notes typed, shared or spoken there ('' for none). */
+export function notesBesides(notes: string, blocks: BlockLike[]): string {
+  let rest = spaced(notes);
+  for (const block of blocks) {
+    const text = spaced(block.text);
+    if (text) rest = rest.split(text).join(' ');
+  }
+  return spaced(rest);
+}
+
+/**
+ * At most `max` recordings in one review, the oldest first (as read), so
+ * one review rarely finds more than it can list (20 items); the rest wait
+ * for the next read and are counted with those already waiting.
+ */
+export const RECORDINGS_PER_REVIEW = 6;
+
+export function firstRecordings<T extends { text: string; blocks: BlockLike[]; later: number }>(plan: T, max = RECORDINGS_PER_REVIEW): T {
+  if (plan.blocks.length <= max) return plan;
+  const blocks = plan.blocks.slice(0, max);
+  return { ...plan, blocks, text: blocks.map((block) => block.text).join('\n\n'), later: plan.later + plan.blocks.length - blocks.length };
+}
+
+/**
+ * The recordings of a read that are done as soon as the review comes back:
+ * those nothing was found in. None while an item's quote is in no one of
+ * them (it could be from any), and none when the review stopped at its cap
+ * (what it left out may be in any of them).
+ */
+export function recordingsDoneOnRead(blockIds: string[], rowIds: Iterable<string[]>, truncated: boolean): string[] {
+  const lists = [...rowIds];
+  if (truncated || lists.some((ids) => !ids.length)) return [];
+  const withRows = new Set(lists.flat());
+  return blockIds.filter((id) => !withRows.has(id));
+}
+
+/**
+ * Recordings read again next time whatever happens to this review's rows:
+ * when it stopped at its cap, those nothing was listed from (their items
+ * may be the ones left out).
+ */
+export function recordingsHeld(blockIds: string[], rowIds: Iterable<string[]>, truncated: boolean): string[] {
+  if (!truncated) return [];
+  const withRows = new Set([...rowIds].flat());
+  return blockIds.filter((id) => !withRows.has(id));
 }
 
 // ─── The writes ────────────────────────────────────────────────────────────
@@ -1053,6 +1174,24 @@ export function countLine(kinds: ReviewKind[]): string {
     return `${count} ${PLURAL[kind][count === 1 ? 0 : 1]}`;
   });
   return parts.length ? `${parts.join(', ')}.` : 'Nothing to add.';
+}
+
+/** "Saved: 2 new leads." after Approve; '' when nothing was saved (never "Saved: Nothing to add."). */
+export function savedLine(kinds: ReviewKind[]): string {
+  return kinds.length ? `Saved: ${countLine(kinds)}` : '';
+}
+
+/**
+ * What the review says when it stopped at its cap (20 items, the most
+ * important first). `held`: the recordings nothing was listed from, read
+ * again next time.
+ */
+export function stoppedAtCapMessage(held: number, recorder: { name: string; noun: string } | null): string {
+  const first = 'There was more than one review can show (20 items). These are the most important.';
+  if (!recorder) return `${first} For the rest, review a shorter part of the notes.`;
+  if (!held) return `${first} A few smaller items in these ${recorder.noun}s may not be listed.`;
+  const what = held === 1 ? `The ${recorder.name} ${recorder.noun} with nothing listed here is` : `The ${held} ${recorder.name} ${recorder.noun}s with nothing listed here are`;
+  return `${first} ${what} read again next time.`;
 }
 
 /** A case's title for the review; a new lead above reads as one. */
