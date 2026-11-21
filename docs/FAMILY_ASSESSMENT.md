@@ -173,3 +173,26 @@ assessment emails, and an email it cannot write is dropped, not retried.
 8. App Store: check the App Privacy answers (health, insurance and
    identifiers collected from people who are not app users, through the
    web page) and add a line to the App Review notes.
+
+## Bug audit, 2026-11-20
+
+Migration `20261120120000_nov20_audit.sql` (paste in the SQL editor, with its
+`schema_migrations` record before `COMMIT;`) and the `family-assessment-upload`
+function:
+
+- **Emailed invites** go out only from an account whose own email address is
+  confirmed, and at most 400 a day across all practices, so referralfit.com
+  cannot be used to send in bulk. Texting or copying a link is unchanged.
+  Production confirms new accounts at sign-up today (Supabase Auth "Confirm
+  email" appears to be off), so the confirmed-address rule only bites once
+  that is turned on: Matt's call.
+- **Fifty links** of an assessment work at a time (was ten): each "Text or
+  copy" tap and each resend makes one, and the family's working link was
+  retired after ten.
+- **After "Stop"**, a new link carries the stopped assessment's answers on:
+  the family continues where they were; the stopped links stay stopped.
+- **An invite email that could not be delivered** shows on the case ("The
+  email did not go out…") instead of "Sent" (`family_assessment_invite_failures`).
+- **Uploads**: a link can hold at most 12 photo files at once (two card
+  photos plus replaced or abandoned uploads awaiting clean-up).
+- **Account deletion** also removes the practice logo (public bucket).

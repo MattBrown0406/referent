@@ -261,9 +261,12 @@ Deno.test('due dates: only on follow-ups, inside a year, and a missed call is du
     item({ kind: 'follow_up', summary: 'Call Tom back about a bed.', due_date: '', missed: true, organization: 'Harbor Light' }),
     item({ kind: 'follow_up', summary: 'Too far out.', due_date: '2028-01-01' }),
     item({ kind: 'case_note', due_date: '2026-11-13' }),
+    item({ kind: 'follow_up', summary: 'Call Ana back (said Tuesday).', due_date: '2026-11-04' }),
+    item({ kind: 'follow_up', summary: 'Call Bo back (said yesterday).', due_date: '2026-11-08' }),
+    item({ kind: 'follow_up', summary: 'Long ago.', due_date: '2026-09-01' }),
   ), request());
-  assertEquals(items.map((entry) => entry.dueDate), ['2026-11-13', '2026-11-09', '', '']);
-  assertEquals(items[1].missed, true);
+  assertEquals(items.map((entry) => entry.dueDate), ['2026-11-13', '2026-11-09', '', '', '2026-11-09', '2026-11-09', '']);
+  assertEquals(items.map((entry) => entry.missed), [false, true, false, false, true, true, false], 'a date that passed within the week is late: due today, possibly missed');
 });
 
 Deno.test('items without what they need are dropped; urgent ones come first', () => {

@@ -120,7 +120,7 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
   const live = current && current.id === newest?.id && isOpen(current) ? current : null;
   // Danger in answers saved before the family finished: the alerts show (the answers do not, until they send it).
   // Only on the newest assessment: an old stopped or expired one is history, not "reach out today".
-  const earlyAlerts = current && current.id === newest?.id && !finished && Object.keys(current.answers).length ? assessmentAlerts(current) : [];
+  const earlyAlerts = current && current.id === newest?.id && !finished && current.status !== 'revoked' && Object.keys(current.answers).length ? assessmentAlerts(current) : [];
 
   // Card photos: short-lived links, fetched when a finished assessment has them.
   useEffect(() => {
@@ -164,7 +164,7 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
 
   function stop() {
     if (!live || busy) return;
-    Alert.alert('Stop this link?', 'The family can no longer open or finish it. Their unfinished answers are kept but not shown here; you can delete them.', [
+    Alert.alert('Stop this link?', 'The family can no longer open it. If you send a new link afterwards, they continue where they left off; the stopped link stays stopped.', [
       { text: 'Keep it', style: 'cancel' },
       {
         text: 'Stop the link',

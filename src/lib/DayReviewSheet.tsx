@@ -524,7 +524,11 @@ export default function DayReviewSheet({
     } catch (error) {
       if (opening !== openingRef.current) return;
       setPhase('paste');
-      if (error instanceof FieldyError && error.reason === 'disconnected') setRecorder(recorder.id, { state: 'off', email: '' });
+      if (error instanceof FieldyError && error.reason === 'disconnected') {
+        setRecorder(recorder.id, { state: 'off', email: '' });
+        // Its count and the reminder go with it, now, not at the next recount.
+        onRecordersChanged?.();
+      }
       setMessage({ ok: false, text: error instanceof Error ? error.message : `${recorder.name} could not be read right now.` });
       return;
     }
@@ -614,8 +618,11 @@ export default function DayReviewSheet({
     const results: Record<string, SaveResult> = { ...saved };
     const order = saveOrder(ready);
     const dueTime = leadDueTime(leadResponseMinutes);
+    // The day as it is now: a review found before midnight and approved after
+    // dates a new lead's first call (and a referral) today, not yesterday.
+    const day = localDay();
+    if (day !== today) setToday(day);
     let any = false;
-    const fromRecordings: Record<string, string[]> = {};
     try {
       // One at a time: new leads first, then what may go on their cases.
       for (const row of order) {
@@ -624,7 +631,7 @@ export default function DayReviewSheet({
           results[row.key] = { saved: false, message: 'This saves once the new lead above is saved.' };
           continue;
         }
-        const result = await saveReviewRow(row, userId, { today, leadDueTime: dueTime, licenseNote: licenseNoteFor(row) });
+        const result = await saveReviewRow(row, userId, { today: day, leadDueTime: dueTime, licenseNote: licenseNoteFor(row) });
         results[row.key] = result;
         if (result.saved) {
           any = true;
@@ -633,9 +640,14 @@ export default function DayReviewSheet({
           for (const signature of signatures) savedSignaturesRef.current.add(signature);
           // Kept with each recording it came from (every one in this read when
           // its quote is in none), for when that recording is read again.
+          // Remembered at once, row by row: if the app is closed or killed
+          // part way through, what was saved is still known next time.
           const read = recorderReadRef.current;
-          const from = read?.rowIds.get(row.key)?.length ? read.rowIds.get(row.key)! : read?.blocks.map((block) => block.id) ?? [];
-          for (const id of from) fromRecordings[id] = [...(fromRecordings[id] ?? []), ...signatures.map(signatureHash)];
+          if (read) {
+            const from = read.rowIds.get(row.key)?.length ? read.rowIds.get(row.key)! : read.blocks.map((block) => block.id);
+            const hashes = signatures.map(signatureHash);
+            await rememberSaved(read.recorder, userId, Object.fromEntries(from.map((id) => [id, hashes]))).catch(() => undefined);
+          }
         }
         if (opening !== openingRef.current) break;
       }
@@ -643,7 +655,6 @@ export default function DayReviewSheet({
       savingRef.current = false;
     }
     if (any) onSaved();
-    if (recorderReadRef.current) void rememberSaved(recorderReadRef.current.recorder, userId, fromRecordings).catch(() => undefined);
     settleRecordings(results, rows);
     if (opening !== openingRef.current) return;
     setSaved(results);

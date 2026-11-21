@@ -11,11 +11,11 @@ SELECT plan(105);
 --   p1  owner of practice P (sends assessments)
 --   p2  member of practice P
 --   q1  owner of practice Q (another workspace)
-INSERT INTO auth.users (id, email)
+INSERT INTO auth.users (id, email, email_confirmed_at)
 VALUES
-  ('fa100000-0000-0000-0000-0000000000fa', 'assess-p1@example.test'),
-  ('fa200000-0000-0000-0000-0000000000fa', 'assess-p2@example.test'),
-  ('fa300000-0000-0000-0000-0000000000fa', 'assess-q1@example.test');
+  ('fa100000-0000-0000-0000-0000000000fa', 'assess-p1@example.test', now()),
+  ('fa200000-0000-0000-0000-0000000000fa', 'assess-p2@example.test', now()),
+  ('fa300000-0000-0000-0000-0000000000fa', 'assess-q1@example.test', now());
 SELECT set_config('test.org_p', org_id::text, true) FROM public.org_members WHERE user_id = 'fa100000-0000-0000-0000-0000000000fa';
 SELECT set_config('test.org_q', org_id::text, true) FROM public.org_members WHERE user_id = 'fa300000-0000-0000-0000-0000000000fa';
 UPDATE public.org_members SET org_id = current_setting('test.org_p')::uuid, role = 'member', display_name = 'Teammate'
@@ -122,10 +122,12 @@ SELECT throws_ok($$ SELECT public.family_assessment_send('fac10000-0000-0000-000
   '22023', NULL, 'a bad address is refused');
 SELECT throws_ok($$ SELECT public.family_assessment_send('fac10000-0000-0000-0000-0000000000fa', 'X', '', true) $$,
   '22023', NULL, 'email needs an address');
--- Ten links work at a time: ten more, and the first one goes.
-SELECT public.family_assessment_send('fac10000-0000-0000-0000-0000000000fa', '', '', false) FROM generate_series(1, 10);
+-- Fifty links work at a time (20261120120000): fifty more, and the first one goes.
 RESET ROLE;
-SELECT is((SELECT count(*)::int FROM public.family_assessment_links WHERE assessment_id = current_setting('test.id')::uuid), 10, 'ten links at most');
+SELECT public.family_assessment_new_link(current_setting('test.id')::uuid, 'fa100000-0000-0000-0000-0000000000fa') FROM generate_series(1, 50);
+SELECT is((SELECT count(*)::int FROM public.family_assessment_links WHERE assessment_id = current_setting('test.id')::uuid), 50, 'fifty links at most');
+SET LOCAL ROLE authenticated;
+RESET ROLE;
 SELECT is(public.public_family_assessment_open(current_setting('test.token1')), NULL, 'the oldest link stopped');
 
 -- The daily limits count every link made, however many still work.
