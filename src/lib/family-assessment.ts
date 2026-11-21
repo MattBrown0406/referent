@@ -121,13 +121,13 @@ export function statusLine(assessment: FamilyAssessment, now = new Date()): stri
   if (assessment.status === 'revoked') return `Stopped ${shortDate(assessment.revokedAt)}`;
   if (!isOpen(assessment, now)) return `The link expired ${shortDate(assessment.expiresAt)}. Send a new one.`;
   const to = assessment.recipientName ? ` to ${assessment.recipientName}` : '';
+  if (assessment.inviteFailed) {
+    return `The email${assessment.recipientEmail ? ` to ${assessment.recipientEmail}` : ''} did not go out. Check the address, or text or copy the link instead.`;
+  }
   if (assessment.status === 'started') {
     const section = Math.min(Math.max(assessment.step, 1), SECTIONS.length);
     const attention = safetyFlags(assessment.answers).length ? ' · needs attention today' : '';
     return `In progress${to} · section ${section} of ${SECTIONS.length} · saved ${shortDate(assessment.lastSavedAt)}${attention}`;
-  }
-  if (assessment.inviteFailed) {
-    return `The email${assessment.recipientEmail ? ` to ${assessment.recipientEmail}` : ''} did not go out. Check the address, or text or copy the link instead.`;
   }
   return `Sent${to} ${shortDate(assessment.emailedAt || assessment.createdAt)} · not started yet`;
 }

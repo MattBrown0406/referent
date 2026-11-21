@@ -6,7 +6,7 @@
 -- This file is never pasted into production.
 
 BEGIN;
-SELECT plan(12);
+SELECT plan(15);
 
 -- Actors
 --   n1  owner of practice N, email confirmed
@@ -44,7 +44,8 @@ SET LOCAL ROLE authenticated;
 SELECT set_config('test.first', public.family_assessment_send('abc10000-0000-0000-0000-0000000000ab', 'Rosa', '', false) ->> 'id', true);
 RESET ROLE;
 UPDATE public.family_assessments
-   SET answers = '{"relationship": "Mother"}'::jsonb, step = 3, status = 'started', started_at = now() - interval '1 hour', last_saved_at = now() - interval '5 minutes'
+   SET answers = '{"relationship": "Mother"}'::jsonb, step = 3, status = 'started', started_at = now() - interval '1 hour', last_saved_at = now() - interval '5 minutes',
+       urgent_notified_at = now() - interval '10 minutes'
  WHERE id = current_setting('test.first')::uuid;
 SET LOCAL ROLE authenticated;
 SELECT is(public.family_assessment_revoke(current_setting('test.first')::uuid), true, 'stopped');
@@ -55,6 +56,8 @@ SELECT is((SELECT answers FROM public.family_assessments WHERE id = current_sett
   'its answers carry on');
 SELECT is((SELECT status || ':' || step FROM public.family_assessments WHERE id = current_setting('test.second')::uuid), 'started:3',
   'in progress, at the same section');
+SELECT ok((SELECT urgent_notified_at IS NOT NULL FROM public.family_assessments WHERE id = current_setting('test.second')::uuid),
+  'an urgent answer already reported is not reported again');
 SELECT is((SELECT status FROM public.family_assessments WHERE id = current_setting('test.first')::uuid), 'revoked', 'the stopped one stays stopped');
 SELECT is((SELECT count(*)::int FROM public.family_assessment_links WHERE assessment_id = current_setting('test.first')::uuid), 0,
   'and none of its links work');
@@ -73,6 +76,18 @@ RESET ROLE;
 SELECT set_config('request.jwt.claim.sub', 'ab200000-0000-0000-0000-0000000000ab', true);
 SET LOCAL ROLE authenticated;
 SELECT is(public.family_assessment_invite_failures('abc30000-0000-0000-0000-0000000000ab'), '{}'::uuid[], 'another practice learns nothing');
+RESET ROLE;
+
+-- The owner sees (so can list and remove) the practice's own logo files, and no other practice's.
+SELECT set_config('test.org_n', org_id::text, true) FROM public.org_members WHERE user_id = 'ab100000-0000-0000-0000-0000000000ab';
+INSERT INTO storage.objects (bucket_id, name) VALUES ('org-logos', current_setting('test.org_n') || '/logo-1763600000000.png');
+SELECT set_config('request.jwt.claim.sub', 'ab100000-0000-0000-0000-0000000000ab', true);
+SET LOCAL ROLE authenticated;
+SELECT is((SELECT count(*)::int FROM storage.objects WHERE bucket_id = 'org-logos'), 1, 'the owner sees the practice logo file');
+RESET ROLE;
+SELECT set_config('request.jwt.claim.sub', 'ab200000-0000-0000-0000-0000000000ab', true);
+SET LOCAL ROLE authenticated;
+SELECT is((SELECT count(*)::int FROM storage.objects WHERE bucket_id = 'org-logos'), 0, 'another practice does not');
 RESET ROLE;
 
 SELECT * FROM finish();

@@ -34,7 +34,7 @@ export async function listFamilyAssessments(caseId: string): Promise<FamilyAsses
   const list = (data || []).map(assessmentFromRow).filter((item): item is FamilyAssessment => Boolean(item));
   // Which invites could not be delivered (the outbox is not readable from the
   // app). Best effort: an older server without the function shows none.
-  if (list.some((item) => item.status === 'sent' && item.emailedAt)) {
+  if (list.some((item) => (item.status === 'sent' || item.status === 'started') && item.emailedAt)) {
     const { data: failed, error: failedError } = await supabase.rpc('family_assessment_invite_failures', { p_case_id: caseId });
     if (!failedError && Array.isArray(failed)) {
       const ids = new Set(failed.filter((id): id is string => typeof id === 'string'));

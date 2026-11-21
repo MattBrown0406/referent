@@ -14,6 +14,8 @@
 --      assessment's answers on, so the family continues where they were.
 --   4. family_assessment_invite_failures: which invites could not be
 --      delivered, so the case says so instead of "Sent".
+--   5. "org logos: owner read": lets the owner list and remove the
+--      practice's own logo files (old ones, and on account deletion).
 
 BEGIN;
 
@@ -92,6 +94,7 @@ DECLARE
   v_carry_step integer;
   v_carry_started timestamptz;
   v_carry_saved timestamptz;
+  v_carry_urgent timestamptz;
 BEGIN
   IF v_user IS NULL THEN
     RAISE EXCEPTION 'Authentication is required' USING ERRCODE = '28000';
@@ -119,25 +122,28 @@ BEGIN
     -- The case's newest assessment was stopped part way (a link forwarded by
     -- mistake, say): the new one carries its answers on, so the family
     -- continues instead of starting over. The stopped links stay stopped.
-    SELECT a.answers, a.step, a.started_at, a.last_saved_at
-      INTO v_carry_answers, v_carry_step, v_carry_started, v_carry_saved
+    SELECT a.answers, a.step, a.started_at, a.last_saved_at, a.urgent_notified_at
+      INTO v_carry_answers, v_carry_step, v_carry_started, v_carry_saved, v_carry_urgent
       FROM public.family_assessments a
      WHERE a.case_id = p_case_id
      ORDER BY a.created_at DESC LIMIT 1;
     IF NOT FOUND OR v_carry_answers IS NULL OR v_carry_answers = '{}'::jsonb
        OR NOT EXISTS (SELECT 1 FROM public.family_assessments a
                        WHERE a.case_id = p_case_id AND a.status = 'revoked' AND a.submitted_at IS NULL
+                         AND a.revoked_at > now() - interval '30 days'
                          AND a.created_at = (SELECT max(b.created_at) FROM public.family_assessments b WHERE b.case_id = p_case_id)) THEN
       v_carry_answers := NULL;
     END IF;
     INSERT INTO public.family_assessments (case_id, created_by, recipient_name, recipient_email, expires_at,
-                                           answers, step, status, started_at, last_saved_at)
+                                           answers, step, status, started_at, last_saved_at, urgent_notified_at)
     VALUES (p_case_id, v_user, v_name, v_email, v_expires,
             coalesce(v_carry_answers, '{}'::jsonb),
             CASE WHEN v_carry_answers IS NULL THEN 0 ELSE v_carry_step END,
             CASE WHEN v_carry_answers IS NULL THEN 'sent' ELSE 'started' END,
             CASE WHEN v_carry_answers IS NULL THEN NULL ELSE v_carry_started END,
-            CASE WHEN v_carry_answers IS NULL THEN NULL ELSE v_carry_saved END)
+            CASE WHEN v_carry_answers IS NULL THEN NULL ELSE v_carry_saved END,
+            -- The practitioner was already told about an urgent answer carried on.
+            CASE WHEN v_carry_answers IS NULL THEN NULL ELSE v_carry_urgent END)
     RETURNING id, recipient_name INTO v_id, v_to_name;
   ELSE
     -- A corrected address: a mistyped one must not keep reading the answers.
@@ -176,12 +182,14 @@ AS $$
     FROM public.family_assessments a
     JOIN public.cases c ON c.id = a.case_id AND c.org_id = public.current_org_id()
    WHERE a.case_id = p_case_id
-     AND a.status = 'sent'
+     AND a.status IN ('sent', 'started')
      AND EXISTS (
        SELECT 1 FROM public.email_outbox o
         WHERE o.kind = 'family_assessment_invite'
           AND o.data ->> 'assessment_id' = a.id::text
           AND o.sent_at IS NULL AND o.error IS NOT NULL
+          -- Started (answers carried on after a Stop): nothing saved since the invite.
+          AND (a.status = 'sent' OR a.last_saved_at IS NULL OR a.last_saved_at < o.created_at)
           AND NOT EXISTS (SELECT 1 FROM public.email_outbox n
                            WHERE n.kind = 'family_assessment_invite'
                              AND n.data ->> 'assessment_id' = a.id::text
@@ -189,5 +197,18 @@ AS $$
 $$;
 REVOKE ALL ON FUNCTION public.family_assessment_invite_failures(uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.family_assessment_invite_failures(uuid) TO authenticated;
+
+-- 5. The practice owner can see the logo files in its own folder (the
+--    bucket is public by URL, but listing and removing them through the
+--    storage API needs a read policy): older logos are cleared on upload,
+--    and the logo goes with the account when it is deleted.
+DROP POLICY IF EXISTS "org logos: owner read" ON storage.objects;
+CREATE POLICY "org logos: owner read" ON storage.objects FOR SELECT
+  TO authenticated
+  USING (
+    bucket_id = 'org-logos'
+    AND (storage.foldername(name))[1] = public.current_org_id()::text
+    AND public.current_org_role() = 'owner'
+  );
 
 COMMIT;
