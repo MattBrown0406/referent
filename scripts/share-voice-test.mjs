@@ -152,7 +152,8 @@ check(() => {
   assert.match(app, /lastShareRef\.current\.key === key && now - lastShareRef\.current\.at < 60_000\) return;/, 'a share delivered twice is one');
   assert.match(app, /const userId = account\.resolved \? account\.userId : null;/, 'a share belongs to the account signed in when it came');
   assert.match(app, /setPendingShares\(\(current\) => \[\.\.\.current, \{ \.\.\.note, id, userId \}\]\);/, 'a second share before the first is taken waits its turn (never replaces it)');
-  assert.match(app, /onIncomingShareTaken=\{\(id\) => setPendingShares\(\(current\) => current\.filter\(\(share\) => share\.id !== id\)\)\}/, 'only the one taken is let go');
+  assert.match(app, /onIncomingShareTaken=\{\(id\) => \{\s*setPendingShares\(\(current\) => current\.filter\(\(share\) => share\.id !== id\)\);/, 'only the one taken is let go');
+  assert.match(app, /lastShareRef\.current = \{ \.\.\.lastShareRef\.current, at: Math\.min\(lastShareRef\.current\.at, Date\.now\(\) - 55_000\) \}/, 'once taken, the same text shared again on purpose opens again (only a double delivery seconds apart is dropped)');
   assert.match(app, /if \(pendingShare\.userId && pendingShare\.userId !== userId\) \{[\s\S]{0,160}setPendingShares\(\(current\) => current\.filter\(\(share\) => !share\.userId \|\| share\.userId === userId\)\);/, 'never opened in another account');
   assert.match(app, /if \(anySheetOpenRef\.current \|\| overlayOpen\(\)\) \{[\s\S]{0,400}setShowDayReview\(true\);/, 'waits for a clear screen, like a notification tap');
   assert.match(app, /incomingShare=\{pendingShare && pendingShare\.userId !== null && pendingShare\.userId !== activeUserId \? null : pendingShare\}/, 'the sheet gets it only for its own account');
