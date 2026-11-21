@@ -12,6 +12,7 @@ import {
   notesPhones,
   outputSchema,
   parseApiKey,
+  parseReviewAnswer,
   parseReviewOutput,
   parseReviewRequest,
   REVIEW_KINDS,
@@ -106,7 +107,7 @@ Deno.test('the system prompt sets the rules that keep the model honest', () => {
 
 Deno.test('the output schema is strict', () => {
   const schema = outputSchema() as { required: string[]; additionalProperties: boolean; properties: { items: { items: { required: string[]; additionalProperties: boolean; properties: Record<string, unknown> } } } };
-  assertEquals(schema.required, ['items']);
+  assertEquals(schema.required, ['items', 'more']);
   assertEquals(schema.additionalProperties, false);
   const entry = schema.properties.items.items;
   assertEquals(entry.additionalProperties, false);
@@ -292,4 +293,33 @@ Deno.test('the output is capped and cleaned', () => {
   assertEquals(clean('  a\u0000b   c ', 10), 'a b c');
   assertThrows(() => parseReviewOutput('not json', request()), ReviewOutputError);
   assertThrows(() => parseReviewOutput('{"items":"x"}', request()), ReviewOutputError);
+});
+
+Deno.test('a review that stopped at its cap says so (truncated)', () => {
+  const answer = (items: Record<string, unknown>[], more?: boolean) =>
+    parseReviewAnswer(JSON.stringify(more === undefined ? { items } : { items, more }), request());
+  // Fewer than the cap, and the model says that is all: not truncated.
+  const few = answer([item(), item({ summary: 'Spoke with Sarah again.' })], false);
+  assertEquals(few.items.length, 2);
+  assertEquals(few.truncated, false);
+  // An answer without the field (an older prompt) and under the cap: not truncated.
+  assertEquals(answer([item()]).truncated, false);
+  // The model says there was more: truncated, whatever the count.
+  assertEquals(answer([item()], true).truncated, true);
+  // As many as the cap: truncated even when the model did not say so.
+  const full = answer(Array.from({ length: LIMITS.items }, (_, index) => item({ summary: `Note ${index}` })), false);
+  assertEquals(full.items.length, LIMITS.items);
+  assertEquals(full.truncated, true);
+  // More than the cap: the extra ones are dropped, and that is said.
+  const over = answer(Array.from({ length: LIMITS.items + 5 }, (_, index) => item({ summary: `Note ${index}` })), false);
+  assertEquals(over.items.length, LIMITS.items);
+  assertEquals(over.truncated, true);
+  // Nothing found: not truncated.
+  assertEquals(answer([], false).truncated, false);
+  // parseReviewOutput still answers the items alone.
+  assertEquals(parseReviewOutput(output(item()), request()).length, 1);
+});
+
+Deno.test('the prompt asks the model to say when it stopped at the cap', () => {
+  assertStringIncludes(SYSTEM_PROMPT, `Set more to true only when the notes hold more items than you listed (you stopped at ${LIMITS.items})`);
 });

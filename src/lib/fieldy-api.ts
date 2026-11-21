@@ -61,6 +61,8 @@ import {
   type TranscriptPlan,
 } from './fieldy';
 
+import { firstRecordings, mergeFingerprints } from './day-review';
+
 export { FieldyError, FIELDY, PLAUD, RECORDERS, type Recorder, type RecorderId } from './fieldy';
 
 export const fieldySupported = Platform.OS === 'ios' || Platform.OS === 'android';
@@ -626,7 +628,8 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
       for (const id of recovered) delete current.failing[id];
     }).catch(() => undefined);
   }
-  const plan = reviewPlan(read, now.getTime(), texts, recorder.name);
+  // A few recordings per review, so it rarely finds more than it can list.
+  const plan = firstRecordings(reviewPlan(read, now.getTime(), texts, recorder.name));
   return { ...plan, later: plan.later + (fresh.length - read.length), recorder };
 }
 
@@ -659,7 +662,8 @@ export async function rememberSaved(recorder: Recorder, userId: string, byRecord
   await changeState(recorder, userId, (state) => {
     for (const id of ids) {
       const before = state.saved[id]?.split(' ').slice(1) ?? [];
-      state.saved[id] = [at, ...new Set([...before, ...byRecording[id]])].slice(0, 201).join(' ');
+      // The newest 200 are kept: a long day's last saves are never the ones dropped.
+      state.saved[id] = [at, ...mergeFingerprints(before, byRecording[id])].join(' ');
     }
   });
 }

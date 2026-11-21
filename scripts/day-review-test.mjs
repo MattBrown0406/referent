@@ -700,4 +700,163 @@ check(() => {
   assert.match(sheet, /results\[row\.key\] = \{ saved: false, message: caseProblem \};/, 'a row on a case that could not be created is not saved');
 }, 'New case: a note for a family not in ReferralFit yet');
 
+// ─── Bug audit, 2026-11-21 ─────────────────────────────────────────────────
+check(() => {
+  // A review that stopped at its cap (20 items): what it left out may be in
+  // any recording, so one with nothing listed is never done on reading, and
+  // is held for the next read whatever happens to the rows.
+  const ids = ['a', 'b', 'c'];
+  assert.deepEqual(rules.recordingsDoneOnRead(ids, [['a'], ['a']], false), ['b', 'c'], 'not truncated: nothing found in b and c, so they are done');
+  assert.deepEqual(rules.recordingsDoneOnRead(ids, [['a'], ['a']], true), [], 'truncated: none is done on reading');
+  assert.deepEqual(rules.recordingsDoneOnRead(ids, [['a'], []], false), [], 'an item from no one recording still holds them all');
+  assert.deepEqual(rules.recordingsHeld(ids, [['a'], ['a', 'b']], true), ['c'], 'truncated: those nothing was listed from are held');
+  assert.deepEqual(rules.recordingsHeld(ids, [['a']], false), [], 'not truncated: none is held');
+  assert.deepEqual(rules.recordingsDoneOnRead(ids, new Map([['r0', ['a']]]).values(), false), ['b', 'c'], 'takes the sheet\'s map of rows to recordings');
+  assert.equal(rules.stoppedAtCapMessage(2, { name: 'Fieldy', noun: 'conversation' }),
+    'There was more than one review can show (20 items). These are the most important. The 2 Fieldy conversations with nothing listed here are read again next time.');
+  assert.match(rules.stoppedAtCapMessage(1, { name: 'Plaud', noun: 'recording' }), /The Plaud recording with nothing listed here is read again next time\.$/);
+  assert.match(rules.stoppedAtCapMessage(0, { name: 'Plaud', noun: 'recording' }), /may not be listed\.$/);
+  assert.match(rules.stoppedAtCapMessage(0, null), /review a shorter part of the notes\.$/);
+  // A few recordings per review, so truncation is rare; the rest wait.
+  const blocks = Array.from({ length: 8 }, (_, index) => ({ id: `b${index}`, text: `[From Fieldy, Nov ${index + 1}]\nNotes ${index}` }));
+  const plan = rules.firstRecordings({ text: blocks.map((block) => block.text).join('\n\n'), blocks, later: 1, skipped: ['x'] });
+  assert.equal(rules.RECORDINGS_PER_REVIEW, 6);
+  assert.deepEqual(plan.blocks.map((block) => block.id), ['b0', 'b1', 'b2', 'b3', 'b4', 'b5'], 'the oldest first');
+  assert.equal(plan.text, blocks.slice(0, 6).map((block) => block.text).join('\n\n'), 'the text is only theirs');
+  assert.equal(plan.later, 3, 'the rest are counted as waiting');
+  assert.deepEqual(plan.skipped, ['x']);
+  const few = { text: 'x', blocks: blocks.slice(0, 2), later: 0 };
+  assert.equal(rules.firstRecordings(few), few, 'a short read is unchanged');
+}, 'a review that stopped at 20 items never marks unread recordings reviewed');
+
+check(() => {
+  // The recordings stay linked while their text is still in the box.
+  const a = { id: 'a', text: '[From Fieldy, Nov 9, 2:15 PM · Call with Sarah]\nSarah Miller called about her son Jake.' };
+  const b = { id: 'b', text: '[From Fieldy, Nov 9, 4:00 PM · Juniper Ridge]\nDana at Juniper Ridge has a bed Friday.' };
+  const box = `${a.text}\n\n${b.text}`;
+  assert.deepEqual(rules.blocksInNotes(box, [a, b]).map((block) => block.id), ['a', 'b']);
+  assert.equal(rules.notesBesides(box, [a, b]), '', 'nothing typed besides them');
+  const shared = `${box}\n\nFrom Messages:\nTom texted: call me back about the Rivera family.`;
+  assert.deepEqual(rules.blocksInNotes(shared, [a, b]).map((block) => block.id), ['a', 'b'], 'a share below them keeps the link');
+  assert.equal(rules.notesBesides(shared, [a, b]), 'From Messages: Tom texted: call me back about the Rivera family.', 'and is the typed part');
+  const typedAbove = `Also: Ana called.\n${a.text}   \n\n\n${b.text}\n`;
+  assert.deepEqual(rules.blocksInNotes(typedAbove, [a, b]).map((block) => block.id), ['a', 'b'], 'spacing aside, word for word');
+  const edited = box.replace('has a bed Friday', 'has a bed Saturday');
+  assert.deepEqual(rules.blocksInNotes(edited, [a, b]).map((block) => block.id), ['a'], 'one edited is let go (read again next time)');
+  assert.notEqual(rules.notesBesides(edited, rules.blocksInNotes(edited, [a, b])), '', 'and its words count as typed');
+  assert.deepEqual(rules.blocksInNotes(a.text, [a, b]).map((block) => block.id), ['a'], 'one deleted is let go');
+  assert.deepEqual(rules.blocksInNotes('', [a, b]), [], 'an emptied box links none');
+  // The sheet keeps the recordings still in the box, remembers an item from none of them on every recording of the read,
+  // and asks before closing or replacing whenever anything else is in the box.
+  assert.match(sheet, /const kept = linked \? blocksInNotes\(notes, linked\.blocks\) : \[\];/);
+  assert.match(sheet, /linked && kept\.length \? \{ recorder: linked\.recorder, blocks: kept, everyId: linked\.everyId, skipped: linked\.skipped \} : null/);
+  assert.match(sheet, /const from = read\.rowIds\.get\(row\.key\)\?\.length \? read\.rowIds\.get\(row\.key\)! : read\.everyId;/);
+  assert.match(sheet, /const recorderText = Boolean\(recorderReadRef\.current\) && !notesBesides\(notes, recorderReadRef\.current\?\.blocks \?\? \[\]\);/);
+  assert.match(sheet, /const typed = linked \? notesBesides\(notes, blocksInNotes\(notes, linked\.blocks\)\) : notes\.trim\(\);/);
+  assert.doesNotMatch(sheet, /recorderReadRef\.current\??\.text/, 'the link never depends on the box being exactly the recorder text');
+}, 'editing the box, or a share landing in it, keeps the link to the recordings');
+
+check(() => {
+  // A note saved after picking its case by hand comes back with no case picked: still known, and shown on that case.
+  const noteFound = found({ kind: 'case_note', personName: 'Sarah', summary: 'Sarah asked about family week.', evidence: 'Sarah asked whether family week is in person', regarding: 'family' });
+  const [row] = build(noteFound);
+  assert.equal(row.caseId, null, 'two Sarahs: no case picked');
+  assert.deepEqual(row.caseChoices.sort(), ['case-miller', 'case-sarah2']);
+  const picked = rules.chooseCase(row, 'case-sarah2', workspace);
+  const kept = new Set(rules.laterSignatures(picked).map(rules.signatureHash));
+  const [again] = rules.markSavedBefore(build(noteFound), kept);
+  assert.equal(again.include, false, 'read again with no case picked: saved before');
+  assert.equal(again.caseId, 'case-sarah2', 'shown on the case it was saved on');
+  assert.match(again.hint, /^Saved in an earlier review\./);
+  assert.equal(rules.savedBefore(again, kept), true, 'and decided (the close question does not ask about it)');
+  // Saved in this review (Back to the notes, then Find): its signatures.
+  const [here] = rules.markSavedBefore(build(noteFound), new Set(rules.laterSignatures(picked)));
+  assert.match(here.hint, /^Saved earlier in this review\./);
+  assert.equal(here.caseId, 'case-sarah2');
+  // Saved on both cases: saved, no case guessed.
+  const both = new Set([...rules.laterSignatures(picked), ...rules.laterSignatures(rules.chooseCase(row, 'case-miller', workspace))]);
+  const [twice] = rules.markSavedBefore(build(noteFound), both);
+  assert.equal(twice.include, false);
+  assert.equal(twice.caseId, null, 'two places match: neither is picked for it');
+  // Another note about a Sarah is still offered.
+  const [other] = rules.markSavedBefore(build({ ...noteFound, summary: 'Sarah asked about the cost.', evidence: 'Sarah asked how much the intervention costs' }), kept);
+  assert.equal(other.include, true);
+  // A sure pick is not second-guessed: a note on Ana's case is not taken for one saved on another case.
+  const [ana] = build(found({ kind: 'case_note', phone: '541-555-0142', summary: 'Sarah asked about family week.', evidence: 'Sarah asked whether family week is in person', regarding: 'family' }));
+  assert.equal(ana.caseId, 'case-rivera');
+  assert.equal(rules.markSavedBefore([ana], kept)[0].include, true, 'saved on another case: this one is new');
+}, 'a case note saved on a case picked by hand is known again');
+
+check(() => {
+  // Partner notes, referrals and follow-ups, the same way.
+  const [partnerRow] = build(found({ kind: 'partner_note', organization: 'Harbor Light', summary: 'Talked beds with admissions.', evidence: 'talked with admissions about open beds' }));
+  const loose = { ...partnerRow, partnerId: null, partnerUnsure: false, partnerChoices: ['p-juniper', 'p-harbor'] };
+  const partnerKept = new Set(rules.laterSignatures(rules.choosePartner(loose, 'p-juniper')).map(rules.signatureHash));
+  const [partnerAgain] = rules.markSavedBefore([loose], partnerKept);
+  assert.equal(partnerAgain.include, false, 'a partner note saved on a partner picked by hand');
+  assert.equal(partnerAgain.partnerId, 'p-juniper');
+  // An unsure pick (by name only) also tries the other choices.
+  const unsure = { ...loose, partnerId: 'p-harbor', partnerUnsure: true };
+  const [unsureAgain] = rules.markSavedBefore([unsure], partnerKept);
+  assert.equal(unsureAgain.include, false);
+  assert.equal(unsureAgain.partnerId, 'p-juniper', 'moved to where it was saved');
+
+  const [referral] = build(found({ kind: 'referral', organization: 'Juniper Ridge Recovery', direction: 'sent', summary: 'Referred the family to Juniper Ridge.', evidence: 'I referred the family to Juniper Ridge' }));
+  assert.equal(referral.partnerId, 'p-juniper');
+  const looseReferral = { ...referral, caseId: null, caseChoices: ['case-rivera', 'case-miller'] };
+  const referralKept = new Set(rules.laterSignatures(rules.chooseCase(looseReferral, 'case-miller', workspace)).map(rules.signatureHash));
+  const [referralAgain] = rules.markSavedBefore([looseReferral], referralKept);
+  assert.equal(referralAgain.include, false, 'a referral saved on a case picked by hand');
+  assert.equal(referralAgain.caseId, 'case-miller');
+  assert.equal(referralAgain.partnerId, 'p-juniper');
+
+  const followFound = found({ kind: 'follow_up', personName: 'Sarah', summary: 'Send Sarah the family week schedule.', evidence: 'I will send Sarah the family week schedule', regarding: 'family', dueDate: '2026-11-12' });
+  const [follow] = build(followFound);
+  assert.equal(follow.caseId, null);
+  const followKept = new Set(rules.laterSignatures(rules.chooseCase(follow, 'case-miller', workspace)).map(rules.signatureHash));
+  const [followAgain] = rules.markSavedBefore(build(followFound), followKept);
+  assert.equal(followAgain.include, false, 'a follow-up saved on a case picked by hand');
+  assert.equal(followAgain.caseId, 'case-miller');
+  assert.equal(followAgain.partnerId, null, 'a follow-up goes on one place');
+  const notLinked = new Set(rules.laterSignatures({ ...follow, noLink: true }).map(rules.signatureHash));
+  assert.equal(rules.markSavedBefore(build(followFound), notLinked)[0].include, false, 'one saved Not linked is known too');
+  const [otherDay] = rules.markSavedBefore(build({ ...followFound, dueDate: '2026-11-19' }), followKept);
+  assert.equal(otherDay.include, true, 'on another date it is another follow-up');
+}, 'partner notes, referrals and follow-ups saved on a place picked by hand are known again');
+
+check(() => {
+  assert.equal(rules.savedLine([]), '', 'nothing saved: no "Saved:"');
+  assert.equal(rules.savedLine(['new_lead', 'follow_up']), 'Saved: 1 new lead, 1 follow-up.');
+  const approve = /async function approve\(\) \{[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(approve, /const savedText = savedLine\(savedKinds\);/);
+  assert.doesNotMatch(approve, /Saved: \$\{countLine/, 'never "Saved: Nothing to add."');
+}, 'after a failed Approve, "Saved:" only when something was');
+
+check(() => {
+  const before = Array.from({ length: 200 }, (_, index) => `h:${index}`);
+  const merged = rules.mergeFingerprints(before, ['h:new', 'h:5']);
+  assert.equal(merged.length, 200, 'still 200');
+  assert.deepEqual(merged.slice(-2), ['h:new', 'h:5'], 'the newest are kept, last');
+  assert.equal(merged.includes('h:0'), false, 'the oldest drops');
+  assert.equal(merged.filter((hash) => hash === 'h:5').length, 1, 'each once');
+  assert.deepEqual(rules.mergeFingerprints(['h:a'], ['h:b', 'h:b']), ['h:a', 'h:b']);
+  assert.deepEqual(rules.mergeFingerprints([], []), []);
+  const fieldyApi = read('src/lib/fieldy-api.ts');
+  assert.match(fieldyApi, /state\.saved\[id\] = \[at, \.\.\.mergeFingerprints\(before, byRecording\[id\]\)\]\.join\(' '\);/);
+  assert.doesNotMatch(fieldyApi, /\.slice\(0, 201\)/);
+  assert.match(fieldyApi, /const plan = firstRecordings\(reviewPlan\(read, now\.getTime\(\), texts, recorder\.name\)\);/, 'a few recordings per review');
+}, 'saved fingerprints past 200: the newest are kept');
+
+check(() => {
+  // The function says when it stopped; an older one says nothing and is taken as not truncated.
+  assert.match(fn, /return reply\(\{ items, truncated, remaining:/);
+  assert.match(api, /truncated: data\.truncated === true/);
+  assert.match(sheet, /const \{ items, truncated \} = await requestDayReview\(text, day, key\);/);
+  assert.match(sheet, /held = recordingsHeld\(blockIds, rowIds\.values\(\), truncated\);/);
+  assert.match(sheet, /const done = recordingsDoneOnRead\(blockIds, rowIds\.values\(\), truncated\)\.concat\(skipped\);/);
+  assert.match(sheet, /\.filter\(\(id\) => !read\.held\.includes\(id\)\)\n/, 'one held is never settled on Approve or close');
+  assert.match(sheet, /markReviewed\(read\.recorder, read\.blocks\.map\(\(block\) => block\.id\)\.filter\(\(id\) => !read\.held\.includes\(id\)\)\);/, '"Done with them" on close leaves those held');
+  assert.match(sheet, /This review stopped at 20 items, so/, '"Done with these" says plainly some were not read in full');
+}, 'the truncated flag reaches the recordings rule');
+
 console.log(`day-review-test: ${checks} checks passed`);

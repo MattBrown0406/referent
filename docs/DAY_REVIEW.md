@@ -88,7 +88,9 @@ OAuth (`src/lib/fieldy.ts` has both; `src/lib/fieldy-api.ts` the calls).
   Conversations not yet reviewed, from the last week at most (the first
   time: since the start of today), oldest first, each under a header
   ("From Fieldy, Nov 9, 2:15 PM · title"), up to the review's 12,000
-  characters; each summary is kept to 6,000 characters (its start and end).
+  characters and six recordings (so one review rarely finds more than the
+  20 items it lists); each summary is kept to 6,000 characters (its start
+  and end).
   The rest wait for the next read, as does one still in progress or not
   summarized yet. One with no summary is read from its transcript; one with
   neither a day after it ended is skipped, and the review says so.
@@ -286,7 +288,8 @@ the row unverified, and it starts switched off; due dates outside yesterday
 to a year out are cleared; a missed promise is due today; a referral whose
 direction the notes do not make clear is left for the practitioner; anything
 urgent comes first. Notes are capped at 12,000 characters and 20 items, so
-the answer comes back inside the function's deadline (no SDK retry); text in
+the answer comes back inside the function's deadline (no SDK retry); an
+answer that stopped at 20 says so (`truncated`, below); text in
 the notes that looks like the `<notes>` tags is changed.
 
 How rows are placed (all on the phone, `src/lib/day-review.ts`):
@@ -524,3 +527,50 @@ provisioning profile that lacks App Groups, run it again interactively.
   notes to the day review section (what is read, that the sound is never
   saved, that speech is turned into text on the phone or by Apple).
 
+## Bug audit, 2026-11-21
+
+Branch `fix/day-review-audit`. Five findings, all fixed:
+
+1. **A review that stopped at 20 items no longer marks unread recordings
+   reviewed.** The model now says when the notes held more than it listed
+   (`more` in the output schema); the function answers `truncated: true` then,
+   and also whenever it got 20 or more items (`parseReviewAnswer` in
+   `review.ts`). A function deployed before this sends no such field: the app
+   takes that as not truncated. On the phone, when truncated, a recording
+   nothing was listed from is not done on reading, nor on Approve or close
+   (`recordingsDoneOnRead`, `recordingsHeld` in `day-review.ts`): it is read
+   again next time, and the review says so ("There was more than one review
+   can show (20 items). These are the most important. The 2 Fieldy
+   conversations with nothing listed here are read again next time.").
+   "Done with these" still marks them all, saying that some were not read in
+   full. A read now takes at most six recordings (`firstRecordings`), so this
+   is rare; the rest wait and are counted.
+2. **Editing the box keeps the link to the recordings.** After "Back to the
+   notes", the review stays linked to each recording whose text (with its
+   header) is still in the box word for word, spacing aside
+   (`blocksInNotes`). Notes typed, shared or spoken beside them are read with
+   them; a recording edited or deleted there is let go and read again next
+   time. A saved item whose quote is in none of the linked recordings is
+   remembered on every recording of the read (an edited one may be its
+   source), so it is never offered twice. Closing during a read, and reading
+   a recorder again, ask first whenever the box holds anything besides the
+   recordings (`notesBesides`).
+3. **A note saved on a case or partner picked by hand is known again.** Read
+   again, a case note, partner note, referral or follow-up with no pick (or
+   one made by name only) is checked against each case and partner it could
+   be (`savedTargets`); when it was saved on exactly one, it starts switched
+   off on that one ("Saved in an earlier review."). Saved on two: switched
+   off, with no place picked.
+4. After a failed Approve, "Saved: …" is said only when something was saved
+   (`savedLine`), never "Saved: Nothing to add."
+5. A recording's saved fingerprints past 200 keep the newest 200, each once
+   (`mergeFingerprints`); before, the newest were the ones dropped.
+
+Tests: `review_test.ts` (truncated), `scripts/day-review-test.mjs` (the
+rules and the wiring).
+
+**For Matt:** finding 1 needs the `day-review` function deployed again
+(`supabase functions deploy day-review --no-verify-jwt --project-ref
+ovfafffvcpaahktvlsdm`); the rest ships with the next iPhone build. Either
+order is safe: the new function with today's app, and the new app with
+today's function, both work as before.

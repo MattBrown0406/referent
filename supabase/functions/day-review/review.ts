@@ -181,7 +181,7 @@ Also:
 - evidence: copy the exact words from the notes that support the item, at least 4 and at most about 20 words. Do not paraphrase.
 - summary: one plain, factual sentence of at most 20 words. Past tense for notes, an instruction for follow-ups. No clinical judgments, no diagnoses, no recommendations of programs.
 
-Leave out personal or unrelated conversations. Never describe referrals as owed, traded or exchanged. Use "" for any text field that does not apply. List at most ${LIMITS.items} items, the most important first; if there is nothing to record, return an empty list.`;
+Leave out personal or unrelated conversations. Never describe referrals as owed, traded or exchanged. Use "" for any text field that does not apply. List at most ${LIMITS.items} items, the most important first; if there is nothing to record, return an empty list. Set more to true only when the notes hold more items than you listed (you stopped at ${LIMITS.items}), otherwise false.`;
 
 // Text in the notes that looks like the tags around them ("</notes>") is
 // changed so the notes cannot appear to end early.
@@ -230,8 +230,11 @@ export function outputSchema(): Record<string, unknown> {
   };
   return {
     type: 'object',
-    properties: { items: { type: 'array', items: item } },
-    required: ['items'],
+    properties: {
+      items: { type: 'array', items: item },
+      more: { type: 'boolean', description: `True only when the notes hold more items than the ${LIMITS.items} listed.` },
+    },
+    required: ['items', 'more'],
     additionalProperties: false,
   };
 }
@@ -445,7 +448,19 @@ function usable(item: FoundItem): boolean {
   }
 }
 
+/**
+ * What the review found, and whether it stopped at its cap (`truncated`):
+ * the model said there was more, or listed as many as it may (or more). The
+ * phone then reads recordings with nothing listed again instead of taking
+ * them as done (docs/DAY_REVIEW.md, "Bug audit, 2026-11-21").
+ */
+export type ReviewAnswer = { items: FoundItem[]; truncated: boolean };
+
 export function parseReviewOutput(raw: string, request: ReviewRequest): FoundItem[] {
+  return parseReviewAnswer(raw, request).items;
+}
+
+export function parseReviewAnswer(raw: string, request: ReviewRequest): ReviewAnswer {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -454,13 +469,15 @@ export function parseReviewOutput(raw: string, request: ReviewRequest): FoundIte
   }
   const list = record(parsed).items;
   if (!Array.isArray(list)) throw new ReviewOutputError('The review came back unreadable.');
+  // At the cap, even when the model did not say so: what it left out may be anywhere in the notes.
+  let truncated = record(parsed).more === true || list.length >= LIMITS.items;
   const phones = notesPhones(request.text);
   const emails = notesEmails(request.text);
   const notesComparable = ` ${comparable(request.text)} `;
   const capitals = capitalizedWords(request.text);
   const items: FoundItem[] = [];
   for (const entry of list) {
-    if (items.length >= LIMITS.items) break;
+    if (items.length >= LIMITS.items) { truncated = true; break; }
     const input = record(entry);
     const kind = oneOf(input.kind, REVIEW_KINDS, 'case_note');
     if (!(REVIEW_KINDS as readonly unknown[]).includes(input.kind)) continue;
@@ -496,5 +513,5 @@ export function parseReviewOutput(raw: string, request: ReviewRequest): FoundIte
     if (usable(item)) items.push(item);
   }
   // Anything urgent first; otherwise the order of the notes.
-  return items.filter((item) => item.urgent).concat(items.filter((item) => !item.urgent));
+  return { items: items.filter((item) => item.urgent).concat(items.filter((item) => !item.urgent)), truncated };
 }
