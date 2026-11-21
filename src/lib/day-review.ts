@@ -123,7 +123,7 @@ const CLOSED = new Set(['closed', 'lost']);
 export const PENDING_STATUS = 'pending';
 /** A case the practitioner made in this review for a note about a family not in ReferralFit yet; created at Approve. */
 export const NEW_CASE_STATUS = 'new_case';
-export type PendingCase = { id: string; title: string };
+export type PendingCase = { id: string; title: string; contact?: { name: string; phone: string; email: string; about: string } };
 
 // ─── Names ─────────────────────────────────────────────────────────────────
 

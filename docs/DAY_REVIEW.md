@@ -350,7 +350,10 @@ row, under CASE, **+ New case** opens a name field (filled in from the notes,
 case** puts the row on it; the other rows of the review can choose it too
 ("… (new case)"). Nothing is created until Approve: then each new case that a
 row being saved is on is created first (stage Inquiry, no first call added,
-since the conversation in the notes was it), and its rows are saved on it. A
+since the conversation in the notes was it; a follow-up in 48 hours unless a
+follow-up in the review goes on it, so it never has no next step; the person
+the notes name, with their phone or email, as its contact), and its rows are
+saved on it. A name that is already a case puts the row on that case. A
 case that cannot be created leaves its rows unsaved with the reason, and
 Approve again retries with the same case id (a repeat that landed is taken as
 done). `withPendingCases`, `suggestedCaseTitle` in `src/lib/day-review.ts`.

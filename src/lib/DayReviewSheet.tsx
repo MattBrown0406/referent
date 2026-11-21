@@ -24,7 +24,8 @@ import {
 } from 'react-native';
 
 import type { Partner, Referral } from '../data';
-import { createCaseBundle, newUuid, type CaseContact, type CaseRecord } from './cases';
+import { createCaseBundle, leadCallerRelationship, newUuid, type CaseContact, type CaseRecord } from './cases';
+import { initialCaseFollowUp } from './outreach';
 import {
   addDays,
   buildRows,
@@ -46,6 +47,7 @@ import {
   saveOrder,
   signatureHash,
   switchKind,
+  NEW_CASE_STATUS,
   withPendingCases,
   withPendingLeads,
   suggestedCaseTitle,
@@ -377,6 +379,7 @@ export default function DayReviewSheet({
   }
 
   async function find(read: { recorder: Recorder; text: string; blocks: FieldyBlock[]; skipped?: string[] } | null = null) {
+    setCaseDraft(null);
     if (busy && !read) return;
     // "Back to the notes", then Find again on the same recorder text: still that recorder's recordings.
     const same = recorderReadRef.current && notes.trim() === recorderReadRef.current.text.trim() ? recorderReadRef.current : null;
@@ -645,9 +648,18 @@ export default function DayReviewSheet({
         id: pending.id, title: pending.title, status: 'inquiry', summary: '', leadSource: 'Unspecified', leadSourceDetail: '',
         lostReason: '', stageChangedAt: at, paymentStatus: 'none', quotedAmount: null, paidAmount: 0, createdAt: at, updatedAt: at,
       };
+      const contact: CaseContact | null = pending.contact ? {
+        id: newUuid(), caseId: pending.id, name: pending.contact.name.slice(0, 120),
+        relationship: pending.contact.about ? leadCallerRelationship(pending.contact.about) : '',
+        phone: pending.contact.phone, email: pending.contact.email, isPrimary: true, note: '',
+      } : null;
+      // No first call (the conversation in the notes was it), but never no
+      // next step: unless a follow-up in this review goes on the case, a
+      // follow-up in 48 hours, as the app's own new cases get.
+      const hasNextStep = order.some((row) => row.kind === 'follow_up' && row.caseId === pending.id);
+      const nextStep = hasNextStep ? null : initialCaseFollowUp(newUuid(), { ...record, status: 'consult' }, new Date());
       try {
-        // No first call is added: the conversation in the notes was it.
-        await createCaseBundle(record, null, null, userId);
+        await createCaseBundle(record, contact, nextStep, userId);
         any = true;
       } catch (error) {
         caseProblems.set(pending.id, `The new case “${pending.title}” could not be created${error instanceof Error && error.message ? `: ${error.message}` : ''}. Try Approve again.`);
@@ -719,8 +731,22 @@ export default function DayReviewSheet({
   function addNewCase(key: string, title: string) {
     const name = title.trim().slice(0, 120);
     if (!name) return;
+    // A case of that name already in ReferralFit (or a new lead's above): that one, not a second.
+    const existing = view.cases.find((record) => record.status !== NEW_CASE_STATUS && comparable(record.title) === comparable(name));
+    if (existing) {
+      updateRow(key, (current) => chooseCase(current, existing.id, view));
+      setCaseDraft(null);
+      setMessage({ ok: true, text: `“${existing.title}” is already a case, so the row is on it.` });
+      return;
+    }
     const same = newCases.find((item) => comparable(item.title) === comparable(name));
-    const pending = same ?? { id: newUuid(), title: name };
+    // The person the notes name (with their phone or email) becomes the
+    // case's contact, as a new lead's caller does.
+    const source = rows.find((item) => item.key === key)?.found;
+    const contact = source && source.personName.trim() && (source.phone || source.email)
+      ? { name: source.personName.trim(), phone: source.phone, email: source.email, about: source.aboutRelationship }
+      : undefined;
+    const pending: PendingCase = same ?? { id: newUuid(), title: name, contact };
     const next = same ? newCases : [...newCases, pending];
     if (!same) setNewCases(next);
     const withIt = withPendingCases(view, next);
@@ -767,7 +793,7 @@ export default function DayReviewSheet({
           <TouchableOpacity
             accessibilityRole="button"
             accessibilityLabel={open ? `Done finding a ${noun}` : `Find another ${noun}`}
-            onPress={() => setPicker(open ? null : { key: row.key, what, query: '' })}
+            onPress={() => { setCaseDraft(null); setPicker(open ? null : { key: row.key, what, query: '' }); }}
             style={styles.pill}
           >
             <Text style={styles.pillText}>{open ? 'Done' : `Find another ${noun}`}</Text>
@@ -788,7 +814,10 @@ export default function DayReviewSheet({
             <Text style={styles.hint}>Name the new case (the family name and who it is about works well). It is created when you approve this row.</Text>
             <TextInput
               value={caseDraft.title}
-              onChangeText={(value) => setCaseDraft({ key: row.key, title: value.slice(0, 120) })}
+              onChangeText={(value) => setCaseDraft({ key: row.key, title: value })}
+              maxLength={120}
+              returnKeyType="done"
+              onSubmitEditing={() => { if (caseDraft.title.trim()) addNewCase(row.key, caseDraft.title); }}
               placeholder="Case name, e.g. Rivera family — son Luis"
               placeholderTextColor={COLORS.gray}
               accessibilityLabel="New case name"
