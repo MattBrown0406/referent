@@ -119,12 +119,15 @@ const PREFERENCE_NEEDS: { pattern: RegExp; need: string }[] = [
 ];
 
 /** Words that turn a clause into a "no" ("no wilderness", "does not need EMDR"). */
-const NEGATION = /\b(no|not|never|none|nothing|without|avoid|against|dont|doesnt|isnt|wont|cant|refuses?|hates?|dislikes?|rather not|instead of|other than|except|anything but)\b|n't\b/i;
+const NEGATION = /\b(no|non|not|never|none|nothing|without|avoid|against|dont|doesnt|isnt|wont|cant|cannot|refuses?|hates?|dislikes?|rather not|instead of|other than|except)\b|n't\b/i;
 
 /** The family's preferences as clauses, keeping only the ones that ask for something. */
 export function wantedClauses(preferences: string): string[] {
   return preferences
-    .split(/[.,;:!?\n]+/)
+    // "Anything but X" is a no to X; then each sentence, and each side of a
+    // "but", stands alone (never split on "and": "doesn't need EMDR and DBT").
+    .replace(/\banything but\b/gi, 'not')
+    .split(/[.,;:!?\n]+|\b(?:but|though|although|however|whereas)\b/i)
     .map((clause) => clause.trim())
     .filter((clause) => clause && !NEGATION.test(clause.replace(/’/g, "'")));
 }

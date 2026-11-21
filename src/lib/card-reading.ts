@@ -40,7 +40,8 @@ export function readCardReading(value: unknown): CardReading | null {
     memberIdLast4: last4.length === 4 ? last4 : '',
     note: text(input.note, LIMITS.note),
   };
-  return reading.carrier || reading.planName || reading.memberIdLast4 ? reading : null;
+  // An insurer the app does not list comes back only as printed (cardCarrier): still a reading.
+  return reading.carrier || reading.cardCarrier || reading.planName || reading.memberIdLast4 ? reading : null;
 }
 
 export type CardField = 'carrier' | 'planName' | 'memberIdLast4';
@@ -103,7 +104,7 @@ export function cardSides(assessment: { cardFront: boolean; cardBack: boolean })
 /** What was read, in one line, for when the form cannot open (offline). */
 export function cardReadingLine(reading: CardReading): string {
   return [
-    reading.carrier,
+    reading.carrier || reading.cardCarrier,
     reading.planName,
     reading.memberIdLast4 ? `member ID ending ${reading.memberIdLast4}` : '',
   ].filter(Boolean).join(', ');

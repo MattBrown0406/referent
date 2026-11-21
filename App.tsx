@@ -2614,7 +2614,7 @@ export default function App() {
   // open sheet (it waits until that one is closed, as a notification tap
   // does). A share that came for one account never opens in another. Two
   // shares before the first is taken wait in turn, each going into the box.
-  const [pendingShares, setPendingShares] = useState<(SharedNote & { id: string; userId: string | null })[]>([]);
+  const [pendingShares, setPendingShares] = useState<(SharedNote & { id: string; userId: string | null; key: string })[]>([]);
   const pendingShare = pendingShares[0] ?? null;
   const shareSignInAskedRef = useRef<string | null>(null);
   const shareAccountRef = useRef<{ resolved: boolean; userId: string | null }>({ resolved: false, userId: null });
@@ -2638,7 +2638,7 @@ export default function App() {
       shareCountRef.current += 1;
       const id = `share-${now}-${shareCountRef.current}`;
       const userId = account.resolved ? account.userId : null;
-      setPendingShares((current) => [...current, { ...note, id, userId }]);
+      setPendingShares((current) => [...current, { ...note, id, userId, key }]);
       if (account.resolved && account.userId && anySheetOpenRef.current && !showDayReviewRef.current) {
         Alert.alert('Shared to ReferralFit', 'It opens in Review notes when you close this screen.');
       }
@@ -7548,7 +7548,7 @@ export default function App() {
           {matchInsurance === 'Cash pay' ? (
             <View style={styles.budgetRow}>
               <View style={styles.budgetIcon}><AppIcon name="wallet-outline" size={18} color={COLORS.forest} /></View>
-              <View style={{ flex: 1 }}><Text style={styles.inputCaption}>Maximum cash budget</Text><TextInput value={matchBudget} onChangeText={setMatchBudget} keyboardType="number-pad" placeholder="Optional" style={styles.inlineInput} /></View>
+              <View style={{ flex: 1 }}><Text style={styles.inputCaption}>Maximum cash budget, per month</Text><TextInput value={matchBudget} onChangeText={setMatchBudget} keyboardType="number-pad" placeholder="Optional" style={styles.inlineInput} /></View>
               <Text style={styles.budgetValue}>{!matchBudget.trim() ? 'Any budget' : parseWholeDollars(matchBudget) === undefined ? 'Check the amount' : formatMoney(parseWholeDollars(matchBudget) || 0)}</Text>
             </View>
           ) : null}
@@ -10698,7 +10698,8 @@ export default function App() {
           setPendingShares((current) => current.filter((share) => share.id !== id));
           // Taken: the same text shared again on purpose opens again; only
           // iOS's own double delivery, seconds apart, is still dropped.
-          if (lastShareRef.current) lastShareRef.current = { ...lastShareRef.current, at: Math.min(lastShareRef.current.at, Date.now() - 55_000) };
+          const taken = pendingShares.find((share) => share.id === id);
+          if (taken && lastShareRef.current && lastShareRef.current.key === taken.key) lastShareRef.current = { ...lastShareRef.current, at: Math.min(lastShareRef.current.at, Date.now() - 55_000) };
         }}
         onRecordersChanged={(reviewed) => {
           if (reviewed) lowerRecordingsWaiting(reviewed.recorder, reviewed.count);

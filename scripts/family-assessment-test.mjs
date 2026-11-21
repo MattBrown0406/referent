@@ -324,6 +324,9 @@ check(() => {
   assert.equal(card.readCardReading({ carrier: 'Aetna', memberIdLast4: 'XOJ88345521' }).memberIdLast4, '5521', 'never more than four characters');
   assert.equal(card.readCardReading({ carrier: 'Aetna', memberIdLast4: '12' }).memberIdLast4, '', 'four characters or none');
   assert.equal(card.readCardReading({ carrier: '', planName: '', memberIdLast4: '' }), null, 'nothing read');
+  const printedOnly = card.readCardReading({ carrier: '', cardCarrier: 'Ambetter of Texas', planName: '', memberIdLast4: '' });
+  assert.ok(printedOnly, 'an insurer the app does not list is still a reading');
+  assert.equal(card.cardReadingLine(printedOnly), 'Ambetter of Texas', 'the offline line names the printed insurer');
   assert.equal(card.readCardReading('nope'), null);
   assert.equal(card.readCardReading({ carrier: 'A'.repeat(500) }).carrier.length, 120);
 }, 'the reading is read defensively');

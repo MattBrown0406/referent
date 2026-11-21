@@ -71,6 +71,12 @@ check('a preference the family says no to is never added', () => {
   }
   const mixed = matchFromAssessment({ ...base, answers: { treatmentPreferences: 'EMDR yes. No wilderness' } });
   assert.deepEqual(mixed.needs, ['EMDR']);
+  for (const words of ['Non-faith based program', 'Non spiritual approach please', 'He cannot stand wilderness programs']) {
+    assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: words } }).needs, [], words);
+  }
+  assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'Faith based but no wilderness' } }).needs, ['Faith based']);
+  assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'Not sure but she did well with EMDR' } }).needs, ['EMDR']);
+  assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'He doesn’t need EMDR and DBT' } }).needs, []);
 });
 
 check('needs come from plain answers and are never MAT', () => {
