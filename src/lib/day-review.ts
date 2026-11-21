@@ -601,11 +601,14 @@ function placeReferral(row: ReviewRow, workspace: Workspace, today: string) {
   if (row.found.personName || row.found.aboutFirstName) pickCase(row, workspace);
   setReferralCase(row, workspace, row.caseId);
   const directions = row.direction === 'received' ? ['Inbound'] : row.direction === 'sent' ? ['Outbound'] : ['Inbound', 'Outbound'];
+  // A referral from a recording is saved on the recording's day (referralWrite).
+  const happened = localDayOf(row.occurredAt);
   const duplicate = row.partnerId && workspace.referrals.some((item) => item.partnerId === row.partnerId
-    && directions.includes(item.direction) && item.date === today && (!row.caseId || !item.caseId || item.caseId === row.caseId));
+    && directions.includes(item.direction) && (item.date === today || item.date === happened)
+    && (!row.caseId || !item.caseId || item.caseId === row.caseId));
   if (duplicate) {
     row.include = false;
-    addHint(row, 'Already in the referral history today.');
+    addHint(row, happened && happened !== today ? 'Already in the referral history on the day of the recording.' : 'Already in the referral history today.');
   }
 }
 
@@ -838,8 +841,16 @@ export function rowSignatures(row: ReviewRow, saved = false): string[] {
   // A follow-up is also the date the notes gave it ("Call Ana back" on the
   // 10th and on the 13th are two), never one typed in or defaulted to
   // tomorrow, which would not match when the notes are read again.
-  const base = `${row.found.kind}|${target}${row.kind === 'follow_up' ? `|d:${row.found.dueDate}` : ''}`;
+  // A promise already late ("possibly missed") is due on whatever day it is
+  // read, so its day never tells it apart: it is known as missed.
+  const base = `${row.found.kind}|${target}${row.kind === 'follow_up' ? `|d:${row.found.missed ? 'missed' : row.found.dueDate}` : ''}`;
   const out = [`${base}|t:${comparable(row.text)}`, `${base}|s:${comparable(row.found.summary)}`];
+  // A follow-up saved with its date, read again once that date has passed,
+  // comes back as a late promise ("missed"): it is still this one.
+  if (saved && row.kind === 'follow_up' && !row.found.missed) {
+    const late = `${row.found.kind}|${target}|d:missed`;
+    out.push(`${late}|t:${comparable(row.text)}`, `${late}|s:${comparable(row.found.summary)}`);
+  }
   if (row.found.evidence) out.push(`${base}|q:${comparable(row.found.evidence)}`);
   // Whatever it is matched to now: a lead saved earlier is a case today, so
   // the same words from the notes read again become a note on it. Its
@@ -890,7 +901,8 @@ export function laterSignatures(row: ReviewRow): string[] {
   // follow-up: one sentence often holds two ("call Ana and Sarah back
   // tomorrow", both on one case); those are known by their wording and date.
   const quoted = new Set<string>(['case_note', 'partner_note', 'referral']);
-  const targeted = Boolean(row.caseId || row.partnerId);
+  // As for a lead: a quote of four words or more, never a fragment two items could share.
+  const targeted = Boolean(row.caseId || row.partnerId) && comparable(row.found.evidence).split(' ').length >= 4;
   return rowSignatures(row, true).filter((signature) => !signature.includes('|q:')
     || signature.startsWith('new_lead|any|')
     || (targeted && quoted.has(row.found.kind) && signature.startsWith(`${row.found.kind}|`)));

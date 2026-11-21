@@ -125,12 +125,34 @@ Deno.serve(async (request) => {
   // A link holder cannot fill storage: an assessment holds two card photos,
   // and a few replaced or abandoned uploads waiting to be cleaned up.
   const folder = prefix.slice(0, prefix.lastIndexOf('/'));
-  const { data: present, error: listError } = await supabase.storage.from('assessment-files').list(folder, { limit: MAX_FILES_PER_ASSESSMENT + 1 });
+  const { data: present, error: listError } = await supabase.storage.from('assessment-files').list(folder, { limit: 100 });
   if (listError) {
     console.error('listing card photos failed');
     return failure(500, 'server_error', 'The photo could not be sent right now. Try again.');
   }
-  if ((present || []).length >= MAX_FILES_PER_ASSESSMENT) {
+  // Uploads never recorded and older than any upload link (a "done" that
+  // never arrived on a weak signal) are cleared first, so they cannot fill
+  // the folder for good; only recorded photos and recent uploads count.
+  const cutoff = Date.now() - UPLOAD_LINK_LIFETIME_MS;
+  let count = 0;
+  const stale: string[] = [];
+  for (const item of present || []) {
+    const path = `${folder}/${item.name}`;
+    if (Date.parse(String(item.created_at || '')) < cutoff) {
+      const { data: recorded, error: checkError } = await supabase.rpc('family_assessment_photo_recorded', { p_path: path });
+      if (!checkError && recorded === false) { stale.push(path); continue; }
+    }
+    count += 1;
+  }
+  if (stale.length) {
+    const { error: removeError } = await supabase.storage.from('assessment-files').remove(stale);
+    if (removeError) {
+      // Not cleared: they still count, so a folder cannot grow without end.
+      console.error('removing stale card photo uploads failed');
+      count += stale.length;
+    }
+  }
+  if (count >= MAX_FILES_PER_ASSESSMENT) {
     return failure(429, 'too_many', 'Too many photos were sent for this assessment. Wait a few minutes and try again, or ask the practice for help.');
   }
 
