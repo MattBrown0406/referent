@@ -104,6 +104,30 @@ questions, options and stored values follow the FI form, with these changes:
 - **Logo:** Workspace and settings > Practice logo (owner only), public like
   a logo on a website, shown on the page and in the invite.
 
+## From answers to matches (2026-11-21, Matt)
+
+On a finished assessment, **See matches from these answers** opens Match
+filled in from what the family said (`src/lib/assessment-match.ts`, tests in
+`scripts/assessment-match-test.mjs`). It starts like "Find placement" (the
+case's name, the state named in the case, the plan on Benefits), then:
+
+| Field | From |
+| --- | --- |
+| Population | Under 18: Adolescent. Otherwise gender Male: Men, Female: Women (these hide only programs for the other group) |
+| Men only / Women only | Only when the family asked for gender-specific care in their own words |
+| Needs (preferences, never must-haves) | Trauma (a yes, not "suspected"), Dual diagnosis (psychiatric history or signs of a mood disorder), Chronic pain, Chronic relapse (two or more earlier programs), and what the family wrote under treatment preferences (faith based, LGBTQ+, EMDR, DBT, CBT, IFS, equine, adventure, family program, trauma, eating disorders, gambling) |
+| Payment | The plan on Benefits; else the carrier the family typed, when the form lists it (common spellings such as BCBS and UHC are known); else their cash budget, the top of the range they picked |
+| Level of care | Only the level chosen on the case's level-of-care rating |
+
+MAT is never added on its own (it is a must-have by default and would hide
+programs): "Opioids or alcohol are named" is listed to check instead, with
+State Medicaid, a carrier the form does not list, seizures or DTs, and no
+level rating yet. A banner above the form lists every field it filled and
+the answer it came from, and **Draft for the family** opens "Explain to the
+family" on the ranked list. When the case already has a saved match, the app
+asks first and keeps every field the answers do not speak to. Nothing is
+saved until the practitioner saves the match.
+
 ## Data and access
 
 | Data | Where | Who |

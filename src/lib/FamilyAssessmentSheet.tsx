@@ -72,11 +72,13 @@ type Props = {
   onClose: () => void;
   /** Rate the level of care, starting from what the assessment says. */
   onRateLevel: (seed: LevelOfCareSeed) => void;
+  /** Open Match filled in from the family's answers (src/lib/assessment-match.ts). */
+  onMatch?: (answers: FamilyAssessment['answers']) => void;
 };
 
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClose, onRateLevel }: Props) {
+export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClose, onRateLevel, onMatch }: Props) {
   const [practiceName, setPracticeName] = useState('Your practice');
   const [list, setList] = useState<FamilyAssessment[] | null>(null);
   const [loadError, setLoadError] = useState('');
@@ -346,6 +348,17 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
                   </TouchableOpacity>
                 ) : null}
               </View>
+
+              {onMatch ? (
+                <View style={styles.card}>
+                  <Text style={styles.cardTitle}>Find programs</Text>
+                  <Text style={styles.body}>Open Match filled in from these answers: who your loved one is, how the family pays, what they asked for, and the level of care you rated. The ranked programs and a draft for the family are one tap away.</Text>
+                  <TouchableOpacity accessibilityRole="button" disabled={Boolean(busy)} onPress={() => onMatch(finished.answers)} style={[styles.primaryButton, busy && styles.off]}>
+                    <Text style={styles.primaryButtonText}>See matches from these answers</Text>
+                  </TouchableOpacity>
+                  <Text style={styles.hint}>Nothing is saved until you save the match. You check every field first.</Text>
+                </View>
+              ) : null}
 
               {photos.front || photos.back ? (
                 <View style={styles.card}>

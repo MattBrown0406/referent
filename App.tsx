@@ -179,6 +179,8 @@ import PartnerImportSheet from './src/lib/PartnerImportSheet';
 import { contactFilesAvailable, deviceContactsAvailable } from './src/lib/partner-import-api';
 import { useCaseAssessments } from './src/lib/level-of-care-api';
 import { levelOfCarePacketLines, reasonNames, type PlacementLevel } from './src/lib/level-of-care';
+import { matchFromAssessment } from './src/lib/assessment-match';
+import type { Answers } from './src/lib/assessment-schema';
 import {
   assignMatchReferral,
   completeFollowUpWithNext,
@@ -1367,6 +1369,8 @@ export default function App() {
   // the head start it gives the level-of-care sheet when opened from it.
   const [familyAssessmentCaseId, setFamilyAssessmentCaseId] = useState<string | null>(null);
   const [levelOfCareSeed, setLevelOfCareSeed] = useState<LevelOfCareSeed | null>(null);
+  // What "See matches from these answers" filled in on the Match form, shown above it until another match loads.
+  const [matchFromAnswers, setMatchFromAnswers] = useState<{ caseId: string; used: string[]; toCheck: string[] } | null>(null);
   const assessmentBackRef = useRef<() => void>(() => setAssessmentCaseId(null));
   // The shortlist the clinician saw when they started an assignment, so the
   // placement record can say what was shown and at what rank the pick sat.
@@ -1593,6 +1597,7 @@ export default function App() {
   const applyMatchToForm = useCallback((match: ReferralMatch | null) => {
     appliedMatchFormRef.current = matchFormSignature(matchFormValuesFor(match));
     matchFormLoadsRef.current += 1;
+    setMatchFromAnswers(null);
     setPendingCaseMatchId(null);
     setSelectedMatchId(match?.id || null);
     setMatchClientLabel(match?.clientLabel || '');
@@ -5167,6 +5172,49 @@ export default function App() {
     closeCase();
   }
 
+  // "See matches from these answers" (finished family assessment,
+  // src/lib/assessment-match.ts): Find placement as above, then the
+  // family's answers on top. A saved match of the case keeps everything the
+  // answers do not speak to; nothing is saved until the practitioner saves.
+  function startMatchFromAssessment(record: CaseRecord, answers: Answers) {
+    const existing = referralMatches.find((item) => item.id === record.matchProfileId);
+    const fill = () => {
+      const text = `${record.title} ${record.summary}`;
+      const stateHint = stateOptions.find((state) => new RegExp(`\\b${state.code}\\b`).test(text) || text.toLowerCase().includes(state.name.toLowerCase()));
+      const state = existing ? existing.state : stateHint?.code || 'ANY';
+      const result = matchFromAssessment({
+        answers,
+        planCarrier: benefitsByCase[record.id]?.carrier || '',
+        ratedLevel: caseAssessments.currentFor(record.id)?.chosenLevel ?? null,
+        insuranceOptions: insuranceProvidersForState(state),
+        needOptions: therapyOptions,
+      });
+      startMatchForCase(record, (result.levelOfCare as PlacementLevel | null) ?? undefined);
+      if (result.population !== 'Any') setMatchPopulation(result.population);
+      if (result.needs.length) {
+        const base = existing ? existing.therapies : [];
+        const next = Array.from(new Set([...base, ...result.needs]));
+        // Population needs are always required; every other need from the
+        // answers is a preference (it raises a program, never hides one).
+        const required = existing ? (existing.mustHaveTherapies ?? defaultMustHaveNeeds(existing.therapies)) : [];
+        setMatchTherapies(next);
+        setMatchMustHave(required.filter((need) => next.includes(need)));
+      }
+      if (result.insurance !== 'Cash pay') { setMatchInsurance(result.insurance); setMatchBudget(''); }
+      else if (result.budget) { setMatchInsurance('Cash pay'); setMatchBudget(result.budget); }
+      setMatchFromAnswers({ caseId: record.id, used: result.used, toCheck: result.toCheck });
+    };
+    if (!existing) { fill(); return; }
+    Alert.alert(
+      'Update the saved match?',
+      'This case already has a match. Fill it in from the family’s answers? Fields the answers do not cover stay as they are, and nothing is saved until you save the match.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Fill it in', onPress: fill },
+      ],
+    );
+  }
+
   // ─── Today Command Center ───────────────────────────────────────────────
   // Home is a prioritized operating list built from open follow_ups (mirroring
   // the today_actions view semantics client-side) + virtual partner-cadence
@@ -7227,6 +7275,33 @@ export default function App() {
             </ScrollView>
           ) : <Text style={styles.noSavedMatches}>No active matches. Create and save a client match now; add partners whenever you are ready.</Text>}
         </View>
+
+        {/* "See matches from these answers": what the family's assessment filled in, and what to check (src/lib/assessment-match.ts). */}
+        {matchFromAnswers && matchCaseId === matchFromAnswers.caseId ? (
+          <View style={styles.infoCard} accessibilityLiveRegion="polite">
+            <View style={styles.caseSectionHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.infoTitle}>Filled in from the family’s assessment</Text>
+                <Text style={styles.caseSectionHint}>Check each field below, then save the match.</Text>
+              </View>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Hide this note" onPress={() => setMatchFromAnswers(null)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <AppIcon name="close" size={18} color={COLORS.gray} />
+              </TouchableOpacity>
+            </View>
+            {matchFromAnswers.used.map((line) => <Text key={`u-${line}`} style={styles.caseSectionHint}>✓ {line}</Text>)}
+            {matchFromAnswers.toCheck.map((line) => <Text key={`c-${line}`} style={styles.caseSectionHint}>To check: {line}</Text>)}
+            {matches.length ? (
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Draft the explanation for the family" onPress={() => setShowMatchExplanation(true)} style={styles.askProgramsButton}>
+                <AppIcon name="chatbubbles-outline" size={18} color={COLORS.forest} />
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.askProgramsTitle}>Draft for the family</Text>
+                  <Text style={styles.askProgramsBody}>Why the top programs fit, in this order, ready to send.</Text>
+                </View>
+                <AppIcon name="chevron-forward" size={16} color={COLORS.gray} />
+              </TouchableOpacity>
+            ) : <Text style={styles.caseSectionHint}>No program fits these answers yet. Loosen a field or add partners.</Text>}
+          </View>
+        ) : null}
 
         <View style={styles.filterCard}>
           <View style={styles.matchEditorHeader}>
@@ -9873,6 +9948,7 @@ export default function App() {
           recipient={{ name: primary?.name || '', email: primary?.email || '' }}
           onClose={() => setFamilyAssessmentCaseId(null)}
           onRateLevel={(seed) => { setLevelOfCareSeed(seed); setAssessmentCaseId(record.id); }}
+          onMatch={(answers) => startMatchFromAssessment(record, answers)}
         />
       </Modal>
     );
