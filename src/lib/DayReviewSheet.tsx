@@ -24,7 +24,7 @@ import {
 } from 'react-native';
 
 import type { Partner, Referral } from '../data';
-import { newUuid, type CaseContact, type CaseRecord } from './cases';
+import { createCaseBundle, newUuid, type CaseContact, type CaseRecord } from './cases';
 import {
   addDays,
   buildRows,
@@ -46,7 +46,10 @@ import {
   saveOrder,
   signatureHash,
   switchKind,
+  withPendingCases,
   withPendingLeads,
+  suggestedCaseTitle,
+  type PendingCase,
   type ReviewRow,
   type RowContext,
   type Workspace,
@@ -156,6 +159,11 @@ export default function DayReviewSheet({
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [saved, setSaved] = useState<Record<string, SaveResult>>({});
   const [picker, setPicker] = useState<{ key: string; what: 'case' | 'partner'; query: string } | null>(null);
+  // "New case" on a row: cases made in this review for a family not in
+  // ReferralFit yet, created only when a row on them is approved; and the
+  // row whose name-the-case form is open.
+  const [newCases, setNewCases] = useState<PendingCase[]>([]);
+  const [caseDraft, setCaseDraft] = useState<{ key: string; title: string } | null>(null);
   const [index, setIndex] = useState<DirectoryIndex | null>(null);
   // Bumped on every open and close: a review or save finishing afterwards changes nothing.
   const openingRef = useRef(0);
@@ -197,6 +205,8 @@ export default function DayReviewSheet({
     setRows([]);
     setSaved({});
     setPicker(null);
+    setNewCases([]);
+    setCaseDraft(null);
     setMessage(null);
     savedSignaturesRef.current = new Set();
     savedCountRef.current = 0;
@@ -249,7 +259,7 @@ export default function DayReviewSheet({
 
   // The workspace with this review's new leads in it: a follow-up about a
   // caller who is new today can go on the case the lead will create.
-  const view = useMemo(() => withPendingLeads(workspace, rows), [workspace, rows]);
+  const view = useMemo(() => withPendingCases(withPendingLeads(workspace, rows), newCases), [workspace, rows, newCases]);
   const context: RowContext = { rows, licenseConcern: (partnerId) => Boolean(licenseConcernFor(partnerId)) };
   const isSaved = (row: ReviewRow) => saved[row.key]?.saved === true;
   const pending = rows.filter((row) => !isSaved(row));
@@ -623,9 +633,36 @@ export default function DayReviewSheet({
     const day = localDay();
     if (day !== today) setToday(day);
     let any = false;
+    // New cases made in this review, created first: only those a row being
+    // saved is on, and each once (a retry sends the same id; a repeat that
+    // already landed is taken as done).
+    const caseProblems = new Map<string, string>();
+    const known = new Set(workspace.cases.map((record) => record.id));
+    for (const pending of newCases) {
+      if (known.has(pending.id) || !order.some((row) => row.caseId === pending.id)) continue;
+      const at = new Date().toISOString();
+      const record: CaseRecord = {
+        id: pending.id, title: pending.title, status: 'inquiry', summary: '', leadSource: 'Unspecified', leadSourceDetail: '',
+        lostReason: '', stageChangedAt: at, paymentStatus: 'none', quotedAmount: null, paidAmount: 0, createdAt: at, updatedAt: at,
+      };
+      try {
+        // No first call is added: the conversation in the notes was it.
+        await createCaseBundle(record, null, null, userId);
+        any = true;
+      } catch (error) {
+        caseProblems.set(pending.id, `The new case “${pending.title}” could not be created${error instanceof Error && error.message ? `: ${error.message}` : ''}. Try Approve again.`);
+      }
+      if (opening !== openingRef.current) break;
+    }
     try {
       // One at a time: new leads first, then what may go on their cases.
       for (const row of order) {
+        if (opening !== openingRef.current) break;
+        const caseProblem = row.caseId ? caseProblems.get(row.caseId) : undefined;
+        if (caseProblem) {
+          results[row.key] = { saved: false, message: caseProblem };
+          continue;
+        }
         const lead = leadFor(row, rows);
         if (lead && !results[lead.key]?.saved) {
           results[row.key] = { saved: false, message: 'This saves once the new lead above is saved.' };
@@ -676,6 +713,21 @@ export default function DayReviewSheet({
 
   // ─── Rows ───────────────────────────────────────────────────────────────
 
+  // A case for a family not in ReferralFit yet: chosen for this row now,
+  // created at Approve (nothing is saved before), and offered to the other
+  // rows of this review like any case.
+  function addNewCase(key: string, title: string) {
+    const name = title.trim().slice(0, 120);
+    if (!name) return;
+    const same = newCases.find((item) => comparable(item.title) === comparable(name));
+    const pending = same ?? { id: newUuid(), title: name };
+    const next = same ? newCases : [...newCases, pending];
+    if (!same) setNewCases(next);
+    const withIt = withPendingCases(view, next);
+    updateRow(key, (current) => chooseCase(current, pending.id, withIt));
+    setCaseDraft(null);
+  }
+
   function renderChoices(row: ReviewRow, what: 'case' | 'partner') {
     const ids = what === 'case' ? row.caseChoices : row.partnerChoices;
     const chosen = what === 'case' ? row.caseId : row.partnerId;
@@ -720,7 +772,45 @@ export default function DayReviewSheet({
           >
             <Text style={styles.pillText}>{open ? 'Done' : `Find another ${noun}`}</Text>
           </TouchableOpacity>
+          {what === 'case' && row.kind !== 'new_lead' && caseDraft?.key !== row.key ? (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="New case: make a case for this family"
+              onPress={() => { setPicker(null); setCaseDraft({ key: row.key, title: suggestedCaseTitle(row) }); }}
+              style={styles.pill}
+            >
+              <Text style={styles.pillText}>+ New case</Text>
+            </TouchableOpacity>
+          ) : null}
         </View>
+        {what === 'case' && caseDraft?.key === row.key ? (
+          <View style={styles.newCaseForm}>
+            <Text style={styles.hint}>Name the new case (the family name and who it is about works well). It is created when you approve this row.</Text>
+            <TextInput
+              value={caseDraft.title}
+              onChangeText={(value) => setCaseDraft({ key: row.key, title: value.slice(0, 120) })}
+              placeholder="Case name, e.g. Rivera family — son Luis"
+              placeholderTextColor={COLORS.gray}
+              accessibilityLabel="New case name"
+              autoFocus
+              style={styles.input}
+            />
+            <View style={styles.pillRow}>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityState={{ disabled: !caseDraft.title.trim() }}
+                disabled={!caseDraft.title.trim()}
+                onPress={() => addNewCase(row.key, caseDraft.title)}
+                style={[styles.pill, styles.pillOn, !caseDraft.title.trim() && styles.off]}
+              >
+                <Text style={[styles.pillText, styles.pillTextOn]}>Use this new case</Text>
+              </TouchableOpacity>
+              <TouchableOpacity accessibilityRole="button" onPress={() => setCaseDraft(null)} style={styles.pill}>
+                <Text style={styles.pillText}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        ) : null}
         {chosen && unsure ? (
           <View style={styles.confirmRow}>
             <Text style={[styles.hint, styles.flex]}>Matched by name only. Is this the right {noun}?</Text>
@@ -1159,6 +1249,7 @@ const styles = StyleSheet.create({
   hint: { fontSize: 12, lineHeight: 17, color: COLORS.muted, marginTop: 4 },
   label: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, color: COLORS.muted, marginTop: 14, marginBottom: 8 },
   sourceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
+  newCaseForm: { gap: 8, marginTop: 8 },
   reminderRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
   notice: { backgroundColor: COLORS.coralPale, borderRadius: 12, padding: 12, marginTop: 12 },
   fieldyCard: { backgroundColor: COLORS.white, borderRadius: 14, borderWidth: 1, borderColor: COLORS.line, padding: 14, marginTop: 12, gap: 8 },

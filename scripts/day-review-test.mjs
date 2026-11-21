@@ -669,4 +669,24 @@ check(() => assert.match(read('src/lib/cases.ts'), /\.\.\.\(input\.note \? \{ no
 check(() => assert.match(read('supabase/config.toml'), /\[functions\.day-review\]\nverify_jwt = false/), 'the function checks the session itself');
 check(() => assert.match(read('.github/workflows/quality.yml'), /supabase\/functions\/day-review\//), 'CI runs the function tests');
 
+check(() => {
+  // "New case": a note about a family not in ReferralFit yet.
+  const noteFound = found({ kind: 'case_note', personName: 'Dana Whitfield', aboutRelationship: 'son', aboutFirstName: 'Eli', summary: 'Dana wants help with her son Eli.', evidence: 'Dana called about her son Eli and his drinking', regarding: 'family' });
+  assert.equal(rules.suggestedCaseTitle({ found: noteFound }), 'Dana Whitfield — son Eli', 'named like a new lead\'s case');
+  assert.equal(rules.suggestedCaseTitle({ found: { ...noteFound, aboutRelationship: '', aboutFirstName: '' } }), 'Dana Whitfield');
+  const pending = { id: 'c-new-1', title: 'Whitfield family' };
+  const withIt = rules.withPendingCases(workspace, [pending]);
+  assert.equal(withIt.cases[0].id, 'c-new-1', 'the new case is offered first');
+  assert.equal(rules.caseLabel(withIt, 'c-new-1'), 'Whitfield family (new case)', 'and says it is new');
+  assert.equal(rules.withPendingCases({ ...workspace, cases: [{ id: 'c-new-1', title: 'Whitfield family', status: 'inquiry', updatedAt: '' }, ...workspace.cases] }, [pending]).cases.filter((item) => item.id === 'c-new-1').length, 1,
+    'once created and loaded, it is shown once, as the real case');
+  const [row] = build(noteFound);
+  const chosen = rules.chooseCase(row, 'c-new-1', withIt);
+  assert.equal(chosen.caseId, 'c-new-1');
+  assert.equal(rules.rowProblem(chosen), '', 'a note on a new case is ready to save');
+  assert.match(sheet, /await createCaseBundle\(record, null, null, userId\);/, 'created at Approve, with no first call added');
+  assert.match(sheet, /if \(known\.has\(pending\.id\) \|\| !order\.some\(\(row\) => row\.caseId === pending\.id\)\) continue;/, 'only a new case a saved row is on is created');
+  assert.match(sheet, /results\[row\.key\] = \{ saved: false, message: caseProblem \};/, 'a row on a case that could not be created is not saved');
+}, 'New case: a note for a family not in ReferralFit yet');
+
 console.log(`day-review-test: ${checks} checks passed`);

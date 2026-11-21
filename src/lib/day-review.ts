@@ -121,6 +121,9 @@ const CLOSED = new Set(['closed', 'lost']);
 // A new lead in this review that is not saved yet: rows below it can be
 // about it. Its case exists only in the review until the lead is saved.
 export const PENDING_STATUS = 'pending';
+/** A case the practitioner made in this review for a note about a family not in ReferralFit yet; created at Approve. */
+export const NEW_CASE_STATUS = 'new_case';
+export type PendingCase = { id: string; title: string };
 
 // ─── Names ─────────────────────────────────────────────────────────────────
 
@@ -413,6 +416,25 @@ export function withPendingLeads(workspace: Workspace, rows: ReviewRow[], firstC
       caseId: row.ids.caseId, title: `First call with ${row.callerName || 'the new caller'}`, dueOn: firstCalls.today, status: 'open', kind: 'first_call',
     })), ...workspace.followUps] : workspace.followUps,
   };
+}
+
+/**
+ * The review's new cases (made with "New case" on a row), shown like the
+ * workspace's own until they exist: once created and loaded, the real case
+ * is shown instead.
+ */
+export function withPendingCases(workspace: Workspace, pending: PendingCase[]): Workspace {
+  const known = new Set(workspace.cases.map((record) => record.id));
+  const add = pending.filter((item) => !known.has(item.id));
+  if (!add.length) return workspace;
+  return { ...workspace, cases: [...add.map((item) => ({ id: item.id, title: item.title, status: NEW_CASE_STATUS, updatedAt: '' })), ...workspace.cases] };
+}
+
+/** A name for a new case from what the notes say: "Ana Rivera — son Luis" (as a new lead's case is named). */
+export function suggestedCaseTitle(row: Pick<ReviewRow, 'found'>): string {
+  const person = row.found.personName.trim();
+  const about = `${row.found.aboutRelationship.trim()} ${row.found.aboutFirstName.trim()}`.trim();
+  return (person && about ? `${person} — ${about}` : person || about).slice(0, 120);
 }
 
 function newRowIds(makeId: () => string): RowIds {
@@ -1025,7 +1047,8 @@ export function countLine(kinds: ReviewKind[]): string {
 export function caseLabel(workspace: Workspace, caseId: string): string {
   const record = workspace.cases.find((item) => item.id === caseId);
   if (!record) return 'A case';
-  return record.status === PENDING_STATUS ? `${record.title} (new lead above)` : record.title;
+  if (record.status === PENDING_STATUS) return `${record.title} (new lead above)`;
+  return record.status === NEW_CASE_STATUS ? `${record.title} (new case)` : record.title;
 }
 
 /**

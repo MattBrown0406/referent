@@ -341,3 +341,16 @@ This feature's own parts:
    policy on referralfit.com (what is sent, to whom, not stored) and to the
    App Review notes.
 
+
+## New case from a review (2026-11-20, Matt)
+
+A note, follow-up or referral about a family not in ReferralFit yet: on its
+row, under CASE, **+ New case** opens a name field (filled in from the notes,
+"Dana Whitfield — son Eli", as a new lead's case is named). **Use this new
+case** puts the row on it; the other rows of the review can choose it too
+("… (new case)"). Nothing is created until Approve: then each new case that a
+row being saved is on is created first (stage Inquiry, no first call added,
+since the conversation in the notes was it), and its rows are saved on it. A
+case that cannot be created leaves its rows unsaved with the reason, and
+Approve again retries with the same case id (a repeat that landed is taken as
+done). `withPendingCases`, `suggestedCaseTitle` in `src/lib/day-review.ts`.
