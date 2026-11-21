@@ -89,8 +89,10 @@ export async function requestDayReview(notes: string, today: string, apiKey: str
     throw new ReviewUnavailableError('The review came back unreadable. Try again.', 'unavailable');
   }
   // truncated: the review stopped at its cap (20 items). A function deployed
-  // before it said so sends no such field: taken as not truncated.
-  return { items: readFoundItems(data.items), remaining: typeof data.remaining === 'number' ? data.remaining : null, truncated: data.truncated === true };
+  // before it said so sends no such field: taken as not truncated. Nor is a
+  // review with nothing in it (a false alarm would hold recordings for nothing).
+  const items = readFoundItems(data.items);
+  return { items, remaining: typeof data.remaining === 'number' ? data.remaining : null, truncated: data.truncated === true && items.length > 0 };
 }
 
 export type SaveResult = {

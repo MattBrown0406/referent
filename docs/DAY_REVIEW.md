@@ -88,8 +88,8 @@ OAuth (`src/lib/fieldy.ts` has both; `src/lib/fieldy-api.ts` the calls).
   Conversations not yet reviewed, from the last week at most (the first
   time: since the start of today), oldest first, each under a header
   ("From Fieldy, Nov 9, 2:15 PM · title"), up to the review's 12,000
-  characters and six recordings (so one review rarely finds more than the
-  20 items it lists); each summary is kept to 6,000 characters (its start
+  characters and three recordings (so one review rarely finds more than the
+  20 items it lists; when it does, it reads fewer, below); each summary is kept to 6,000 characters (its start
   and end).
   The rest wait for the next read, as does one still in progress or not
   summarized yet. One with no summary is read from its transcript; one with
@@ -574,3 +574,71 @@ rules and the wiring).
 ovfafffvcpaahktvlsdm`); the rest ships with the next iPhone build. Either
 order is safe: the new function with today's app, and the new app with
 today's function, both work as before.
+
+### Round 2 (confirming round), branch `fix/day-review-round2`
+
+Six findings, all fixed:
+
+1. **One sentence about two people: saving one never marks the other
+   saved.** "Both Sarahs want the Saturday family session", read as two case
+   notes with no case picked: once one was saved on Sarah Miller's case, a
+   re-read checked the other against Miller's case too, matched the shared
+   quote, and showed both as saved; Sarah Chen's note was never offered
+   again and the recording was done. Now a case or partner other than the
+   row's own pick is matched by the row's text or summary only, never its
+   quote (`possibleTargets`, `claims` in `day-review.ts`), and one saved
+   signature marks one row of a review only: when two rows match it, the
+   closer one (its own pick, its text) is the saved one and the other stays
+   as it was (`markSavedBefore`). The sheet takes "decided" from what
+   `markSavedBefore` found (`row.savedEarlier`), never works it out again.
+   Cost, accepted: two notes on the same case from one sentence, with one
+   reworded by the model on the re-read, can bring that one back switched
+   on; the practitioner sees it and can switch it off.
+2. **No items lost past 20 when every recording got a row.** A read takes at
+   most three recordings now (`RECORDINGS_PER_REVIEW`). When a review of
+   several comes back stopped at 20 and the box is only the recordings, the
+   older half is read again on its own before any row is shown (`olderHalf`,
+   at most `NARROWED_READS` = 2 extra reads; with three recordings it is one,
+   down to one recording), and the rest wait for the next read. The box then
+   holds what was read, and the review says so ("Your 3 Fieldy
+   conversations held more than one review can show (20 items), so this
+   review reads the oldest conversation on its own. 2 more Fieldy
+   conversations wait for the next review."). If that extra read fails, the
+   first review is shown. A review of several that still stopped at 20 (notes
+   typed beside them, or the extra read failed) holds all of them for the
+   next read whatever is saved now (`recordingsHeld`); what is saved is not
+   offered again, and the next read takes fewer at a time, so none is held
+   forever. A single recording still over 20 is done once its shown rows
+   are decided, as before, and the review says a few smaller items may not
+   be listed. The "N more wait for the next review" line now always shows
+   beside any other message (`waitingLine`).
+3. **A failed read keeps which recordings the rows came from.** Find no
+   longer clears the link before the request. If it fails (or there is no
+   key), a Find again keeps the review on screen linked to its recordings
+   still in the box, with those held; a fresh recorder read that failed
+   keeps its recordings for a retry and drops the rows of the earlier notes.
+   The Discard question says how many recordings are read again next time,
+   counted as Discard will settle them (`readAgainLine`).
+4. **A new partner or new lead saved as a note is known again.** A new
+   partner saved as a note on a partner it may be ("Possibly already in your
+   network") and an unchecked new lead saved as a note on a case it may be
+   are checked there too, by their wording, and come back as that note,
+   switched off.
+5. **`truncated` comes from the count alone** (20 items): the model's own
+   `more` flag is gone from the schema and the prompt; under 20 it could only
+   be a false alarm that held recordings for nothing. On the phone, a
+   truncated answer with no items is taken as not truncated.
+6. A row moved to the case it was saved on is set the way the row's own
+   pickers set it (`chooseCase`, `choosePartner`): a referral's automatic
+   client label follows that case.
+
+Tests: `scripts/day-review-test.mjs` (round 2 checks, the two-Sarahs
+scenario among them), `review_test.ts` (truncated by count, no `more`).
+
+**For Matt:** finding 5 changes the `day-review` function (deploy it with
+the round 1 change: `supabase functions deploy day-review --no-verify-jwt
+--project-ref ovfafffvcpaahktvlsdm`); the rest ships with the next iPhone
+build. Either order is safe. Until it is deployed, a round 1 function can
+still send a false `truncated` under 20 items: the phone then reads fewer
+recordings, or holds them one read longer; nothing is lost or settled
+unread. A function from before round 1 sends no `truncated` at all.
