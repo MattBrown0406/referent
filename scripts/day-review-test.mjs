@@ -709,21 +709,27 @@ check(() => {
   assert.deepEqual(rules.recordingsDoneOnRead(ids, [['a'], ['a']], false), ['b', 'c'], 'not truncated: nothing found in b and c, so they are done');
   assert.deepEqual(rules.recordingsDoneOnRead(ids, [['a'], ['a']], true), [], 'truncated: none is done on reading');
   assert.deepEqual(rules.recordingsDoneOnRead(ids, [['a'], []], false), [], 'an item from no one recording still holds them all');
-  assert.deepEqual(rules.recordingsHeld(ids, [['a'], ['a', 'b']], true), ['c'], 'truncated: those nothing was listed from are held');
+  assert.deepEqual(rules.recordingsHeld(ids, [['a'], ['a', 'b']], true), ['a', 'b', 'c'], 'truncated, several: all are held (what was left out may be in any)');
+  assert.deepEqual(rules.recordingsHeld(ids, [['a'], ['b'], ['c']], true), ['a', 'b', 'c'], 'even when every one got a row');
+  assert.deepEqual(rules.recordingsHeld(['a'], [['a']], true), [], 'truncated, one alone with rows: done once they are decided');
+  assert.deepEqual(rules.recordingsHeld(['a'], [[]], true), ['a'], 'truncated, one alone with nothing listed from it: held');
   assert.deepEqual(rules.recordingsHeld(ids, [['a']], false), [], 'not truncated: none is held');
   assert.deepEqual(rules.recordingsDoneOnRead(ids, new Map([['r0', ['a']]]).values(), false), ['b', 'c'], 'takes the sheet\'s map of rows to recordings');
   assert.equal(rules.stoppedAtCapMessage(2, { name: 'Fieldy', noun: 'conversation' }),
     'There was more than one review can show (20 items). These are the most important. The 2 Fieldy conversations with nothing listed here are read again next time.');
   assert.match(rules.stoppedAtCapMessage(1, { name: 'Plaud', noun: 'recording' }), /The Plaud recording with nothing listed here is read again next time\.$/);
   assert.match(rules.stoppedAtCapMessage(0, { name: 'Plaud', noun: 'recording' }), /may not be listed\.$/);
+  assert.match(rules.stoppedAtCapMessage(0, { name: 'Plaud', noun: 'recording' }, 1), /A few smaller items in this recording may not be listed\.$/);
+  assert.equal(rules.stoppedAtCapMessage(3, { name: 'Fieldy', noun: 'conversation' }, 3),
+    'There was more than one review can show (20 items). These are the most important. These 3 Fieldy conversations are read again next time, a few at a time, for the rest; what you save now is not offered again.');
   assert.match(rules.stoppedAtCapMessage(0, null), /review a shorter part of the notes\.$/);
   // A few recordings per review, so truncation is rare; the rest wait.
   const blocks = Array.from({ length: 8 }, (_, index) => ({ id: `b${index}`, text: `[From Fieldy, Nov ${index + 1}]\nNotes ${index}` }));
   const plan = rules.firstRecordings({ text: blocks.map((block) => block.text).join('\n\n'), blocks, later: 1, skipped: ['x'] });
-  assert.equal(rules.RECORDINGS_PER_REVIEW, 6);
-  assert.deepEqual(plan.blocks.map((block) => block.id), ['b0', 'b1', 'b2', 'b3', 'b4', 'b5'], 'the oldest first');
-  assert.equal(plan.text, blocks.slice(0, 6).map((block) => block.text).join('\n\n'), 'the text is only theirs');
-  assert.equal(plan.later, 3, 'the rest are counted as waiting');
+  assert.equal(rules.RECORDINGS_PER_REVIEW, 3);
+  assert.deepEqual(plan.blocks.map((block) => block.id), ['b0', 'b1', 'b2'], 'the oldest first');
+  assert.equal(plan.text, blocks.slice(0, 3).map((block) => block.text).join('\n\n'), 'the text is only theirs');
+  assert.equal(plan.later, 6, 'the rest are counted as waiting');
   assert.deepEqual(plan.skipped, ['x']);
   const few = { text: 'x', blocks: blocks.slice(0, 2), later: 0 };
   assert.equal(rules.firstRecordings(few), few, 'a short read is unchanged');
@@ -850,13 +856,141 @@ check(() => {
 check(() => {
   // The function says when it stopped; an older one says nothing and is taken as not truncated.
   assert.match(fn, /return reply\(\{ items, truncated, remaining:/);
-  assert.match(api, /truncated: data\.truncated === true/);
-  assert.match(sheet, /const \{ items, truncated \} = await requestDayReview\(text, day, key\);/);
+  assert.match(api, /truncated: data\.truncated === true && items\.length > 0/, 'truncated with nothing in it is not truncated');
+  assert.match(sheet, /let answer = await requestDayReview\(text, day, key\);/);
+  assert.match(sheet, /const \{ items, truncated \} = answer;/);
   assert.match(sheet, /held = recordingsHeld\(blockIds, rowIds\.values\(\), truncated\);/);
   assert.match(sheet, /const done = recordingsDoneOnRead\(blockIds, rowIds\.values\(\), truncated\)\.concat\(skipped\);/);
   assert.match(sheet, /\.filter\(\(id\) => !read\.held\.includes\(id\)\)\n/, 'one held is never settled on Approve or close');
   assert.match(sheet, /markReviewed\(read\.recorder, read\.blocks\.map\(\(block\) => block\.id\)\.filter\(\(id\) => !read\.held\.includes\(id\)\)\);/, '"Done with them" on close leaves those held');
   assert.match(sheet, /This review stopped at 20 items, so/, '"Done with these" says plainly some were not read in full');
 }, 'the truncated flag reaches the recordings rule');
+
+// ─── Bug audit, 2026-11-21, round 2 ────────────────────────────────────────
+check(() => {
+  // "Both Sarahs want the Saturday family session": two case notes from one
+  // sentence, neither on a case. Saving the first on Sarah Miller's case
+  // never marks the second (Sarah Chen's) saved on read again.
+  const quote = 'both Sarahs want the Saturday family session';
+  const millerFound = found({ kind: 'case_note', personName: 'Sarah', summary: 'Sarah Miller wants the Saturday family session.', evidence: quote, regarding: 'family' });
+  const chenFound = found({ kind: 'case_note', personName: 'Sarah', summary: 'Sarah Chen wants the Saturday family session.', evidence: quote, regarding: 'family' });
+  const [miller, chen] = build(millerFound, chenFound);
+  assert.equal(miller.caseId, null);
+  assert.equal(chen.caseId, null);
+  const kept = new Set(rules.laterSignatures(rules.chooseCase(miller, 'case-miller', workspace)).map(rules.signatureHash));
+  const [millerAgain, chenAgain] = rules.markSavedBefore(build(millerFound, chenFound), kept);
+  assert.equal(millerAgain.include, false, 'the one saved is known');
+  assert.equal(millerAgain.caseId, 'case-miller');
+  assert.equal(millerAgain.savedEarlier, true, 'and decided');
+  assert.equal(chenAgain.include, true, 'the other is offered again');
+  assert.equal(chenAgain.savedEarlier, false, 'and not decided, so its recording does not settle');
+  assert.equal(chenAgain.caseId, null);
+  assert.equal(rules.savedBefore(chenAgain, kept), false, 'another case is known by its wording only, never by a shared quote');
+  // Both picked (by name) on Miller's case: the shared quote marks the closer one only, whichever comes first.
+  const onMiller = (row) => ({ ...row, caseId: 'case-miller', caseUnsure: true });
+  const [a, b] = rules.markSavedBefore([onMiller(miller), onMiller(chen)], kept);
+  assert.equal(a.include, false);
+  assert.equal(b.include, true, 'one saved signature never marks two rows');
+  const [b2, a2] = rules.markSavedBefore([onMiller(chen), onMiller(miller)], kept);
+  assert.equal(a2.include, false, 'the closer match wins, in either order');
+  assert.equal(b2.include, true);
+  assert.equal(b2.savedEarlier, false);
+  // Saved in this review, Back to the notes, Find again: the same.
+  const here = new Set(rules.laterSignatures(rules.chooseCase(miller, 'case-miller', workspace)));
+  const [, chenHere] = rules.markSavedBefore(build(millerFound, chenFound), here);
+  assert.equal(chenHere.include, true);
+  // The sheet takes "decided" from what markSavedBefore found, never works it out again.
+  assert.match(sheet, /return switchedOffRef\.current\.has\(row\.key\) \|\| row\.found\.verified \|\| row\.savedEarlier;/);
+  assert.doesNotMatch(sheet, /savedBefore\(row, savedSignaturesRef\.current\)/);
+}, 'one sentence about two people: saving one never marks the other saved');
+
+check(() => {
+  // A new partner saved as a note on the partner it may be ("Possibly already in your network").
+  const partnerFound = found({ kind: 'new_partner', organization: 'Cascade Detox', partnerType: 'Detox', summary: 'Met the Cascade detox team.', evidence: 'met the Cascade detox team today' });
+  const [row] = build(partnerFound);
+  assert.equal(row.kind, 'new_partner');
+  const kept = new Set(rules.laterSignatures(rules.choosePartner(row, 'p-cascade')).map(rules.signatureHash));
+  const [again] = rules.markSavedBefore(build(partnerFound), kept);
+  assert.equal(again.include, false, 'known again');
+  assert.equal(again.kind, 'partner_note', 'as the note it was saved as');
+  assert.equal(again.partnerId, 'p-cascade');
+  assert.match(again.hint, /^Saved in an earlier review\./);
+  // Saved as a new partner: still known as one.
+  const asNew = new Set(rules.laterSignatures(row).map(rules.signatureHash));
+  const [newAgain] = rules.markSavedBefore(build(partnerFound), asNew);
+  assert.equal(newAgain.include, false);
+  assert.equal(newAgain.kind, 'new_partner');
+  // A new lead nothing could check, saved as a note on a case it may be.
+  const leadFound = found({ kind: 'new_lead', personName: 'Ana Rivera', phone: '(971) 555-0100', summary: 'Ana Rivera called.', evidence: 'Ana Rivera called from her work phone', verified: false });
+  const [lead] = build(leadFound);
+  assert.deepEqual(lead.possibleCases, ['case-rivera']);
+  const noteKept = new Set(rules.laterSignatures(rules.chooseCase(rules.switchKind(lead, 'case_note'), 'case-rivera', workspace)).map(rules.signatureHash));
+  const [leadAgain] = rules.markSavedBefore(build(leadFound), noteKept);
+  assert.equal(leadAgain.include, false, 'known again');
+  assert.equal(leadAgain.kind, 'case_note');
+  assert.equal(leadAgain.caseId, 'case-rivera');
+  assert.equal(leadAgain.caseUnsure, false);
+}, 'a new partner or new lead saved as a note is known again');
+
+check(() => {
+  // A referral moved to the case it was saved on gets that case's label, as the case picker would give it.
+  const [referral] = build(found({ kind: 'referral', summary: 'Referred the Rivera family to Juniper Ridge.', organization: 'Juniper Ridge Recovery', personName: 'the Rivera family', direction: 'sent', evidence: 'referred the Rivera family to Juniper Ridge' }));
+  assert.equal(referral.clientLabel, 'AR / L');
+  const loose = { ...referral, caseChoices: ['case-rivera', 'case-miller'] };
+  const kept = new Set(rules.laterSignatures(rules.chooseCase(loose, 'case-miller', workspace)).map(rules.signatureHash));
+  const [again] = rules.markSavedBefore([loose], kept, workspace);
+  assert.equal(again.caseId, 'case-miller');
+  assert.equal(again.clientLabel, 'SM / J', 'the automatic label follows the case');
+  assert.equal(again.autoLabel, 'SM / J');
+  const [typed] = rules.markSavedBefore([{ ...loose, clientLabel: 'Fam 7' }], kept, workspace);
+  assert.equal(typed.clientLabel, 'Fam 7', 'a typed label stays');
+  assert.match(sheet, /savedSignaturesRef\.current,\n        workspaceRef\.current,\n      \);/, 'the sheet passes the workspace');
+}, 'a referral moved to its saved case takes that case\'s label');
+
+check(() => {
+  // A review of several recordings that stopped at its cap is read again with the older half.
+  assert.deepEqual(rules.olderHalf(['a', 'b', 'c']), ['a']);
+  assert.deepEqual(rules.olderHalf(['a', 'b']), ['a']);
+  assert.deepEqual(rules.olderHalf(['a', 'b', 'c', 'd']), ['a', 'b']);
+  assert.equal(rules.olderHalf(['a']), null, 'one alone: nothing to narrow');
+  assert.equal(rules.NARROWED_READS, 2, 'a couple of extra reads at most');
+  assert.equal(rules.waitingLine(2, { name: 'Fieldy', noun: 'conversation' }), '2 more Fieldy conversations wait for the next review.');
+  assert.equal(rules.waitingLine(1, { name: 'Plaud', noun: 'recording' }), '1 more Plaud recording waits for the next review.');
+  assert.equal(rules.waitingLine(0, { name: 'Plaud', noun: 'recording' }), '');
+  assert.equal(rules.narrowedMessage(3, 1, { name: 'Fieldy', noun: 'conversation' }),
+    'Your 3 Fieldy conversations held more than one review can show (20 items), so this review reads the oldest conversation on its own.');
+  const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(findFn, /for \(let extra = 0; answer\.truncated && extra < NARROWED_READS; extra \+= 1\) \{/, 'bounded: never a loop of model calls');
+  assert.match(findFn, /const fewer: FieldyBlock\[\] \| null = olderHalf\(fromRecorder\.blocks\);\n\s+if \(!fewer\) break;/, 'stops at one recording');
+  assert.match(findFn, /if \(fromRecorder && !notesBesides\(text, fromRecorder\.blocks\)\) \{/, 'only when the box is just the recordings');
+  assert.match(findFn, /if \(setAside\) setNotes\(text\);/, 'the box holds what was read');
+  assert.match(findFn, /if \(recorder\) parts\.push\(waitingLine\(\(read\?\.later \?\? 0\) \+ setAside, recorder\)\);/, 'those waiting are always said, beside a cap message');
+  assert.doesNotMatch(sheet, /setMessage\(\(current\) => current \?\?/, 'the waiting line never gives way to another');
+  assert.match(sheet, /later: read\.later \}\);/);
+  // 6 calls x 4 items: the first 3 read, truncated; the oldest read alone; the 2 others and the 3 not read wait.
+  const blocks = Array.from({ length: 6 }, (_, index) => ({ id: `c${index}`, text: `[From Fieldy, Nov ${index + 1}]\nCall ${index}` }));
+  const plan = rules.firstRecordings({ text: '', blocks, later: 0 });
+  assert.equal(plan.blocks.length, 3);
+  assert.equal(plan.later, 3);
+  const narrowed = rules.olderHalf(plan.blocks);
+  assert.deepEqual(narrowed.map((block) => block.id), ['c0']);
+  assert.deepEqual(rules.recordingsHeld(['c0', 'c1', 'c2'], [['c0'], ['c1'], ['c2']], true), ['c0', 'c1', 'c2'], 'never narrowed (notes typed beside): none settles');
+}, 'a review of several recordings that stopped at its cap is read again with fewer');
+
+check(() => {
+  // A failed read keeps the link of the review on screen until a new one lands.
+  const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.doesNotMatch(findFn, /recorderReadRef\.current = fromRecorder \? \{ \.\.\.fromRecorder, rowIds: new Map\(\), held: \[\] \} : null;/, 'never reset before the request');
+  assert.match(findFn, /\? \{ \.\.\.linked, blocks: kept, held: linked\.held\.filter\(\(id\) => kept\.some\(\(block\) => block\.id === id\)\) \}/, 'kept, limited to the recordings still in the box');
+  assert.match(findFn, /recorderReadRef\.current = \{ \.\.\.first, rowIds: new Map\(\), held: \[\] \};\n\s+setRows\(\[\]\);/, 'a fresh read that failed: its recordings, and no rows of other notes');
+  assert.match(findFn, /\} catch \(error\) \{\n\s+if \(opening !== openingRef\.current\) return;\n\s+keepLink\(\);/);
+  assert.match(findFn, /if \(opening === openingRef\.current\) \{ keepLink\(\); setKeyState\('missing'\); setPhase\('paste'\); \}/);
+  // The Discard question says what will happen.
+  assert.equal(rules.readAgainLine(2, { name: 'Fieldy', noun: 'conversation' }), '2 Fieldy conversations are read again next time.');
+  assert.equal(rules.readAgainLine(1, { name: 'Plaud', noun: 'recording' }), '1 Plaud recording is read again next time.');
+  assert.equal(rules.readAgainLine(0, { name: 'Plaud', noun: 'recording' }), '');
+  assert.match(sheet, /const settling = read && rows\.length && phase !== 'finding' \? recordingsDone\(saved, rows\)\.length : 0;/);
+  assert.doesNotMatch(sheet, /with items not saved or switched off will be read again next time/);
+}, 'a failed read never loses which recordings the rows on screen came from');
 
 console.log(`day-review-test: ${checks} checks passed`);
