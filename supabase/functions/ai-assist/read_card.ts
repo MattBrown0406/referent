@@ -19,7 +19,7 @@ import { AssistFailure, AssistOutputError, AssistRequestError, clean, comparable
 export const CARD_LIMITS = {
   /** The assessment-files bucket's own cap (20261109140000). */
   fileBytes: 10 * 1024 * 1024,
-  /** Anthropic's limit for one image. A larger photo is shrunk by storage first, or refused. */
+  /** Anthropic's limit for one image, measured on its base64 text (4/3 of the file). A larger photo is shrunk by storage first, or refused. */
   imageBytes: 5 * 1024 * 1024,
   carriers: 120,
   carrier: 120, // case_benefits.carrier
@@ -57,7 +57,7 @@ export function parseCardRequest(body: unknown): CardRequest {
 // ─── The photos ───────────────────────────────────────────────────────────
 
 /** What the assessment row says about its card photos (read under RLS). */
-export type CardAssessmentRow = { id: string; case_id: string; card_front_path: string | null; card_back_path: string | null };
+export type CardAssessmentRow = { id: string; case_id: string; status?: string | null; card_front_path: string | null; card_back_path: string | null };
 
 /** Reading the photos with the caller's own session; index.ts builds the real one, the tests a fake. */
 export type CardStore = {
@@ -98,13 +98,18 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+/** The length of a file's base64 text: what Anthropic measures an image by. */
+export function base64Length(byteLength: number): number {
+  return Math.ceil(byteLength / 3) * 4;
+}
+
 /** A side ready to send, or why it cannot be read. */
 export function readyCardFile(side: CardSide, bytes: Uint8Array): CardFile | { side: CardSide; problem: 'size' | 'type' } {
   if (bytes.byteLength > CARD_LIMITS.fileBytes) return { side, problem: 'size' };
   const type = sniffCardFile(bytes);
   if (type === 'application/pdf') return { side, type, base64: toBase64(bytes) };
   if (SENDABLE_IMAGES.includes(type)) {
-    return bytes.byteLength <= CARD_LIMITS.imageBytes ? { side, type, base64: toBase64(bytes) } : { side, problem: 'size' };
+    return base64Length(bytes.byteLength) <= CARD_LIMITS.imageBytes ? { side, type, base64: toBase64(bytes) } : { side, problem: 'size' };
   }
   return { side, problem: 'type' };
 }
@@ -127,6 +132,8 @@ export async function loadCardFiles(store: CardStore, request: CardRequest): Pro
   const { row, failed } = await store.assessment(request.assessmentId);
   if (failed) throw new AssistFailure(503, 'busy', 'The assessment could not be loaded. Try again in a minute.');
   if (!row) throw new AssistFailure(404, 'not_found', 'This assessment was deleted, or you can no longer see it.');
+  // Only once the family has sent it (and signed the consent): never a link still open or stopped.
+  if (row.status !== 'submitted') throw new AssistFailure(422, 'not_finished', 'The family has not sent this assessment yet. The card can be read once they finish it.');
   const paths = request.sides.map((side) => ({ side, path: cardPath(row, side) })).filter((item) => item.path);
   if (!paths.length) throw new AssistFailure(422, 'no_photo', 'The family has not added a card photo to this assessment.');
 

@@ -56,7 +56,7 @@ function store(
   };
 }
 
-const ROW: CardAssessmentRow = { id: ID, case_id: CASE, card_front_path: FRONT, card_back_path: BACK };
+const ROW: CardAssessmentRow = { id: ID, case_id: CASE, status: 'submitted', card_front_path: FRONT, card_back_path: BACK };
 
 async function refusal(promise: Promise<unknown>): Promise<AssistFailure> {
   const error = await assertRejects(() => promise, AssistFailure);
@@ -92,6 +92,10 @@ Deno.test('only a photo in this assessment\'s own folder is read', () => {
 
 Deno.test('refusals before anything is sent: deleted, no photo, gone, unreadable', async () => {
   assertEquals((await refusal(loadCardFiles(store(null, {}), request()))).code, 'not_found');
+  for (const status of ['sent', 'started', 'revoked', null]) {
+    const open = await refusal(loadCardFiles(store({ ...ROW, status }, {}), request()));
+    assertEquals([open.status, open.code], [422, 'not_finished'], `status ${status}`);
+  }
   assertEquals((await refusal(loadCardFiles(store(ROW, {}, {}, true), request()))).code, 'busy');
   const noPhoto = await refusal(loadCardFiles(store({ ...ROW, card_front_path: null, card_back_path: null }, {}), request()));
   assertEquals([noPhoto.status, noPhoto.code], [422, 'no_photo']);
@@ -104,6 +108,16 @@ Deno.test('refusals before anything is sent: deleted, no photo, gone, unreadable
   assertStringIncludes(heic.message, 'front photo is in a file type that cannot be read');
   const html = await refusal(loadCardFiles(store({ ...ROW, card_back_path: null }, { [FRONT]: bytes('<html>') }), request()));
   assertEquals(html.code, 'unreadable');
+});
+
+Deno.test('the image limit is measured on the base64 text: a 4 MB photo is shrunk first', async () => {
+  const four = JPEG(4 * 1024 * 1024);
+  const shrunk = store({ ...ROW, card_back_path: null }, { [FRONT]: four }, { [FRONT]: JPEG(2000) });
+  const { files } = await loadCardFiles(shrunk, request());
+  assertEquals(files.map((file) => file.side), ['front']);
+  assertEquals(shrunk.downloads, ['get front', 'shrink front']);
+  const three = await loadCardFiles(store({ ...ROW, card_back_path: null }, { [FRONT]: JPEG(3 * 1024 * 1024) }), request());
+  assertEquals(three.files.length, 1);
 });
 
 Deno.test('a photo too large or in a type Anthropic cannot take is shrunk by storage, or skipped', async () => {

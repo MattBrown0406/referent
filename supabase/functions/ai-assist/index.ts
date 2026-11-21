@@ -165,7 +165,7 @@ function callerCardStore(token: string): CardStore {
     async assessment(id) {
       const { data, error } = await client
         .from('family_assessments')
-        .select('id, case_id, card_front_path, card_back_path')
+        .select('id, case_id, status, card_front_path, card_back_path')
         .eq('id', id)
         .abortSignal(signal)
         .maybeSingle();

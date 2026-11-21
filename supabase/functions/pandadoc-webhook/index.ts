@@ -28,8 +28,10 @@ Deno.serve(async (request) => {
 
     const deliveries = JSON.parse(rawBody);
     if (!Array.isArray(deliveries)) return jsonResponse({ error: 'Expected an event array' }, 400);
-    const headerEventId = request.headers.get('x-pandadoc-webhook-event-id') || '';
-    if (!headerEventId) return jsonResponse({ error: 'Missing event identity' }, 400);
+    // A delivery is known by its signed body (the HMAC above), never by the
+    // unsigned event-id header: a captured delivery re-sent under a new
+    // header id is still the same body, so it is still a duplicate.
+    const headerEventId = `body:${expectedSignature}`;
 
     const supabase = createClient(requiredEnv('SUPABASE_URL'), requiredEnv('SUPABASE_SERVICE_ROLE_KEY'), {
       auth: { persistSession: false, autoRefreshToken: false },
