@@ -36,6 +36,8 @@ const schema = load('src/lib/assessment-schema.ts', 'app/assessment-schema.js');
 const app = load('src/lib/family-assessment.ts', 'app/family-assessment.js');
 load('portal/src/assessment-schema.ts', 'portal/assessment-schema.js');
 const link = load('portal/src/assessment-link-rules.ts', 'portal/assessment-link-rules.js');
+load('src/lib/insurance.ts', 'app/insurance.js');
+const card = load('src/lib/card-reading.ts', 'app/card-reading.js');
 
 // ─── One question list, two copies ─────────────────────────────────────────
 check(() => assert.equal(read('portal/src/assessment-schema.ts'), read('src/lib/assessment-schema.ts')), 'the portal and app copies are identical');
@@ -313,5 +315,49 @@ check(() => {
   assert.match(email, /'family_assessment_invite' \| 'family_assessment_submitted'/);
   assert.match(read('supabase/migrations/20261109140000_family_assessment.sql'), /'family_assessment_invite', 'family_assessment_submitted', 'family_assessment_urgent'\)\)/);
 }, 'the emails');
+
+// ─── Reading the card into Benefits (2026-11-21) ───────────────────────────
+
+check(() => {
+  const read = card.readCardReading({ carrier: ' Blue Cross ', cardCarrier: 'BCBS of Texas', planName: 'Blue Choice PPO', memberIdLast4: '5521', note: '' });
+  assert.deepEqual(read, { carrier: 'Blue Cross', cardCarrier: 'BCBS of Texas', planName: 'Blue Choice PPO', memberIdLast4: '5521', note: '' });
+  assert.equal(card.readCardReading({ carrier: 'Aetna', memberIdLast4: 'XOJ88345521' }).memberIdLast4, '5521', 'never more than four characters');
+  assert.equal(card.readCardReading({ carrier: 'Aetna', memberIdLast4: '12' }).memberIdLast4, '', 'four characters or none');
+  assert.equal(card.readCardReading({ carrier: '', planName: '', memberIdLast4: '' }), null, 'nothing read');
+  assert.equal(card.readCardReading('nope'), null);
+  assert.equal(card.readCardReading({ carrier: 'A'.repeat(500) }).carrier.length, 120);
+}, 'the reading is read defensively');
+
+check(() => {
+  const reading = { carrier: 'Aetna', cardCarrier: 'Aetna', planName: 'Choice POS II', memberIdLast4: '1234', note: '' };
+  const empty = card.cardFill({ carrier: '', planName: '', memberIdLast4: '' }, reading);
+  assert.deepEqual(empty.fields, { carrier: 'Aetna', planName: 'Choice POS II', memberIdLast4: '1234' });
+  assert.deepEqual(empty.filled, ['Carrier', 'Plan name', 'Member ID, last four']);
+  assert.deepEqual(empty.differences, []);
+  const have = card.cardFill({ carrier: 'Cigna', planName: 'choice pos ii', memberIdLast4: '' }, reading);
+  assert.deepEqual(have.fields, { carrier: 'Cigna', planName: 'choice pos ii', memberIdLast4: '1234' }, 'what the case has is never replaced');
+  assert.deepEqual(have.filled, ['Member ID, last four']);
+  assert.deepEqual(have.differences, [{ field: 'carrier', label: 'Carrier', current: 'Cigna', read: 'Aetna' }], 'a difference is shown; the same words in other case are not one');
+  const partial = card.cardFill({ carrier: 'Aetna', planName: 'PPO', memberIdLast4: '9999' }, { ...reading, planName: '', memberIdLast4: '' });
+  assert.deepEqual([partial.filled, partial.differences], [[], []], 'what the card did not read changes nothing');
+  assert.deepEqual(card.cardSides({ cardFront: false, cardBack: true }), ['back']);
+  assert.equal(card.cardReadingLine(reading), 'Aetna, Choice POS II, member ID ending 1234');
+}, 'the card fills only empty fields and lists every difference');
+
+check(() => {
+  const sheet = read('src/lib/FamilyAssessmentSheet.tsx');
+  const app = read('App.tsx');
+  assert.match(sheet, /requestCardReading\(assessment\.id, cardSides\(assessment\), carriers, key\)/);
+  assert.match(sheet, /The card photos go to Anthropic on your own key to be read/);
+  assert.match(sheet, /deleted while the card was being read, so nothing was filled in/);
+  assert.match(app, /activeCaseIdRef\.current !== caseId \|\| familyAssessmentCaseId !== caseId/, 'a reading for a case no longer open is dropped');
+  assert.match(app, /Read from the card: check each field before saving\./);
+  assert.match(app, /cardReadRef\.current = openBenefitsFromCard;/);
+  assert.match(read('src/lib/ai-assist-api.ts'), /invokeAssist\('read_card', \{ assessmentId, sides, carriers \}, apiKey\)/);
+  assert.match(read('supabase/functions/ai-assist/index.ts'), /read_card: \{\n\s+kind: 'read_card'/);
+  assert.match(read('supabase/migrations/20261121120000_read_card.sql'), /WHEN 'read_card' THEN 30/);
+  // Only the last four ever leave the function: no field for the full ID on the phone.
+  assert.doesNotMatch(read('src/lib/card-reading.ts'), /memberId[^L]/);
+}, 'the card reading wiring');
 
 console.log(`family-assessment-test: ${checks} checks passed`);

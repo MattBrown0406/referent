@@ -155,3 +155,12 @@ SELECT p.proname, has_function_privilege('authenticated', p.oid, 'EXECUTE') AS a
 Expected: two rows with `relrowsecurity = true`, `can_select = true`,
 `can_insert = false`, `can_update = false`; one constraint name; five
 functions with `authenticated_ok = true` and `anon_ok = false`.
+
+## Reading the card (2026-11-21)
+
+From a finished family assessment with card photos, **Read the card into
+Benefits** fills the plan editor's empty carrier, plan name and member ID
+last four from the photos (AI on the practitioner's own key; only the last
+four ever leaves the function). Differences from what the case has are
+shown, never written over; saving is the normal save. See
+docs/FAMILY_ASSESSMENT.md, "Reading the card, 2026-11-21".
