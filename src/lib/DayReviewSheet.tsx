@@ -1,5 +1,6 @@
 // Day review: paste notes from the day (a recorder's summary from Fieldy or
-// Plaud, call notes), and ReferralFit lists what belongs in it: new leads,
+// Plaud, call notes, text shared from another app, a voice note), and
+// ReferralFit lists what belongs in it: new leads,
 // case and partner notes, follow-ups, referrals, new partners. Each row is
 // matched to a case or partner on this phone; nothing is saved until the
 // practitioner taps Approve. Uses the practitioner's own Anthropic key, like
@@ -75,7 +76,10 @@ import { DAY_REVIEW_DEFAULT_TIME, DAY_REVIEW_REMINDER_OFF, dayReviewReminderLabe
 import { licenseConcernAlert, licenseOverrideNote, type LicenseConcern } from './integrity';
 import { aiKeysSupported, getAnthropicKey } from './outreach-api';
 import { directoryIndex, IMPORT_TYPES, type DirectoryIndex, type ImportType } from './partner-import';
+import { appendToNotes, REVIEW_TEXT_MAX, sharedNoteMessage, type SharedNote } from './share-intake';
+import { shareToAppSupported } from './share-receiver';
 import type { FollowUp } from './store';
+import { useVoiceNote } from './voice-note';
 import { WEB_PAGE } from './web-layout';
 
 const COLORS = {
@@ -122,6 +126,14 @@ type Props = {
    * marked done: the count drops by them at once, before the recount answers.
    */
   onRecordersChanged?: (reviewed?: { recorder: RecorderId; count: number }) => void;
+  /**
+   * Text shared to ReferralFit from another app (App.tsx keeps it until it is
+   * taken). It goes into the notes box, below anything already there, and
+   * waits for Find; a review in progress keeps it until it is done.
+   */
+  incomingShare?: (SharedNote & { id: string }) | null;
+  /** The share is in the notes box now: App.tsx lets it go. */
+  onIncomingShareTaken?: (id: string) => void;
 };
 
 type Phase = 'paste' | 'finding' | 'review' | 'saving' | 'done';
@@ -152,7 +164,7 @@ const SWITCH_LABEL: Partial<Record<ReviewRow['kind'], string>> = {
 
 export default function DayReviewSheet({
   visible, userId, cases, contacts, partners, followUps, referrals, directoryEntitled, leadResponseMinutes, licenseConcernFor, onClose, onSaved,
-  startWithRecorder = null, onRecordersChanged,
+  startWithRecorder = null, onRecordersChanged, incomingShare = null, onIncomingShareTaken,
 }: Props) {
   const [phase, setPhase] = useState<Phase>('paste');
   const [notes, setNotes] = useState('');
@@ -191,6 +203,22 @@ export default function DayReviewSheet({
   const recorderReadRef = useRef<{ recorder: Recorder; text: string; blocks: FieldyBlock[]; rowIds: Map<string, string[]>; skipped: string[] } | null>(null);
   // Rows the practitioner switched off: set aside (one off from the start, unchecked, is not).
   const switchedOffRef = useRef<Set<string>>(new Set());
+  // This opening has read the key and the recorders (and started a recorder
+  // read when it was opened for one): a share can go into the box now.
+  const [openReady, setOpenReady] = useState(false);
+  // The share last put in the box, and the one last told about while a review was on screen.
+  const takenShareRef = useRef<string | null>(null);
+  const noticedShareRef = useRef<string | null>(null);
+  // A voice note writes after what was in the box when it started.
+  const voiceBaseRef = useRef('');
+  const voice = useVoiceNote({
+    onText: (spoken) => {
+      const base = voiceBaseRef.current;
+      setNotes(spoken ? (base ? `${base}\n\n${spoken}` : spoken) : base);
+    },
+    onNotice: (text, ok) => setMessage({ ok, text }),
+  });
+  const voiceActive = voice.state !== 'idle';
   const setRecorder = (id: RecorderId, value: RecorderState | ((current: RecorderState) => RecorderState)) =>
     setRecorders((current) => ({ ...current, [id]: typeof value === 'function' ? value(current[id]) : value }));
 
@@ -223,6 +251,8 @@ export default function DayReviewSheet({
   useEffect(() => {
     openingRef.current += 1;
     clearReview();
+    voice.cancel();
+    setOpenReady(false);
     if (!visible) return;
     setToday(localDay());
     setKeyState('checking');
@@ -232,6 +262,7 @@ export default function DayReviewSheet({
     void Promise.all([getAnthropicKey(userId), ...RECORDERS.map((recorder) => recorderStatus(recorder, userId))]).then(([key, ...statuses]) => {
       if (opening !== openingRef.current) return;
       setKeyState(key ? 'ready' : 'missing');
+      setOpenReady(true);
       const next = { ...RECORDERS_CHECKING };
       RECORDERS.forEach((recorder, index) => {
         const status = statuses[index] as { connected: boolean; email: string };
@@ -245,6 +276,9 @@ export default function DayReviewSheet({
       const connected = RECORDERS.filter((recorder) => next[recorder.id].state === 'on');
       const [first, ...rest] = [...connected.filter((recorder) => recorder.id === startWithRecorder), ...connected.filter((recorder) => recorder.id !== startWithRecorder)];
       if (first) void readRecorder(first, opening, rest[0]);
+    }).catch(() => {
+      // The key could not be read: Find stays off, but a share can still go in the box.
+      if (opening === openingRef.current) setOpenReady(true);
     });
     // readRecorder is this opening's own; startWithRecorder is read once, as the sheet opens.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -319,11 +353,56 @@ export default function DayReviewSheet({
     if (!hold && phase !== 'finding' && phase !== 'saving') settleRecordings(saved, rows);
     openingRef.current += 1;
     clearReview();
+    voice.cancel();
     onClose();
+  }
+
+  // Text shared from another app: into the box, below what is there, never
+  // sent on its own. Not while a read, a review's save or a voice note is
+  // writing to the box; a review on screen keeps it until the practitioner
+  // goes back to the notes, or everything is saved (then it starts a new one).
+  useEffect(() => {
+    if (!visible || !incomingShare || !openReady || takenShareRef.current === incomingShare.id || voiceActive) return;
+    if (phase === 'review') {
+      if (noticedShareRef.current !== incomingShare.id) {
+        noticedShareRef.current = incomingShare.id;
+        setMessage({ ok: true, text: 'You shared something to ReferralFit. It goes into the notes box when you tap Back to the notes, or once this review is saved.' });
+      }
+      return;
+    }
+    if (phase !== 'paste' && phase !== 'done') return;
+    takenShareRef.current = incomingShare.id;
+    let before = notes;
+    if (phase === 'done') {
+      // Everything from that review is saved: a new review for what was shared.
+      settleRecordings(saved, rows);
+      openingRef.current += 1;
+      clearReview();
+      before = '';
+    }
+    const next = appendToNotes(before, incomingShare.text);
+    setNotes(next);
+    setMessage({ ok: true, text: sharedNoteMessage(incomingShare, { appended: Boolean(before.trim()), totalLength: next.length }) });
+    onIncomingShareTaken?.(incomingShare.id);
+    // notes, saved and rows are read as they are when the share is taken.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, incomingShare, openReady, phase, voiceActive]);
+
+  function startVoiceNote() {
+    if (busy || voiceActive) return;
+    const base = notes.trimEnd();
+    voiceBaseRef.current = base;
+    setMessage({
+      ok: true,
+      text: `Listening. Say what happened; the words appear in the box. Tap Stop when you are done. ${voice.onDevice ? 'Your voice stays on this phone.' : 'Apple turns your voice into text; the sound is not saved.'}`,
+    });
+    void voice.start(REVIEW_TEXT_MAX - (base ? base.length + 2 : 0));
   }
 
   function close() {
     if (phase === 'saving') return;
+    // What a voice note has heard so far is in the box; the box's own question below covers it.
+    if (voiceActive) voice.cancel();
     // A read or a review can be stopped (what comes back late is ignored);
     // notes the practitioner typed or pasted are not thrown away without asking.
     const recorderText = Boolean(recorderReadRef.current) && notes.trim() === recorderReadRef.current?.text.trim();
@@ -381,7 +460,7 @@ export default function DayReviewSheet({
 
   async function find(read: { recorder: Recorder; text: string; blocks: FieldyBlock[]; skipped?: string[] } | null = null) {
     setCaseDraft(null);
-    if (busy && !read) return;
+    if ((busy || voiceActive) && !read) return;
     // "Back to the notes", then Find again on the same recorder text: still that recorder's recordings.
     const same = recorderReadRef.current && notes.trim() === recorderReadRef.current.text.trim() ? recorderReadRef.current : null;
     const fromRecorder = read ?? (same ? { recorder: same.recorder, text: same.text, blocks: same.blocks, skipped: same.skipped } : null);
@@ -1096,7 +1175,9 @@ export default function DayReviewSheet({
   const pasteScreen = (
     <View>
       <Text style={styles.intro}>
-        Paste notes from your day: a summary from Fieldy or Plaud, or your own call notes. ReferralFit finds new leads, notes, follow-ups and referrals, and you approve each one before anything is saved.
+        {shareToAppSupported || voice.supported
+          ? 'Paste notes from your day, share them here from another app (a text thread, an email, a Voice Memos transcript, a note), or record a voice note after a call. ReferralFit finds new leads, notes, follow-ups and referrals, and you approve each one before anything is saved.'
+          : 'Paste notes from your day: a summary from Fieldy or Plaud, or your own call notes. ReferralFit finds new leads, notes, follow-ups and referrals, and you approve each one before anything is saved.'}
       </Text>
       {fieldySupported ? RECORDERS.map((recorder) => {
         const status = recorders[recorder.id];
@@ -1109,7 +1190,7 @@ export default function DayReviewSheet({
               <>
                 <Text style={styles.hint}>Connected{status.email ? ` as ${status.email}` : ''}. ReferralFit reads your new {recorder.noun}s here; you approve each item.</Text>
                 {keyMissing ? null : (
-                  <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => readRecorderAsking(recorder)} style={[styles.primaryButton, busy && styles.off]}>
+                  <TouchableOpacity accessibilityRole="button" disabled={busy || voiceActive} onPress={() => readRecorderAsking(recorder)} style={[styles.primaryButton, (busy || voiceActive) && styles.off]}>
                     <Text style={styles.primaryButtonText}>Read new {recorder.name} {recorder.noun}s</Text>
                   </TouchableOpacity>
                 )}
@@ -1172,20 +1253,48 @@ export default function DayReviewSheet({
         </View>
       ) : null}
       <View style={styles.sourceRow}>
-        <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void pasteFromClipboard(); }} style={styles.secondaryButton}>
+        <TouchableOpacity accessibilityRole="button" disabled={busy || voiceActive} onPress={() => { void pasteFromClipboard(); }} style={[styles.secondaryButton, voiceActive && styles.off]}>
           <Text style={styles.secondaryButtonText}>Paste</Text>
         </TouchableOpacity>
-        {notes ? (
+        {voice.supported ? (
+          voiceActive ? (
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Stop the voice note"
+              accessibilityState={{ busy: voice.state !== 'listening' }}
+              disabled={voice.state === 'stopping'}
+              onPress={voice.stop}
+              style={[styles.secondaryButton, styles.stopButton]}
+            >
+              {voice.state === 'listening' ? (
+                <Text style={[styles.secondaryButtonText, styles.stopButtonText]}>Stop</Text>
+              ) : <ActivityIndicator color={COLORS.white} accessibilityLabel={voice.state === 'asking' ? 'Starting the voice note' : 'Finishing the voice note'} />}
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel="Voice note: say your notes and they are typed into the box" disabled={busy} onPress={startVoiceNote} style={styles.secondaryButton}>
+              <Text style={styles.secondaryButtonText}>Voice note</Text>
+            </TouchableOpacity>
+          )
+        ) : null}
+        {notes && !voiceActive ? (
           <TouchableOpacity accessibilityRole="button" accessibilityLabel="Clear the notes" disabled={busy} onPress={() => setNotes('')} style={styles.secondaryButton}>
             <Text style={styles.secondaryButtonText}>Clear</Text>
           </TouchableOpacity>
         ) : null}
       </View>
+      {voice.supported && !voiceActive ? (
+        <Text style={styles.hint}>
+          Voice note: right after a call, say what happened and it is typed into the box for you to check. {voice.onDevice ? 'Your voice stays on this phone.' : 'Apple turns your voice into text; the sound is not saved.'}
+        </Text>
+      ) : null}
+      {voice.state === 'listening' ? (
+        <Text style={styles.listening} accessibilityLiveRegion="polite">Listening… tap Stop when you are done.</Text>
+      ) : null}
       <TextInput
         value={notes}
         onChangeText={setNotes}
         multiline
-        editable={!busy}
+        editable={!busy && !voiceActive}
         placeholder="Paste or type your notes here"
         placeholderTextColor={COLORS.gray}
         accessibilityLabel="Your notes"
@@ -1236,10 +1345,10 @@ export default function DayReviewSheet({
             {phase === 'paste' || phase === 'finding' ? (
               <TouchableOpacity
                 accessibilityRole="button"
-                accessibilityState={{ disabled: busy || keyMissing, busy }}
-                disabled={busy || keyMissing || keyState === 'checking'}
+                accessibilityState={{ disabled: busy || voiceActive || keyMissing, busy }}
+                disabled={busy || voiceActive || keyMissing || keyState === 'checking'}
                 onPress={() => { void find(); }}
-                style={[styles.primaryButton, (busy || keyMissing || keyState === 'checking') && styles.off]}
+                style={[styles.primaryButton, (busy || voiceActive || keyMissing || keyState === 'checking') && styles.off]}
               >
                 {phase === 'finding' ? (
                   <View style={styles.busyRow}>
@@ -1330,5 +1439,8 @@ const styles = StyleSheet.create({
   busyRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   secondaryButton: { minHeight: 44, paddingHorizontal: 16, borderRadius: 12, borderWidth: 1, borderColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', alignSelf: 'flex-start', marginTop: 8 },
   secondaryButtonText: { color: COLORS.forest, fontSize: 15, fontWeight: '800' },
+  stopButton: { backgroundColor: COLORS.coral, borderColor: COLORS.coral, minWidth: 88 },
+  stopButtonText: { color: COLORS.white },
+  listening: { fontSize: 13, fontWeight: '700', color: COLORS.coralText, marginTop: 8 },
   off: { opacity: 0.5 },
 });

@@ -238,7 +238,15 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   const appJson = JSON.parse(await readFile(new URL('../app.json', import.meta.url), 'utf8'));
   const picker = appJson.expo.plugins.find((plugin) => Array.isArray(plugin) && plugin[0] === 'expo-image-picker')?.[1] || {};
   assert.equal(picker.cameraPermission, false, 'no camera usage string: the app never opens the camera');
-  assert.equal(picker.microphonePermission, false, 'no microphone usage string');
+  // The microphone is used only for a voice note in Review notes
+  // (expo-speech-recognition). The picker's own setting must carry the same
+  // string: `false` there deletes NSMicrophoneUsageDescription after the
+  // speech plugin sets it, and iOS ends an app that opens the microphone
+  // without one.
+  const speech = appJson.expo.plugins.find((plugin) => Array.isArray(plugin) && plugin[0] === 'expo-speech-recognition')?.[1] || {};
+  assert.match(speech.microphonePermission || '', /voice note/, 'the microphone usage string says it is only for a voice note');
+  assert.equal(picker.microphonePermission, speech.microphonePermission, 'the picker does not remove the microphone usage string');
+  assert.match(speech.speechRecognitionPermission || '', /Apple/, 'the speech usage string says the sound may go to Apple');
   assert.match(picker.photosPermission || '', /photo/i);
   const secureStore = appJson.expo.plugins.find((plugin) => Array.isArray(plugin) && plugin[0] === 'expo-secure-store')?.[1] || {};
   // Face ID is used now (Lock with Face ID, modules/app-lock): the usage

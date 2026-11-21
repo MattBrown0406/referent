@@ -2,8 +2,10 @@
 
 **Status: Phase 1 built (2026-11-08, branch feat/day-review): paste notes,
 review, approve. Phase 2, Fieldy and Plaud connected, built 2026-11-08 on
-the same branch** (see "Recorders, as built" below). The share extension,
-background refresh and push are still the plan. For practitioners who
+the same branch** (see "Recorders, as built" below). **Share to
+ReferralFit and voice notes built 2026-11-21, branch feat/share-voice** (see
+"Share to ReferralFit and voice notes, as built" at the end). Background
+refresh and push are still the plan. For practitioners who
 have added their own Anthropic key (AI drafts). Goal from Matt: "as
 automated as possible, the fewer steps for the user the better."
 
@@ -35,12 +37,17 @@ or a packet that was promised and never sent.
    like the Anthropic key. `expo-auth-session` and `expo-web-browser` are
    in Expo's bundled set, and the app already has the `referralfit://`
    scheme for the return trip.
-2. **Share to ReferralFit (any app, one tap).** An iOS share extension puts
-   ReferralFit in the share sheet. In Plaud, Otter, Voice Memos, Mail or Notes:
-   Share, then ReferralFit, and the text goes straight into the review.
-   This is how Plaud users get it until Plaud has an API.
-3. **Paste.** A text box on the review screen. A fallback for anything else.
-4. **Later: push.** Fieldy can call a URL when a conversation finishes (its
+2. **Share to ReferralFit (any app, one tap). Built 2026-11-21.** An iOS
+   share extension puts ReferralFit in the share sheet. In Messages, Mail,
+   Notes, Voice Memos (its transcript), Otter or a recorder's app: select the
+   text, Share, then ReferralFit, and the text lands in the Review notes box.
+   The practitioner checks it and taps Find, as for pasted notes; nothing is
+   sent on its own.
+3. **Voice note. Built 2026-11-21.** "Voice note" on the review screen: right
+   after a call, say what happened and it is typed into the box; Stop, edit,
+   Find.
+4. **Paste.** A text box on the review screen. A fallback for anything else.
+5. **Later: push.** Fieldy can call a URL when a conversation finishes (its
    organization webhook, `conversation.completed`, HMAC-signed). Plaud can do
    the same through a Zapier zap ("Transcript & Summary Ready", then a POST
    to a private ReferralFit link). Both land on ReferralFit's server, so they
@@ -357,3 +364,163 @@ saved on it. A name that is already a case puts the row on that case. A
 case that cannot be created leaves its rows unsaved with the reason, and
 Approve again retries with the same case id (a repeat that landed is taken as
 done). `withPendingCases`, `suggestedCaseTitle` in `src/lib/day-review.ts`.
+
+
+## Share to ReferralFit and voice notes, as built (2026-11-21, Matt approved)
+
+Branch `feat/share-voice` (from `feat/next-build`). iPhone and iPad only; the
+web app has neither (its pages also turn the microphone off).
+
+### What the practitioner sees
+
+**Share.** In Messages, Mail, Notes, Voice Memos, Safari or any app: select
+the text (or the whole note, or a link), tap Share, then ReferralFit (the
+icon in the row of apps; the first time, it may be under More).
+
+1. ReferralFit opens on Review notes with the text in the notes box. If
+   notes were already typed there, the shared text goes below them; it never
+   replaces them. A line above it says where it came from when iOS says so (a
+   web page's title, a file's name). iOS does not tell an app which app shared
+   to it, so plain text has no such line.
+2. A message says what happened: "What you shared is in the box. Check it,
+   then tap Find what's in it." For a link: ReferralFit reads only the words
+   in the box, not the page the link opens. Longer than one review reads
+   (12,000 characters, the `day-review` function's own cap): "Only the first
+   12,000 characters were kept: that is the most one review reads. Share the
+   rest after this review."
+3. They tap Find, as for pasted notes. Nothing is sent to the AI until then.
+   "+ New case" on a row works as before, so a call about a family not in
+   ReferralFit yet can be captured from anywhere.
+
+When it cannot open at once:
+
+| Situation | What happens |
+| --- | --- |
+| Signed out | "Sign in to review it": it opens once they sign in (kept in memory only, so closing ReferralFit clears it). |
+| Face ID lock on | The lock's own cover hides the sheet until they unlock; the text is already waiting. |
+| Another screen is open (a case file, a compose sheet) | "It opens in Review notes when you close this screen." It waits for a clear screen, as a notification tap does. |
+| Review notes already open | Into the box at once; during a review on screen, it waits until they tap Back to the notes, or everything is saved (then a new review starts with it); during a read, a save or a voice note, it waits for that to finish. |
+| Two shares before the first is taken | Each goes into the box in turn, below the last. |
+| Shared while one account was signed in, then another signs in | Dropped: it never opens in another account. |
+| A photo or another file | "ReferralFit takes text and links from other apps, not photos or other files." |
+
+**Voice note.** On the review screen, next to Paste: **Voice note**.
+
+1. The first time, iOS asks for the microphone and for speech recognition
+   (the reasons below). Turned down: an alert says to turn both on in
+   Settings > Apps > ReferralFit, with an Open Settings button.
+2. "Listening": the words appear in the box as they speak (after any notes
+   already there). The box, Paste, Find and the recorder buttons wait.
+3. **Stop**: the last words land, and the box can be edited. Then Find.
+4. The small print says where the voice goes: "Your voice stays on this
+   phone" when the iPhone can turn speech into text itself (most can;
+   `requiresOnDeviceRecognition` is then set, so nothing goes to Apple), or
+   "Apple turns your voice into text; the sound is not saved" when it cannot.
+   The sound is never saved by ReferralFit.
+
+It stops by itself, keeping what was heard, and says why: a phone call, Siri
+or an alarm; leaving ReferralFit; a long pause after speaking; no words at
+all ("No words were heard"); the box reaching the 12,000 characters one
+review reads; or 30 minutes. iOS ends a recognition session on its own now
+and then (a pause, or Apple's time limit when its servers do the work): the
+note goes on in a new session without a break the practitioner sees (up to
+40 times). If speech recognition is off on the phone (Dictation off,
+restricted by Screen Time or a work profile, or offline when the phone needs
+Apple's servers), it says to check Dictation in Settings > General >
+Keyboard.
+
+### Pieces
+
+| Piece | Where |
+| --- | --- |
+| Share extension (a second iOS target, `ShareExtension`, bundle id `com.mattbrown.referralfit.share-extension`) | `expo-share-intent` 8.0.1 in `app.json`: text (`NSExtensionActivationSupportsText`) and one link (`NSExtensionActivationSupportsWebURLWithMaxCount`); no photos, videos or other files; `disableAndroid` |
+| Its name in the share sheet ("ReferralFit", not "ReferralFit - Share Extension") | `plugins/share-extension-name.js` |
+| App Group shared by the app and the extension | `group.com.mattbrown.referralfit` (the plugin adds it to both entitlements and to `extra.eas.build.experimental.ios.appExtensions`, which EAS reads for credentials; it must not also be written in app.json, or the plugin stops) |
+| Receiving a share | `src/lib/share-receiver.ts` (loads expo-share-intent only on an iPhone build that has its native module and ExpoLinking's) |
+| The text rules (cap, source line, appending, messages) | `src/lib/share-intake.ts` |
+| Waiting through sign-in, other sheets and account switches | `App.tsx` ("Share to ReferralFit", `pendingShares`) |
+| Into the box | `src/lib/DayReviewSheet.tsx` (`incomingShare`) |
+| Voice note | `src/lib/voice-note.ts` (`expo-speech-recognition` 57.1.1, through `requireOptionalNativeModule`), button in `DayReviewSheet.tsx` |
+| Tests | `scripts/share-voice-test.mjs`; `scripts/mutation-test.mjs` (the usage strings) |
+
+Details that matter:
+
+- **Deep links do not collide.** The extension opens
+  `referralfit://dataUrl=referralfitShareKey?nonce=…#text`. The auth handler
+  in App.tsx ignores it (no tokens or code: `parseAuthRedirect` is null, and
+  the test checks it), and the Fieldy and Plaud returns
+  (`com.mattbrown.referralfit:/oauth/…`) come back inside the sign-in sheet,
+  not through links. Another app can open that URL too, but it only makes
+  ReferralFit read what the extension stored in the App Group (only the
+  extension can write there), and that never leaves the box without Find.
+- **Nothing shared stays on the phone outside the box.** The share is read
+  from the App Group and cleared there at once; a file the extension copied
+  (a .txt, or a picture in a shared note) is deleted after reading. The
+  pending share is kept in memory only.
+- **A shared .txt file** is read when the sending app hands it over as a
+  file (up to 512 KB). Some apps hand a .txt over in a way the extension
+  cannot read; the share sheet then shows its own error, and copying the text
+  works instead.
+- **Microphone usage string.** `expo-image-picker`'s `microphonePermission`
+  carries the same string as the speech plugin's: `false` there deletes
+  `NSMicrophoneUsageDescription` after the speech plugin sets it (checked with
+  `expo config --type introspect`), and iOS ends an app that opens the
+  microphone without one.
+- **Pinned versions.** `expo-linking` 57.0.4 and `expo-constants` 57.0.7 are
+  the versions expo 57.0.8 bundles (later 57.0.x versions are what
+  `expo install` and expo-doctor ask for; like expo-contacts they are held,
+  in `expo.install.exclude`, and `scripts/native-compat-test.mjs` checks it).
+
+### Usage strings (iOS asks with these)
+
+- Microphone: "ReferralFit uses the microphone only while you record a voice
+  note in Review notes. What you say becomes text in the notes box. The sound
+  is not saved."
+- Speech recognition: "ReferralFit turns your voice note into text in the
+  notes box. On most iPhones this happens on the phone. If your iPhone cannot
+  do it on the phone, Apple turns the sound into text on its servers.
+  ReferralFit never saves the sound."
+
+### For Matt: the next iPhone build
+
+The share extension is a second app target inside ReferralFit with its own
+bundle id (`com.mattbrown.referralfit.share-extension`), and both it and the
+app now use an App Group (`group.com.mattbrown.referralfit`). EAS has no
+signing for them yet, so **the first build after this must be run in a
+terminal where you can answer questions**, without `--non-interactive`:
+
+```
+npx -y eas-cli@21.4.0 build --platform ios --profile production
+```
+
+What to expect:
+
+1. EAS lists two targets, ReferralFit and ShareExtension, and asks to log in
+   to your Apple Developer account (Apple ID, password, the 6-digit code).
+2. It should register the new bundle id
+   `com.mattbrown.referralfit.share-extension`, register the App Group
+   `group.com.mattbrown.referralfit`, and turn App Groups on for both ids (it
+   prints "Syncing capabilities"). If it cannot, add them by hand at
+   developer.apple.com > Certificates, Identifiers & Profiles (Identifiers:
+   the App Group, then App Groups on both app ids), and run the build again.
+3. It reuses the distribution certificate you have and makes a new App Store
+   provisioning profile for the extension; the app's own profile is made
+   again because it now needs App Groups. Say yes when it offers.
+4. The build then runs as usual. After this one, builds can go back to
+   `--non-interactive`.
+
+Nothing is needed in App Store Connect for the extension itself (it ships
+inside the app). If the build fails with "Credentials are not set up" or a
+provisioning profile that lacks App Groups, run it again interactively.
+
+### Before release
+
+- Matt's device test (TestFlight): share a text thread, an email, a Notes
+  page and a Voice Memos transcript; share while signed out and while the lock
+  is on; a voice note with a call coming in; a voice note longer than a
+  minute; turning the microphone off in Settings.
+- App Review notes and the App Privacy answers: `APP_REVIEW.md`, section 3b.
+- The privacy policy on referralfit.com: add the share extension and voice
+  notes to the day review section (what is read, that the sound is never
+  saved, that speech is turned into text on the phone or by Apple).
+
