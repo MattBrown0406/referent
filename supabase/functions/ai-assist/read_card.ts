@@ -19,8 +19,8 @@ import { AssistFailure, AssistOutputError, AssistRequestError, clean, comparable
 export const CARD_LIMITS = {
   /** The assessment-files bucket's own cap (20261109140000). */
   fileBytes: 10 * 1024 * 1024,
-  /** Anthropic's limit for one image, measured on its base64 text (4/3 of the file). A larger photo is shrunk by storage first, or refused. */
-  imageBytes: 5 * 1024 * 1024,
+  /** The Claude API's limit for one image, measured on its base64 text (4/3 of the file, so about 7.5 MB of photo). A larger photo is shrunk by storage first, or refused. */
+  imageBytes: 10 * 1024 * 1024,
   carriers: 120,
   carrier: 120, // case_benefits.carrier
   planName: 120, // case_benefits.plan_name
@@ -159,7 +159,7 @@ export async function loadCardFiles(store: CardStore, request: CardRequest): Pro
     }
     if ('problem' in ready) {
       skipped.push(ready.problem === 'size'
-        ? `The ${sideWord(side)} photo is too large to read (over 5 MB).`
+        ? `The ${sideWord(side)} photo is too large to read.`
         : `The ${sideWord(side)} photo is in a file type that cannot be read here.`);
       continue;
     }
@@ -263,15 +263,19 @@ export function parseCardOutput(raw: string, request: CardRequest, skipped: stri
   const output = record(parsed);
   const listed = clean(output.carrier, CARD_LIMITS.carrier);
   const carrier = request.carriers.includes(listed) ? listed : '';
-  const cardCarrier = withoutNumbers(clean(output.cardCarrier, CARD_LIMITS.carrier * 2)).slice(0, CARD_LIMITS.carrier).trim();
-  const planName = withoutNumbers(clean(output.planName, CARD_LIMITS.planName * 2)).slice(0, CARD_LIMITS.planName).trim();
-  const last4 = memberIdLast4(clean(output.memberId, CARD_LIMITS.memberId * 2));
-  let unclear = withoutNumbers(clean(output.unclear, CARD_LIMITS.note * 2));
   const fullId = typeof output.memberId === 'string' ? comparable(output.memberId).replace(/ /g, '') : '';
-  if (fullId.length >= 4 && comparable(unclear).replace(/ /g, '').includes(fullId)) unclear = '';
+  // A text field that repeats the full member id is dropped whole: only its last four ever leave.
+  const withoutId = (value: string) => (fullId.length >= 4 && comparable(value).replace(/ /g, '').includes(fullId) ? '' : value);
+  const cardCarrier = withoutId(withoutNumbers(clean(output.cardCarrier, CARD_LIMITS.carrier * 2)).slice(0, CARD_LIMITS.carrier).trim());
+  const planName = withoutId(withoutNumbers(clean(output.planName, CARD_LIMITS.planName * 2)).slice(0, CARD_LIMITS.planName).trim());
+  const last4 = memberIdLast4(clean(output.memberId, CARD_LIMITS.memberId * 2));
+  const unclear = withoutId(withoutNumbers(clean(output.unclear, CARD_LIMITS.note * 2)));
   const note = clip([...skipped, unclear].filter(Boolean).join(' '), CARD_LIMITS.note);
   if (!carrier && !cardCarrier && !planName && !last4) {
     throw new AssistFailure(422, 'unreadable', 'Nothing could be read from the card photos. Look at the photos and type the details into Benefits instead.');
   }
-  return { carrier: carrier || cardCarrier, cardCarrier, planName, memberIdLast4: last4, note };
+  // The carrier only as one of the app's own names: Match compares plan names
+  // exactly, so a name as printed would hide every program. The printed name
+  // still shows beside the form for the practitioner to choose from.
+  return { carrier, cardCarrier, planName, memberIdLast4: last4, note };
 }

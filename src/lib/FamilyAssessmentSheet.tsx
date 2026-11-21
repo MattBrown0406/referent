@@ -469,7 +469,7 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
               {builtBrief ? (
                 <View style={styles.card}>
                   <Text style={styles.cardTitle}>Case brief for programs</Text>
-                  <Text style={styles.body}>A short summary for a program’s admissions team, from the family’s choices and your level-of-care rating. It leaves out names, contact details, dates, numbers and anything the family typed in their own words. Read it, change what you like, then send it with a referral.</Text>
+                  <Text style={styles.body}>A short summary for a program’s admissions team, from the family’s choices and your level-of-care rating. It leaves out names, contact details, dates, ID and phone numbers, money and anything the family typed in their own words. Read it, change what you like, then send it with a referral.</Text>
                   <TextInput
                     value={brief}
                     onChangeText={(value) => finished && setBriefEdit({ id: finished.id, text: value })}

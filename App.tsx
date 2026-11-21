@@ -3442,15 +3442,18 @@ export default function App() {
   // the practitioner can still edit before sharing.
   const packetTargetRef = useRef(packetTarget);
   packetTargetRef.current = packetTarget;
+  const packetAudienceRef = useRef(packetAudience);
+  packetAudienceRef.current = packetAudience;
   async function addCaseBriefToPacket() {
     const target = packetTarget;
     const caseId = target?.match.caseId;
-    if (!target || !caseId || packetBriefBusy) return;
+    if (!target || !caseId || packetBriefBusy || packetAudience !== 'partner') return;
     if (packetText.includes(BRIEF_HEADER)) { Alert.alert('Already in the packet', 'The case brief is already in this packet.'); return; }
     setPacketBriefBusy(true);
     try {
       const list = await listFamilyAssessments(caseId);
-      if (packetTargetRef.current !== target) return;
+      // The program's copy only: never the family's, even if the toggle moved meanwhile.
+      if (packetTargetRef.current !== target || packetAudienceRef.current !== 'partner') return;
       const newest = currentFamilyAssessment(list);
       const finished = newest?.status === 'submitted' ? newest : list.find((item) => item.status === 'submitted') ?? null;
       if (!finished) { Alert.alert('No case brief yet', 'The case brief comes from a finished family assessment. Send the family the assessment from the case file.'); return; }
@@ -5370,7 +5373,6 @@ export default function App() {
         setMatchMustHave(required.filter((need) => next.includes(need)));
       }
       if (result.insurance !== 'Cash pay') { setMatchInsurance(result.insurance); setMatchBudget(''); }
-      else if (result.budget) { setMatchInsurance('Cash pay'); setMatchBudget(result.budget); }
       setMatchFromAnswers({ caseId: record.id, used: result.used, toCheck: result.toCheck });
     };
     if (!existing) { fill(); return; }
@@ -6131,7 +6133,7 @@ export default function App() {
         return;
       }
       launch(primary.phone, primary.name).then((opened) => {
-        if (opened) logCardContact(card, action, primary);
+        if (opened) logCardContactRef.current(card, action, primary);
       });
       return;
     }
@@ -6143,7 +6145,7 @@ export default function App() {
         return;
       }
       launch(partner?.phone ?? digits, partner?.organization || 'this partner').then((opened) => {
-        if (opened) logCardContact(card, action, undefined);
+        if (opened) logCardContactRef.current(card, action, undefined);
       });
       return;
     }
@@ -6152,6 +6154,11 @@ export default function App() {
 
   // The logging half of a card call/text. A case event and partner touch are
   // committed/queued as one owner-fenced operation after the OS handoff succeeds.
+  // Called after the call or text app returns (which can take minutes): the
+  // newest render's copy, so it logs on top of data refreshed meanwhile,
+  // never on the snapshot from the tap.
+  const logCardContactRef = useRef(logCardContact);
+  logCardContactRef.current = logCardContact;
   function logCardContact(card: TodayCard, action: 'call' | 'text', contact?: CaseContact, options: { deferNoteSheet?: boolean } = {}) {
     if (!mutationSlotAvailable('The contact log')) return;
     const now = new Date().toISOString();
@@ -9741,7 +9748,7 @@ export default function App() {
               <Text style={styles.fieldLabel}>SENDING TO</Text>
               <View style={styles.segmented}>
                 {(['family', 'partner'] as PacketAudience[]).map((audience) => (
-                  <TouchableOpacity key={audience} onPress={() => switchPacketAudience(audience)} style={[styles.segment, packetAudience === audience && styles.segmentActive]}>
+                  <TouchableOpacity key={audience} disabled={packetBriefBusy} onPress={() => switchPacketAudience(audience)} style={[styles.segment, packetAudience === audience && styles.segmentActive]}>
                     <AppIcon name={audience === 'family' ? 'people' : 'business'} size={16} color={packetAudience === audience ? COLORS.white : COLORS.inkSoft} />
                     <Text style={[styles.segmentText, packetAudience === audience && styles.segmentTextActive]}>{audience === 'family' ? 'Sending to family' : 'Sending to partner'}</Text>
                   </TouchableOpacity>
@@ -10543,7 +10550,7 @@ export default function App() {
                   const pick = contactPick;
                   setContactPick(null);
                   const opened = await openCallOrText(pick.action, contact.phone, contact.name);
-                  if (opened === 'done') logCardContact(pick.card, pick.action, contact, { deferNoteSheet: true });
+                  if (opened === 'done') logCardContactRef.current(pick.card, pick.action, contact, { deferNoteSheet: true });
                   else if (opened === 'failed') Alert.alert('Unable to open', 'This device could not open that action. Nothing was logged.');
                 }}>
                   <View style={{ flex: 1 }}>
@@ -10687,7 +10694,12 @@ export default function App() {
         onSaved={() => refreshAfterServerChange()}
         startWithRecorder={dayReviewRecorder}
         incomingShare={pendingShare && pendingShare.userId !== null && pendingShare.userId !== activeUserId ? null : pendingShare}
-        onIncomingShareTaken={(id) => setPendingShares((current) => current.filter((share) => share.id !== id))}
+        onIncomingShareTaken={(id) => {
+          setPendingShares((current) => current.filter((share) => share.id !== id));
+          // Taken: the same text shared again on purpose opens again; only
+          // iOS's own double delivery, seconds apart, is still dropped.
+          if (lastShareRef.current) lastShareRef.current = { ...lastShareRef.current, at: Math.min(lastShareRef.current.at, Date.now() - 55_000) };
+        }}
         onRecordersChanged={(reviewed) => {
           if (reviewed) lowerRecordingsWaiting(reviewed.recorder, reviewed.count);
           void refreshFieldyWaiting(true);

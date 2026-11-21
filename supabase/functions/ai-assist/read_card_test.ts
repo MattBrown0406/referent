@@ -110,18 +110,18 @@ Deno.test('refusals before anything is sent: deleted, no photo, gone, unreadable
   assertEquals(html.code, 'unreadable');
 });
 
-Deno.test('the image limit is measured on the base64 text: a 4 MB photo is shrunk first', async () => {
-  const four = JPEG(4 * 1024 * 1024);
+Deno.test('the image limit is measured on the base64 text: an 8 MB photo is shrunk first', async () => {
+  const four = JPEG(8 * 1024 * 1024);
   const shrunk = store({ ...ROW, card_back_path: null }, { [FRONT]: four }, { [FRONT]: JPEG(2000) });
   const { files } = await loadCardFiles(shrunk, request());
   assertEquals(files.map((file) => file.side), ['front']);
   assertEquals(shrunk.downloads, ['get front', 'shrink front']);
-  const three = await loadCardFiles(store({ ...ROW, card_back_path: null }, { [FRONT]: JPEG(3 * 1024 * 1024) }), request());
+  const three = await loadCardFiles(store({ ...ROW, card_back_path: null }, { [FRONT]: JPEG(7 * 1024 * 1024) }), request());
   assertEquals(three.files.length, 1);
 });
 
 Deno.test('a photo too large or in a type Anthropic cannot take is shrunk by storage, or skipped', async () => {
-  const big = JPEG(CARD_LIMITS.imageBytes + 1);
+  const big = JPEG(8 * 1024 * 1024); // over the image limit once in base64, under the file cap
   const shrunk = store(ROW, { [FRONT]: big, [BACK]: HEIC }, { [FRONT]: JPEG(2000) });
   const { files, skipped } = await loadCardFiles(shrunk, request());
   assertEquals(files.map((file) => [file.side, file.type]), [['front', 'image/jpeg']]);
@@ -178,8 +178,11 @@ Deno.test('the reading: only the last four of the member ID ever comes back', ()
 });
 
 Deno.test('a carrier not in the app\'s list comes back as printed', () => {
-  assertEquals(parseCardOutput(output({ carrier: 'Highmark' }), request()).carrier, 'Blue Cross Blue Shield of Texas');
-  assertEquals(parseCardOutput(output({ carrier: '' }), request()).carrier, 'Blue Cross Blue Shield of Texas');
+  assertEquals(parseCardOutput(output({ carrier: 'Highmark' }), request()).carrier, '', 'an unlisted name is never the carrier');
+  assertEquals(parseCardOutput(output({ carrier: 'Highmark' }), request()).cardCarrier, 'Blue Cross Blue Shield of Texas');
+  assertEquals(parseCardOutput(output({ carrier: '' }), request()).carrier, '');
+  assertEquals(parseCardOutput(output({ planName: 'Plan XJK4821QZ', memberId: 'XJK4821QZ' }), request()).planName, '', 'a plan name repeating the id is dropped');
+  assertEquals(parseCardOutput(output({ cardCarrier: 'XJK4821QZ', memberId: 'XJK4821QZ' }), request()).cardCarrier, '');
   assertEquals(parseCardOutput(output({ carrier: 'Aetna' }), request()).carrier, 'Aetna');
 });
 

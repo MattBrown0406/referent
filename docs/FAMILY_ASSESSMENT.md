@@ -114,9 +114,9 @@ case's name, the state named in the case, the plan on Benefits), then:
 | Field | From |
 | --- | --- |
 | Population | Under 18: Adolescent. Otherwise gender Male: Men, Female: Women (these hide only programs for the other group) |
-| Men only / Women only | Only when the family asked for gender-specific care in their own words |
-| Needs (preferences, never must-haves) | Trauma (a yes, not "suspected"), Dual diagnosis (psychiatric history or signs of a mood disorder), Chronic pain, Chronic relapse (two or more earlier programs), and what the family wrote under treatment preferences (faith based, LGBTQ+, EMDR, DBT, CBT, IFS, equine, adventure, family program, trauma, eating disorders, gambling) |
-| Payment | The plan on Benefits; else the carrier the family typed, when the form lists it (common spellings such as BCBS and UHC are known); else their cash budget, the top of the range they picked |
+| Men only / Women only | Never filled in (they are requirements and would hide every co-ed program). A request for gender-specific care is listed to check |
+| Needs (preferences, never must-haves) | Trauma (a yes, not "suspected"), Dual diagnosis (psychiatric history or signs of a mood disorder), Chronic pain, Chronic relapse (two or more earlier programs), and what the family wrote under treatment preferences (faith based, LGBTQ+, EMDR, DBT, CBT, IFS, equine, adventure, family program, trauma, eating disorders, gambling), skipping any sentence or phrase with a "no" in it ("No wilderness programs") |
+| Payment | The plan on Benefits (named to check when Match does not list that name); else the carrier the family typed, when the form lists it (common spellings such as BCBS and UHC are known). The family's budget is for the whole stay and Match's is per month, so it is listed to check, never filled in |
 | Level of care | Only the level chosen on the case's level-of-care rating |
 
 MAT is never added on its own (it is a must-have by default and would hide
@@ -282,8 +282,8 @@ other AI help. That fills "True cost to the family" without typing.
   access; the service role is used only for sign-in and the daily cap, as
   before. A photo path is used only when it sits in that assessment's own
   folder.
-- Types are read from the file's bytes. JPEG, PNG, WebP, GIF (up to 5 MB,
-  Anthropic's limit per image) and PDF (up to 10 MB) are sent as they are.
+- Types are read from the file's bytes. JPEG, PNG, WebP, GIF (up to about 7.5 MB of photo: the Claude API's
+  10 MB per image, measured in base64) and PDF (up to 10 MB) are sent as they are.
   A larger photo or an iPhone HEIC photo is asked from storage as a smaller
   copy (image transformation); if the project does not have that, the side
   is skipped and named in the note. All the reads share 20 seconds.
@@ -291,8 +291,11 @@ other AI help. That fills "True cost to the family" without typing.
   none), the plan name, the member ID and a note. The function works out
   the **last four** of the member ID itself and returns only that (four
   letters or digits with at least one digit in the ID, else nothing).
-  Numbers of five digits or more and dates are taken out of the free text.
-  Never a name, date of birth or group number (Benefits has nowhere to keep
+  Numbers of five digits or more and dates are taken out of the free text,
+  and a text that repeats the full member ID is dropped. The carrier fills
+  Benefits only as one of the app's own names (Match compares plan names
+  exactly); an insurer the list does not have shows as printed, for the
+  practitioner to choose. Never a name, date of birth or group number (Benefits has nowhere to keep
   a group number).
 - Refusals: no photo recorded (`no_photo`), assessment or photos deleted or
   not the caller's (`not_found`), nothing readable (`unreadable`), plus the

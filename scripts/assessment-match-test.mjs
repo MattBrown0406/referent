@@ -37,7 +37,6 @@ check('an empty assessment fills nothing and says so', () => {
   assert.equal(result.population, 'Any');
   assert.deepEqual(result.needs, []);
   assert.equal(result.insurance, 'Cash pay');
-  assert.equal(result.budget, '');
   assert.equal(result.levelOfCare, null);
   assert.deepEqual(result.used, []);
   assert.match(result.toCheck[0], /Nothing in the answers/);
@@ -51,16 +50,27 @@ check('population: under 18 is Adolescent, before gender', () => {
   assert.equal(matchFromAssessment({ ...base, answers: { age: 'abc', gender: 'other' } }).population, 'Any');
 });
 
-check('gender-specific care adds Men only / Women only only when asked for', () => {
+check('gender-specific care is only ever to check: Men only / Women only would hide co-ed programs', () => {
   const men = matchFromAssessment({ ...base, answers: { gender: 'male', treatmentPreferences: 'Gender-specific, near the beach' } });
-  assert.deepEqual(men.needs, ['Men only']);
+  assert.deepEqual(men.needs, []);
+  assert.ok(men.toCheck.some((line) => /add Men only if so/.test(line)));
   const women = matchFromAssessment({ ...base, answers: { gender: 'female', treatmentPreferences: 'women only please' } });
-  assert.deepEqual(women.needs, ['Women only']);
-  const unknown = matchFromAssessment({ ...base, answers: { treatmentPreferences: 'single gender' } });
-  assert.deepEqual(unknown.needs, []);
-  assert.ok(unknown.toCheck.some((line) => /gender-specific/.test(line)));
+  assert.deepEqual(women.needs, []);
+  assert.ok(women.toCheck.some((line) => /add Women only if so/.test(line)));
+  const coed = matchFromAssessment({ ...base, answers: { gender: 'male', treatmentPreferences: 'Co-ed is fine, does not need to be gender-specific' } });
+  assert.deepEqual(coed.needs, []);
+  assert.ok(!coed.toCheck.some((line) => /gender-specific/.test(line)));
   const none = matchFromAssessment({ ...base, answers: { gender: 'male' } });
   assert.deepEqual(none.needs, []);
+});
+
+check('a preference the family says no to is never added', () => {
+  for (const words of ['No faith-based or Christian programs', 'No wilderness programs', 'not interested in EMDR', 'He doesn’t want DBT', 'Anything but a faith based program', 'without equine therapy']) {
+    const result = matchFromAssessment({ ...base, answers: { treatmentPreferences: words } });
+    assert.deepEqual(result.needs, [], words);
+  }
+  const mixed = matchFromAssessment({ ...base, answers: { treatmentPreferences: 'EMDR yes. No wilderness' } });
+  assert.deepEqual(mixed.needs, ['EMDR']);
 });
 
 check('needs come from plain answers and are never MAT', () => {
@@ -89,7 +99,6 @@ check('every used line names the answer it came from', () => {
 check('payment: the plan on the case wins, then the typed carrier', () => {
   const plan = matchFromAssessment({ ...base, planCarrier: 'Cigna', answers: { insuranceProvider: 'Aetna', budgetForTreatment: '20000-30000' } });
   assert.equal(plan.insurance, 'Cigna');
-  assert.equal(plan.budget, '');
   const typed = matchFromAssessment({ ...base, answers: { insuranceProvider: 'BCBS of Texas PPO' } });
   assert.equal(typed.insurance, 'Blue Cross');
   const unknown = matchFromAssessment({ ...base, answers: { insuranceProvider: 'Local Mutual' } });
@@ -97,14 +106,28 @@ check('payment: the plan on the case wins, then the typed carrier', () => {
   assert.ok(unknown.toCheck.some((line) => /Local Mutual/.test(line)));
 });
 
-check('a cash budget is the top of the family range, and only with cash pay', () => {
-  assert.equal(matchFromAssessment({ ...base, answers: { budgetForTreatment: '20000-30000' } }).budget, '30000');
-  assert.equal(matchFromAssessment({ ...base, answers: { budgetForTreatment: '50000+' } }).budget, '50000');
-  assert.equal(matchFromAssessment({ ...base, answers: { budgetForTreatment: 'not-applicable' } }).budget, '');
-  assert.equal(matchFromAssessment({ ...base, answers: { insuranceProvider: 'Aetna', budgetForTreatment: '20000-30000' } }).budget, '');
-  const medicaid = matchFromAssessment({ ...base, answers: { stateMedicaid: 'yes', budgetForTreatment: '20000-30000' } });
-  assert.equal(medicaid.budget, '');
+check('the family budget is for the whole stay: to check, never a monthly cap', () => {
+  const cash = matchFromAssessment({ ...base, answers: { budgetForTreatment: '20000-30000' } });
+  assert.equal('budget' in cash, false);
+  assert.equal(cash.insurance, 'Cash pay');
+  assert.ok(cash.toCheck.some((line) => /\$20,000 - \$30,000 for the whole stay/.test(line)));
+  assert.ok(!matchFromAssessment({ ...base, answers: { budgetForTreatment: 'not-applicable' } }).toCheck.some((line) => /whole stay/.test(line)));
+  const medicaid = matchFromAssessment({ ...base, answers: { stateMedicaid: 'yes' } });
   assert.ok(medicaid.toCheck.some((line) => /Medicaid/.test(line)));
+  // An insured family whose plan the form does not list stays as it was, never Cash pay with a cap.
+  const unlisted = matchFromAssessment({ ...base, answers: { insuranceProvider: 'Highmark', budgetForTreatment: '20000-30000' } });
+  assert.equal(unlisted.insurance, 'Cash pay');
+  assert.ok(unlisted.toCheck.some((line) => /Highmark/.test(line)));
+});
+
+check('a plan on Benefits that Match does not list is named to check', () => {
+  const listed = matchFromAssessment({ ...base, planCarrier: 'Aetna', answers: {} });
+  assert.ok(!listed.toCheck.some((line) => /plan on Benefits/.test(line)));
+  const near = matchFromAssessment({ ...base, planCarrier: 'BCBS of Texas', answers: {} });
+  assert.equal(near.insurance, 'BCBS of Texas');
+  assert.ok(near.toCheck.some((line) => /choose Blue Cross if that is the plan/.test(line)));
+  const far = matchFromAssessment({ ...base, planCarrier: 'Local Mutual', answers: {} });
+  assert.ok(far.toCheck.some((line) => /choose the closest plan/.test(line)));
 });
 
 check('carrierFromText prefers the form’s own longest name, then common spellings', () => {

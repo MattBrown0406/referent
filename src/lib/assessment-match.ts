@@ -10,16 +10,19 @@
 // says so plainly):
 //   - population: under 18 is Adolescent; otherwise the gender answer (Male
 //     is Men, Female is Women). Men and Women hide only programs for the
-//     other group; "Men only" / "Women only" as a need is added only when
-//     the family asked for gender-specific care in their own words.
+//     other group. "Men only" / "Women only" are never added from the
+//     family's words (they are requirements and would hide every co-ed
+//     program): a request for gender-specific care is "to check".
 //   - needs are added as preferences (they raise a program, never hide
-//     one). MAT is never added on its own: it is a must-have by default and
-//     would hide programs, so it is listed under "to check" instead.
+//     one), from plain answers and from the family's preferences, skipping
+//     any clause that says no to it ("no faith-based programs"). MAT is
+//     never added on its own: it is a must-have by default and would hide
+//     programs, so it is listed under "to check" instead.
 //   - payment: the case's plan on file wins (as "Find placement" already
 //     does); otherwise the carrier the family typed, when it names one the
-//     form lists; otherwise their cash budget (the top of the range they
-//     picked). State Medicaid and a carrier the form does not list are
-//     "to check".
+//     form lists. The family's budget is for the whole stay, and the Match
+//     budget is per month, so it is "to check", never filled in. State
+//     Medicaid and a carrier the form does not list are "to check".
 //   - level of care: the level chosen on the case's own level-of-care
 //     rating, never a guess from the answers.
 //
@@ -44,10 +47,8 @@ export type AssessmentMatch = {
   population: ClientPopulation;
   /** Needs to select, every one a preference unless it is a population need. */
   needs: string[];
-  /** A payment choice from insuranceOptions, or 'Cash pay'. */
+  /** A payment choice from insuranceOptions (or the case's plan), or 'Cash pay' when the answers name none. */
   insurance: string;
-  /** Whole dollars, only with Cash pay; '' when none. */
-  budget: string;
   /** The rated level, when there is one. */
   levelOfCare: string | null;
   /** What was filled in, and from which answer, in plain words. */
@@ -92,15 +93,6 @@ export function carrierFromText(typed: string, options: string[]): string | null
   return null;
 }
 
-const BUDGET_TOPS: Record<string, number> = {
-  '10000-15000': 15000,
-  '15000-20000': 20000,
-  '20000-30000': 30000,
-  '30000-40000': 40000,
-  '40000-50000': 50000,
-  '50000+': 50000,
-};
-
 const BUDGET_LABELS: Record<string, string> = {
   '10000-15000': '$10,000 - $15,000',
   '15000-20000': '$15,000 - $20,000',
@@ -125,6 +117,17 @@ const PREFERENCE_NEEDS: { pattern: RegExp; need: string }[] = [
   { pattern: /\b(eating disorder|anorexia|bulimia|binge eating)/i, need: 'Eating disorders' },
   { pattern: /\bgambl/i, need: 'Gambling' },
 ];
+
+/** Words that turn a clause into a "no" ("no wilderness", "does not need EMDR"). */
+const NEGATION = /\b(no|not|never|none|nothing|without|avoid|against|dont|doesnt|isnt|wont|cant|refuses?|hates?|dislikes?|rather not|instead of|other than|except|anything but)\b|n't\b/i;
+
+/** The family's preferences as clauses, keeping only the ones that ask for something. */
+export function wantedClauses(preferences: string): string[] {
+  return preferences
+    .split(/[.,;:!?\n]+/)
+    .map((clause) => clause.trim())
+    .filter((clause) => clause && !NEGATION.test(clause.replace(/’/g, "'")));
+}
 
 const GENDER_SPECIFIC = /\b(gender[\s-]?specific|single[\s-]?gender|same[\s-]?gender|men[\s-]?only|male[\s-]?only|women[\s-]?only|female[\s-]?only|all[\s-]?(male|men|female|women))\b/i;
 
@@ -172,10 +175,13 @@ export function matchFromAssessment(input: AssessmentMatchInput): AssessmentMatc
   }
 
   const preferences = text(answers.treatmentPreferences);
-  if (preferences && GENDER_SPECIFIC.test(preferences)) {
-    if (population === 'Men') addNeed('Men only', 'the family asked for gender-specific care');
-    else if (population === 'Women') addNeed('Women only', 'the family asked for gender-specific care');
-    else toCheck.push('The family asked for gender-specific care: choose Men only or Women only if that fits.');
+  const wanted = wantedClauses(preferences);
+  if (wanted.some((clause) => GENDER_SPECIFIC.test(clause))) {
+    toCheck.push(population === 'Men'
+      ? 'The family may want gender-specific care: add Men only if so (it hides co-ed programs).'
+      : population === 'Women'
+        ? 'The family may want gender-specific care: add Women only if so (it hides co-ed programs).'
+        : 'The family may want gender-specific care: choose Men only or Women only if that fits.');
   }
 
   // Needs from the answers.
@@ -187,7 +193,7 @@ export function matchFromAssessment(input: AssessmentMatchInput): AssessmentMatc
   const programs = Array.isArray(answers.treatmentHistory) ? answers.treatmentHistory.filter((row) => row && typeof row === 'object') : [];
   if (programs.length >= 2) addNeed('Chronic relapse', `${programs.length} programs before`);
   for (const rule of PREFERENCE_NEEDS) {
-    if (preferences && rule.pattern.test(preferences)) addNeed(rule.need, 'the family’s treatment preferences');
+    if (wanted.some((clause) => rule.pattern.test(clause))) addNeed(rule.need, 'the family’s treatment preferences');
   }
   if (/\bgambl/i.test(text(answers.primarySubstances))) addNeed('Gambling', 'named as a concern');
 
@@ -196,12 +202,17 @@ export function matchFromAssessment(input: AssessmentMatchInput): AssessmentMatc
 
   // How they pay.
   let insurance = 'Cash pay';
-  let budget = '';
   const planCarrier = (input.planCarrier || '').trim();
   const typedCarrier = text(answers.insuranceProvider);
   if (planCarrier) {
     insurance = planCarrier;
     used.push(`${planCarrier}: the plan on the case’s Benefits`);
+    if (!insuranceOptions.includes(planCarrier)) {
+      const named = carrierFromText(planCarrier, insuranceOptions);
+      toCheck.push(named
+        ? `The plan on Benefits, “${planCarrier.slice(0, 60)}”, is not one of Match’s plan names: choose ${named} if that is the plan.`
+        : `The plan on Benefits, “${planCarrier.slice(0, 60)}”, is not one of Match’s plan names, so programs may not show as in network: choose the closest plan.`);
+    }
   } else if (typedCarrier) {
     const named = carrierFromText(typedCarrier, insuranceOptions);
     if (named) {
@@ -215,9 +226,8 @@ export function matchFromAssessment(input: AssessmentMatchInput): AssessmentMatc
     toCheck.push('State Medicaid: pick the state, then its Medicaid plan.');
   }
   const budgetValue = text(answers.budgetForTreatment);
-  if (insurance === 'Cash pay' && !yes(answers.stateMedicaid) && BUDGET_TOPS[budgetValue]) {
-    budget = String(BUDGET_TOPS[budgetValue]);
-    used.push(`Budget $${BUDGET_TOPS[budgetValue].toLocaleString('en-US')}: the top of the family’s range, ${BUDGET_LABELS[budgetValue]}`);
+  if (BUDGET_LABELS[budgetValue]) {
+    toCheck.push(`The family’s budget is ${BUDGET_LABELS[budgetValue]} for the whole stay. Match’s budget is per month, so set it by hand if you use one.`);
   }
 
   // Level of care: only from the practitioner's own rating.
@@ -226,5 +236,5 @@ export function matchFromAssessment(input: AssessmentMatchInput): AssessmentMatc
   else toCheck.push('No level of care yet: rate it from the assessment for a closer match.');
 
   if (!used.length) toCheck.unshift('Nothing in the answers fills in the form on its own.');
-  return { population, needs, insurance, budget, levelOfCare, used, toCheck };
+  return { population, needs, insurance, levelOfCare, used, toCheck };
 }
