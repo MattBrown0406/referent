@@ -1161,7 +1161,7 @@ check(() => {
   assert.equal(rules.failedMark(undefined, '2026-11-21T10:00:00.000Z'), '2026-11-21T10:00:00.000Z 2026-11-21T10:00:00.000Z');
   assert.equal(rules.lastTried('2026-11-20T09:00:00.000Z'), Date.parse('2026-11-20T09:00:00.000Z'), 'an older mark: its one time');
   const api = read('src/lib/fieldy-api.ts');
-  assert.match(api, /state\.unreviewable\[id\] = failedMark\(state\.unreviewable\[id\], new Date\(\)\.toISOString\(\)\);/, 'each failure refreshes the last-tried time');
+  assert.match(api, /const at = new Date\(\)\.toISOString\(\);[^]{0,200}state\.unreviewable\[id\] = failedMark\(state\.unreviewable\[id\], at\);/, 'each failure refreshes the last-tried time');
   assert.doesNotMatch(api, /failedApart/);
 }, 'round 4: a recording that failed alone is set aside before the plan, and each failed one gets its turn');
 
@@ -1172,7 +1172,7 @@ check(() => {
   const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
   assert.match(findFn, /void reviewCameBack\(fromRecorder\.recorder, userId, blockIds\)/, 'a review that came back clears the mark');
   const api = read('src/lib/fieldy-api.ts');
-  assert.match(api, /export async function reviewCameBack[^]*if \(state\.unreviewable\[id\]\) \{ delete state\.unreviewable\[id\]; changed = true; \}[^]*return changed;/);
+  assert.match(api, /export async function reviewCameBack[^]*if \(!state\.unreviewable\[id\]\) continue;[^]*delete state\.unreviewable\[id\];\s*noteUnsent\(state, id, at, \{ unreviewable: true \}\);\s*changed = true;[^]*return changed;/, 'cleared here, and a clear kept until the server has it');
 }, 'round 4: a slow moment is not held against a recording');
 
 check(() => {
@@ -1181,7 +1181,16 @@ check(() => {
   assert.doesNotMatch(sheet, /phase === 'done' \|\| \(phase === 'review' && rows\.every/, 'Done no longer skips the check');
   const readNextFn = /async function readNext\(\) \{[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
   assert.match(readNextFn, /if \(!rows\.every\(\(row\) => rowDecided\(row, saved\)\)\) return;/, 'and readNext refuses past an undecided row');
-  assert.match(sheet, /not read in full again now/, 'held recordings: read again, not "the next"');
+  assert.match(sheet, /const nextLabel = !nextRead \|\| !nextCount \? '' : nextReadLabel\(heldCount, nextRead\.waiting, nextRead\.recorder\.noun\);/, 'held recordings: read again, not "the next"');
+  // Round 5: the button names what the read takes (up to 3, the held ones first).
+  assert.equal(rules.nextReadLabel(0, 4, 'conversation'), 'Read the next 3 conversations now');
+  assert.equal(rules.nextReadLabel(0, 1, 'conversation'), 'Read the next conversation now');
+  assert.equal(rules.nextReadLabel(2, 0, 'conversation'), 'Read the 2 conversations not read in full again now');
+  assert.equal(rules.nextReadLabel(1, 5, 'recording'), 'Read the recording not read in full again, and the next 2 recordings, now');
+  assert.equal(rules.nextReadLabel(2, 1, 'conversation'), 'Read the 2 conversations not read in full again, and the next conversation, now');
+  assert.equal(rules.nextReadLabel(3, 2, 'conversation'), 'Read the 3 conversations not read in full again now', 'three held fill the read');
+  assert.equal(rules.nextReadLabel(5, 2, 'conversation'), 'Read 3 of the 5 conversations not read in full again now');
+  assert.equal(rules.nextReadLabel(0, 0, 'conversation'), '');
   // 5. Carried urgent items come back on Find again.
   const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
   assert.match(findFn, /const carriedBefore = !read && linked && kept\.length \? linked\.carried \?\? \[\] : \[\];/);

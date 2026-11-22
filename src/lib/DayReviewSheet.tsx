@@ -51,6 +51,7 @@ import {
   readAgainLine,
   recordingsDoneOnRead,
   recordingsHeld,
+  nextReadLabel,
   RECORDINGS_PER_REVIEW,
   rowProblem,
   rowReady,
@@ -1487,10 +1488,8 @@ export default function DayReviewSheet({
   const heldCount = nextRead ? nextRead.held.length : 0;
   const nextCount = nextRead && (nextRead.waiting > 0 || heldCount > 0) && (phase === 'done' || phase === 'review') && allDecided
     ? Math.min(nextRead.waiting + heldCount, RECORDINGS_PER_REVIEW) : 0;
-  const nextLabel = !nextRead || !nextCount ? ''
-    : heldCount
-      ? `Read the ${heldCount === 1 ? nextRead.recorder.noun : `${heldCount} ${nextRead.recorder.noun}s`} not read in full again now`
-      : `Read the next ${nextCount === 1 ? nextRead.recorder.noun : `${nextCount} ${nextRead.recorder.noun}s`} now`;
+  // What the read takes, by name: the held ones first (the oldest), then the next waiting, up to RECORDINGS_PER_REVIEW.
+  const nextLabel = !nextRead || !nextCount ? '' : nextReadLabel(heldCount, nextRead.waiting, nextRead.recorder.noun);
   const nextButton = nextRead && nextCount ? (
     <TouchableOpacity accessibilityRole="button" onPress={() => { void readNext(); }} style={[styles.secondaryButton, styles.nextButton]}>
       <Text style={styles.secondaryButtonText}>{nextLabel}</Text>

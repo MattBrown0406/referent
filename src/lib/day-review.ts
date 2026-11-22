@@ -1128,6 +1128,21 @@ export function notesBesides(notes: string, blocks: BlockLike[]): string {
  */
 export const RECORDINGS_PER_REVIEW = 3;
 
+/**
+ * The "Read the next N now" button, naming what that read takes: up to
+ * `max`, the oldest first, so the ones a review held (not read in full)
+ * before the ones still waiting. '' when there is nothing to read.
+ */
+export function nextReadLabel(held: number, waiting: number, noun: string, max = RECORDINGS_PER_REVIEW): string {
+  const some = (count: number) => (count === 1 ? noun : `${count} ${noun}s`);
+  const heldTaken = Math.min(Math.max(held, 0), max);
+  const nextTaken = Math.min(Math.max(waiting, 0), max - heldTaken);
+  if (!heldTaken) return nextTaken ? `Read the next ${some(nextTaken)} now` : '';
+  if (held > heldTaken) return `Read ${heldTaken} of the ${held} ${noun}s not read in full again now`;
+  if (!nextTaken) return `Read the ${some(held)} not read in full again now`;
+  return `Read the ${some(held)} not read in full again, and the next ${some(nextTaken)}, now`;
+}
+
 export function firstRecordings<T extends { text: string; blocks: BlockLike[]; later: number }>(plan: T, max = RECORDINGS_PER_REVIEW): T {
   if (plan.blocks.length <= max) return plan;
   const blocks = plan.blocks.slice(0, max);
