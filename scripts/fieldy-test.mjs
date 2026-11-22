@@ -309,7 +309,7 @@ check(() => {
   assert.match(sheet, /if \(results\[row\.key\]\?\.saved === true\) return true;\s*if \(row\.include\) return false;\s*return switchedOffRef\.current\.has\(row\.key\) \|\| row\.found\.verified/,
     'an item is decided when saved, switched off by the practitioner, or off for a reason the app gave; one off only because it could not be checked is not');
   assert.match(sheet, /switchedOffRef\.current = new Set\(\);\s*setSaved\(\{\}\);/, 'what was switched off in an earlier review is not this one\'s');
-  assert.match(sheet, /phase === 'done' \? \(\s*<TouchableOpacity accessibilityRole="button" onPress=\{close\}/, 'the Done button asks about undecided recordings too');
+  assert.match(sheet, /phase === 'done' \? \(\s*<>\s*\{nextButton\}\s*<TouchableOpacity accessibilityRole="button" onPress=\{close\}/, 'the Done button asks about undecided recordings too');
   assert.match(sheet, /\.\.\.\(phase === 'done' \? \[\] : \[\{ text: 'Keep reviewing'/, 'with everything saved there is no "Keep reviewing" to go back to');
   assert.match(sheet, /\{ text: 'Read again next time', onPress: \(\) => finish\(holdAll\) \}/, 'an undecided item from no one recording holds them all when read again');
   assert.match(sheet, /for \(const fingerprint of before\) savedSignaturesRef\.current\.add\(fingerprint\);/, 'a recording read again knows what was saved from it');

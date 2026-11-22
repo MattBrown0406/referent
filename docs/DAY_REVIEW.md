@@ -642,3 +642,76 @@ build. Either order is safe. Until it is deployed, a round 1 function can
 still send a false `truncated` under 20 items: the phone then reads fewer
 recordings, or holds them one read longer; nothing is lost or settled
 unread. A function from before round 1 sends no `truncated` at all.
+
+### Round 3, branch `fix/day-review-round3`
+
+Four findings, all fixed:
+
+1. **A narrowed review keeps the urgent items already found.** When a review
+   of several recordings stopped at 20 and was read again with the older
+   half, what the first review had found in the recordings set aside was
+   thrown away, urgent items included ("she's not safe tonight, call her back
+   by 6" waited for another review). Now every urgent item of the first
+   review whose quote is in a recording set aside (or in none) is shown with
+   the narrowed review, unless that review found it too (`carriedUrgent`,
+   `sameFinding` in `day-review.ts`), and the review says so ("1 urgent item
+   already found in the Fieldy conversations that wait is shown here too.").
+   Each is tied to the set-aside recordings it is from: its save is
+   remembered on them, so it is not offered again when they are read, and
+   they are not this review's recordings, so they are never settled here and
+   are read in full next time. Once everything in a review is decided and
+   recordings wait (set aside, or beyond this read), the sheet offers "Read
+   the next N now": the decided recordings are marked done (written before
+   the next read looks), then the next read runs in the same opening. It
+   runs only on a tap.
+2. **Notes worded alike, one saved on each case, each go back to their own
+   case.** Round 2 gave each saved signature to the closest row, so with two
+   identical case notes ("Wants the Saturday family session.", both about
+   "Sarah", choices Miller and Chen), one saved on each, the first row took
+   both cases (and showed no case) and the second came back switched on.
+   Now saved places and rows are matched one to one (`assignSaved`): the
+   closest claims first; a row that takes a place lets go of its other
+   claims, and the signatures it took there are nobody else's. Between
+   equals, the row with fewer places left goes first, then the place fewer
+   rows want, then the first row, so the result does not depend on the
+   order. A row that alone matches two saved places is still saved with no
+   place guessed (round 1).
+3. **Cancel during a recorder read asks about that read.** The read in
+   progress is kept on its own (`inFlightRef`): while recordings are being
+   fetched, or the box is just them, Cancel closes without asking; with
+   notes typed beside them, the Discard question counts that read's
+   recordings, never the previous review's.
+4. **A read that fails no longer blocks the queue.** A read of several
+   recordings, with only the recordings in the box, that came back
+   incomplete (`max_tokens`), was turned down, or took too long (the
+   function's `timeout`, or the phone's own) is read again with the older
+   half, down to one, sharing the extra-read budget (`NARROWED_READS`) with
+   the cap narrowing; the rest wait (`failedForLength` in
+   `day-review-api.ts`; the function's error code now reaches the phone).
+   After any failed recorder read the box offers "Done with these: don't
+   read them again", with a confirm that says they are not offered again and
+   that anything not saved from them is not saved (notes typed beside them
+   stay in the box). A single recording whose review fails on its own is
+   remembered on the phone (`unreviewable` in the read state,
+   `rememberReviewFailed`): from then on it is read alone, and only when
+   nothing else is new (`failedApart`), counted with those waiting, so it
+   never holds newer recordings back; "Read the next N now" brings it up
+   after the others are decided. The existing one-day give-up clock does not
+   cover this: it is only for a recording whose summary or transcript cannot
+   be fetched from the recorder (the recorder answering with an error), and
+   never for a review that failed. A recording that fails alone is not given
+   up by itself either, so nothing is dropped unread without the
+   practitioner choosing "Done with this"; until then it keeps counting on
+   Today and in the reminder (and, like any recording not reviewed, falls out
+   of the 7-day look-back after a week).
+
+Tests: `scripts/day-review-test.mjs` (round 3 checks: the two Sarahs both
+saved, one saved, either order; carried urgent items; Cancel during a read;
+failure narrowing, "Done with these", `failedApart`), `scripts/fieldy-test.mjs`.
+
+**For Matt:** nothing new to deploy for this round: the `day-review`
+function is unchanged (the error codes it already sends, live on main too,
+are read now; the round 1 and 2 deploy above still stands); everything
+ships with the next iPhone build. Each narrowed read is one more review against the day's cap
+(at most two extra per Find). Not tried on a device: a read that fails for
+its length, and "Read the next N now".

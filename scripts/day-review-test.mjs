@@ -757,7 +757,7 @@ check(() => {
   assert.match(sheet, /const kept = linked \? blocksInNotes\(notes, linked\.blocks\) : \[\];/);
   assert.match(sheet, /linked && kept\.length \? \{ recorder: linked\.recorder, blocks: kept, everyId: linked\.everyId, skipped: linked\.skipped \} : null/);
   assert.match(sheet, /const from = read\.rowIds\.get\(row\.key\)\?\.length \? read\.rowIds\.get\(row\.key\)! : read\.everyId;/);
-  assert.match(sheet, /const recorderText = Boolean\(recorderReadRef\.current\) && !notesBesides\(notes, recorderReadRef\.current\?\.blocks \?\? \[\]\);/);
+  assert.match(sheet, /: Boolean\(recorderReadRef\.current\) && !notesBesides\(notes, recorderReadRef\.current\?\.blocks \?\? \[\]\);/);
   assert.match(sheet, /const typed = linked \? notesBesides\(notes, blocksInNotes\(notes, linked\.blocks\)\) : notes\.trim\(\);/);
   assert.doesNotMatch(sheet, /recorderReadRef\.current\??\.text/, 'the link never depends on the box being exactly the recorder text');
 }, 'editing the box, or a share landing in it, keeps the link to the recordings');
@@ -850,15 +850,15 @@ check(() => {
   const fieldyApi = read('src/lib/fieldy-api.ts');
   assert.match(fieldyApi, /state\.saved\[id\] = \[at, \.\.\.mergeFingerprints\(before, byRecording\[id\]\)\]\.join\(' '\);/);
   assert.doesNotMatch(fieldyApi, /\.slice\(0, 201\)/);
-  assert.match(fieldyApi, /const plan = firstRecordings\(reviewPlan\(read, now\.getTime\(\), texts, recorder\.name\)\);/, 'a few recordings per review');
+  assert.match(fieldyApi, /const plan = firstRecordings\(failedApart\(reviewPlan\(read, now\.getTime\(\), texts, recorder\.name\), new Set\(Object\.keys\(state\.unreviewable\)\)\)\);/, 'a few recordings per review, one that failed alone apart');
 }, 'saved fingerprints past 200: the newest are kept');
 
 check(() => {
   // The function says when it stopped; an older one says nothing and is taken as not truncated.
   assert.match(fn, /return reply\(\{ items, truncated, remaining:/);
   assert.match(api, /truncated: data\.truncated === true && items\.length > 0/, 'truncated with nothing in it is not truncated');
-  assert.match(sheet, /let answer = await requestDayReview\(text, day, key\);/);
-  assert.match(sheet, /const \{ items, truncated \} = answer;/);
+  assert.match(sheet, /answer = await requestDayReview\(text, day, key\);/);
+  assert.match(sheet, /const \{ truncated \} = answer;/);
   assert.match(sheet, /held = recordingsHeld\(blockIds, rowIds\.values\(\), truncated\);/);
   assert.match(sheet, /const done = recordingsDoneOnRead\(blockIds, rowIds\.values\(\), truncated\)\.concat\(skipped\);/);
   assert.match(sheet, /\.filter\(\(id\) => !read\.held\.includes\(id\)\)\n/, 'one held is never settled on Approve or close');
@@ -960,11 +960,13 @@ check(() => {
   assert.equal(rules.narrowedMessage(3, 1, { name: 'Fieldy', noun: 'conversation' }),
     'Your 3 Fieldy conversations held more than one review can show (20 items), so this review reads the oldest conversation on its own.');
   const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
-  assert.match(findFn, /for \(let extra = 0; answer\.truncated && extra < NARROWED_READS; extra \+= 1\) \{/, 'bounded: never a loop of model calls');
-  assert.match(findFn, /const fewer: FieldyBlock\[\] \| null = olderHalf\(fromRecorder\.blocks\);\n\s+if \(!fewer\) break;/, 'stops at one recording');
-  assert.match(findFn, /if \(fromRecorder && !notesBesides\(text, fromRecorder\.blocks\)\) \{/, 'only when the box is just the recordings');
-  assert.match(findFn, /if \(setAside\) setNotes\(text\);/, 'the box holds what was read');
-  assert.match(findFn, /if \(recorder\) parts\.push\(waitingLine\(\(read\?\.later \?\? 0\) \+ setAside, recorder\)\);/, 'those waiting are always said, beside a cap message');
+  assert.match(findFn, /for \(; answer\.truncated && extra < NARROWED_READS; extra \+= 1\) \{/, 'bounded: never a loop of model calls');
+  assert.match(findFn, /const fewer: FieldyBlock\[\] \| null = olderHalf\(fromRecorder!\.blocks\);\n\s+if \(!fewer\) break;/, 'stops at one recording');
+  assert.match(findFn, /const onlyRecordings = Boolean\(fromRecorder\) && !notesBesides\(text, fromRecorder!\.blocks\);/, 'only when the box is just the recordings');
+  assert.match(findFn, /if \(onlyRecordings\) \{\n\s+for \(; answer\.truncated/);
+  assert.match(findFn, /if \(setAside\.length\) setNotes\(text\);/, 'the box holds what was read');
+  assert.match(findFn, /if \(recorder\) parts\.push\(waitingLine\(waitingBefore \+ setAside\.length, recorder\)\);/, 'those waiting are always said, beside a cap message');
+  assert.match(findFn, /const waitingBefore = read \? read\.later \?\? 0 : linked && kept\.length \? linked\.waiting : 0;/);
   assert.doesNotMatch(sheet, /setMessage\(\(current\) => current \?\?/, 'the waiting line never gives way to another');
   assert.match(sheet, /later: read\.later \}\);/);
   // 6 calls x 4 items: the first 3 read, truncated; the oldest read alone; the 2 others and the 3 not read wait.
@@ -982,8 +984,9 @@ check(() => {
   const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
   assert.doesNotMatch(findFn, /recorderReadRef\.current = fromRecorder \? \{ \.\.\.fromRecorder, rowIds: new Map\(\), held: \[\] \} : null;/, 'never reset before the request');
   assert.match(findFn, /\? \{ \.\.\.linked, blocks: kept, held: linked\.held\.filter\(\(id\) => kept\.some\(\(block\) => block\.id === id\)\) \}/, 'kept, limited to the recordings still in the box');
-  assert.match(findFn, /recorderReadRef\.current = \{ \.\.\.first, rowIds: new Map\(\), held: \[\] \};\n\s+setRows\(\[\]\);/, 'a fresh read that failed: its recordings, and no rows of other notes');
-  assert.match(findFn, /\} catch \(error\) \{\n\s+if \(opening !== openingRef\.current\) return;\n\s+keepLink\(\);/);
+  assert.match(findFn, /recorderReadRef\.current = \{ \.\.\.\(alone \?\? first!\), rowIds: new Map\(\), held: \[\], waiting: waitingBefore \+ setAsideCount \};\n[^]*?setRows\(\[\]\);/, 'a fresh read that failed: its recordings, and no rows of other notes');
+  assert.match(findFn, /if \(\(read && first\) \|\| alone\) \{/);
+  assert.match(findFn, /if \(alone && setAside\.length\) keepLink\(alone, setAside\.length\);\n\s+else keepLink\(\);/);
   assert.match(findFn, /if \(opening === openingRef\.current\) \{ keepLink\(\); setKeyState\('missing'\); setPhase\('paste'\); \}/);
   // The Discard question says what will happen.
   assert.equal(rules.readAgainLine(2, { name: 'Fieldy', noun: 'conversation' }), '2 Fieldy conversations are read again next time.');
@@ -992,5 +995,148 @@ check(() => {
   assert.match(sheet, /const settling = read && rows\.length && phase !== 'finding' \? recordingsDone\(saved, rows\)\.length : 0;/);
   assert.doesNotMatch(sheet, /with items not saved or switched off will be read again next time/);
 }, 'a failed read never loses which recordings the rows on screen came from');
+
+// ─── Bug audit, 2026-11-21, round 3 ────────────────────────────────────────
+check(() => {
+  // Two case notes worded alike ("Wants the Saturday family session.", both
+  // about "Sarah", choices Miller and Chen), one saved on each case: both
+  // come back off, each on its own case.
+  const quote = 'both Sarahs want the Saturday family session';
+  const alike = found({ kind: 'case_note', personName: 'Sarah', summary: 'Wants the Saturday family session.', evidence: quote, regarding: 'family' });
+  const [m, c] = build(alike, alike);
+  assert.equal(m.caseId, null);
+  assert.deepEqual([...m.caseChoices].sort(), ['case-miller', 'case-sarah2']);
+  const onMiller = rules.laterSignatures(rules.chooseCase(m, 'case-miller', workspace));
+  const onChen = rules.laterSignatures(rules.chooseCase(c, 'case-sarah2', workspace));
+  const both = new Set([...onMiller, ...onChen].map(rules.signatureHash));
+  const again = rules.markSavedBefore(build(alike, alike), both, workspace);
+  assert.deepEqual(again.map((row) => row.include), [false, false], 'both saved: both off');
+  assert.deepEqual(again.map((row) => row.savedEarlier), [true, true]);
+  assert.deepEqual(again.map((row) => row.caseId).sort(), ['case-miller', 'case-sarah2'], 'each on its own case');
+  // Order independence: the saved set in either order, and the rows in either order.
+  const reversed = new Set([...onChen, ...onMiller].map(rules.signatureHash));
+  const again2 = rules.markSavedBefore(build(alike, alike), reversed, workspace);
+  assert.deepEqual(again2.map((row) => [row.include, row.caseId]), again.map((row) => [row.include, row.caseId]));
+  // Only one saved (Miller's): one row is the saved one, the other comes back on, with no case.
+  const one = new Set(onMiller.map(rules.signatureHash));
+  const single = rules.markSavedBefore(build(alike, alike), one, workspace);
+  assert.deepEqual(single.map((row) => [row.include, row.caseId, row.savedEarlier]), [[false, 'case-miller', true], [true, null, false]]);
+  // A row sure of its own case wins that case whichever comes first; the loose one takes the other.
+  const [loose] = build(alike);
+  const sureMiller = { ...loose, caseId: 'case-miller', caseUnsure: false };
+  const [x, y] = rules.markSavedBefore([loose, sureMiller], both, workspace);
+  assert.deepEqual([x.caseId, x.include, y.caseId, y.include], ['case-sarah2', false, 'case-miller', false]);
+  const [y2, x2] = rules.markSavedBefore([sureMiller, loose], both, workspace);
+  assert.deepEqual([y2.caseId, y2.include, x2.caseId, x2.include], ['case-miller', false, 'case-sarah2', false]);
+  // A row that could be either, beside a row that can only be Miller: Miller goes to the one that can only be Miller.
+  const onlyMiller = { ...loose, caseChoices: ['case-miller'] };
+  const [p, q] = rules.markSavedBefore([loose, onlyMiller], both, workspace);
+  assert.deepEqual([p.caseId, q.caseId], ['case-sarah2', 'case-miller'], 'the row with fewer places left goes first between equals');
+}, 'saved places and rows are matched one to one');
+
+check(() => {
+  // A review of 3 that stopped at 20 is read again with the oldest alone: the
+  // urgent items it already found in the 2 set aside are shown too, tied to
+  // their own recordings, never settled here.
+  const fieldy = { name: 'Fieldy', noun: 'conversation' };
+  const blocks = [
+    { id: 'c0', text: '[From Fieldy, Nov 9, 9:00 AM]\nAna asked about the packet.' },
+    { id: 'c1', text: "[From Fieldy, Nov 9, 1:00 PM]\nSarah said she's not safe tonight, call her back by 6." },
+    { id: 'c2', text: '[From Fieldy, Nov 9, 4:00 PM]\nTom wants the brochure. Ana asked about the packet.' },
+  ];
+  const loose = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const sourceOf = (item) => blocks.filter((block) => loose(block.text).includes(loose(item.evidence))).map((block) => block.id);
+  const urgent = found({ kind: 'follow_up', summary: 'Call Sarah back by 6.', evidence: "she's not safe tonight, call her back by 6", urgent: true });
+  const brochure = found({ kind: 'follow_up', summary: 'Send Tom the brochure.', evidence: 'Tom wants the brochure' });
+  const packet = found({ kind: 'case_note', summary: 'Ana asked about the packet.', evidence: 'Ana asked about the packet', urgent: true });
+  const nowhere = found({ kind: 'follow_up', summary: 'Call the detox today.', evidence: 'words in no recording', urgent: true });
+  const carried = rules.carriedUrgent([urgent, brochure, packet, nowhere], ['c1', 'c2'], sourceOf, []);
+  assert.deepEqual(carried.map((entry) => [entry.found.summary, entry.ids]), [
+    ['Call Sarah back by 6.', ['c1']],
+    ['Ana asked about the packet.', ['c2']],
+    ['Call the detox today.', ['c1', 'c2']],
+  ], 'urgent only; tied to the set-aside recordings it is in (each of them when its quote is in none)');
+  // The narrowed review found the packet note itself: not shown twice.
+  const again = rules.carriedUrgent([urgent, packet], ['c1', 'c2'], sourceOf, [{ ...packet, summary: 'Ana asked about the packet again.' }]);
+  assert.deepEqual(again.map((entry) => entry.found.summary), ['Call Sarah back by 6.'], 'one found again by the narrowed review is not carried');
+  assert.equal(rules.carriedUrgent([urgent, urgent], ['c1'], sourceOf).length, 1, 'each once');
+  assert.equal(rules.carriedUrgent([found({ ...urgent, evidence: 'Ana asked about the packet' })], ['c1'], () => ['c0']).length, 0, 'one only in a recording still read is not carried');
+  assert.equal(rules.sameFinding(urgent, { ...urgent, summary: 'Other words.' }), true, 'same quote');
+  assert.equal(rules.sameFinding(urgent, { ...urgent, evidence: 'other words', summary: 'call sarah back by 6' }), true, 'same summary');
+  assert.equal(rules.sameFinding(urgent, { ...urgent, kind: 'case_note' }), false, 'another kind is another item');
+  assert.equal(rules.carriedLine(1, fieldy), '1 urgent item already found in the Fieldy conversations that wait is shown here too.');
+  assert.equal(rules.carriedLine(0, fieldy), '');
+  // The sheet: carried rows are tied to their own recordings, which are not this read's (so never settled here).
+  const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(findFn, /carried = \[\.\.\.carried, \.\.\.carriedUrgent\(answer\.items, dropped\.map\(\(block\) => block\.id\),/);
+  assert.match(findFn, /carried = carried\.filter\(\(entry\) => !shownItems\.some\(\(item\) => sameFinding\(entry\.found, item\)\)\);/);
+  assert.match(findFn, /const rowIds = new Map\(built\.map\(\(row\) => \[row\.key, carriedIds\.get\(row\.found\) \?\? blocksFor\(row\.found\.evidence, fromRecorder!\.blocks\)/);
+  assert.match(findFn, /recorderReadRef\.current = \{ \.\.\.fromRecorder, rowIds, held, waiting: waitingBefore \+ setAside\.length \};/, 'the link is this read\'s recordings only');
+  assert.match(findFn, /\.\.\.carried\.flatMap\(\(entry\) => entry\.ids\)/, 'saves from the set-aside recordings are known again');
+  // recordingsDone only ever settles the read's own recordings.
+  assert.match(sheet, /return read\.blocks\.map\(\(block\) => block\.id\)\n\s+\.filter\(\(id\) => !read\.held\.includes\(id\)\)/);
+  // Saves: remembered on the row's own recordings.
+  assert.match(sheet, /const from = read\.rowIds\.get\(row\.key\)\?\.length \? read\.rowIds\.get\(row\.key\)! : read\.everyId;/);
+  // "Read the next N now": on a tap, once everything is decided; settled (and written) before the next read looks.
+  const readNextFn = /async function readNext\(\) \{[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(readNextFn, /await markReviewed\(read\.recorder, done\);\n\s+if \(opening !== openingRef\.current\) return;/);
+  assert.match(readNextFn, /await readRecorder\(read\.recorder, opening\);/);
+  assert.ok(readNextFn.indexOf('markReviewed') < readNextFn.indexOf('readRecorder('), 'settled first');
+  assert.match(sheet, /function markReviewed\(recorder: Recorder, ids: string\[\]\): Promise<void> \{\n\s+return markRecordingsReviewed\(/, 'written before it answers');
+  assert.match(sheet, /nextRead\.waiting > 0 && \(phase === 'done' \|\| \(phase === 'review' && rows\.every\(\(row\) => rowDecided\(row, saved\)\)\)\)/);
+}, 'a narrowed review keeps the urgent items found in the recordings it set aside');
+
+check(() => {
+  // Cancel during a recorder read asks about that read, not the review it replaces.
+  const close = /function close\(\) \{[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(close, /const live = phase === 'finding' \? inFlightRef\.current : null;/);
+  assert.match(close, /\? Boolean\(live\.recorder\) && \(!live\.blocks\.length \|\| !notesBesides\(notes, live\.blocks\)\)/, 'being fetched, or the box just them: a plain close');
+  assert.match(close, /const asked = live \? \(live\.recorder \? \{ recorder: live\.recorder, blocks: live\.blocks \} : null\) : read;/, 'the Discard line counts that read');
+  const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(findFn, /inFlightRef\.current = \{ recorder: fromRecorder\?\.recorder \?\? null, blocks: fromRecorder\?\.blocks \?\? \[\] \};/);
+  assert.match(findFn, /\} finally \{\n\s+if \(opening === openingRef\.current\) inFlightRef\.current = null;\n\s+\}/, 'cleared when this opening\'s read ends, never a later one\'s');
+  const readRecorderFn = /async function readRecorder\([^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(readRecorderFn, /inFlightRef\.current = \{ recorder, blocks: \[\] \};/);
+  assert.match(sheet, /recorderReadRef\.current = null;\n\s+inFlightRef\.current = null;/, 'a new opening forgets it');
+}, 'Cancel during a recorder read asks about that read');
+
+check(() => {
+  // A read of several that failed for its length is read again with fewer; one that fails alone can be let go and never blocks newer ones.
+  const fieldy = { name: 'Fieldy', noun: 'conversation' };
+  assert.equal(rules.narrowedMessage(3, 1, fieldy, 'failed'), 'Your 3 Fieldy conversations could not be reviewed together, so this review reads the oldest conversation on its own.');
+  assert.match(rules.failedAloneLine(fieldy), /^This Fieldy conversation could not be reviewed even on its own\. Try again later, or tap Done with this conversation/);
+  const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(findFn, /while \(!narrowed && onlyRecordings && failedForLength\(failure\) && extra < NARROWED_READS\) \{/, 'bounded, and only for a failure of length, only when the box is just the recordings');
+  assert.match(findFn, /extra \+= 1;\n\s+narrowedFor = 'failed';/, 'shares the extra-read budget with the cap narrowing');
+  assert.match(findFn, /const alone = fromRecorder && onlyRecordings && fromRecorder\.blocks\.length === 1 && failedForLength\(error\) \? fromRecorder : null;/);
+  assert.match(findFn, /if \(alone\) void rememberReviewFailed\(alone\.recorder, userId, alone\.blocks\[0\]\.id\)/);
+  assert.match(findFn, /setFailedRead\(Boolean\(recorderReadRef\.current\?\.blocks\.length\)\);/, '"Done with these" is offered after a failed recorder read');
+  const api = read('src/lib/day-review-api.ts');
+  assert.match(api, /error\.reason === 'refused' \|\| error\.code === 'incomplete' \|\| error\.code === 'timeout'/);
+  assert.match(api, /'unavailable', 'timeout'\);/, 'the phone\'s own timeout counts too');
+  assert.match(api, /throw new ReviewUnavailableError\(message, 'unavailable', code\);/, 'the function\'s code reaches the phone');
+  assert.match(fn, /failure\(502, 'incomplete'/);
+  assert.match(fn, /failure\(504, 'timeout'/);
+  assert.match(fn, /failure\(422, 'refused'/);
+  // "Done with these" after a failed read: a confirm that says they are not offered again.
+  const doneFn = /function doneWithUnread\(\) \{[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(doneFn, /ReferralFit will not offer \$\{one \? 'it' : 'them'\} again\./);
+  assert.match(doneFn, /if \(opening !== openingRef\.current \|\| recorderReadRef\.current !== read\) return;/, 'a stale confirm does nothing');
+  assert.match(doneFn, /markReviewed\(recorder, blocks\.map\(\(block\) => block\.id\)\);/);
+  // One that failed alone waits until nothing else is new, then is read alone.
+  const plan = (ids) => ({ text: ids.join('\n\n'), blocks: ids.map((id) => ({ id, text: id })), skipped: [], later: 1 });
+  const apart = rules.failedApart(plan(['bad', 'b', 'c']), new Set(['bad']));
+  assert.deepEqual(apart.blocks.map((block) => block.id), ['b', 'c'], 'never blocks newer ones');
+  assert.equal(apart.later, 2, 'and is counted as waiting');
+  assert.equal(apart.text, 'b\n\nc');
+  const alone = rules.failedApart(plan(['bad', 'bad2']), new Set(['bad', 'bad2']));
+  assert.deepEqual(alone.blocks.map((block) => block.id), ['bad'], 'nothing else new: the oldest is read alone');
+  assert.equal(alone.later, 2);
+  const none = plan(['a', 'b']);
+  assert.equal(rules.failedApart(none, new Set()), none);
+  const fieldyApi = read('src/lib/fieldy-api.ts');
+  assert.match(fieldyApi, /delete state\.unreviewable\[id\];/, 'let go once it is reviewed');
+  assert.match(fieldyApi, /unreviewable: times\(data\.unreviewable\),/, 'kept on the phone');
+}, 'a read that fails for its length is read again with fewer, and one bad recording can be let go');
 
 console.log(`day-review-test: ${checks} checks passed`);

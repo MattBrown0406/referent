@@ -61,7 +61,7 @@ import {
   type TranscriptPlan,
 } from './fieldy';
 
-import { firstRecordings, mergeFingerprints } from './day-review';
+import { failedApart, firstRecordings, mergeFingerprints } from './day-review';
 
 export { FieldyError, FIELDY, PLAUD, RECORDERS, type Recorder, type RecorderId } from './fieldy';
 
@@ -112,8 +112,12 @@ const LOOK_BACK_MS = 7 * 24 * 60 * 60 * 1000;
 // since when; one that fails again a day later is taken as having no text.
 // `saved`: per recording, when, and the fingerprints of items saved from it
 // (src/lib/day-review.ts signatureHash), so a recording read again does not
-// offer them twice.
-type ReadState = { floor: string; reviewed: Record<string, string>; failing: Record<string, string>; saved: Record<string, string> };
+// offer them twice. `unreviewable`: recordings whose review failed when
+// read on their own (incomplete, turned down, too slow), and since when:
+// read alone, only when nothing else is new (day-review.ts failedApart).
+type ReadState = {
+  floor: string; reviewed: Record<string, string>; failing: Record<string, string>; saved: Record<string, string>; unreviewable: Record<string, string>;
+};
 
 const readKey = (recorder: Recorder, userId: string) => `referralfit.${recorder.id}.read.v1.${clean(userId)}`;
 
@@ -138,6 +142,7 @@ async function readState(recorder: Recorder, userId: string): Promise<ReadState 
       reviewed: times(data.reviewed),
       failing: times(data.failing),
       saved,
+      unreviewable: times(data.unreviewable),
     };
   } catch {
     return null;
@@ -150,10 +155,11 @@ async function writeState(recorder: Recorder, userId: string, value: ReadState):
     .filter(([, at]) => Date.parse(at.split(' ')[0]) >= cutoff).slice(-limit));
   await SecureStore.setItemAsync(readKey(recorder, userId), JSON.stringify({
     floor: value.floor, reviewed: recent(value.reviewed), failing: recent(value.failing), saved: recent(value.saved, 200),
+    unreviewable: recent(value.unreviewable, 200),
   }), KEYCHAIN);
 }
 
-const emptyState = (now = new Date()): ReadState => ({ floor: startOfToday(now), reviewed: {}, failing: {}, saved: {} });
+const emptyState = (now = new Date()): ReadState => ({ floor: startOfToday(now), reviewed: {}, failing: {}, saved: {}, unreviewable: {} });
 
 // Accounts deleted in this session: what was reviewed is never written for them again.
 const forgotten = new Set<string>();
@@ -628,8 +634,9 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
       for (const id of recovered) delete current.failing[id];
     }).catch(() => undefined);
   }
-  // A few recordings per review, so it rarely finds more than it can list.
-  const plan = firstRecordings(reviewPlan(read, now.getTime(), texts, recorder.name));
+  // A few recordings per review, so it rarely finds more than it can list;
+  // one whose review failed on its own waits until nothing else is new.
+  const plan = firstRecordings(failedApart(reviewPlan(read, now.getTime(), texts, recorder.name), new Set(Object.keys(state.unreviewable))));
   return { ...plan, later: plan.later + (fresh.length - read.length), recorder };
 }
 
@@ -649,9 +656,22 @@ export async function markRecordingsReviewed(recorder: Recorder, userId: string,
       state.reviewed[id] = at;
       delete state.failing[id];
       delete state.saved[id];
+      delete state.unreviewable[id];
     }
   });
   return marked;
+}
+
+/**
+ * This recording's review failed when it was read on its own (incomplete,
+ * turned down, too slow): from now on it is read alone, and only when
+ * nothing else is new, so it never holds newer recordings back. Kept until
+ * it is marked reviewed ("Done with this", or a review of it settles).
+ */
+export async function rememberReviewFailed(recorder: Recorder, userId: string, id: string): Promise<void> {
+  await changeState(recorder, userId, (state) => {
+    if (!state.unreviewable[id]) state.unreviewable[id] = new Date().toISOString();
+  });
 }
 
 /** Fingerprints of items saved from these recordings, kept until each is reviewed. */
