@@ -126,12 +126,16 @@ export function AiKeySetup({ userId, saveLabel, onSaved, onCancel, cancelLabel }
       <Text style={styles.body}>To get a key, sign in at console.anthropic.com and create one under API keys, then paste it here.</Text>
       <Text style={styles.label}>YOUR ANTHROPIC API KEY</Text>
       <TextInput
-        style={styles.input}
+        style={[styles.input, KEY_IN_BROWSER ? (WEB_MASK as object) : null]}
         value={value}
         onChangeText={(text) => { setValue(text); setProblem(''); }}
         placeholder="sk-ant-…"
         placeholderTextColor="#99A6A1"
-        secureTextEntry
+        // In a browser a password field is offered to the password manager
+        // (which would save the key as this site's password, or fill the
+        // sign-in password here): a masked plain field instead.
+        secureTextEntry={!KEY_IN_BROWSER}
+        autoComplete="off"
         autoCapitalize="none"
         autoCorrect={false}
         spellCheck={false}
@@ -239,6 +243,9 @@ export function AiDraftsCard({ userId, visible }: { userId: string; visible: boo
     </View>
   );
 }
+
+// Masks the key as it is typed in a browser without making it a password field.
+const WEB_MASK = { WebkitTextSecurity: 'disc' };
 
 const styles = StyleSheet.create({
   card: { backgroundColor: COLORS.white, borderRadius: 16, borderWidth: 1, borderColor: COLORS.line, padding: 16, marginBottom: 14 },

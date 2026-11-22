@@ -69,10 +69,18 @@ assert.match(supabase, /const LOCAL_URL = DEV_BUILD \? process\.env\.EXPO_PUBLIC
 // Hosting: one page app, never framed, not indexed.
 const vercel = JSON.parse(read('vercel.json'));
 assert.equal(vercel.outputDirectory, 'dist');
-assert.deepEqual(vercel.rewrites, [{ source: '/(.*)', destination: '/index.html' }]);
+// Every page is the app, but a missing bundle file is a 404, never the page cached for a year.
+assert.deepEqual(vercel.rewrites, [{ source: '/((?!_expo/|assets/).*)', destination: '/index.html' }]);
 const headers = Object.fromEntries(vercel.headers.find((rule) => rule.source === '/(.*)').headers.map((h) => [h.key, h.value]));
 assert.equal(headers['X-Frame-Options'], 'DENY');
 assert.match(headers['Content-Security-Policy'], /frame-ancestors 'none'/);
+// Only the app's own scripts run, and it talks only to its own servers (the Anthropic key and the Fieldy sign-in live in this browser).
+assert.match(headers['Content-Security-Policy'], /script-src 'self';/);
+assert.match(headers['Content-Security-Policy'], /connect-src 'self' https:\/\/ovfafffvcpaahktvlsdm\.supabase\.co wss:\/\/ovfafffvcpaahktvlsdm\.supabase\.co https:\/\/api\.fieldy\.ai/);
+const keyField = read('src/lib/AiDraftKey.tsx');
+assert.match(keyField, /secureTextEntry=\{!KEY_IN_BROWSER\}\s*autoComplete="off"/, 'the key field in a browser is never a password field');
+assert.match(read('src/lib/web-share.ts'), /export async function copyForSure/, 'a copy that did not happen is never reported as copied');
+assert.match(read('src/lib/FamilyAssessmentSheet.tsx'), /sent\.link && Platform\.OS === 'web'\) \{\s*setWebLink/, 'the family link is shown in the browser, copied on its own tap');
 assert.equal(headers['Referrer-Policy'], 'no-referrer');
 assert.match(headers['X-Robots-Tag'], /noindex/);
 assert.equal(JSON.parse(read('app.json')).expo.web.output, 'single');

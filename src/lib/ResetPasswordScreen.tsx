@@ -89,6 +89,8 @@ export default function ResetPasswordScreen({ email, onDone }: Props) {
                   secureTextEntry
                   autoCapitalize="none"
                   textContentType="newPassword"
+                  autoComplete="new-password"
+                  accessibilityLabel="New password"
                   style={styles.input}
                 />
                 <Text style={styles.fieldLabel}>CONFIRM NEW PASSWORD</Text>
@@ -100,6 +102,8 @@ export default function ResetPasswordScreen({ email, onDone }: Props) {
                   secureTextEntry
                   autoCapitalize="none"
                   textContentType="newPassword"
+                  autoComplete="new-password"
+                  accessibilityLabel="Type the new password again"
                   onSubmitEditing={save}
                   style={styles.input}
                 />

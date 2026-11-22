@@ -275,6 +275,8 @@ export default function LoginScreen({ onSignedIn }: Props) {
               placeholderTextColor="#99A6A1"
               autoCapitalize="words"
               textContentType="organizationName"
+              autoComplete="organization"
+              accessibilityLabel="Practice name"
               maxLength={120}
               style={styles.input}
             />
@@ -286,6 +288,8 @@ export default function LoginScreen({ onSignedIn }: Props) {
               placeholderTextColor="#99A6A1"
               autoCapitalize="words"
               textContentType="name"
+              autoComplete="name"
+              accessibilityLabel="Your name"
               maxLength={80}
               style={styles.input}
             />
@@ -302,6 +306,8 @@ export default function LoginScreen({ onSignedIn }: Props) {
           autoCapitalize="none"
           autoCorrect={false}
           textContentType="emailAddress"
+              autoComplete="email"
+              accessibilityLabel="Email"
           onSubmitEditing={mode === 'forgot' ? sendReset : undefined}
           style={styles.input}
         />
@@ -317,6 +323,8 @@ export default function LoginScreen({ onSignedIn }: Props) {
               secureTextEntry
               autoCapitalize="none"
               textContentType={mode === 'signUp' ? 'newPassword' : 'password'}
+              autoComplete={mode === 'signUp' ? 'new-password' : 'current-password'}
+              accessibilityLabel="Password"
               onSubmitEditing={mode === 'signIn' ? signIn : undefined}
               style={styles.input}
             />
@@ -334,6 +342,8 @@ export default function LoginScreen({ onSignedIn }: Props) {
               secureTextEntry
               autoCapitalize="none"
               textContentType="newPassword"
+              autoComplete="new-password"
+              accessibilityLabel="Type the password again"
               onSubmitEditing={signUp}
               style={styles.input}
             />

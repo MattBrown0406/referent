@@ -21,9 +21,45 @@ async function webShare(content: ShareContent): Promise<ShareAction> {
     }
   }
   const text = [message, url && !message.includes(url) ? url : ''].filter(Boolean).join('\n\n');
-  if (!(await Clipboard.setStringAsync(text))) throw new Error('Could not copy to the clipboard');
-  Alert.alert('Copied', 'It is on your clipboard. Paste it into an email or a message.');
+  if (await copyForSure(text)) {
+    Alert.alert('Copied', 'It is on your clipboard. Paste it into an email or a message.');
+  } else {
+    // Never "Copied" when it was not: show the text to select and copy by hand.
+    Alert.alert('Copy this', text);
+  }
   return { action: Share.sharedAction };
+}
+
+/**
+ * Copies and says whether it really did. expo-clipboard's web fallback
+ * reports success even when the browser refused the copy (after a wait,
+ * outside the tap), so the result of each step is checked here.
+ */
+export async function copyForSure(text: string): Promise<boolean> {
+  const nav = typeof navigator === 'undefined' ? undefined : navigator as Navigator & { clipboard?: { writeText?: (value: string) => Promise<void> } };
+  if (nav?.clipboard?.writeText) {
+    try {
+      await nav.clipboard.writeText(text);
+      return true;
+    } catch { /* refused: try the older way */ }
+  }
+  if (typeof document === 'undefined') return Clipboard.setStringAsync(text).catch(() => false);
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.opacity = '0';
+  document.body.appendChild(area);
+  area.select();
+  let copied = false;
+  try {
+    copied = document.execCommand('copy');
+  } catch {
+    copied = false;
+  } finally {
+    document.body.removeChild(area);
+  }
+  return copied;
 }
 
 let installed = false;

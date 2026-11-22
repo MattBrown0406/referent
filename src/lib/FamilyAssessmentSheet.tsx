@@ -29,6 +29,7 @@ import * as Clipboard from 'expo-clipboard';
 import { AssistUnavailableError, requestCardReading, requestLevelSuggestion } from './ai-assist-api';
 import { cardSides, type CardReading } from './card-reading';
 import { assessmentNames, caseBriefText, shareBriefProblem, type BriefInput } from './case-brief';
+import { copyForSure } from './web-share';
 import {
   answerSections,
   assessmentAlerts,
@@ -110,6 +111,11 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
   const [hasKey, setHasKey] = useState(false);
   // An earlier assessment the practitioner opened (the newest is shown otherwise).
   const [shownId, setShownId] = useState<string | null>(null);
+  // In a browser: the link just made, shown with its own Copy and Share
+  // buttons. Safari allows the share sheet and the clipboard only during a
+  // tap, never after the wait for the server, so the web never shares or
+  // copies on the tap that made the link.
+  const [webLink, setWebLink] = useState<string | null>(null);
   const mountedRef = useRef(true);
   // One action at a time, even with two quick taps before a re-render.
   const busyRef = useRef(false);
@@ -171,7 +177,10 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
     try {
       const sent = await sendFamilyAssessment(caseId, who, address, how === 'email');
       setShownId(null);
-      if (how === 'share' && sent.link) {
+      if (how === 'share' && sent.link && Platform.OS === 'web') {
+        setWebLink(linkMessage(practiceName, sent.link));
+        setMessage({ ok: true, text: 'The new link is below. Copy it or share it. It works for 30 days; only the ten newest links work.' });
+      } else if (how === 'share' && sent.link) {
         const shared = await Share.share({ message: linkMessage(practiceName, sent.link) });
         setMessage(shared?.action === Share.dismissedAction
           ? { ok: true, text: 'Not sent. The new link was made anyway; only the ten newest links work.' }
@@ -367,6 +376,29 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
     </View>
   );
 
+  async function copyWebLink() {
+    if (!webLink) return;
+    try {
+      if (!(await copyForSure(webLink))) throw new Error('not copied');
+      setMessage({ ok: true, text: 'Link copied. Paste it into a text or an email to the family.' });
+    } catch {
+      setMessage({ ok: false, text: 'This browser did not copy it. Select the link in the box and copy it.' });
+    }
+  }
+
+  const webLinkCard = webLink ? (
+    <View style={styles.card}>
+      <Text style={styles.cardTitle}>The family’s link</Text>
+      <TextInput value={webLink} editable={false} multiline selectTextOnFocus accessibilityLabel="The message with the family's link" style={[styles.input, styles.briefInput, { minHeight: 90 }]} />
+      <TouchableOpacity accessibilityRole="button" onPress={() => { void copyWebLink(); }} style={styles.primaryButton}>
+        <Text style={styles.primaryButtonText}>Copy the link</Text>
+      </TouchableOpacity>
+      <TouchableOpacity accessibilityRole="button" onPress={() => { void Share.share({ message: webLink }).catch(() => undefined); }} style={styles.secondaryButton}>
+        <Text style={styles.secondaryButtonText}>Share the link</Text>
+      </TouchableOpacity>
+    </View>
+  ) : null;
+
   return (
     <SafeAreaView style={styles.page}>
       <View style={styles.header}>
@@ -390,6 +422,8 @@ export default function FamilyAssessmentSheet({ caseId, userId, recipient, onClo
               <TouchableOpacity accessibilityRole="button" onPress={() => { void load(); }} style={styles.secondaryButton}><Text style={styles.secondaryButtonText}>Try again</Text></TouchableOpacity>
             </View>
           ) : null}
+
+          {webLinkCard}
 
           {list && current ? (
             <View style={styles.card}>
