@@ -119,7 +119,10 @@ const PREFERENCE_NEEDS: { pattern: RegExp; need: string }[] = [
 ];
 
 /** Words that turn a clause into a "no" ("no wilderness", "does not need EMDR"). */
-const NEGATION = /\b(no|non|not|never|none|nothing|without|avoid|against|dont|doesnt|isnt|wont|cant|cannot|refuses?|hates?|dislikes?|rather not|instead of|other than|except)\b|n't\b/i;
+const NEGATION = /\b(no|not|never|none|nothing|without|avoid(s|ed|ing)?|against|dont|doesnt|isnt|wont|cant|cannot|refus(e|es|ed|ing)|hat(e|es|ed|ing)|dislik(e|es|ed|ing)|rather not|instead of|other than|except)\b|n't\b|\bnon[\s-]?(faith|spiritual|religious|christian|denominational\s+only|12[\s-]?step|wilderness|outdoor|equine|clinical)/i;
+
+/** Everyday words that start with "non" and mean yes: "non-denominational", "non-negotiable". */
+const NON_YES = /\bnon[\s-]?(denominational|negotiable|profit|judg\w*)/gi;
 
 /** The family's preferences as clauses, keeping only the ones that ask for something. */
 export function wantedClauses(preferences: string): string[] {
@@ -127,7 +130,8 @@ export function wantedClauses(preferences: string): string[] {
     // "Anything but X" is a no to X; then each sentence, and each side of a
     // "but", stands alone (never split on "and": "doesn't need EMDR and DBT").
     .replace(/\banything but\b/gi, 'not')
-    .split(/[.,;:!?\n]+|\b(?:but|though|although|however|whereas)\b/i)
+    .replace(NON_YES, (word) => word.replace(/^non[\s-]?/i, ''))
+    .split(/[.,;:!?\n]+|\s[-–—]\s|[–—]|\b(?:but|though|although|however|whereas)\b/i)
     .map((clause) => clause.trim())
     .filter((clause) => clause && !NEGATION.test(clause.replace(/’/g, "'")));
 }

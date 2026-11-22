@@ -10083,7 +10083,13 @@ export default function App() {
                 <View style={styles.cardReadNotice} accessibilityRole="summary">
                   <Text style={styles.cardReadTitle}>Read from the card: check each field before saving.</Text>
                   <Text style={styles.cardReadText}>
-                    {benefitsForm.fromCard.filled.length ? `Filled in: ${benefitsForm.fromCard.filled.join(', ')}.` : benefitsForm.fromCard.differences.length ? 'Nothing was filled in: these fields already had something.' : 'The card matches what this case already has.'}
+                    {benefitsForm.fromCard.filled.length
+                      ? `Filled in: ${benefitsForm.fromCard.filled.join(', ')}.`
+                      : benefitsForm.fromCard.differences.length
+                        ? 'Nothing was filled in: these fields already had something.'
+                        : benefitsForm.fromCard.cardCarrier && benefitsForm.fromCard.cardCarrier !== benefitsForm.carrier
+                          ? 'Nothing was filled in: the card’s insurer is not one of the app’s carrier names. Choose the carrier below.'
+                          : 'The card matches what this case already has.'}
                   </Text>
                   {benefitsForm.fromCard.cardCarrier && benefitsForm.fromCard.cardCarrier !== benefitsForm.carrier && !benefitsForm.fromCard.differences.some((item) => item.read === benefitsForm.fromCard?.cardCarrier) ? (
                     <Text style={styles.cardReadText}>The card says “{benefitsForm.fromCard.cardCarrier}”.</Text>

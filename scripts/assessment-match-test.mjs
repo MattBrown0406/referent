@@ -77,6 +77,20 @@ check('a preference the family says no to is never added', () => {
   assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'Faith based but no wilderness' } }).needs, ['Faith based']);
   assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'Not sure but she did well with EMDR' } }).needs, ['EMDR']);
   assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'He doesn’t need EMDR and DBT' } }).needs, []);
+  // "non" words that mean yes keep the want.
+  for (const [words, needs] of [
+    ['A non-denominational Christian program', ['Faith based']],
+    ['Non denominational faith program', ['Faith based']],
+    ['Faith based is non-negotiable', ['Faith based']],
+    ['EMDR is non negotiable for us', ['EMDR']],
+    ['Non-judgmental staff and EMDR', ['EMDR']],
+  ]) assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: words } }).needs, needs, words);
+  // A dash separates; verb endings of a no still say no.
+  assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'Trauma - no MAT' } }).needs, ['Trauma']);
+  assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'Equine therapy—no faith' } }).needs, ['Equine']);
+  assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'Avoiding wilderness; EMDR yes' } }).needs, ['EMDR']);
+  assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'Refused wilderness before. Wants EMDR' } }).needs, ['EMDR']);
+  assert.deepEqual(matchFromAssessment({ ...base, answers: { treatmentPreferences: 'A family-run, trauma-informed program' } }).needs, ['Trauma']);
 });
 
 check('needs come from plain answers and are never MAT', () => {
