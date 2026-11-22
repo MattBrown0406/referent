@@ -84,10 +84,10 @@ export function rotationId(): string {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/** This tab-only sign-in's line is now at `gen`; notes older than two weeks go. */
-export function noteTabRotation(line: string, gen: string): void {
+/** This tab-only sign-in's line is now at `gen`; notes older than two weeks go. False when it could not be noted. */
+export function noteTabRotation(line: string, gen: string): boolean {
   const store = browserStore('local');
-  if (!store || !line) return;
+  if (!store || !line) return false;
   try {
     const cutoff = Date.now() - ROTATION_KEEP_MS;
     const old: string[] = [];
@@ -101,7 +101,10 @@ export function noteTabRotation(line: string, gen: string): void {
     }
     for (const name of old) store.removeItem(name);
     store.setItem(`${ROTATION_PREFIX}${line}`, JSON.stringify({ gen, at: Date.now() }));
-  } catch { /* storage refused: a duplicated tab is then not caught */ }
+    return true;
+  } catch {
+    return false; // storage refused: a duplicated tab is then not caught
+  }
 }
 
 /** Another tab with a copy of this tab-only sign-in has rotated it since: this copy no longer works. */

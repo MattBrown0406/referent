@@ -596,8 +596,8 @@ check(() => {
     delete globalThis.sessionStorage;
   }
   assert.match(api, /if \(token\?\.scope === 'tab' && tabCopyStale\(token\.line, token\.gen\)\) \{\s*tabRemove\(tokenKey\(recorder, userId\)\);\s*return null;/, 'a stale copy is dropped (connect again), never sent');
-  assert.match(api, /const tab = scope === 'tab' \? \{ line: kept\.line \|\| rotationId\(\), gen: rotationId\(\) \} : null;/, 'a new generation at every write');
-  assert.match(api, /if \(tab\) noteTabRotation\(tab\.line, tab\.gen\);/);
+  assert.match(api, /const gen = rotationId\(\);\s*return noteTabRotation\(line, gen\) \? \{ line, gen \} : \{ line, gen: kept\.gen \|\| gen \};/, 'a new generation at every write, noted before the token is kept; a note that fails keeps the noted generation');
+  assert.doesNotMatch(api, /if \(tab\) noteTabRotation\(tab\.line, tab\.gen\);/, 'never noted after the token (a failed note would make the fresh token look stale)');
   // Round 5, A: a refresh on its way at sign-out never writes its rotated token back.
   assert.match(api, /if \(signedOut\.has\(name\)\) \{\s*revokeInBackground\(recorder, value\.refreshToken\);\s*throw new FieldyError/, 'refused, and the rotated token revoked');
   assert.match(api, /\/\/ A refresh on its way in this tab never writes its rotated token back\.\s*signedOut\.add\(item\.name\);/);

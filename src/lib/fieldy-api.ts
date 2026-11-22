@@ -197,8 +197,15 @@ async function writeToken(recorder: Recorder, userId: string, value: Token): Pro
       revokeInBackground(recorder, value.refreshToken);
       throw new FieldyError(`Connect ${recorder.name} first.`, 'disconnected');
     }
-    // A tab-only sign-in: a new generation at every write, noted for the other tabs.
-    const tab = scope === 'tab' ? { line: kept.line || rotationId(), gen: rotationId() } : null;
+    // A tab-only sign-in: a new generation at every write, noted for the other
+    // tabs BEFORE the token is kept. When the note cannot be written, the copy
+    // keeps the generation already noted, so this tab never mistakes its own
+    // fresh token for a duplicated tab's stale copy.
+    const tab = scope === 'tab' ? (() => {
+      const line = kept.line || rotationId();
+      const gen = rotationId();
+      return noteTabRotation(line, gen) ? { line, gen } : { line, gen: kept.gen || gen };
+    })() : null;
     const record = tab ? { ...kept, ...tab } : { ...kept, line: undefined, gen: undefined };
     // Once more on a failure: a rotated refresh token that is not kept would end the connection.
     try {
@@ -206,7 +213,6 @@ async function writeToken(recorder: Recorder, userId: string, value: Token): Pro
     } catch {
       browserWrite(name, JSON.stringify(record), scope ?? 'browser');
     }
-    if (tab) noteTabRotation(tab.line, tab.gen);
     return;
   }
   // Once more on a failure: a rotated refresh token that is not kept would end the connection.

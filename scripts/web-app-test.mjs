@@ -76,7 +76,7 @@ assert.equal(headers['X-Frame-Options'], 'DENY');
 assert.match(headers['Content-Security-Policy'], /frame-ancestors 'none'/);
 // Only the app's own scripts run, and it talks only to its own servers (the Anthropic key and the Fieldy sign-in live in this browser).
 assert.match(headers['Content-Security-Policy'], /script-src 'self';/);
-assert.match(headers['Content-Security-Policy'], /connect-src 'self' https:\/\/ovfafffvcpaahktvlsdm\.supabase\.co wss:\/\/ovfafffvcpaahktvlsdm\.supabase\.co https:\/\/api\.fieldy\.ai/);
+assert.match(headers['Content-Security-Policy'], /connect-src 'self' blob: data: https:\/\/ovfafffvcpaahktvlsdm\.supabase\.co wss:\/\/ovfafffvcpaahktvlsdm\.supabase\.co https:\/\/api\.fieldy\.ai/);
 const keyField = read('src/lib/AiDraftKey.tsx');
 assert.match(keyField, /secureTextEntry=\{!KEY_IN_BROWSER\}\s*autoComplete="off"/, 'the key field in a browser is never a password field');
 assert.match(read('src/lib/web-share.ts'), /export async function copyForSure/, 'a copy that did not happen is never reported as copied');
