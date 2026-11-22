@@ -4,6 +4,8 @@ import { ActivityIndicator, Alert, StyleSheet, Text, TextInput, TouchableOpacity
 import { looksLikeAnthropicKey, maskAnthropicKey, normalizeAnthropicKey } from './outreach';
 import {
   aiKeysSupported,
+  browserKeyScope,
+  KEY_IN_BROWSER,
   DraftUnavailableError,
   getAnthropicKey,
   removeAnthropicKey,
@@ -44,7 +46,9 @@ export function AiKeyDisclosure() {
       <Text style={styles.body}>For each draft, ReferralFit sends Anthropic only:</Text>
       {SHARED_WITH_ANTHROPIC.map((line) => <Text key={line} style={styles.bullet}>•  {line}</Text>)}
       <Text style={styles.body}>
-        Never phone numbers, email addresses, last names, case titles, case notes, or documents. Anthropic does not train its models on API data. Your key stays in this phone’s keychain; ReferralFit’s server passes it to Anthropic with each draft and never stores it.
+        Never phone numbers, email addresses, last names, case titles, case notes, or documents. Anthropic does not train its models on API data. {KEY_IN_BROWSER
+          ? 'Your key stays in this browser, for this account only, and is removed when you sign out. Anything else running in this browser (such as an extension you installed) could read it, so use a browser you trust. ReferralFit’s server passes it to Anthropic with each draft and never stores it.'
+          : 'Your key stays in this phone’s keychain; ReferralFit’s server passes it to Anthropic with each draft and never stores it.'}
       </Text>
       <Text style={styles.body}>
         If your practice needs a business associate agreement for this, set it up with Anthropic on your own account.
@@ -66,6 +70,8 @@ export function AiKeySetup({ userId, saveLabel, onSaved, onCancel, cancelLabel }
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState('');
+  // In a browser: keep the key only until this tab closes (a shared computer).
+  const [tabOnly, setTabOnly] = useState(false);
   // Cancel (or closing the sheet) while the key is being checked means no:
   // the key is not saved and nothing is drafted.
   const abandonedRef = useRef(false);
@@ -73,7 +79,7 @@ export function AiKeySetup({ userId, saveLabel, onSaved, onCancel, cancelLabel }
   useEffect(() => () => { abandonedRef.current = true; }, []);
 
   if (!aiKeysSupported) {
-    return <Text style={styles.body}>AI drafts use your phone’s keychain, so they are set up in the iPhone app.</Text>;
+    return <Text style={styles.body}>AI drafts are not available here.</Text>;
   }
 
   async function save() {
@@ -91,17 +97,18 @@ export function AiKeySetup({ userId, saveLabel, onSaved, onCancel, cancelLabel }
       await verifyAnthropicKey(apiKey);
       if (abandonedRef.current) return;
       const previous = await getAnthropicKey(userId);
-      await saveAnthropicKey(userId, apiKey);
+      const previousScope = browserKeyScope(userId);
+      await saveAnthropicKey(userId, apiKey, { tabOnly });
       if (abandonedRef.current) {
-        // Cancelled while the keychain write was in flight: put back what was there.
-        if (previous) await saveAnthropicKey(userId, previous).catch(() => undefined);
+        // Cancelled while the write was in flight: put back what was there.
+        if (previous) await saveAnthropicKey(userId, previous, { tabOnly: previousScope === 'tab' }).catch(() => undefined);
         else await removeAnthropicKey(userId);
         return;
       }
       setValue('');
       onSaved(apiKey);
     } catch (error) {
-      if (!abandonedRef.current) setProblem(error instanceof DraftUnavailableError ? error.message : 'The key could not be saved on this phone. Try again.');
+      if (!abandonedRef.current) setProblem(error instanceof DraftUnavailableError || (KEY_IN_BROWSER && error instanceof Error) ? error.message : 'The key could not be saved on this phone. Try again.');
     } finally {
       savingRef.current = false;
       if (!abandonedRef.current) setBusy(false);
@@ -133,6 +140,18 @@ export function AiKeySetup({ userId, saveLabel, onSaved, onCancel, cancelLabel }
         accessibilityLabel="Your Anthropic API key"
       />
       {problem ? <Text style={styles.problem}>{problem}</Text> : null}
+      {KEY_IN_BROWSER ? (
+        <TouchableOpacity
+          accessibilityRole="checkbox"
+          accessibilityState={{ checked: tabOnly }}
+          accessibilityLabel="Keep the key only until I close this tab"
+          onPress={() => setTabOnly((current) => !current)}
+          style={styles.checkRow}
+        >
+          <View style={[styles.checkBox, tabOnly && styles.checkBoxOn]}>{tabOnly ? <Text style={styles.checkMark}>✓</Text> : null}</View>
+          <Text style={styles.checkText}>Keep it only until I close this tab (for a shared computer)</Text>
+        </TouchableOpacity>
+      ) : null}
       <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => { void save(); }} style={[styles.primaryButton, busy && styles.busy]}>
         {busy ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.primaryButtonText}>{saveLabel}</Text>}
       </TouchableOpacity>
@@ -145,7 +164,7 @@ export function AiKeySetup({ userId, saveLabel, onSaved, onCancel, cancelLabel }
   );
 }
 
-// Workspace → AI drafts: shows whether a key is saved on this phone, and
+// Workspace → AI drafts: shows whether a key is saved on this phone (or in this browser), and
 // lets the user add, replace, or remove it.
 export function AiDraftsCard({ userId, visible }: { userId: string; visible: boolean }) {
   const [savedKey, setSavedKey] = useState<string | null>(null);
@@ -165,7 +184,7 @@ export function AiDraftsCard({ userId, visible }: { userId: string; visible: boo
   }, [visible, userId]);
 
   function confirmRemove() {
-    Alert.alert('Remove your API key?', 'AI drafts stop on this phone until you add a key again. Plain drafts and sending still work.', [
+    Alert.alert('Remove your API key?', `AI drafts stop ${KEY_IN_BROWSER ? 'in this browser' : 'on this phone'} until you add a key again. Plain drafts and sending still work.`, [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Remove',
@@ -190,7 +209,10 @@ export function AiDraftsCard({ userId, visible }: { userId: string; visible: boo
         />
       ) : savedKey ? (
         <>
-          <Text style={styles.body}>Connected on this phone with {maskAnthropicKey(savedKey)}. Follow-up drafts are written by Claude on your Anthropic account.</Text>
+          <Text style={styles.body}>
+            Connected {KEY_IN_BROWSER ? (browserKeyScope(userId) === 'tab' ? 'in this tab, until you close it,' : 'in this browser') : 'on this phone'} with {maskAnthropicKey(savedKey)}. AI drafts, Day review and the other AI helps use Claude on your Anthropic account.
+            {KEY_IN_BROWSER ? ' Your phone keeps its own copy; add or remove each one where you use it.' : ''}
+          </Text>
           <View style={styles.row}>
             <TouchableOpacity accessibilityRole="button" onPress={() => setEditing(true)} style={styles.smallButton}>
               <Text style={styles.smallButtonText}>Replace key</Text>
@@ -205,7 +227,7 @@ export function AiDraftsCard({ userId, visible }: { userId: string; visible: boo
           <Text style={styles.body}>
             {aiKeysSupported
               ? 'Add your own Anthropic API key to have AI draft follow-up texts, emails, and call scripts. Without one, Follow up still gives you a plain draft to edit and send.'
-              : 'AI drafts are set up in the iPhone app.'}
+              : 'AI drafts are not available here.'}
           </Text>
           {aiKeysSupported ? (
             <TouchableOpacity accessibilityRole="button" onPress={() => setEditing(true)} style={styles.primaryButton}>
@@ -229,6 +251,11 @@ const styles = StyleSheet.create({
   primaryButton: { minHeight: 50, borderRadius: 14, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center', marginTop: 16 },
   primaryButtonText: { color: COLORS.white, fontSize: 16, fontWeight: '800' },
   busy: { opacity: 0.7 },
+  checkRow: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 12 },
+  checkBox: { width: 22, height: 22, borderRadius: 6, borderWidth: 2, borderColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
+  checkBoxOn: { backgroundColor: COLORS.forest },
+  checkMark: { color: COLORS.white, fontSize: 14, fontWeight: '900' },
+  checkText: { flex: 1, fontSize: 14, lineHeight: 20, color: COLORS.inkSoft },
   textButton: { minHeight: 44, alignItems: 'center', justifyContent: 'center', marginTop: 6 },
   textButtonText: { color: COLORS.inkSoft, fontSize: 15, fontWeight: '700' },
   row: { flexDirection: 'row', gap: 10, marginTop: 12 },

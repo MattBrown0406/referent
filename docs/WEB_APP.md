@@ -16,7 +16,8 @@ iPhone build.
 | Call / Text buttons | Show the number; logged only after "I called" / "I texted" |
 | Share sheet | The browser's share sheet, or a copy to the clipboard (`src/lib/web-share.ts`) |
 | Push and reminders | None; Home shows what is due. Settings says to turn push on in the iPhone app |
-| AI drafts | iPhone only (the key lives in the phone's keychain) |
+| AI helps (drafts, Day review, level-of-care suggestion, card reading, warmer words) | The same, on a key kept in this browser for this account (or this tab only), removed at sign-out (2026-11-21) |
+| Fieldy / Plaud, voice notes, Share to ReferralFit, Face ID lock, Contacts | iPhone only (Day review on the web is paste) |
 | Offline copy kept after sign-out | Signing out removes the practice's data from the browser |
 | Email links open the app | Email links return to the page they started on (`/auth/confirmed`, `/auth/recovery`) |
 

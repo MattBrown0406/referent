@@ -89,7 +89,7 @@ import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
 import type { LevelOfCareSeed } from './src/lib/LevelOfCareSheet';
 import { cardFill, cardReadingLine, type CardDifference, type CardReading } from './src/lib/card-reading';
 import { countNewRecordings, fieldySupported, RECORDERS, type RecorderId } from './src/lib/fieldy-api';
-import { aiKeysSupported, getAnthropicKey, onAnthropicKeyChange } from './src/lib/outreach-api';
+import { aiKeysSupported, getAnthropicKey, onAnthropicKeyChange, removeBrowserAnthropicKeys } from './src/lib/outreach-api';
 import {
   caseRecipients,
   caseTarget,
@@ -2014,6 +2014,8 @@ export default function App() {
     // device signed out, a revoked token, another account signing in, a
     // browser reopened after any of these) takes it out, as Sign out does.
     if (IS_WEB) {
+      // The Anthropic key too: only the account signed in here keeps one in this browser.
+      removeBrowserAnthropicKeys(userId);
       void wipeAccountDataWithoutSession(userId)
         .then((unsent) => {
           if (unsent <= 0 || generation !== authGenerationRef.current) return;
@@ -4575,7 +4577,8 @@ export default function App() {
     if (status === record.paymentStatus) return;
 
     if (status === 'quoted' && record.paidAmount === 0 && record.quotedAmount == null) {
-      if (Platform.OS !== 'ios') {
+      // iOS and the web app's dialog both take a typed amount; Android's Alert cannot.
+      if (Platform.OS === 'android') {
         Alert.alert('Enter the quote first', 'Add the quoted amount. The payment status will change to quoted automatically.');
         return;
       }
@@ -6822,6 +6825,7 @@ export default function App() {
             // so it works when the session has already gone too.
             await flushWriteQueue(userId).catch(() => undefined);
             await wipeAccountDataWithoutSession();
+            removeBrowserAnthropicKeys();
           }
           // Offline, supabase-js cannot sign out (it tries to refresh first and
           // gives up after ~25 s without clearing anything): clear it here.

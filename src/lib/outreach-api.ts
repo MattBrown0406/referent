@@ -118,25 +118,78 @@ export async function fetchPracticeName(): Promise<string> {
   }
 }
 
-// ─── The user's own Anthropic key, in this phone's keychain ─────────────────
-// One per account per device, never synced (WHEN_UNLOCKED_THIS_DEVICE_ONLY
-// keeps it out of iCloud Keychain and backups), never sent to ReferralFit's
-// database. Saving it is also the consent to AI drafts: the setup screen says
-// exactly what is shared and with whom first (App Review 5.1.2(i)).
+// ─── The user's own Anthropic key, on this device only ──────────────────────
+// One per account per device, never sent to ReferralFit's database. On the
+// phone: the keychain, never synced (WHEN_UNLOCKED_THIS_DEVICE_ONLY keeps it
+// out of iCloud Keychain and backups). In a browser (Matt, 2026-11-21): this
+// browser's own storage for this account, or only this tab
+// (sessionStorage) when the practitioner chooses; every copy in the browser
+// is removed at sign-out (removeBrowserAnthropicKeys). Saving it is also the
+// consent to AI drafts: the setup screen says exactly what is shared and
+// with whom first (App Review 5.1.2(i)).
 
-export const aiKeysSupported = Platform.OS === 'ios' || Platform.OS === 'android';
+export const aiKeysSupported = Platform.OS === 'ios' || Platform.OS === 'android' || Platform.OS === 'web';
+export const KEY_IN_BROWSER = Platform.OS === 'web';
+
+const KEY_PREFIX = 'referralfit.anthropicKey.v1.';
 
 function keyName(userId: string): string {
-  return `referralfit.anthropicKey.v1.${userId.toLowerCase().replace(/[^a-z0-9._-]/g, '')}`;
+  return `${KEY_PREFIX}${userId.toLowerCase().replace(/[^a-z0-9._-]/g, '')}`;
+}
+
+type BrowserStore = { getItem(name: string): string | null; setItem(name: string, value: string): void; removeItem(name: string): void; key(index: number): string | null; readonly length: number };
+
+/** This browser's storage, or null (private mode can refuse it; never on the phone). */
+function browserStore(kind: 'local' | 'session'): BrowserStore | null {
+  if (!KEY_IN_BROWSER) return null;
+  try {
+    const scope = globalThis as unknown as { localStorage?: BrowserStore; sessionStorage?: BrowserStore };
+    return (kind === 'local' ? scope.localStorage : scope.sessionStorage) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Where this browser keeps the key for this account: 'tab' (only until the tab closes), 'browser', or null. */
+export function browserKeyScope(userId: string): 'tab' | 'browser' | null {
+  if (!KEY_IN_BROWSER || !userId) return null;
+  try {
+    if (browserStore('session')?.getItem(keyName(userId))) return 'tab';
+    if (browserStore('local')?.getItem(keyName(userId))) return 'browser';
+  } catch { /* storage refused */ }
+  return null;
 }
 
 export async function getAnthropicKey(userId: string): Promise<string | null> {
   if (!aiKeysSupported || !userId) return null;
   try {
-    const key = await SecureStore.getItemAsync(keyName(userId));
+    const key = KEY_IN_BROWSER
+      ? browserStore('session')?.getItem(keyName(userId)) ?? browserStore('local')?.getItem(keyName(userId)) ?? null
+      : await SecureStore.getItemAsync(keyName(userId));
     return key && looksLikeAnthropicKey(key) ? key : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * In a browser, every account's key leaves it except `keepUserId`'s (the
+ * account signed in here now): at sign-out, account deletion, a session
+ * that ended, or another account signing in.
+ */
+export function removeBrowserAnthropicKeys(keepUserId?: string): void {
+  const keep = keepUserId ? keyName(keepUserId) : null;
+  for (const kind of ['local', 'session'] as const) {
+    const store = browserStore(kind);
+    if (!store) continue;
+    try {
+      const names: string[] = [];
+      for (let index = 0; index < store.length; index += 1) {
+        const name = store.key(index);
+        if (name && name.startsWith(KEY_PREFIX) && name !== keep) names.push(name);
+      }
+      for (const name of names) store.removeItem(name);
+    } catch { /* storage refused: nothing was kept */ }
   }
 }
 
@@ -156,17 +209,35 @@ function keyChanged(userId: string): void {
   }
 }
 
-export async function saveAnthropicKey(userId: string, apiKey: string): Promise<void> {
+export async function saveAnthropicKey(userId: string, apiKey: string, options: { tabOnly?: boolean } = {}): Promise<void> {
   if (!aiKeysSupported) throw new Error('AI drafts need the iPhone app.');
   // Never a key with no account in its name: nothing could read it back or remove it.
   if (!userId) throw new Error('Sign in again, then add your key.');
-  await SecureStore.setItemAsync(keyName(userId), apiKey, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
+  if (KEY_IN_BROWSER) {
+    const keep = browserStore(options.tabOnly ? 'session' : 'local');
+    if (!keep) throw new Error('This browser does not let ReferralFit keep the key (a private window can refuse). Try a normal window.');
+    try {
+      keep.setItem(keyName(userId), apiKey);
+    } catch {
+      throw new Error('This browser did not keep the key. Try a normal window.');
+    }
+    // Only one copy: the other storage forgets this account's key.
+    try { browserStore(options.tabOnly ? 'local' : 'session')?.removeItem(keyName(userId)); } catch { /* nothing kept */ }
+  } else {
+    await SecureStore.setItemAsync(keyName(userId), apiKey, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
+  }
   keyChanged(userId);
 }
 
 export async function removeAnthropicKey(userId: string): Promise<void> {
   if (!aiKeysSupported || !userId) return;
-  await SecureStore.deleteItemAsync(keyName(userId)).catch(() => undefined);
+  if (KEY_IN_BROWSER) {
+    for (const kind of ['local', 'session'] as const) {
+      try { browserStore(kind)?.removeItem(keyName(userId)); } catch { /* nothing kept */ }
+    }
+  } else {
+    await SecureStore.deleteItemAsync(keyName(userId)).catch(() => undefined);
+  }
   keyChanged(userId);
 }
 
@@ -303,6 +374,22 @@ export async function sendEmailMessage(email: string, subject: string, body: str
 export async function placeCall(phone: string): Promise<SendResult> {
   const digits = digitsForPhone(phone);
   if (!digits) return 'failed';
+  // A browser cannot place a call (a computer has no dialer): it shows the
+  // number, as every other Call on the web does, and goes on only once the
+  // practitioner says they called from their phone.
+  if (Platform.OS === 'web') {
+    return new Promise<SendResult>((resolve) => {
+      Alert.alert(
+        'Call',
+        `${phone.trim()}\n\nA browser can't place calls. Use your phone, then come back to log how it went.`,
+        [
+          { text: 'Not now', style: 'cancel', onPress: () => resolve('cancelled') },
+          { text: 'I called', onPress: () => resolve('unknown') },
+        ],
+        { cancelable: true, onDismiss: () => resolve('cancelled') },
+      );
+    });
+  }
   return (await openUrl(`tel:${digits}`)) ? 'unknown' : 'failed';
 }
 

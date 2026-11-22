@@ -41,8 +41,13 @@ const authSession = read('src/lib/auth-session.ts');
 assert.match(authSession, /export async function checkLinkToken\([\s\S]{0,600}fetch\(`\$\{SUPABASE_URL\}\/auth\/v1\/user`/, 'a link\'s token is read by a plain request, which never touches this device\'s session');
 assert.ok(!app.includes('supabase.auth.signOut()'), 'signing out ends this device\'s session only, never the phone\'s');
 // ...and a session that ended any other way does the same.
-assert.match(app, /resetAccountState\(\);\s*(\/\/[^\n]*\n\s*)+if \(IS_WEB\) \{\s*void wipeAccountDataWithoutSession\(userId\)/,
-  'signed out elsewhere, revoked, or another account: the browser keeps practice data only for the account signed in now');
+assert.match(app, /resetAccountState\(\);\s*(\/\/[^\n]*\n\s*)+if \(IS_WEB\) \{\s*(\/\/[^\n]*\n\s*)*removeBrowserAnthropicKeys\(userId\);\s*void wipeAccountDataWithoutSession\(userId\)/,
+  'signed out elsewhere, revoked, or another account: the browser keeps practice data, and an Anthropic key, only for the account signed in now');
+assert.match(app, /await wipeAccountDataWithoutSession\(\);\s*removeBrowserAnthropicKeys\(\);/, 'Sign out removes every Anthropic key from this browser');
+const outreachApi = read('src/lib/outreach-api.ts');
+assert.match(outreachApi, /export const aiKeysSupported = [^;]*Platform\.OS === 'web'/, 'AI helps work in the browser, on a key kept in this browser (Matt, 2026-11-21)');
+assert.match(outreachApi, /name\.startsWith\(KEY_PREFIX\) && name !== keep/, 'only the signed-in account keeps its key in this browser');
+assert.match(outreachApi, /if \(Platform\.OS === 'web'\) \{\s*return new Promise<SendResult>[\s\S]{0,200}A browser can't place calls/, 'Follow up\'s Call shows the number in a browser');
 
 // System notifications are never touched in a browser.
 const notifications = read('src/lib/notifications.ts');

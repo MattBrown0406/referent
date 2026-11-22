@@ -169,8 +169,8 @@ check(() => assert.doesNotMatch(answerPage, /public_placement_answer_seen[\s\S]{
 check(() => assert.match(answerPage, /\(\{ error \}\) => \{ if \(error\) seenRef\.current = false; \}/), 'a failed "seen" is tried again on the next tap');
 for (const sheet of ['src/lib/PlacementRequestSheet.tsx', 'src/lib/PlacementCompare.tsx']) {
   const source = read(sheet);
-  check(() => assert.match(source, /let answerLink = cachedPlacementAnswerLink\([^)]*\);[^\n]*\n[^\n]*\n\s*if \(!answerLink && Platform\.OS === 'web'\) prefetchPlacementAnswerLinks\(\[[^\]]+\]\);\s*if \(!answerLink && Platform\.OS !== 'web'\) \{/),
-    `${sheet}: the web never waits before sending, and a miss makes the link for the next tap`);
+  check(() => assert.match(source, /let answerLink = cachedPlacementAnswerLink\([^)]*\);[\s\S]{0,200}if \(!answerLink && Platform\.OS === 'web'\) \{\s*prefetchPlacementAnswerLinks\(\[[^\]]+\]\);\s*Alert\.alert\('Getting the answer link'[^\n]*\n\s*return;\s*\}\s*if \(!answerLink && Platform\.OS !== 'web'\) \{/),
+    `${sheet}: the web never waits before sending and never sends without the answer link: a miss makes it and asks to tap again`);
   check(() => assert.match(source, /Platform\.OS (?:!==|===) 'web'[^\n]*acceptingAnswers\(/), `${sheet}: links are made ahead only on the web, while answers are accepted`);
   check(() => assert.match(source, /phone\.trim\(\) \|\| [a-z.]*email\.trim\(\)/), `${sheet}: only for programs that can be texted or emailed`);
 }

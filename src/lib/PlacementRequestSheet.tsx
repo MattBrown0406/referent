@@ -407,8 +407,13 @@ export default function PlacementRequestSheet({ request, senderName, onClose, on
       // Safari allows the clipboard and mail only during the tap, so the web
       // uses a link already made, or sends without one.
       let answerLink = cachedPlacementAnswerLink(recipientId);
-      // The web sends this one without a link; the next tap has it.
-      if (!answerLink && Platform.OS === 'web') prefetchPlacementAnswerLinks([recipientId]);
+      // The web never sends without the program's answer link: it asks for
+      // one now and says to tap again in a moment.
+      if (!answerLink && Platform.OS === 'web') {
+        prefetchPlacementAnswerLinks([recipientId]);
+        Alert.alert('Getting the answer link', 'ReferralFit is making this program’s link to answer from. Tap again in a moment so the message carries it.');
+        return;
+      }
       if (!answerLink && Platform.OS !== 'web') {
         setPreparingId(recipientId);
         try {

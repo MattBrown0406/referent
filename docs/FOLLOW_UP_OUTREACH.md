@@ -91,8 +91,16 @@ follow-up, and a step deleted in the meantime does not block the log.
 - Anthropic's answers are passed back in plain words: a key Anthropic does
   not accept (or without permission) sends the user back to **Update your
   Anthropic key**; no credit or billing, or the account's rate limit, says so.
-- Web (`npm run web`) has no keychain, so AI drafts are set up in the iPhone
-  app only; everything else works there.
+- In the web app (Matt, 2026-11-21) the key is kept in this browser, for
+  this account only (`localStorage`), or only until the tab closes when the
+  practitioner ticks "Keep it only until I close this tab" (`sessionStorage`).
+  Only the account signed in keeps one: sign-out, account deletion, a session
+  that ended and another account signing in remove the rest
+  (`removeBrowserAnthropicKeys`). The setup screen says plainly that anything
+  else running in the browser, such as an extension, could read it. The
+  phone and each browser keep their own copy. Every AI help then works on
+  the web: drafts, Day review (paste), level-of-care suggestions, card
+  reading and warmer words.
 
 ## What leaves the device, and what does not
 
