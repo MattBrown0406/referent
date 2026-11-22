@@ -82,6 +82,7 @@ import {
   FieldyError,
   fieldySupported,
   markRecordingsReviewed,
+  recorderOnWeb,
   readNewRecordings,
   recorderStatus,
   rememberReviewFailed,
@@ -98,7 +99,7 @@ import { appendToNotes, REVIEW_TEXT_MAX, sharedNoteMessage, type SharedNote } fr
 import { shareToAppSupported } from './share-receiver';
 import type { FollowUp } from './store';
 import { useVoiceNote } from './voice-note';
-import { WEB_PAGE } from './web-layout';
+import { IS_WEB, WEB_PAGE } from './web-layout';
 
 const COLORS = {
   ink: '#16352E',
@@ -774,13 +775,31 @@ export default function DayReviewSheet({
 
   // ─── Recorders (Fieldy, Plaud) ───────────────────────────────────────────
 
-  async function connect(recorder: Recorder) {
+  // In a browser the page goes to Fieldy's sign-in and comes back (App.tsx
+  // finishes it): said first, with where the sign-in is kept, as for the
+  // Anthropic key (this browser, or only this tab).
+  function connectAsking(recorder: Recorder) {
+    if (!IS_WEB) { void connect(recorder); return; }
+    if (busy || recorders[recorder.id].state === 'busy') return;
+    const boxNote = notes.trim() ? ' What is in the box now is not kept: copy it first if you need it.' : '';
+    Alert.alert(
+      `Connect ${recorder.name}`,
+      `This page goes to ${recorder.name} for you to sign in, then comes back here.${boxNote} Keep the ${recorder.name} sign-in in this browser, or only in this tab until it closes? Either way it is removed when you sign out.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Only this tab', onPress: () => { void connect(recorder, { tabOnly: true }); } },
+        { text: 'This browser', onPress: () => { void connect(recorder); } },
+      ],
+    );
+  }
+
+  async function connect(recorder: Recorder, options: { tabOnly?: boolean } = {}) {
     if (busy || recorders[recorder.id].state === 'busy') return;
     const opening = openingRef.current;
     setRecorder(recorder.id, (current) => ({ ...current, state: 'busy' }));
     setMessage(null);
     try {
-      const status = await connectRecorder(recorder, userId);
+      const status = await connectRecorder(recorder, userId, options);
       if (opening !== openingRef.current) return;
       setRecorder(recorder.id, { state: 'on', email: status.email });
       onRecordersChanged?.();
@@ -1487,10 +1506,25 @@ export default function DayReviewSheet({
           ? 'Paste notes from your day, share them here from another app (a text thread, an email, a Voice Memos transcript, a note), or record a voice note after a call. ReferralFit finds new leads, notes, follow-ups and referrals, and you approve each one before anything is saved.'
           : 'Paste notes from your day: a summary from Fieldy or Plaud, or your own call notes. ReferralFit finds new leads, notes, follow-ups and referrals, and you approve each one before anything is saved.'}
       </Text>
-      {fieldySupported ? RECORDERS.map((recorder) => {
+      {fieldySupported || IS_WEB ? RECORDERS.map((recorder) => {
         const status = recorders[recorder.id];
         // Without a key there is nothing to read with, but a connected recorder can always be disconnected.
         if (keyMissing && status.state !== 'on' && status.state !== 'leaving') return null;
+        // In a browser: Plaud is phone-only (its server refuses browser
+        // pages); Fieldy says "soon" until the web client is registered.
+        const onWeb = IS_WEB ? recorderOnWeb(recorder) : 'ready';
+        if (onWeb !== 'ready' && status.state !== 'on' && status.state !== 'leaving') {
+          return (
+            <View key={recorder.id} style={styles.fieldyCard}>
+              <Text style={styles.label}>{recorder.name.toUpperCase()}</Text>
+              <Text style={styles.hint}>
+                {onWeb === 'phone'
+                  ? `${recorder.name} connects in the iPhone app.`
+                  : `${recorder.name} connects in the browser soon. For now, connect it in the ReferralFit app on your iPhone, or paste its summary here.`}
+              </Text>
+            </View>
+          );
+        }
         return (
           <View key={recorder.id} style={styles.fieldyCard}>
             <Text style={styles.label}>{recorder.name.toUpperCase()}</Text>
@@ -1510,8 +1544,8 @@ export default function DayReviewSheet({
               <ActivityIndicator color={COLORS.forest} accessibilityLabel={status.state === 'leaving' ? `Disconnecting ${recorder.name}` : `Checking ${recorder.name}`} />
             ) : (
               <>
-                <Text style={styles.hint}>Use {recorder.name}? Connect it once and ReferralFit reads your {recorder.noun}s for you: no copying or pasting. You sign in to {recorder.name}; your sign-in stays on this phone.</Text>
-                <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: status.state === 'busy' }} disabled={busy || status.state === 'busy'} onPress={() => { void connect(recorder); }} style={[styles.secondaryButton, (busy || status.state === 'busy') && styles.off]}>
+                <Text style={styles.hint}>Use {recorder.name}? Connect it once and ReferralFit reads your {recorder.noun}s for you: no copying or pasting. You sign in to {recorder.name}; your sign-in stays {IS_WEB ? 'in this browser' : 'on this phone'}.</Text>
+                <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: status.state === 'busy' }} disabled={busy || status.state === 'busy'} onPress={() => connectAsking(recorder)} style={[styles.secondaryButton, (busy || status.state === 'busy') && styles.off]}>
                   {status.state === 'busy' ? <ActivityIndicator color={COLORS.forest} accessibilityLabel="Connecting" /> : <Text style={styles.secondaryButtonText}>Connect {recorder.name}</Text>}
                 </TouchableOpacity>
               </>

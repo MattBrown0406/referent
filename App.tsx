@@ -88,7 +88,7 @@ import MatchExplanationSheet from './src/lib/MatchExplanationSheet';
 import FamilyAssessmentSheet from './src/lib/FamilyAssessmentSheet';
 import type { LevelOfCareSeed } from './src/lib/LevelOfCareSheet';
 import { cardFill, cardReadingLine, type CardDifference, type CardReading } from './src/lib/card-reading';
-import { countNewRecordings, fieldySupported, RECORDERS, type RecorderId } from './src/lib/fieldy-api';
+import { countNewRecordings, FIELDY, finishWebConnect, recorderOnWeb, recordersHere, RECORDERS, removeBrowserRecorderSignIns, type RecorderId } from './src/lib/fieldy-api';
 import { aiKeysSupported, getAnthropicKey, onAnthropicKeyChange, removeBrowserAnthropicKeys } from './src/lib/outreach-api';
 import {
   caseRecipients,
@@ -1407,7 +1407,7 @@ export default function App() {
   const recordingsWaitingRef = useRef<{ userId: string; counts: Record<RecorderId, number> }>({ userId: '', counts: { fieldy: 0, plaud: 0 } });
   const refreshFieldyWaiting = useCallback(async (force = false) => {
     const userId = activeUserIdRef.current;
-    if (!userId || !fieldySupported || !aiKeysSupported) return;
+    if (!userId || !recordersHere || !aiKeysSupported) return;
     const last = fieldyCountRef.current;
     if (!force && last.userId === userId && Date.now() - last.at < 15 * 60_000) return;
     fieldyCountRef.current = { at: Date.now(), userId };
@@ -2016,6 +2016,8 @@ export default function App() {
     if (IS_WEB) {
       // The Anthropic key too: only the account signed in here keeps one in this browser.
       removeBrowserAnthropicKeys(userId);
+      // And a Fieldy sign-in (revoked at Fieldy in the background).
+      removeBrowserRecorderSignIns(userId);
       void wipeAccountDataWithoutSession(userId)
         .then((unsent) => {
           if (unsent <= 0 || generation !== authGenerationRef.current) return;
@@ -2032,6 +2034,27 @@ export default function App() {
       cancelReferralFitNotifications().catch(() => undefined);
       setLoaded(true);
       return undefined;
+    }
+
+    // In a browser, back from Fieldy's sign-in: finished for this account
+    // only (fieldy-api finishWebConnect checks the tab, the account, the
+    // state and the issuer), then said so.
+    if (IS_WEB) {
+      void finishWebConnect(userId).then((done) => {
+        if (!done || generation !== authGenerationRef.current) return;
+        void refreshFieldyWaiting(true);
+        Alert.alert(
+          `${done.recorder.name} is connected`,
+          `${done.status.email ? `Connected as ${done.status.email}. ` : ''}Open Review notes to read your new ${done.recorder.name} ${done.recorder.noun}s; you approve each item before anything is saved.`,
+          [
+            { text: 'Later', style: 'cancel' },
+            { text: 'Review notes', onPress: () => { setDayReviewRecorder(null); setShowDayReview(true); } },
+          ],
+        );
+      }).catch((error) => {
+        if (generation !== authGenerationRef.current) return;
+        Alert.alert('Fieldy was not connected', error instanceof Error ? error.message : 'Try connecting again from Review notes.');
+      });
     }
 
     setLoaded(false);
@@ -6826,6 +6849,7 @@ export default function App() {
             await flushWriteQueue(userId).catch(() => undefined);
             await wipeAccountDataWithoutSession();
             removeBrowserAnthropicKeys();
+            removeBrowserRecorderSignIns();
           }
           // Offline, supabase-js cannot sign out (it tries to refresh first and
           // gives up after ~25 s without clearing anything): clear it here.
@@ -7208,7 +7232,9 @@ export default function App() {
               <View style={styles.globalDirectoryCopy}>
                 <Text style={styles.globalDirectoryTitle}>Review notes</Text>
                 <Text style={styles.globalDirectorySubtitle}>{IS_WEB
-                  ? 'Paste your call notes or a recorder’s summary; approve the leads, notes and follow-ups it finds'
+                  ? (recorderOnWeb(FIELDY) === 'ready'
+                    ? 'Read your Fieldy conversations, or paste your call notes; approve the leads, notes and follow-ups it finds'
+                    : 'Paste your call notes or a recorder’s summary; approve the leads, notes and follow-ups it finds')
                   : 'Read your Fieldy or Plaud recordings, or paste your call notes; approve the leads, notes and follow-ups it finds'}</Text>
               </View>
               <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />

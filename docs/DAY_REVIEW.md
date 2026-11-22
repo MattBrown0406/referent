@@ -758,3 +758,130 @@ recordings case).
 
 **For Matt:** nothing to deploy; it ships with the next iPhone build and the
 next web deploy.
+
+## Fieldy on the web (2026-11-21)
+
+Branch `feat/fieldy-web`. Decided by Matt: in the web app
+(app.referralfit.com) Fieldy connects in the browser; Plaud stays
+phone-only (`mcp.plaud.ai` refuses browser pages with 403
+`forbidden_origin`); voice notes stay phone-only. Day review paste already
+worked on the web (the Anthropic key is kept in the browser).
+
+### What the practitioner sees in a browser
+
+1. Today: **Review notes** ("Paste your call notes or a recorder's summary"
+   until Fieldy can connect here; then "Read your Fieldy conversations, or
+   paste your call notes").
+2. In Review notes, the FIELDY card. Until the web client is registered it
+   says "Fieldy connects in the browser soon. For now, connect it in the
+   ReferralFit app on your iPhone, or paste its summary here." (no button).
+   Once registered: **Connect Fieldy**, which asks first: "This page goes to
+   Fieldy for you to sign in, then comes back here" (and, when the box holds
+   text, that it is not kept), and where to keep the sign-in: **This
+   browser** or **Only this tab** (as for the Anthropic key). Either way it
+   is removed when they sign out.
+3. Fieldy's own sign-in and consent page (the same scopes as the phone).
+4. Back on app.referralfit.com: "Fieldy is connected (Connected as …)",
+   with **Review notes** to open it. The card then offers **Read new Fieldy
+   conversations** and **Disconnect Fieldy**, as on the phone.
+5. The PLAUD card: "Plaud connects in the iPhone app." No reminder card (the
+   web app sends no notifications).
+6. Today shows "From your day: N new Fieldy conversations to review" when
+   connected, counted when the page opens and comes back (at most every 15
+   minutes), as on the phone.
+7. A conversation reviewed on the phone is not offered in the browser, nor
+   the reverse, and an item saved from it on one is known on the other
+   ("Saved in an earlier review").
+
+### How it works
+
+- **Sign-in: a full-page trip, not a popup.** Fieldy's sign-in pages send
+  `Cross-Origin-Opener-Policy: same-origin`, which cuts a popup off from the
+  page that opened it, so `expo-web-browser`'s popup flow reports it closed
+  at once. Instead (`src/lib/fieldy-web.ts`): PKCE S256 verifier, state, the
+  account and the chosen storage wait in this tab's `sessionStorage`; the
+  page goes to Fieldy; Fieldy returns to `/oauth/fieldy?code=…&state=…&iss=…`
+  (Vercel already sends every path to the app). `index.ts` keeps that
+  address for the tab and puts the address bar back to `/` before the app
+  draws (`captureFieldyReturn`). Once the app knows who is signed in,
+  `finishWebConnect` (`src/lib/fieldy-api.ts`) takes the started sign-in
+  (used once), refuses it if it was for another account, is over 15 minutes
+  old, came back to another origin, or its state or issuer differ
+  (`codeFromCallback`, as on the phone), then exchanges the code.
+- **Its own client.** The web app is a separate public client at Fieldy
+  (no secret, PKCE), with returns `https://app.referralfit.com/oauth/fieldy`
+  and, for development, `http://localhost:8081/oauth/fieldy` and
+  `http://localhost:3222/oauth/fieldy` (`FIELDY_WEB_REDIRECTS`). Its id is
+  `FIELDY_WEB_CLIENT_ID` in `src/lib/fieldy.ts`: **empty until Matt approves
+  the registration**; while empty, the web app offers no Connect button.
+- **The refresh token** stays in the browser for this account
+  (`localStorage`, or `sessionStorage` for "Only this tab"), never on
+  ReferralFit's server. Every change to it (refresh, connect, disconnect)
+  runs in one queue in the tab and under one Web Lock across tabs, and the
+  token is read inside the lock, so two tabs never refresh the same rotated
+  token. A refused token is removed only if it is still the one kept (another
+  tab may have rotated it since). Disconnect revokes it at Fieldy. Sign-out,
+  a session that ended, and another account signing in remove it from the
+  browser (`removeBrowserRecorderSignIns`, wired next to
+  `removeBrowserAnthropicKeys`) and revoke it at Fieldy in the background.
+  Fieldy's token, userinfo, revoke and `/mcp` endpoints allow browser calls
+  (CORS `*`, `Mcp-Session-Id` exposed).
+- **What was reviewed, on the server.** `public.day_review_recordings`
+  (migration `20261122130000_day_review_recordings.sql`): one row per
+  account, recorder and recording id, with when it was reviewed, when
+  reading it started failing, when its review failed on its own (and was
+  last tried), and the fingerprints of items saved from it. Fingerprints
+  were already one-way hashes on the phone (`signatureHash`, cyrb53: "h:"
+  and at most 12 base-36 characters, never words); the server refuses
+  anything else, and the app drops anything else before sending. No
+  recording text, summary or transcript is ever stored. Clients read only
+  their own rows (RLS on `auth.uid()`, no anon access); writes go only
+  through `day_review_mark_recordings(recorder, marks)`, which joins what it
+  is sent with what is there (reviewed stays reviewed, at its earliest time;
+  fingerprints are a union, the newest 200; the first failure and the latest
+  try are kept), at most 200 marks a call and 6,000 rows an account. Rows go
+  after 14 days (reads look back 7) and with the account.
+- **Phone and web both read and write it** (`src/lib/recording-marks.ts`,
+  `recording-marks-api.ts`). Each device still keeps its own copy (the
+  keychain on the phone, `localStorage` in the browser: ids, times and
+  fingerprints only). A read joins this device's marks with the server's for
+  the recordings listed, and keeps the server's here too. Each change is
+  written here first, then sent. Calls go only for the account signed in on
+  the device at that moment.
+- **Before the migration is applied** the server answers "unknown table or
+  function" (PGRST205/PGRST202/42P01/42883): the app keeps the marks on the
+  device, as before, and asks again every ten minutes. **The first time the
+  server has the table**, each device copies everything it keeps up once
+  (`synced` in the read state; joined on the server, so no reviewed mark is
+  lost on either side); a send the server does not take is copied up again
+  at the next read.
+
+### For Matt
+
+1. **Register the web client (after your OK):** `node
+   scripts/register-fieldy-web-client.mjs` prints the request and sends
+   nothing; `node scripts/register-fieldy-web-client.mjs --send` registers it
+   at Fieldy (dynamic client registration, as for the phone on 2026-11-08)
+   and prints the client id. If Fieldy refuses the `http://localhost`
+   returns, run it with `--send --no-local`. Paste the id into
+   `FIELDY_WEB_CLIENT_ID` in `src/lib/fieldy.ts`, commit, and deploy the web
+   app.
+2. **The database:** paste
+   `supabase/migrations/20261122130000_day_review_recordings.sql` in the SQL
+   editor (ASCII, one BEGIN/COMMIT, safe to re-run), with this as the last
+   line before `COMMIT;`:
+   `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20261122130000','day_review_recordings') ON CONFLICT (version) DO NOTHING;`
+   Either order is safe: the app works without it (each device on its own)
+   and picks it up within ten minutes once it exists.
+3. **Privacy page:** it may need a line that ReferralFit keeps, on its
+   server, which recorder recordings were reviewed (their ids, when, and
+   one-way fingerprints of what was saved from them), never their content,
+   for 14 days. Fieldy's sign-in in the web app stays in the browser.
+4. The phone side (marks on the server) ships with the next iPhone build;
+   the web side with the next web deploy. No function to deploy.
+5. Check: connect Fieldy in a browser, review a conversation there, then
+   open Review notes on the phone: it is not offered again.
+
+Tests: `scripts/fieldy-test.mjs` (the web client, the return checks, what
+goes to the server and how it is joined, the tabs and sign-out wiring),
+`scripts/web-app-test.mjs`, `supabase/tests/day_review_recordings_test.sql`.

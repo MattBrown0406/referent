@@ -4,6 +4,7 @@ import { Platform } from 'react-native';
 
 import App from './App';
 import { startAppLock } from './src/lib/app-lock';
+import { captureFieldyReturn } from './src/lib/fieldy-web';
 import { installWebAlert, WebAlertHost } from './src/lib/web-alert';
 import { installWebShare } from './src/lib/web-share';
 
@@ -12,6 +13,11 @@ import { installWebShare } from './src/lib/web-share';
 // uses the browser's share sheet or the clipboard (src/lib/web-share.ts).
 installWebAlert();
 installWebShare();
+
+// In a browser, back from Fieldy's sign-in (/oauth/fieldy?code=…): the
+// address is kept for this tab and the address bar goes back to "/" before
+// the app draws; App.tsx finishes the sign-in once it knows who is signed in.
+captureFieldyReturn();
 
 // On iPhone: the app-switcher cover, and "Lock with Face ID" when it is on
 // (modules/app-lock), up before the first screen draws.
