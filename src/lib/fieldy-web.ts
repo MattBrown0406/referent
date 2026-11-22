@@ -65,6 +65,63 @@ export function browserRemove(name: string): void {
   }
 }
 
+// ─── A sign-in kept in one tab only, and a duplicated tab ──────────────────
+//
+// The browser's Duplicate Tab copies sessionStorage, so two tabs can hold the
+// same "Only this tab" refresh token. Fieldy rotates it: the second tab to
+// refresh would send one already used (refused, and it can end the first
+// tab's sign-in too). So each tab-only sign-in has a line (one per connect,
+// copied with the tab) and a generation (new at every write); the latest
+// generation of each line is noted in the browser's storage (ids and a time
+// only, never a token). A tab whose copy is not the latest one drops it and
+// asks to connect again, never sending it.
+
+const ROTATION_PREFIX = 'referralfit.tabRotation.v1.';
+const ROTATION_KEEP_MS = 14 * 24 * 60 * 60 * 1000;
+
+/** A new id for a line or a generation (not a secret). */
+export function rotationId(): string {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** This tab-only sign-in's line is now at `gen`; notes older than two weeks go. */
+export function noteTabRotation(line: string, gen: string): void {
+  const store = browserStore('local');
+  if (!store || !line) return;
+  try {
+    const cutoff = Date.now() - ROTATION_KEEP_MS;
+    const old: string[] = [];
+    for (let index = 0; index < store.length; index += 1) {
+      const name = store.key(index);
+      if (!name?.startsWith(ROTATION_PREFIX)) continue;
+      try {
+        const at = (JSON.parse(store.getItem(name) || '{}') as { at?: unknown }).at;
+        if (typeof at !== 'number' || at < cutoff) old.push(name);
+      } catch { old.push(name); }
+    }
+    for (const name of old) store.removeItem(name);
+    store.setItem(`${ROTATION_PREFIX}${line}`, JSON.stringify({ gen, at: Date.now() }));
+  } catch { /* storage refused: a duplicated tab is then not caught */ }
+}
+
+/** Another tab with a copy of this tab-only sign-in has rotated it since: this copy no longer works. */
+export function tabCopyStale(line: string | undefined, gen: string | undefined): boolean {
+  if (!line) return false;
+  try {
+    const raw = browserStore('local')?.getItem(`${ROTATION_PREFIX}${line}`);
+    if (!raw) return false;
+    const noted = (JSON.parse(raw) as { gen?: unknown }).gen;
+    return typeof noted === 'string' && noted !== gen;
+  } catch {
+    return false;
+  }
+}
+
+/** This tab's own copy only (sessionStorage), removed. */
+export function tabRemove(name: string): void {
+  try { browserStore('session')?.removeItem(name); } catch { /* nothing kept */ }
+}
+
 // ─── One change at a time, across tabs ─────────────────────────────────────
 
 type WebLocks = { request: <R>(name: string, callback: () => Promise<R>) => Promise<R> };

@@ -79,13 +79,17 @@ import {
   dropPendingConnect,
   fieldyReturnWaiting,
   IS_WEB,
+  noteTabRotation,
   removeBrowserItems,
+  rotationId,
   savePendingConnect,
+  tabCopyStale,
+  tabRemove,
   takeFieldyReturn,
   takePendingConnect,
   type BrowserScope,
 } from './fieldy-web';
-import { idsIn, rowsFor, withServerMarks, type MarkRow, type ReadState } from './recording-marks';
+import { confirmSent, noteUnsent, pendingRows, readUnsent, withServerMarks, type ReadState } from './recording-marks';
 import { fetchServerMarks, sendServerMarks } from './recording-marks-api';
 
 export { FieldyError, FIELDY, PLAUD, RECORDERS, type Recorder, type RecorderId } from './fieldy';
@@ -126,8 +130,12 @@ const clean = (userId: string) => userId.toLowerCase().replace(/[^a-z0-9._-]/g, 
 
 // ─── The sign-in (one record per recorder and account) ─────────────────────
 
-/** `scope`: in a browser, where it is kept (this tab only, or this browser). */
-type Token = { refreshToken: string; email: string; connectedAt: string; scope?: BrowserScope };
+/**
+ * `scope`: in a browser, where it is kept (this tab only, or this browser).
+ * `line` / `gen`: a tab-only sign-in's line and generation (fieldy-web.ts
+ * noteTabRotation), so a duplicated tab's copy is never sent once rotated.
+ */
+type Token = { refreshToken: string; email: string; connectedAt: string; scope?: BrowserScope; line?: string; gen?: string };
 
 const TOKEN_PREFIX = (id: string) => `referralfit.${id}.v1.`;
 const tokenKey = (recorder: Recorder, userId: string) => `${TOKEN_PREFIX(recorder.id)}${clean(userId)}`;
@@ -141,6 +149,8 @@ function tokenFrom(raw: string, scope?: BrowserScope): Token | null {
       email: typeof data.email === 'string' ? data.email : '',
       connectedAt: typeof data.connectedAt === 'string' ? data.connectedAt : '',
       ...(scope ? { scope } : {}),
+      ...(typeof data.line === 'string' && data.line ? { line: data.line } : {}),
+      ...(typeof data.gen === 'string' && data.gen ? { gen: data.gen } : {}),
     };
   } catch {
     return null;
@@ -152,7 +162,13 @@ async function readToken(recorder: Recorder, userId: string): Promise<Token | nu
   try {
     if (IS_WEB) {
       const kept = browserRead(tokenKey(recorder, userId));
-      return kept ? tokenFrom(kept.value, kept.scope) : null;
+      const token = kept ? tokenFrom(kept.value, kept.scope) : null;
+      // A copy from a duplicated tab that another tab has rotated since: dropped, never sent.
+      if (token?.scope === 'tab' && tabCopyStale(token.line, token.gen)) {
+        tabRemove(tokenKey(recorder, userId));
+        return null;
+      }
+      return token;
     }
     const raw = await SecureStore.getItemAsync(tokenKey(recorder, userId));
     return raw ? tokenFrom(raw) : null;
@@ -161,15 +177,36 @@ async function readToken(recorder: Recorder, userId: string): Promise<Token | nu
   }
 }
 
+// In a browser, the sign-ins removed in this tab (sign-out, a session that
+// ended, another account): a refresh already on its way when they were
+// removed never writes its rotated token back (it is revoked instead).
+// Cleared when that account connects again.
+const signedOut = new Set<string>();
+
+function revokeInBackground(recorder: Recorder, refreshToken: string): void {
+  const here = recorderHere(recorder);
+  if (!here?.revokeUrl || !refreshToken) return;
+  void postForm(here, here.revokeUrl, { token: refreshToken, token_type_hint: 'refresh_token', client_id: here.clientId }).catch(() => undefined);
+}
+
 async function writeToken(recorder: Recorder, userId: string, value: Token): Promise<void> {
   const { scope, ...kept } = value;
   if (IS_WEB) {
+    const name = tokenKey(recorder, userId);
+    if (signedOut.has(name)) {
+      revokeInBackground(recorder, value.refreshToken);
+      throw new FieldyError(`Connect ${recorder.name} first.`, 'disconnected');
+    }
+    // A tab-only sign-in: a new generation at every write, noted for the other tabs.
+    const tab = scope === 'tab' ? { line: kept.line || rotationId(), gen: rotationId() } : null;
+    const record = tab ? { ...kept, ...tab } : { ...kept, line: undefined, gen: undefined };
     // Once more on a failure: a rotated refresh token that is not kept would end the connection.
     try {
-      browserWrite(tokenKey(recorder, userId), JSON.stringify(kept), scope ?? 'browser');
+      browserWrite(name, JSON.stringify(record), scope ?? 'browser');
     } catch {
-      browserWrite(tokenKey(recorder, userId), JSON.stringify(kept), scope ?? 'browser');
+      browserWrite(name, JSON.stringify(record), scope ?? 'browser');
     }
+    if (tab) noteTabRotation(tab.line, tab.gen);
     return;
   }
   // Once more on a failure: a rotated refresh token that is not kept would end the connection.
@@ -199,8 +236,10 @@ const LOOK_BACK_MS = 7 * 24 * 60 * 60 * 1000;
 // read on their own (incomplete, turned down, too slow), since when and when
 // last tried: read alone, only when nothing else is new (day-review.ts
 // apartFromFailed), the one tried least recently first ("<since> <last
-// tried>"). `synced`: all of it is on ReferralFit's server too
-// (src/lib/recording-marks.ts); the phone and the web app read both.
+// tried>"). `unsent`: changes the server has not confirmed yet, written with
+// the change itself and sent again at the next read until it does;
+// `synced`: false when all of it must be copied up once
+// (src/lib/recording-marks.ts). The phone and the web app read both.
 
 const READ_PREFIX = (id: string) => `referralfit.${id}.read.v1.`;
 const readKey = (recorder: Recorder, userId: string) => `${READ_PREFIX(recorder.id)}${clean(userId)}`;
@@ -236,6 +275,7 @@ async function readLocal(recorder: Recorder, userId: string): Promise<ReadState 
       failing: times(data.failing),
       saved,
       unreviewable: marks(data.unreviewable),
+      unsent: readUnsent(data.unsent),
       // Kept before the server knew of it (an older app, or no table yet): copied up once.
       synced: data.synced === true,
     };
@@ -250,7 +290,7 @@ async function writeLocal(recorder: Recorder, userId: string, value: ReadState):
     .filter(([, at]) => Date.parse(at.split(' ')[0]) >= cutoff).slice(-limit));
   const raw = JSON.stringify({
     floor: value.floor, reviewed: recent(value.reviewed), failing: recent(value.failing), saved: recent(value.saved, 200),
-    unreviewable: recent(value.unreviewable, 200), synced: value.synced,
+    unreviewable: recent(value.unreviewable, 200), unsent: value.unsent, synced: value.synced,
   });
   // In a browser: ids, times and fingerprints only (no client data), kept in this browser.
   if (IS_WEB) browserWrite(readKey(recorder, userId), raw, 'browser');
@@ -258,7 +298,7 @@ async function writeLocal(recorder: Recorder, userId: string, value: ReadState):
 }
 
 // A new state has nothing the server lacks.
-const emptyState = (now = new Date()): ReadState => ({ floor: startOfToday(now), reviewed: {}, failing: {}, saved: {}, unreviewable: {}, synced: true });
+const emptyState = (now = new Date()): ReadState => ({ floor: startOfToday(now), reviewed: {}, failing: {}, saved: {}, unreviewable: {}, unsent: {}, synced: true });
 
 // Accounts deleted in this session: what was reviewed is never written for them again.
 const forgotten = new Set<string>();
@@ -267,55 +307,64 @@ const readQueue = (recorder: Recorder, userId: string) => `${slot(recorder, user
 
 /**
  * A change to what was reviewed, in its own queue (apart from the sign-in's;
- * across tabs in a browser). Written here first; then `toServer` (the rows
- * for what changed) goes to the server, one send after another; a send the
- * server does not take leaves this device's state to be copied up in full
- * at the next read.
+ * across tabs in a browser). Written here first, with what the server still
+ * needs in the same write (`noteUnsent`, called by `change`), then sent
+ * (sendUnsent). A send cut off or not taken leaves the change in `unsent`,
+ * sent again at the next read.
  */
-function changeState(recorder: Recorder, userId: string, change: (state: ReadState) => void | boolean,
-  toServer?: (state: ReadState) => MarkRow[]): Promise<void> {
+function changeState(recorder: Recorder, userId: string, change: (state: ReadState) => void | boolean): Promise<void> {
   const key = readQueue(recorder, userId);
   return serial(key, () => acrossTabs(key, async () => {
-    if (forgotten.has(slot(recorder, userId))) return [] as MarkRow[];
+    if (forgotten.has(slot(recorder, userId))) return false;
     const state = (await readLocal(recorder, userId)) ?? emptyState();
     // false: nothing changed, nothing to write.
-    if (change(state) === false) return [] as MarkRow[];
+    if (change(state) === false) return false;
     await writeLocal(recorder, userId, state);
-    return toServer ? toServer(state) : [];
-  })).then((rows) => {
-    if (rows.length) void sendInOrder(recorder, userId, rows);
+    return Object.keys(state.unsent).length > 0 || !state.synced;
+  })).then((pending) => {
+    if (pending) void sendUnsent(recorder, userId).catch(() => undefined);
   });
 }
 
-function sendInOrder(recorder: Recorder, userId: string, rows: MarkRow[]): Promise<void> {
+/**
+ * What the server has not confirmed, sent: read in the read queue, sent
+ * outside it (a slow server never holds a change or a read back), then each
+ * change the server took is taken off the list in the read queue again,
+ * unless it changed meanwhile. One send at a time in this tab. The account
+ * it started for is the one named in every call (the server refuses a call
+ * for an account that is not the one signed in).
+ */
+function sendUnsent(recorder: Recorder, userId: string): Promise<void> {
+  const key = readQueue(recorder, userId);
   return serial(`${slot(recorder, userId)}:send`, async () => {
     if (forgotten.has(slot(recorder, userId))) return;
-    const taken = await sendServerMarks(recorder.id, userId, rows).catch(() => false);
-    if (!taken) await changeState(recorder, userId, (state) => { if (!state.synced) return false; state.synced = false; return true; }).catch(() => undefined);
+    const pending = await serial(key, () => acrossTabs(key, async () => {
+      const state = await readLocal(recorder, userId);
+      return state && (Object.keys(state.unsent).length || !state.synced) ? pendingRows(state) : null;
+    }));
+    if (!pending || forgotten.has(slot(recorder, userId))) return;
+    if (!(await sendServerMarks(recorder.id, userId, pending.rows).catch(() => false))) return;
+    await serial(key, () => acrossTabs(key, async () => {
+      if (forgotten.has(slot(recorder, userId))) return;
+      const state = await readLocal(recorder, userId);
+      if (state && confirmSent(state, pending.sent, pending.full)) await writeLocal(recorder, userId, state);
+    }));
   });
 }
 
 /**
  * What was reviewed, for these recordings: this device's marks joined with
- * the server's. The first time the server can be reached (or after a send
- * it did not take), everything kept here is copied up first (joined there:
- * nothing on the server is lost, and nothing here is). The server's marks
- * are kept here too, so a moment without the server never offers them again.
- * Without the server (no table yet, offline): this device's marks, as before.
+ * the server's. First, what the server has not confirmed is sent (every
+ * change not taken yet, and the first time the server can be reached,
+ * everything kept here: joined there, so nothing on the server is lost, and
+ * nothing here is). The server's marks are kept here too, so a moment
+ * without the server never offers them again. Without the server (no table
+ * yet, offline): this device's marks, as before.
  */
 async function reviewedState(recorder: Recorder, userId: string, ids: string[], now = new Date()): Promise<ReadState> {
-  const key = readQueue(recorder, userId);
   const local = (await readLocal(recorder, userId)) ?? emptyState(now);
   if (forgotten.has(slot(recorder, userId))) return local;
-  if (!local.synced) {
-    await serial(key, () => acrossTabs(key, async () => {
-      const current = await readLocal(recorder, userId);
-      if (!current || current.synced || forgotten.has(slot(recorder, userId))) return;
-      if (!(await sendServerMarks(recorder.id, userId, rowsFor(current, idsIn(current))).catch(() => false))) return;
-      current.synced = true;
-      await writeLocal(recorder, userId, current);
-    })).catch(() => undefined);
-  }
+  if (Object.keys(local.unsent).length || !local.synced) await sendUnsent(recorder, userId).catch(() => undefined);
   const remote = ids.length ? await fetchServerMarks(recorder.id, userId, ids).catch(() => null) : null;
   const base = (await readLocal(recorder, userId)) ?? local;
   if (!remote || !remote.length) return base;
@@ -470,6 +519,8 @@ async function finishConnect(here: Recorder, userId: string, code: string, verif
   }), Date.now(), here.name);
   const key = slot(here, userId);
   await signInQueue(here, userId, async () => {
+    // Connected again: this account's sign-in may be kept again.
+    signedOut.delete(tokenKey(here, userId));
     await writeToken(here, userId, { refreshToken: tokens.refreshToken, email: '', connectedAt: new Date().toISOString(), ...(scope ? { scope } : {}) });
     access.set(key, { token: tokens.accessToken, expiresAt: tokens.expiresAt });
   });
@@ -609,10 +660,23 @@ export function removeBrowserRecorderSignIns(keepUserId?: string): void {
   if (removed.length) access.clear();
   for (const item of removed) {
     const recorder = RECORDERS.find((candidate) => item.name.startsWith(TOKEN_PREFIX(candidate.id)));
-    const here = recorder ? recorderHere(recorder) : null;
+    if (!recorder) continue;
+    // A refresh on its way in this tab never writes its rotated token back.
+    signedOut.add(item.name);
     const token = tokenFrom(item.value);
-    if (!here || !token || !here.revokeUrl) continue;
-    void postForm(here, here.revokeUrl, { token: token.refreshToken, token_type_hint: 'refresh_token', client_id: here.clientId }).catch(() => undefined);
+    if (token) revokeInBackground(recorder, token.refreshToken);
+    // One on its way in another tab: once it lets go of the sign-in's lock,
+    // whatever it wrote back is removed and revoked too.
+    const userId = item.name.slice(TOKEN_PREFIX(recorder.id).length);
+    if (!userId) continue;
+    void signInQueue(recorder, userId, async () => {
+      if (!signedOut.has(item.name)) return;
+      const left = browserRead(item.name);
+      if (!left) return;
+      browserRemove(item.name);
+      const late = tokenFrom(left.value);
+      if (late && late.refreshToken !== token?.refreshToken) revokeInBackground(recorder, late.refreshToken);
+    }).catch(() => undefined);
   }
 }
 
@@ -889,10 +953,18 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
     read.push(item);
   }
   if (Object.keys(failing).length || recovered.length) {
+    const at = new Date().toISOString();
     await changeState(recorder, userId, (current) => {
-      Object.assign(current.failing, failing);
-      for (const id of recovered) delete current.failing[id];
-    }, (current) => rowsFor(current, [...Object.keys(failing), ...recovered], new Set(recovered))).catch(() => undefined);
+      for (const [id, since] of Object.entries(failing)) {
+        current.failing[id] = since;
+        noteUnsent(current, id, at);
+      }
+      // Read again: its failure clock stops, here and (a clear, until the server has it) on the server.
+      for (const id of recovered) {
+        delete current.failing[id];
+        noteUnsent(current, id, at, { failing: true });
+      }
+    }).catch(() => undefined);
   }
   // A few recordings per review, so it rarely finds more than it can list.
   // One whose review failed on its own is set aside before the review is
@@ -921,8 +993,9 @@ export async function markRecordingsReviewed(recorder: Recorder, userId: string,
       delete state.failing[id];
       delete state.saved[id];
       delete state.unreviewable[id];
+      noteUnsent(state, id, at);
     }
-  }, (state) => rowsFor(state, ids));
+  });
   return marked;
 }
 
@@ -933,10 +1006,12 @@ export async function markRecordingsReviewed(recorder: Recorder, userId: string,
  * it is marked reviewed ("Done with this", or a review of it settles).
  */
 export async function rememberReviewFailed(recorder: Recorder, userId: string, id: string): Promise<void> {
+  const at = new Date().toISOString();
   await changeState(recorder, userId, (state) => {
     // Since the first failure; tried again now (with several, the one tried least recently goes next).
-    state.unreviewable[id] = failedMark(state.unreviewable[id], new Date().toISOString());
-  }, (state) => rowsFor(state, [id]));
+    state.unreviewable[id] = failedMark(state.unreviewable[id], at);
+    noteUnsent(state, id, at);
+  });
 }
 
 /**
@@ -945,13 +1020,18 @@ export async function rememberReviewFailed(recorder: Recorder, userId: string, i
  * it for good).
  */
 export async function reviewCameBack(recorder: Recorder, userId: string, ids: string[]): Promise<void> {
+  const at = new Date().toISOString();
   await changeState(recorder, userId, (state) => {
     let changed = false;
     for (const id of ids) {
-      if (state.unreviewable[id]) { delete state.unreviewable[id]; changed = true; }
+      if (!state.unreviewable[id]) continue;
+      // Cleared here, and on the server (a clear, until the server has it).
+      delete state.unreviewable[id];
+      noteUnsent(state, id, at, { unreviewable: true });
+      changed = true;
     }
     return changed;
-  }, (state) => rowsFor(state, ids, new Set(), new Set(ids)));
+  });
 }
 
 /** Fingerprints of items saved from these recordings, kept until each is reviewed. */
@@ -964,8 +1044,9 @@ export async function rememberSaved(recorder: Recorder, userId: string, byRecord
       const before = state.saved[id]?.split(' ').slice(1) ?? [];
       // The newest 200 are kept: a long day's last saves are never the ones dropped.
       state.saved[id] = [at, ...mergeFingerprints(before, byRecording[id])].join(' ');
+      noteUnsent(state, id, at);
     }
-  }, (state) => rowsFor(state, ids));
+  });
 }
 
 /** The fingerprints of items saved earlier from these recordings (on this device or, by the server, another). */

@@ -291,7 +291,7 @@ check(() => {
   assert.match(api, /delete state\.saved\[id\];/, 'and forgotten once it is reviewed');
   assert.match(api, /\.sort\(\(a, b\) => Date\.parse\(a\.startTime\) - Date\.parse\(b\.startTime\)/, 'detail reads go oldest first');
   assert.match(api, /\[\.\.\.untried\.slice\(0, DETAIL_READS - 2\), \.\.\.retry\.slice\(0, 2\)/, 'two reads are kept for recordings that failed before');
-  assert.match(api, /if \(forgotten\.has\(slot\(recorder, userId\)\)\) return \[\] as MarkRow\[\];/, 'a deleted account\'s read state is never written again');
+  assert.match(api, /if \(forgotten\.has\(slot\(recorder, userId\)\)\) return false;\s*const state = \(await readLocal/, 'a deleted account\'s read state is never written again');
   assert.match(api, /await Promise\.all\(RECORDERS\.map\(async \(recorder\) =>/, 'deleting the account forgets every recorder at once');
   assert.match(api, /return await Promise\.race\(\[work, deadline\]\)/, 'the deadline covers the whole answer, body included');
   assert.match(api, /if \(until!\(text\)\) \{ reader\.cancel\(\)/, 'an event stream is read only until the answer is in');
@@ -378,46 +378,125 @@ check(() => {
     failing: { slow: '2026-11-21T09:00:00.000Z' },
     saved: { half: '2026-11-21T11:00:00.000Z h:aa h:bb not-a-fingerprint', done: '2026-11-21T09:00:00.000Z h:zz' },
     unreviewable: { bad: '2026-11-20T09:00:00.000Z 2026-11-21T09:30:00.000Z' },
+    unsent: {},
   };
-  const rows = m.rowsFor(state, m.idsIn(state), new Set(), new Set(['gone']));
+  const rows = m.rowsFor(state, m.idsIn(state));
   assert.deepEqual(rows.find((row) => row.id === 'done'), { id: 'done', reviewed_at: '2026-11-21T10:00:00.000Z' }, 'reviewed: only the time');
   assert.deepEqual(rows.find((row) => row.id === 'half').fingerprints, ['h:aa', 'h:bb'], 'only fingerprints ever leave: anything else is dropped');
   assert.deepEqual(rows.find((row) => row.id === 'bad'), { id: 'bad', unreviewable_since: '2026-11-20T09:00:00.000Z', unreviewable_tried_at: '2026-11-21T09:30:00.000Z' });
-  assert.equal(m.rowsFor(state, ['slow'], new Set(['slow']))[0].failing_since, '2026-11-21T09:00:00.000Z');
-  assert.deepEqual(m.rowsFor({ ...state, failing: {} }, ['slow'], new Set(['slow'])), [{ id: 'slow', clear_failing: true }]);
-  assert.deepEqual(m.rowsFor({ ...state, unreviewable: {} }, ['bad'], new Set(), new Set(['bad'])), [{ id: 'bad', clear_unreviewable: true }]);
-  for (const row of rows) {
+  assert.equal(m.rowsFor(state, ['slow'])[0].failing_since, '2026-11-21T09:00:00.000Z');
+  assert.deepEqual(m.rowsFor(state, ['gone']), [], 'nothing kept, nothing cleared: nothing sent');
+  // A clear travels as a time (a tombstone), from the unsent list.
+  const cleared = { ...state, failing: {}, unreviewable: {}, unsent: { slow: { at: '2026-11-21T12:00:00.000Z', n: 'a', failingCleared: '2026-11-21T12:00:00.000Z' }, bad: { at: '2026-11-21T12:00:00.000Z', n: 'b', unreviewableCleared: '2026-11-21T12:00:00.000Z' } } };
+  assert.deepEqual(m.rowsFor(cleared, ['slow', 'bad']), [{ id: 'slow', failing_cleared_at: '2026-11-21T12:00:00.000Z' }, { id: 'bad', unreviewable_cleared_at: '2026-11-21T12:00:00.000Z' }]);
+  for (const row of [...rows, ...m.rowsFor(cleared, ['slow', 'bad'])]) {
     const keys = Object.keys(row);
-    assert.ok(keys.every((key) => ['id', 'reviewed_at', 'failing_since', 'clear_failing', 'unreviewable_since', 'unreviewable_tried_at', 'clear_unreviewable', 'saved_at', 'fingerprints'].includes(key)), 'ids, times and fingerprints only');
+    assert.ok(keys.every((key) => ['id', 'reviewed_at', 'failing_since', 'failing_cleared_at', 'unreviewable_since', 'unreviewable_tried_at', 'unreviewable_cleared_at', 'saved_at', 'fingerprints'].includes(key)), 'ids, times and fingerprints only');
   }
   // Joined with the server: nothing lost on either side.
   const joined = m.withServerMarks(state, [
     { recording_id: 'half', reviewed_at: '2026-11-21T12:00:00.000Z', failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: null, fingerprints: [] },
     { recording_id: 'phoneOnly', reviewed_at: '2026-11-21T07:00:00.000Z', failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: null, fingerprints: [] },
-    { recording_id: 'done', reviewed_at: null, failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: '2026-11-21T08:00:00Z', fingerprints: ['h:x'] },
+    { recording_id: 'done', reviewed_at: null, failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: '2026-11-21T08:00:00Z', fingerprints: ['h:x'], failing_cleared_at: '2026-11-21T23:00:00.000Z', unreviewable_cleared_at: '2026-11-21T23:00:00.000Z' },
     { recording_id: 'shared', reviewed_at: null, failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: '2026-11-21T12:00:00.000Z', fingerprints: ['h:web', 'Words never'] },
     { recording_id: 'bad', reviewed_at: null, failing_since: null, unreviewable_since: '2026-11-19T09:00:00.000Z', unreviewable_tried_at: '2026-11-21T08:00:00.000Z', saved_at: null, fingerprints: [] },
   ]);
   assert.equal(joined.reviewed.half, '2026-11-21T12:00:00.000Z', 'reviewed on another device: reviewed here');
   assert.equal(joined.saved.half, undefined, 'and its fingerprints are no longer needed');
   assert.equal(joined.reviewed.phoneOnly, '2026-11-21T07:00:00.000Z');
-  assert.equal(joined.reviewed.done, '2026-11-21T10:00:00.000Z', 'a mark here is never lost to the server not having it');
+  assert.equal(joined.reviewed.done, '2026-11-21T10:00:00.000Z', 'a mark here is never lost to the server not having it, nor cleared');
   assert.deepEqual(joined.saved.shared.split(' ').slice(1), ['h:web'], 'words from the server are never taken as fingerprints');
   assert.equal(joined.unreviewable.bad, '2026-11-19T09:00:00.000Z 2026-11-21T09:30:00.000Z', 'the first failure, the latest try');
   assert.equal(state.reviewed.half, undefined, 'the state passed in is not changed');
   const both = m.withServerMarks({ ...state, saved: { r: '2026-11-21T10:00:00.000Z h:a h:b' } },
     [{ recording_id: 'r', reviewed_at: null, failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: '2026-11-21T11:00:00.000Z', fingerprints: ['h:b', 'h:c'] }]);
   assert.equal(both.saved.r, '2026-11-21T11:00:00.000Z h:a h:b h:c', 'fingerprints joined, each once, newest last');
+}, 'what goes to the server, and how it is joined with what a device keeps');
+
+check(() => {
+  // Round 5, 2: a clear wins over any mark whose last time is not after it.
+  const mark = (id, extra) => ({ recording_id: id, reviewed_at: null, failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: null, fingerprints: [], ...extra });
+  const base = { floor: '2026-11-21T08:00:00.000Z', synced: true, reviewed: {}, failing: {}, saved: {}, unreviewable: {}, unsent: {} };
+  // The single clear send failed: the clear is still unsent here; the server sends its stale mark back.
+  const waiting = { ...base, unsent: { slow: { at: '2026-11-21T12:00:00.000Z', n: 'x', failingCleared: '2026-11-21T12:00:00.000Z' }, bad: { at: '2026-11-21T12:00:00.000Z', n: 'y', unreviewableCleared: '2026-11-21T12:00:00.000Z' } } };
+  const back = m.withServerMarks(waiting, [mark('slow', { failing_since: '2026-11-21T09:00:00.000Z' }), mark('bad', { unreviewable_since: '2026-11-20T09:00:00.000Z', unreviewable_tried_at: '2026-11-21T11:00:00.000Z' })]);
+  assert.equal(back.failing.slow, undefined, 'a failure cleared here does not come back from the server');
+  assert.equal(back.unreviewable.bad, undefined, 'nor a "review failed" mark whose review came back');
+  // The server's own clear ends a stale mark kept on this device (another device cleared it).
+  const stale = { ...base, failing: { slow: '2026-11-21T09:00:00.000Z' }, unreviewable: { bad: '2026-11-20T09:00:00.000Z 2026-11-21T11:00:00.000Z' } };
+  const ended = m.withServerMarks(stale, [mark('slow', { failing_cleared_at: '2026-11-21T12:00:00.000Z' }), mark('bad', { unreviewable_cleared_at: '2026-11-21T12:00:00.000Z' })]);
+  assert.equal(ended.failing.slow, undefined);
+  assert.equal(ended.unreviewable.bad, undefined);
+  // A failure newer than the clear is a new one: it stays.
+  const fresh = { ...base, failing: { slow: '2026-11-21T13:00:00.000Z' }, unreviewable: { bad: '2026-11-20T09:00:00.000Z 2026-11-21T13:00:00.000Z' } };
+  const kept = m.withServerMarks(fresh, [mark('slow', { failing_since: '2026-11-21T09:00:00.000Z', failing_cleared_at: '2026-11-21T12:00:00.000Z' }), mark('bad', { unreviewable_cleared_at: '2026-11-21T12:00:00.000Z' })]);
+  assert.equal(kept.failing.slow, '2026-11-21T13:00:00.000Z', 'the stale server time does not replace the new failure');
+  assert.equal(kept.unreviewable.bad, '2026-11-20T09:00:00.000Z 2026-11-21T13:00:00.000Z');
+  // A reviewed mark is never cleared.
+  const reviewed = m.withServerMarks({ ...base, reviewed: { r: '2026-11-21T10:00:00.000Z' } }, [mark('r', { failing_cleared_at: '2026-11-21T12:00:00.000Z', unreviewable_cleared_at: '2026-11-21T12:00:00.000Z' })]);
+  assert.equal(reviewed.reviewed.r, '2026-11-21T10:00:00.000Z');
+}, 'round 5: a clear (here or on the server) outlives a stale copy of the mark it cleared');
+
+check(() => {
+  // Round 5, 1: what still needs sending is written with the change, and taken off only when the server confirms it.
+  const s0 = { floor: '2026-11-21T08:00:00.000Z', synced: true, reviewed: { a: '2026-11-21T10:00:00.000Z' }, failing: {}, saved: {}, unreviewable: {}, unsent: {} };
+  m.noteUnsent(s0, 'a', '2026-11-21T10:00:00.000Z');
+  m.noteUnsent(s0, 'b', '2026-11-21T10:01:00.000Z', { failing: true });
+  const first = m.pendingRows(s0);
+  assert.deepEqual(first.rows, [{ id: 'a', reviewed_at: '2026-11-21T10:00:00.000Z' }, { id: 'b', failing_cleared_at: '2026-11-21T10:01:00.000Z' }]);
+  assert.equal(first.full, false, 'synced: only the changes go');
+  // Before the server answers, 'a' changes again (another save): it must not be taken off with the first answer.
+  m.noteUnsent(s0, 'a', '2026-11-21T10:00:00.000Z');
+  assert.ok(m.confirmSent(s0, first.sent, first.full));
+  assert.deepEqual(Object.keys(s0.unsent), ['a'], 'b confirmed; a changed since, so sent again');
+  const second = m.pendingRows(s0);
+  m.confirmSent(s0, second.sent, second.full);
+  assert.deepEqual(s0.unsent, {}, 'all confirmed');
+  assert.equal(m.confirmSent(s0, second.sent, second.full), false, 'nothing left to confirm');
+  // Two clears of one recording keep the later; a clear stays on the entry when marks change after it.
+  m.noteUnsent(s0, 'c', '2026-11-21T11:00:00.000Z', { unreviewable: true });
+  m.noteUnsent(s0, 'c', '2026-11-21T12:00:00.000Z');
+  assert.equal(s0.unsent.c.unreviewableCleared, '2026-11-21T11:00:00.000Z');
+  // Kept before the server knew of it: everything, with the unsent changes.
+  const old = { ...s0, synced: false, failing: { f: '2026-11-21T09:00:00.000Z' } };
+  const full = m.pendingRows(old);
+  assert.equal(full.full, true);
+  assert.deepEqual(full.rows.map((row) => row.id).sort(), ['a', 'c', 'f']);
+  m.confirmSent(old, full.sent, full.full);
+  assert.equal(old.synced, true);
+  // Bounded: past MAX_UNSENT the oldest go, and everything is copied up once instead.
+  const big = { ...s0, unsent: {}, synced: true };
+  for (let i = 0; i < m.MAX_UNSENT + 5; i += 1) m.noteUnsent(big, `r${i}`, new Date(Date.parse('2026-11-21T00:00:00.000Z') + i * 1000).toISOString());
+  assert.equal(Object.keys(big.unsent).length, m.MAX_UNSENT);
+  assert.ok(!big.unsent.r0 && big.unsent[`r${m.MAX_UNSENT + 4}`], 'the oldest go');
+  assert.equal(big.synced, false, 'and the full copy covers them');
+  const bigFull = m.pendingRows(big);
+  m.confirmSent(big, bigFull.sent, bigFull.full);
+  assert.equal(big.synced, false, 'a full list may have dropped a change meanwhile: copied up again');
+  assert.equal(Object.keys(big.unsent).length, 0);
+  const again = m.pendingRows(big);
+  m.confirmSent(big, again.sent, again.full);
+  assert.equal(big.synced, true, 'then synced');
+  // Older than KEEP_MS: dropped (the server would not keep it either).
+  const aged = { ...s0, unsent: { gone: { at: '2026-10-01T00:00:00.000Z', n: 'z' } } };
+  m.noteUnsent(aged, 'new', '2026-11-21T12:00:00.000Z');
+  assert.deepEqual(Object.keys(aged.unsent), ['new']);
+  // Read back from a device: anything unreadable dropped.
+  assert.deepEqual(m.readUnsent({ ok: { at: '2026-11-21T12:00:00.000Z', n: 'q', failingCleared: 'nope' }, bad: { at: 'x', n: 'q' }, '': { at: '2026-11-21T12:00:00.000Z', n: 'q' } }), { ok: { at: '2026-11-21T12:00:00.000Z', n: 'q' } });
+  assert.deepEqual(m.readUnsent(null), {});
+}, 'round 5: unsent changes, written with the change, confirmed by the server, bounded');
+
+check(() => {
   assert.equal(m.unionNewest(Array.from({ length: 200 }, (_, i) => `h:${i}`), ['h:n']).length, 200);
   assert.ok(m.FINGERPRINT.test('h:2gosa7pa2gv') && !m.FINGERPRINT.test('h:Sarah') && !m.FINGERPRINT.test('call Sarah'));
   assert.deepEqual(m.idGroups(['a', 'b', 'c'], 8).map((group) => group.length), [2, 1]);
   assert.deepEqual(m.inGroups([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
-  for (const code of ['PGRST202', 'PGRST205', '42P01', '42883']) assert.ok(m.notOnServerYet(code), code);
+  for (const code of ['PGRST202', 'PGRST205', '42P01', '42883', '42703']) assert.ok(m.notOnServerYet(code), code);
   assert.ok(!m.notOnServerYet('42501') && !m.notOnServerYet(undefined), 'a refusal is not "no table yet"');
   // The fingerprints the phone keeps are exactly the server's format.
   const dayRules = require(path.join(repoRoot, 'node_modules', '.cache', 'fieldy-test', 'recording-marks.js'));
   assert.ok(dayRules.FINGERPRINT.test('h:abc123'));
-}, 'what goes to the server, and how it is joined with what a device keeps');
+}, 'the marks\' formats and groups');
 
 check(() => {
   const web = read('src/lib/fieldy-web.ts');
@@ -446,13 +525,34 @@ check(() => {
   // The server's copy of what was reviewed.
   assert.match(marksApi, /data\.session\?\.user\?\.id === userId/, 'marks go only to the account signed in now');
   assert.match(marksApi, /\.eq\('user_id', userId\)/);
-  assert.match(marksApi, /supabase\.rpc\('day_review_mark_recordings', \{ p_recorder: recorder, p_marks: group \}\)/);
+  assert.match(marksApi, /supabase\.rpc\('day_review_mark_recordings', \{ p_user: userId, p_recorder: recorder, p_marks: group \}\)/, 'every write names the account it was started for');
   assert.doesNotMatch(marksApi, /refreshToken|accessToken|from '\.\/fieldy/, 'never a sign-in, nor anything read from a recorder');
   assert.match(marksApi, /import \{ inGroups, idGroups, notOnServerYet, type MarkRow, type ServerMark \} from '\.\/recording-marks';/, 'only the rows rowsFor makes');
-  assert.match(api, /const emptyState = [^\n]*synced: true \}\);/, 'a new state has nothing to copy up');
+  assert.match(api, /const emptyState = [^\n]*unsent: \{\}, synced: true \}\);/, 'a new state has nothing to copy up');
   assert.match(api, /synced: data\.synced === true,/, 'a state kept before the server knew of it is copied up once');
-  assert.match(api, /sendServerMarks\(recorder\.id, userId, rowsFor\(current, idsIn\(current\)\)\)/, 'everything kept here, joined on the server (never replacing)');
-  assert.match(api, /if \(!taken\) await changeState\(recorder, userId, \(state\) => \{ if \(!state\.synced\) return false; state\.synced = false; return true; \}\)/, 'a send not taken is copied up again later');
+  assert.match(api, /return state && \(Object\.keys\(state\.unsent\)\.length \|\| !state\.synced\) \? pendingRows\(state\) : null;/, 'what the server lacks, read in the read queue');
+  assert.match(api, /if \(!\(await sendServerMarks\(recorder\.id, userId, pending\.rows\)\.catch\(\(\) => false\)\)\) return;\s*await serial\(key, \(\) => acrossTabs\(key, async \(\) => \{[^]*confirmSent\(state, pending\.sent, pending\.full\)/, 'sent outside it, then confirmed in it (only what the server took)');
+  assert.match(api, /if \(Object\.keys\(local\.unsent\)\.length \|\| !local\.synced\) await sendUnsent\(recorder, userId\)/, 'every read (and count) sends what is still unsent first');
+  assert.match(api, /unsent: readUnsent\(data\.unsent\),/, 'the unsent list is kept with the marks');
+  assert.match(api, /unreviewable: recent\(value\.unreviewable, 200\), unsent: value\.unsent, synced: value\.synced,/, 'in the same write as the change');
+  assert.doesNotMatch(api, /toServer|sendInOrder/, 'no send that only lives in memory');
+  for (const fn of ['markRecordingsReviewed', 'rememberReviewFailed', 'rememberSaved']) {
+    assert.match(api, new RegExp(`export async function ${fn}[^]*?noteUnsent\\(state, id, at\\);[^]*?\\n\\}`), `${fn} notes what to send in the same write`);
+  }
+  assert.match(api, /noteUnsent\(current, id, at, \{ failing: true \}\);/, 'a failing recording read again: a clear, until the server has it');
+  // Round 5, 3 and 4: the account named in every call; a refusal stops the send and waits.
+  assert.match(marksApi, /if \(refused !== undefined && Date\.now\(\) - refused < REFUSED_WAIT_MS\) return false;/, 'a refused send is not tried again for a while');
+  assert.match(marksApi, /if \(refusal\(error\)\) refusedAt\.set\(key, Date\.now\(\)\);\s*return false;/, 'it stops at the refusal');
+  assert.match(marksApi, /export const REFUSED_WAIT_MS = 10 \* 60_000;/);
+  assert.match(marksApi, /failing_cleared_at, unreviewable_since, unreviewable_tried_at, unreviewable_cleared_at/, 'the clears are read back too');
+  const migration = read('supabase/migrations/20261122130000_day_review_recordings.sql');
+  assert.match(migration, /IF p_user IS DISTINCT FROM v_user THEN\s*RAISE EXCEPTION '[^']+' USING ERRCODE = '42501';/, 'the server refuses marks for another account');
+  assert.match(migration, /DROP FUNCTION IF EXISTS public\.day_review_mark_recordings\(text, jsonb\);/);
+  assert.match(migration, /cron\.schedule\('referralfit-day-review-recordings-prune-daily', '50 3 \* \* \*', 'SELECT public\.day_review_recordings_prune\(\)'\)/, 'kept 14 days whether or not the account writes again');
+  assert.match(migration, /r\.first_seen_at := least\(r\.first_seen_at, now\(\), v_rev/, 'a re-send never makes a row younger');
+  assert.ok(/^[\x00-\x7f]*$/.test(migration), 'the migration is ASCII');
+  assert.equal((migration.match(/^BEGIN;$/gm) || []).length, 1);
+  assert.equal((migration.match(/^COMMIT;$/gm) || []).length, 1);
   assert.match(api, /const state = await reviewedState\(recorder, userId, listed\.map\(\(item\) => item\.id\), now\);/, 'reviewed on the other device: not offered here');
   assert.match(api, /const state = await reviewedState\(recorder, userId, ids\);\s*return ids\.flatMap/, 'items saved on the other device are known here');
   // The sheet in a browser.
@@ -461,5 +561,48 @@ check(() => {
   assert.match(sheet, /Only this tab/, 'the sign-in kept in this tab only, if chosen');
   assert.match(app, /if \(!userId \|\| !recordersHere \|\| !aiKeysSupported\) return;/, 'the Today card counts Fieldy in a browser once connected');
 }, 'Fieldy on the web: the trip, the tabs, sign-out, and the server\'s marks');
+
+check(() => {
+  // Round 5, B: a duplicated tab's copy of an "Only this tab" sign-in is never sent once another tab rotated it.
+  writeFileSync(path.join(tmpDir, 'web-layout.js'), 'exports.IS_WEB = true;\n');
+  const fake = () => {
+    const items = new Map();
+    return { getItem: (k) => (items.has(k) ? items.get(k) : null), setItem: (k, v) => items.set(k, String(v)), removeItem: (k) => items.delete(k), key: (i) => [...items.keys()][i] ?? null, get length() { return items.size; } };
+  };
+  globalThis.localStorage = fake();
+  globalThis.sessionStorage = fake();
+  try {
+    const w = load('src/lib/fieldy-web.ts', 'fieldy-web.js');
+    const line = w.rotationId();
+    assert.ok(line && line !== w.rotationId(), 'ids differ');
+    assert.equal(w.tabCopyStale(line, 'g1'), false, 'nothing noted yet: the copy is fine');
+    w.noteTabRotation(line, 'g1');
+    assert.equal(w.tabCopyStale(line, 'g1'), false, 'the latest generation');
+    w.noteTabRotation(line, 'g2');
+    assert.equal(w.tabCopyStale(line, 'g1'), true, 'a copy from before another tab rotated it: stale');
+    assert.equal(w.tabCopyStale(w.rotationId(), 'g1'), false, 'another line (a separate connect) is not affected');
+    assert.equal(w.tabCopyStale(undefined, undefined), false, 'an older record without a line is read as before');
+    assert.ok(![...Array(localStorage.length).keys()].some((i) => /refresh|token/i.test(localStorage.getItem(localStorage.key(i)))), 'the note holds ids and a time, never a token');
+    localStorage.setItem('referralfit.tabRotation.v1.old', JSON.stringify({ gen: 'x', at: Date.now() - 15 * 24 * 60 * 60 * 1000 }));
+    w.noteTabRotation(line, 'g3');
+    assert.equal(localStorage.getItem('referralfit.tabRotation.v1.old'), null, 'old notes go');
+    sessionStorage.setItem('k', 'v');
+    localStorage.setItem('k', 'v');
+    w.tabRemove('k');
+    assert.equal(sessionStorage.getItem('k'), null);
+    assert.equal(localStorage.getItem('k'), 'v', 'only this tab\'s copy');
+  } finally {
+    delete globalThis.localStorage;
+    delete globalThis.sessionStorage;
+  }
+  assert.match(api, /if \(token\?\.scope === 'tab' && tabCopyStale\(token\.line, token\.gen\)\) \{\s*tabRemove\(tokenKey\(recorder, userId\)\);\s*return null;/, 'a stale copy is dropped (connect again), never sent');
+  assert.match(api, /const tab = scope === 'tab' \? \{ line: kept\.line \|\| rotationId\(\), gen: rotationId\(\) \} : null;/, 'a new generation at every write');
+  assert.match(api, /if \(tab\) noteTabRotation\(tab\.line, tab\.gen\);/);
+  // Round 5, A: a refresh on its way at sign-out never writes its rotated token back.
+  assert.match(api, /if \(signedOut\.has\(name\)\) \{\s*revokeInBackground\(recorder, value\.refreshToken\);\s*throw new FieldyError/, 'refused, and the rotated token revoked');
+  assert.match(api, /\/\/ A refresh on its way in this tab never writes its rotated token back\.\s*signedOut\.add\(item\.name\);/);
+  assert.match(api, /void signInQueue\(recorder, userId, async \(\) => \{\s*if \(!signedOut\.has\(item\.name\)\) return;\s*const left = browserRead\(item\.name\);/, 'and one in another tab is removed once it lets go of the lock');
+  assert.match(api, /signedOut\.delete\(tokenKey\(here, userId\)\);\s*await writeToken\(here, userId, \{ refreshToken: tokens\.refreshToken/, 'cleared when the account connects again');
+}, 'round 5: the web sign-in: a sign-out mid-refresh, and a duplicated tab');
 
 console.log(`fieldy-test: ${checks} checks passed`);

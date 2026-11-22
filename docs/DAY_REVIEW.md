@@ -759,6 +759,86 @@ recordings case).
 **For Matt:** nothing to deploy; it ships with the next iPhone build and the
 next web deploy.
 
+### Round 5, branch `fix/marks-sync`
+
+An audit of the server-synced marks (275e2b4) and of the web sign-in
+(c3270da). Eight findings, all fixed:
+
+1. **A mark whose send was cut off is sent again.** A change was written on
+   the device and then sent from memory; `synced` only turned false after a
+   failure the app saw, so when iOS closed the app mid-request the mark never
+   reached the server (and the web could offer the recording again). Now
+   each change notes, in the same write, what the server still needs: an
+   `unsent` list in the read state (`noteUnsent`, one entry per recording,
+   with the kind of change and any clear). The send reads it, sends outside
+   the read queue (a slow server holds nothing back), and takes an entry off
+   only once the server took it and only if it did not change meanwhile
+   (`pendingRows`, `confirmSent`). Every read and count sends what is still
+   unsent first. At most 300 entries, none older than 14 days; past that the
+   oldest go and `synced` turns false (everything is copied up once).
+2. **A cleared mark does not come back.** A failing recording read again
+   (its failure clock stops) and a "review failed" mark whose review came
+   back are cleared with a time (a tombstone, kept in `unsent` until the
+   server has it, then on the server as `failing_cleared_at` /
+   `unreviewable_cleared_at`). On the server and in `withServerMarks` a clear
+   newer than a mark's time (its last try, or since) wins; a mark newer than
+   the clear is a new failure and stays. So a single clear send that failed,
+   or another device sending its stale copy, no longer brings it back. A
+   reviewed mark is never cleared.
+3. **No marks on another account's rows.** `sendServerMarks` checked the
+   signed-in account once and then sent up to about 12 calls; a magic link
+   switching accounts in between would have written the first account's
+   marks to the second's rows (the function writes for `auth.uid()`). Now
+   `day_review_mark_recordings(p_user, p_recorder, p_marks)` takes the
+   account the send started for and refuses (42501) when it is not the one
+   signed in; the app passes it and stops at the refusal.
+4. **A refused send waits ten minutes** (`REFUSED_WAIT_MS` in
+   `recording-marks-api.ts`) before it is tried again, so a refusal never
+   repeats the full copy-up at every read.
+5. **"Read the next N now" names what the read takes** when held and waiting
+   recordings both exist, up to 3, the held ones first (`nextReadLabel`):
+   "Read the 2 conversations not read in full again, and the next
+   conversation, now"; "Read 3 of the 5 conversations not read in full again
+   now".
+6. **Sign-out during a refresh** (web). The sweep that removes Fieldy
+   sign-ins at sign-out did not wait for a refresh on its way, which then
+   wrote the rotated (unrevoked) refresh token back to `localStorage`. Now a
+   sign-in removed in this tab is noted (`signedOut`): a refresh finishing
+   later does not keep its token and revokes it instead. One on its way in
+   another tab is removed and revoked once it lets go of the sign-in's lock.
+   Connecting that account again clears the note.
+7. **A duplicated tab** (web, "Only this tab"). Duplicate Tab copies
+   `sessionStorage`, so two tabs held the same rotating refresh token, and
+   the second to refresh sent one already used (refused, and it can end the
+   first tab's sign-in too). Each tab-only sign-in now has a line (per
+   connect) and a generation (new at every write), the latest generation
+   noted in `localStorage` (ids and a time, no token; notes go after 14
+   days). A tab whose copy is older drops it and asks to connect again,
+   without sending it (`tabCopyStale` in `fieldy-web.ts`).
+8. **"Kept 14 days" holds for every account.** Rows went only when the same
+   account wrote again, and a full re-send reset their age. Now a row's age
+   is `first_seen_at`, the earliest time it was ever sent (a re-send never
+   makes it younger); a mark already past 14 days is not kept again; and
+   `day_review_recordings_prune()` runs daily at 03:50 UTC
+   (`referralfit-day-review-recordings-prune-daily`, where pg_cron is on, as
+   the push jobs are), as well as at each write.
+
+Tests: `scripts/fieldy-test.mjs` (unsent and confirm, tombstones, the bound,
+the account named in every call, the backoff, the duplicated tab and the
+sign-out, the migration's text), `scripts/day-review-test.mjs`
+(`nextReadLabel`), `supabase/tests/day_review_recordings_test.sql` (33
+checks: the clears and stale copies, a refusal for another account, the age,
+the prune). The migration was applied twice to a scratch Postgres 16 with a
+stand-in for Supabase's `auth` and for pgTAP, and the pgTAP file passed
+there (33 of 33); not yet run with `supabase test db`.
+
+**For Matt:** the migration file changed (still not applied anywhere; ASCII,
+one BEGIN/COMMIT, safe to re-run, every statement under 3,700 characters),
+so the Desktop paste copy must be made again from it. Nothing else to
+deploy: the rest ships with the next iPhone build and the next web deploy.
+Not tried on a device or a browser: a send cut off by closing the app, and
+a duplicated tab.
+
 ## Fieldy on the web (2026-11-21)
 
 Branch `feat/fieldy-web`. Decided by Matt: in the web app
@@ -819,42 +899,52 @@ worked on the web (the Anthropic key is kept in the browser).
   ReferralFit's server. Every change to it (refresh, connect, disconnect)
   runs in one queue in the tab and under one Web Lock across tabs, and the
   token is read inside the lock, so two tabs never refresh the same rotated
-  token. A refused token is removed only if it is still the one kept (another
+  token. A tab duplicated from one holding an "Only this tab" sign-in has a
+  copy of it; once either tab refreshes, the other's copy is dropped (never
+  sent) and that tab asks to connect again (`tabCopyStale`). A refused token is removed only if it is still the one kept (another
   tab may have rotated it since). Disconnect revokes it at Fieldy. Sign-out,
   a session that ended, and another account signing in remove it from the
   browser (`removeBrowserRecorderSignIns`, wired next to
-  `removeBrowserAnthropicKeys`) and revoke it at Fieldy in the background.
+  `removeBrowserAnthropicKeys`) and revoke it at Fieldy in the background;
+  a refresh still on its way then never writes its new token back.
   Fieldy's token, userinfo, revoke and `/mcp` endpoints allow browser calls
   (CORS `*`, `Mcp-Session-Id` exposed).
 - **What was reviewed, on the server.** `public.day_review_recordings`
   (migration `20261122130000_day_review_recordings.sql`): one row per
   account, recorder and recording id, with when it was reviewed, when
   reading it started failing, when its review failed on its own (and was
-  last tried), and the fingerprints of items saved from it. Fingerprints
+  last tried), when either was cleared, and the fingerprints of items saved
+  from it. Fingerprints
   were already one-way hashes on the phone (`signatureHash`, cyrb53: "h:"
   and at most 12 base-36 characters, never words); the server refuses
   anything else, and the app drops anything else before sending. No
   recording text, summary or transcript is ever stored. Clients read only
   their own rows (RLS on `auth.uid()`, no anon access); writes go only
-  through `day_review_mark_recordings(recorder, marks)`, which joins what it
-  is sent with what is there (reviewed stays reviewed, at its earliest time;
+  through `day_review_mark_recordings(user, recorder, marks)`, which refuses
+  marks named for any account but the one signed in, and joins what it is
+  sent with what is there (reviewed stays reviewed, at its earliest time;
   fingerprints are a union, the newest 200; the first failure and the latest
-  try are kept), at most 200 marks a call and 6,000 rows an account. Rows go
-  after 14 days (reads look back 7) and with the account.
+  try are kept; a clear newer than a failure's last time ends it), at most
+  200 marks a call and 6,000 rows an account. Rows go 14 days after the
+  earliest time they were sent (reads look back 7), whether or not the
+  account writes again (a daily job, where pg_cron is on, and at each
+  write), and with the account.
 - **Phone and web both read and write it** (`src/lib/recording-marks.ts`,
   `recording-marks-api.ts`). Each device still keeps its own copy (the
   keychain on the phone, `localStorage` in the browser: ids, times and
   fingerprints only). A read joins this device's marks with the server's for
   the recordings listed, and keeps the server's here too. Each change is
-  written here first, then sent. Calls go only for the account signed in on
-  the device at that moment.
+  written here first, with what the server still needs (`unsent`, in the
+  same write), then sent; it stays unsent until the server takes it. Calls
+  go only for the account signed in on the device at that moment, and each
+  names it.
 - **Before the migration is applied** the server answers "unknown table or
   function" (PGRST205/PGRST202/42P01/42883): the app keeps the marks on the
   device, as before, and asks again every ten minutes. **The first time the
   server has the table**, each device copies everything it keeps up once
   (`synced` in the read state; joined on the server, so no reviewed mark is
-  lost on either side); a send the server does not take is copied up again
-  at the next read.
+  lost on either side); a change the server does not take stays unsent and
+  is sent again at the next read (after a refusal, not for ten minutes).
 
 ### For Matt
 
