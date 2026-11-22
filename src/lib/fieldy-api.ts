@@ -61,7 +61,7 @@ import {
   type TranscriptPlan,
 } from './fieldy';
 
-import { failedApart, firstRecordings, mergeFingerprints } from './day-review';
+import { apartFromFailed, failedMark, firstRecordings, mergeFingerprints, planAroundFailed } from './day-review';
 
 export { FieldyError, FIELDY, PLAUD, RECORDERS, type Recorder, type RecorderId } from './fieldy';
 
@@ -114,7 +114,8 @@ const LOOK_BACK_MS = 7 * 24 * 60 * 60 * 1000;
 // (src/lib/day-review.ts signatureHash), so a recording read again does not
 // offer them twice. `unreviewable`: recordings whose review failed when
 // read on their own (incomplete, turned down, too slow), and since when:
-// read alone, only when nothing else is new (day-review.ts failedApart).
+// read alone, only when nothing else is new (day-review.ts apartFromFailed),
+// the one tried least recently first ("<since> <last tried>").
 type ReadState = {
   floor: string; reviewed: Record<string, string>; failing: Record<string, string>; saved: Record<string, string>; unreviewable: Record<string, string>;
 };
@@ -133,6 +134,14 @@ async function readState(recorder: Recorder, userId: string): Promise<ReadState 
       }
       return out;
     };
+    // "<since> <last tried>" (an older mark has its first time only).
+    const marks = (value: unknown) => {
+      const out: Record<string, string> = {};
+      for (const [id, at] of Object.entries(value && typeof value === 'object' ? value : {})) {
+        if (typeof at === 'string' && !Number.isNaN(Date.parse(at.split(' ')[0]))) out[id] = at;
+      }
+      return out;
+    };
     const saved: Record<string, string> = {};
     for (const [id, value] of Object.entries(data.saved && typeof data.saved === 'object' ? data.saved : {})) {
       if (typeof value === 'string' && !Number.isNaN(Date.parse(value.split(' ')[0]))) saved[id] = value;
@@ -142,7 +151,7 @@ async function readState(recorder: Recorder, userId: string): Promise<ReadState 
       reviewed: times(data.reviewed),
       failing: times(data.failing),
       saved,
-      unreviewable: times(data.unreviewable),
+      unreviewable: marks(data.unreviewable),
     };
   } catch {
     return null;
@@ -165,11 +174,12 @@ const emptyState = (now = new Date()): ReadState => ({ floor: startOfToday(now),
 const forgotten = new Set<string>();
 
 /** A change to what was reviewed, in its own queue (apart from the sign-in's). */
-function changeState(recorder: Recorder, userId: string, change: (state: ReadState) => void): Promise<void> {
+function changeState(recorder: Recorder, userId: string, change: (state: ReadState) => void | boolean): Promise<void> {
   return serial(`${slot(recorder, userId)}:read`, async () => {
     if (forgotten.has(slot(recorder, userId))) return;
     const state = (await readState(recorder, userId)) ?? emptyState();
-    change(state);
+    // false: nothing changed, nothing to write.
+    if (change(state) === false) return;
     await writeState(recorder, userId, state);
   });
 }
@@ -634,9 +644,13 @@ export async function readNewRecordings(recorder: Recorder, userId: string, now 
       for (const id of recovered) delete current.failing[id];
     }).catch(() => undefined);
   }
-  // A few recordings per review, so it rarely finds more than it can list;
-  // one whose review failed on its own waits until nothing else is new.
-  const plan = firstRecordings(failedApart(reviewPlan(read, now.getTime(), texts, recorder.name), new Set(Object.keys(state.unreviewable))));
+  // A few recordings per review, so it rarely finds more than it can list.
+  // One whose review failed on its own is set aside before the review is
+  // planned (it takes no room in it), and read alone, the one tried least
+  // recently first, only when nothing else can be read.
+  const { others, apart } = apartFromFailed(read, state.unreviewable);
+  const plan = firstRecordings(planAroundFailed(reviewPlan(others, now.getTime(), texts, recorder.name), apart,
+    (index) => reviewPlan([apart[index]], now.getTime(), texts, recorder.name)));
   return { ...plan, later: plan.later + (fresh.length - read.length), recorder };
 }
 
@@ -670,7 +684,23 @@ export async function markRecordingsReviewed(recorder: Recorder, userId: string,
  */
 export async function rememberReviewFailed(recorder: Recorder, userId: string, id: string): Promise<void> {
   await changeState(recorder, userId, (state) => {
-    if (!state.unreviewable[id]) state.unreviewable[id] = new Date().toISOString();
+    // Since the first failure; tried again now (with several, the one tried least recently goes next).
+    state.unreviewable[id] = failedMark(state.unreviewable[id], new Date().toISOString());
+  });
+}
+
+/**
+ * A review of these recordings came back: one whose review had failed on
+ * its own is an ordinary recording again (a slow moment is not held against
+ * it for good).
+ */
+export async function reviewCameBack(recorder: Recorder, userId: string, ids: string[]): Promise<void> {
+  await changeState(recorder, userId, (state) => {
+    let changed = false;
+    for (const id of ids) {
+      if (state.unreviewable[id]) { delete state.unreviewable[id]; changed = true; }
+    }
+    return changed;
   });
 }
 

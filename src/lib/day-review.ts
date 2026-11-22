@@ -1244,16 +1244,54 @@ export function carriedUrgent(items: FoundItem[], setAsideIds: string[], sourceO
 }
 
 /**
- * A recording whose review failed on its own (came back incomplete, was
- * turned down, took too long) is read alone, and only when nothing else is
- * new: it never holds newer recordings back. The others wait as before.
+ * When a recording whose review failed on its own was last tried: its mark
+ * is "<since> <last tried>" (an older mark has the first time only). NaN when
+ * the mark cannot be read.
  */
-export function failedApart<T extends { text: string; blocks: BlockLike[]; later: number }>(plan: T, failed: Set<string>): T {
-  const apart = plan.blocks.filter((block) => failed.has(block.id));
-  if (!apart.length) return plan;
-  const others = plan.blocks.filter((block) => !failed.has(block.id));
-  const blocks = others.length ? others : apart.slice(0, 1);
-  return { ...plan, blocks, text: blocks.map((block) => block.text).join('\n\n'), later: plan.later + plan.blocks.length - blocks.length };
+export function lastTried(mark: string | undefined): number {
+  const [since, tried] = (mark || '').split(' ');
+  const at = Date.parse(tried || since || '');
+  return Number.isNaN(at) ? Number.NaN : at;
+}
+
+/**
+ * The mark for a recording whose review failed on its own, tried again `now`:
+ * since when (kept from the first failure), and when it was last tried.
+ */
+export function failedMark(previous: string | undefined, now: string): string {
+  const since = (previous || '').split(' ')[0];
+  return `${since && !Number.isNaN(Date.parse(since)) ? since : now} ${now}`;
+}
+
+/**
+ * A recording whose review failed on its own (came back incomplete, was
+ * turned down, took too long) waits apart, before the review is planned: it
+ * takes no room in it, so it never holds newer recordings back. `apart`
+ * comes least recently tried first, so with several, each gets its turn.
+ */
+export function apartFromFailed<T extends { id: string }>(items: T[], marks: Record<string, string>): { others: T[]; apart: T[] } {
+  const others = items.filter((item) => !marks[item.id]);
+  const tried = (item: T) => {
+    const at = lastTried(marks[item.id]);
+    return Number.isNaN(at) ? 0 : at;
+  };
+  const apart = items.filter((item) => marks[item.id])
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => tried(a.item) - tried(b.item) || a.index - b.index)
+    .map((entry) => entry.item);
+  return { others, apart };
+}
+
+/**
+ * The review of the others, when it reads anything; else the recording
+ * tried least recently, alone. Those still apart are counted as waiting.
+ */
+export function planAroundFailed<T extends { text: string; blocks: BlockLike[]; later: number; skipped: string[] }>(
+  others: T, apart: unknown[], alone: (index: number) => T,
+): T {
+  if (others.blocks.length || !apart.length) return { ...others, later: others.later + apart.length };
+  const one = alone(0);
+  return { ...one, skipped: [...others.skipped, ...one.skipped], later: others.later + one.later + apart.length - 1 };
 }
 
 // ─── The writes ────────────────────────────────────────────────────────────

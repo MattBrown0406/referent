@@ -850,7 +850,7 @@ check(() => {
   const fieldyApi = read('src/lib/fieldy-api.ts');
   assert.match(fieldyApi, /state\.saved\[id\] = \[at, \.\.\.mergeFingerprints\(before, byRecording\[id\]\)\]\.join\(' '\);/);
   assert.doesNotMatch(fieldyApi, /\.slice\(0, 201\)/);
-  assert.match(fieldyApi, /const plan = firstRecordings\(failedApart\(reviewPlan\(read, now\.getTime\(\), texts, recorder\.name\), new Set\(Object\.keys\(state\.unreviewable\)\)\)\);/, 'a few recordings per review, one that failed alone apart');
+  assert.match(fieldyApi, /const \{ others, apart \} = apartFromFailed\(read, state\.unreviewable\);\s*const plan = firstRecordings\(planAroundFailed\(reviewPlan\(others, now\.getTime\(\), texts, recorder\.name\), apart,/, 'a few recordings per review, one that failed alone set aside before planning');
 }, 'saved fingerprints past 200: the newest are kept');
 
 check(() => {
@@ -1071,7 +1071,7 @@ check(() => {
   assert.match(findFn, /carried = \[\.\.\.carried, \.\.\.carriedUrgent\(answer\.items, dropped\.map\(\(block\) => block\.id\),/);
   assert.match(findFn, /carried = carried\.filter\(\(entry\) => !shownItems\.some\(\(item\) => sameFinding\(entry\.found, item\)\)\);/);
   assert.match(findFn, /const rowIds = new Map\(built\.map\(\(row\) => \[row\.key, carriedIds\.get\(row\.found\) \?\? blocksFor\(row\.found\.evidence, fromRecorder!\.blocks\)/);
-  assert.match(findFn, /recorderReadRef\.current = \{ \.\.\.fromRecorder, rowIds, held, waiting: waitingBefore \+ setAside\.length \};/, 'the link is this read\'s recordings only');
+  assert.match(findFn, /recorderReadRef\.current = \{\s*\.\.\.fromRecorder, rowIds, held, waiting: waitingBefore \+ setAside\.length, carried,/, 'the link is this read\'s recordings only');
   assert.match(findFn, /\.\.\.carried\.flatMap\(\(entry\) => entry\.ids\)/, 'saves from the set-aside recordings are known again');
   // recordingsDone only ever settles the read's own recordings.
   assert.match(sheet, /return read\.blocks\.map\(\(block\) => block\.id\)\n\s+\.filter\(\(id\) => !read\.held\.includes\(id\)\)/);
@@ -1083,7 +1083,7 @@ check(() => {
   assert.match(readNextFn, /await readRecorder\(read\.recorder, opening\);/);
   assert.ok(readNextFn.indexOf('markReviewed') < readNextFn.indexOf('readRecorder('), 'settled first');
   assert.match(sheet, /function markReviewed\(recorder: Recorder, ids: string\[\]\): Promise<void> \{\n\s+return markRecordingsReviewed\(/, 'written before it answers');
-  assert.match(sheet, /nextRead\.waiting > 0 && \(phase === 'done' \|\| \(phase === 'review' && rows\.every\(\(row\) => rowDecided\(row, saved\)\)\)\)/);
+  assert.match(sheet, /\(nextRead\.waiting > 0 \|\| heldCount > 0\) && \(phase === 'done' \|\| phase === 'review'\) && allDecided/);
 }, 'a narrowed review keeps the urgent items found in the recordings it set aside');
 
 check(() => {
@@ -1108,12 +1108,12 @@ check(() => {
   const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
   assert.match(findFn, /while \(!narrowed && onlyRecordings && failedForLength\(failure\) && extra < NARROWED_READS\) \{/, 'bounded, and only for a failure of length, only when the box is just the recordings');
   assert.match(findFn, /extra \+= 1;\n\s+narrowedFor = 'failed';/, 'shares the extra-read budget with the cap narrowing');
-  assert.match(findFn, /const alone = fromRecorder && onlyRecordings && fromRecorder\.blocks\.length === 1 && failedForLength\(error\) \? fromRecorder : null;/);
+  assert.match(findFn, /const alone = fromRecorder && onlyRecordings && fromRecorder\.blocks\.length === 1 && failedForLength\(error, true\) \? fromRecorder : null;/);
   assert.match(findFn, /if \(alone\) void rememberReviewFailed\(alone\.recorder, userId, alone\.blocks\[0\]\.id\)/);
   assert.match(findFn, /setFailedRead\(Boolean\(recorderReadRef\.current\?\.blocks\.length\)\);/, '"Done with these" is offered after a failed recorder read');
   const api = read('src/lib/day-review-api.ts');
-  assert.match(api, /error\.reason === 'refused' \|\| error\.code === 'incomplete' \|\| error\.code === 'timeout'/);
-  assert.match(api, /'unavailable', 'timeout'\);/, 'the phone\'s own timeout counts too');
+  assert.match(api, /error\.reason === 'refused' \|\| error\.code === 'incomplete' \|\| error\.code === 'timeout' \|\| \(!alone && error\.code === 'phone_timeout'\)/);
+  assert.match(api, /'unavailable', 'phone_timeout'\);/, 'the phone\'s own timeout counts for several (round 4: not for one alone)');
   assert.match(api, /throw new ReviewUnavailableError\(message, 'unavailable', code\);/, 'the function\'s code reaches the phone');
   assert.match(fn, /failure\(502, 'incomplete'/);
   assert.match(fn, /failure\(504, 'timeout'/);
@@ -1123,20 +1123,73 @@ check(() => {
   assert.match(doneFn, /ReferralFit will not offer \$\{one \? 'it' : 'them'\} again\./);
   assert.match(doneFn, /if \(opening !== openingRef\.current \|\| recorderReadRef\.current !== read\) return;/, 'a stale confirm does nothing');
   assert.match(doneFn, /markReviewed\(recorder, blocks\.map\(\(block\) => block\.id\)\);/);
-  // One that failed alone waits until nothing else is new, then is read alone.
-  const plan = (ids) => ({ text: ids.join('\n\n'), blocks: ids.map((id) => ({ id, text: id })), skipped: [], later: 1 });
-  const apart = rules.failedApart(plan(['bad', 'b', 'c']), new Set(['bad']));
-  assert.deepEqual(apart.blocks.map((block) => block.id), ['b', 'c'], 'never blocks newer ones');
-  assert.equal(apart.later, 2, 'and is counted as waiting');
-  assert.equal(apart.text, 'b\n\nc');
-  const alone = rules.failedApart(plan(['bad', 'bad2']), new Set(['bad', 'bad2']));
-  assert.deepEqual(alone.blocks.map((block) => block.id), ['bad'], 'nothing else new: the oldest is read alone');
-  assert.equal(alone.later, 2);
-  const none = plan(['a', 'b']);
-  assert.equal(rules.failedApart(none, new Set()), none);
+  // One that failed alone waits apart (round 4: before the plan, see below).
+  const marks = { bad: '2026-11-20T10:00:00.000Z' };
+  const split = rules.apartFromFailed([{ id: 'bad' }, { id: 'b' }, { id: 'c' }], marks);
+  assert.deepEqual(split.others.map((item) => item.id), ['b', 'c'], 'never blocks newer ones');
+  assert.deepEqual(split.apart.map((item) => item.id), ['bad']);
   const fieldyApi = read('src/lib/fieldy-api.ts');
   assert.match(fieldyApi, /delete state\.unreviewable\[id\];/, 'let go once it is reviewed');
-  assert.match(fieldyApi, /unreviewable: times\(data\.unreviewable\),/, 'kept on the phone');
+  assert.match(fieldyApi, /unreviewable: marks\(data\.unreviewable\),/, 'kept on the phone');
 }, 'a read that fails for its length is read again with fewer, and one bad recording can be let go');
+
+// ─── Round 4 (2026-11-21) ──────────────────────────────────────────────────
+check(() => {
+  // 1. A long recording whose review failed alone takes no room: the newer long ones are read.
+  const now = Date.parse('2026-11-21T20:00:00Z');
+  const long = (id, hour) => ({ id, title: id, summary: `${id} `.repeat(3200), startTime: `2026-11-21T${String(hour).padStart(2, '0')}:00:00Z`, endTime: `2026-11-21T${String(hour).padStart(2, '0')}:30:00Z` });
+  const fieldyRules = load('src/lib/fieldy.ts', 'fieldy.js');
+  const items = [long('x', 8), long('y', 9), long('z', 10)];
+  const state = { x: '2026-11-21T12:00:00.000Z' };
+  const before = fieldyRules.reviewPlan(items, now);
+  assert.deepEqual(before.blocks.map((block) => block.id), ['x'], 'the old way: x alone fits, y and z wait behind it');
+  const { others, apart } = rules.apartFromFailed(items, state);
+  const plan = rules.planAroundFailed(fieldyRules.reviewPlan(others, now), apart, (index) => fieldyRules.reviewPlan([apart[index]], now));
+  assert.deepEqual(plan.blocks.map((block) => block.id), ['y'], 'now y is read (z waits for room), never x');
+  assert.equal(plan.later, 2, 'z and x are counted as waiting');
+  // Nothing else new: the failed one is read alone.
+  const onlyFailed = rules.apartFromFailed([long('x', 8)], state);
+  const alonePlan = rules.planAroundFailed(fieldyRules.reviewPlan(onlyFailed.others, now), onlyFailed.apart, (index) => fieldyRules.reviewPlan([onlyFailed.apart[index]], now));
+  assert.deepEqual(alonePlan.blocks.map((block) => block.id), ['x']);
+  assert.equal(alonePlan.later, 0);
+  // 3. Two failed: the one tried least recently goes next, and a failure moves it to the back.
+  const two = { a: '2026-11-20T08:00:00.000Z 2026-11-21T09:00:00.000Z', b: '2026-11-20T09:00:00.000Z' };
+  assert.deepEqual(rules.apartFromFailed([{ id: 'a' }, { id: 'b' }], two).apart.map((item) => item.id), ['b', 'a'], 'b was tried longest ago');
+  const again = rules.failedMark(two.b, '2026-11-21T10:00:00.000Z');
+  assert.equal(again, '2026-11-20T09:00:00.000Z 2026-11-21T10:00:00.000Z', 'since the first failure, tried now');
+  assert.deepEqual(rules.apartFromFailed([{ id: 'a' }, { id: 'b' }], { ...two, b: again }).apart.map((item) => item.id), ['a', 'b']);
+  assert.equal(rules.failedMark(undefined, '2026-11-21T10:00:00.000Z'), '2026-11-21T10:00:00.000Z 2026-11-21T10:00:00.000Z');
+  assert.equal(rules.lastTried('2026-11-20T09:00:00.000Z'), Date.parse('2026-11-20T09:00:00.000Z'), 'an older mark: its one time');
+  const api = read('src/lib/fieldy-api.ts');
+  assert.match(api, /state\.unreviewable\[id\] = failedMark\(state\.unreviewable\[id\], new Date\(\)\.toISOString\(\)\);/, 'each failure refreshes the last-tried time');
+  assert.doesNotMatch(api, /failedApart/);
+}, 'round 4: a recording that failed alone is set aside before the plan, and each failed one gets its turn');
+
+check(() => {
+  // 4. The phone giving up waiting never marks one recording read alone as unreviewable.
+  const apiRules = read('src/lib/day-review-api.ts');
+  assert.match(apiRules, /export function failedForLength\(error: unknown, alone = false\): boolean/);
+  const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(findFn, /void reviewCameBack\(fromRecorder\.recorder, userId, blockIds\)/, 'a review that came back clears the mark');
+  const api = read('src/lib/fieldy-api.ts');
+  assert.match(api, /export async function reviewCameBack[^]*if \(state\.unreviewable\[id\]\) \{ delete state\.unreviewable\[id\]; changed = true; \}[^]*return changed;/);
+}, 'round 4: a slow moment is not held against a recording');
+
+check(() => {
+  // 2. "Read the next N now" only when every row is decided, in every phase; held ones said as read again.
+  assert.match(sheet, /const allDecided = rows\.every\(\(row\) => rowDecided\(row, saved\)\);/);
+  assert.doesNotMatch(sheet, /phase === 'done' \|\| \(phase === 'review' && rows\.every/, 'Done no longer skips the check');
+  const readNextFn = /async function readNext\(\) \{[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(readNextFn, /if \(!rows\.every\(\(row\) => rowDecided\(row, saved\)\)\) return;/, 'and readNext refuses past an undecided row');
+  assert.match(sheet, /not read in full again now/, 'held recordings: read again, not "the next"');
+  // 5. Carried urgent items come back on Find again.
+  const findFn = /async function find\(read[^]*?\n  \}\n/.exec(sheet)?.[0] || '';
+  assert.match(findFn, /const carriedBefore = !read && linked && kept\.length \? linked\.carried \?\? \[\] : \[\];/);
+  assert.match(findFn, /let carried: \{ found: FoundItem; ids: string\[\] \}\[\] = \[\.\.\.carriedBefore\];/);
+  assert.match(findFn, /carried, carriedFrom: \[\.\.\.setAside, \.\.\.carriedFrom\],/, 'kept with the read, tied to the set-aside recordings');
+  // 6. Web copy.
+  assert.match(sheet, /Click in the box and press Cmd\+V \(Ctrl\+V on Windows\)\./);
+  assert.match(sheet, /Long-press the box and choose Paste\./, 'the phone keeps its own wording');
+}, 'round 4: the next read, carried urgent items, web copy');
 
 console.log(`day-review-test: ${checks} checks passed`);

@@ -715,3 +715,46 @@ are read now; the round 1 and 2 deploy above still stands); everything
 ships with the next iPhone build. Each narrowed read is one more review against the day's cap
 (at most two extra per Find). Not tried on a device: a read that fails for
 its length, and "Read the next N now".
+
+### Round 4, branch `feat/fieldy-web`
+
+Six findings (an audit of 9125f2a), all fixed:
+
+1. **A long recording whose review failed on its own no longer blocks the
+   newer ones.** It was set aside only after the review was planned, so it
+   had already taken the room (a review holds about 11,500 characters, each
+   recording up to 6,000): the newer long ones waited behind it, and the plan
+   then read it alone, every time. Now recordings marked `unreviewable` are
+   set aside before the plan (`apartFromFailed` in `day-review.ts`), counted
+   as waiting, and one is read alone only when nothing else can be read
+   (`planAroundFailed`).
+2. **"Read the next N now" only when every row is decided**, on Done as on
+   the review. On Done it showed with a row still undecided (one switched off
+   because it was not found word for word), and the next read skipped the
+   close question, so nothing was settled and the same oldest recordings
+   were read again (another model call). `readNext` also refuses past an
+   undecided row. After a review that stopped at its cap the button says it
+   reads the held ones again ("Read the 2 conversations not read in full
+   again now").
+3. **Two recordings that failed alone take turns.** The mark is now
+   "<since> <last tried>" (`failedMark`, `lastTried`); each failure refreshes
+   the last-tried time and the one tried least recently goes next. Older
+   marks (one time) still read.
+4. **One slow moment is not held against a recording.** The phone giving up
+   waiting is now its own code (`phone_timeout`, apart from the function's
+   `timeout`); it still narrows a read of several, but never marks one read
+   alone as unreviewable (`failedForLength(error, true)`). A review of a
+   recording that comes back clears its mark (`reviewCameBack`).
+5. **Urgent items carried from set-aside recordings come back** after "Back
+   to the notes", then Find again: they are kept with the read
+   (`carried`, `carriedFrom`), still tied only to the recordings set aside.
+6. Web wording: when the browser will not hand over the clipboard, Paste
+   says to click in the box and press Cmd+V (Ctrl+V on Windows); the phone
+   keeps "Long-press the box". The Today card's "Review notes" line on the
+   web no longer promises Plaud.
+
+Tests: `scripts/day-review-test.mjs` (round 4 checks, with the long
+recordings case).
+
+**For Matt:** nothing to deploy; it ships with the next iPhone build and the
+next web deploy.

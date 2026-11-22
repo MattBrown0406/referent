@@ -86,6 +86,7 @@ import {
   recorderStatus,
   rememberReviewFailed,
   rememberSaved,
+  reviewCameBack,
   savedFrom,
 } from './fieldy-api';
 import { loadDayReviewReminder, saveDayReviewReminder } from './day-review-reminder';
@@ -222,8 +223,12 @@ export default function DayReviewSheet({
   // source). `held`: read again next time whatever happens here (the review
   // stopped at its cap and listed nothing from them). `waiting`: recordings
   // of this recorder left for the next read (beyond this one, or set aside).
+  // `carried`: urgent items found in recordings set aside (each tied to
+  // those only), with `carriedFrom`, the recordings set aside: kept so that
+  // "Back to the notes", then Find again, shows them again.
   const recorderReadRef = useRef<{
     recorder: Recorder; blocks: FieldyBlock[]; everyId: string[]; rowIds: Map<string, string[]>; skipped: string[]; held: string[]; waiting: number;
+    carried?: { found: FoundItem; ids: string[] }[]; carriedFrom?: FieldyBlock[];
   } | null>(null);
   // The read in progress (a recorder's, while it is fetched or reviewed, or
   // the box's): Cancel asks about it, never about the review it replaces.
@@ -505,7 +510,10 @@ export default function DayReviewSheet({
       if (text.trim()) setNotes((current) => (current.trim() ? `${current.trim()}\n\n${text.trim()}` : text.trim()));
       else setMessage({ ok: false, text: 'Nothing to paste. Copy the summary in Fieldy or Plaud first.' });
     } catch {
-      setMessage({ ok: false, text: 'Could not read what you copied. Long-press the box and choose Paste.' });
+      // A browser can refuse to hand over the clipboard: the keyboard still pastes.
+      setMessage({ ok: false, text: Platform.OS === 'web'
+        ? 'This browser did not let ReferralFit read what you copied. Click in the box and press Cmd+V (Ctrl+V on Windows).'
+        : 'Could not read what you copied. Long-press the box and choose Paste.' });
     }
   }
 
@@ -565,7 +573,11 @@ export default function DayReviewSheet({
     // found in them, shown with this review (each tied to its own recording).
     const setAside: FieldyBlock[] = [];
     let narrowedFor: 'cap' | 'failed' = 'cap';
-    let carried: { found: FoundItem; ids: string[] }[] = [];
+    // Find again after "Back to the notes": the urgent items carried with the
+    // review on screen come back, still tied only to their set-aside recordings.
+    const carriedBefore = !read && linked && kept.length ? linked.carried ?? [] : [];
+    const carriedFrom = !read && linked && kept.length ? linked.carriedFrom ?? [] : [];
+    let carried: { found: FoundItem; ids: string[] }[] = [...carriedBefore];
     // Extra reads, a couple at most, whatever they are for: never a loop of model calls.
     let extra = 0;
     try {
@@ -650,7 +662,7 @@ export default function DayReviewSheet({
       }
       const built = markSavedBefore(
         buildRows(items, workspaceRef.current, day, newUuid, blocks ? (found) => {
-          const from = carriedIds.has(found) ? blocksFor(found.evidence, setAside) : blocksFor(found.evidence, blocks);
+          const from = carriedIds.has(found) ? blocksFor(found.evidence, [...setAside, ...carriedFrom]) : blocksFor(found.evidence, blocks);
           return from.length === 1 ? { label: from[0].label, at: from[0].startTime } : null;
         } : undefined),
         savedSignaturesRef.current,
@@ -676,7 +688,11 @@ export default function DayReviewSheet({
         // its recordings, so they are read again next time (of one alone,
         // only when nothing was listed from it).
         held = recordingsHeld(blockIds, rowIds.values(), truncated);
-        recorderReadRef.current = { ...fromRecorder, rowIds, held, waiting: waitingBefore + setAside.length };
+        recorderReadRef.current = {
+          ...fromRecorder, rowIds, held, waiting: waitingBefore + setAside.length, carried, carriedFrom: [...setAside, ...carriedFrom],
+        };
+        // Reviewed: one whose review had failed on its own is an ordinary recording again.
+        void reviewCameBack(fromRecorder.recorder, userId, blockIds).catch(() => undefined);
         // A recording nothing was found in is done now (unless an item's
         // quote is in none of them: it could be from any; or the review
         // stopped at its cap); so is one with no text a day after it ended.
@@ -708,7 +724,8 @@ export default function DayReviewSheet({
       // One recording that failed on its own (after the others were set
       // aside, or read alone): it is read alone from now on, only when
       // nothing newer waits, so it never blocks the queue; and it can be let go.
-      const alone = fromRecorder && onlyRecordings && fromRecorder.blocks.length === 1 && failedForLength(error) ? fromRecorder : null;
+      // The phone giving up waiting on one alone is not held against it (failedForLength's `alone`).
+      const alone = fromRecorder && onlyRecordings && fromRecorder.blocks.length === 1 && failedForLength(error, true) ? fromRecorder : null;
       if (alone) void rememberReviewFailed(alone.recorder, userId, alone.blocks[0].id).catch(() => undefined);
       if (alone && setAside.length) keepLink(alone, setAside.length);
       else keepLink();
@@ -919,6 +936,8 @@ export default function DayReviewSheet({
   async function readNext() {
     const read = recorderReadRef.current;
     if (!read || busy || savingRef.current) return;
+    // Never past an undecided row: it would hold every recording of this read.
+    if (!rows.every((row) => rowDecided(row, saved))) return;
     const opening = openingRef.current;
     const done = recordingsDone(saved, rows);
     setMessage(null);
@@ -1440,12 +1459,22 @@ export default function DayReviewSheet({
 
   // "Read the next N now": everything in this review is decided and more of
   // its recorder's recordings wait. Only on a tap: never a read by itself.
+  // Only once every row is decided, on Done as on the review (an undecided
+  // row would hold every recording, and the same ones would be read again).
+  // Recordings held by a review that stopped at its cap are read again first:
+  // the button says so.
   const nextRead = recorderReadRef.current;
-  const nextCount = nextRead && nextRead.waiting > 0 && (phase === 'done' || (phase === 'review' && rows.every((row) => rowDecided(row, saved))))
-    ? Math.min(nextRead.waiting, RECORDINGS_PER_REVIEW) : 0;
+  const allDecided = rows.every((row) => rowDecided(row, saved));
+  const heldCount = nextRead ? nextRead.held.length : 0;
+  const nextCount = nextRead && (nextRead.waiting > 0 || heldCount > 0) && (phase === 'done' || phase === 'review') && allDecided
+    ? Math.min(nextRead.waiting + heldCount, RECORDINGS_PER_REVIEW) : 0;
+  const nextLabel = !nextRead || !nextCount ? ''
+    : heldCount
+      ? `Read the ${heldCount === 1 ? nextRead.recorder.noun : `${heldCount} ${nextRead.recorder.noun}s`} not read in full again now`
+      : `Read the next ${nextCount === 1 ? nextRead.recorder.noun : `${nextCount} ${nextRead.recorder.noun}s`} now`;
   const nextButton = nextRead && nextCount ? (
     <TouchableOpacity accessibilityRole="button" onPress={() => { void readNext(); }} style={[styles.secondaryButton, styles.nextButton]}>
-      <Text style={styles.secondaryButtonText}>Read the next {nextCount === 1 ? nextRead.recorder.noun : `${nextCount} ${nextRead.recorder.noun}s`} now</Text>
+      <Text style={styles.secondaryButtonText}>{nextLabel}</Text>
     </TouchableOpacity>
   ) : null;
   // After a failed recorder read: let its recordings go.

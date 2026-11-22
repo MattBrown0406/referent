@@ -38,10 +38,14 @@ export class ReviewUnavailableError extends Error {
  * The review failed for what it was given, not for the key, the cap or the
  * connection: it came back incomplete, was turned down, or took too long.
  * A read of several recordings that failed so is read again with fewer.
+ * `alone`: one recording read on its own; then only the function's own
+ * answers count (incomplete, turned down, its own time limit), never the
+ * phone giving up waiting ('phone_timeout'): one slow moment never marks a
+ * normal recording as one that cannot be reviewed.
  */
-export function failedForLength(error: unknown): boolean {
+export function failedForLength(error: unknown, alone = false): boolean {
   return error instanceof ReviewUnavailableError
-    && (error.reason === 'refused' || error.code === 'incomplete' || error.code === 'timeout');
+    && (error.reason === 'refused' || error.code === 'incomplete' || error.code === 'timeout' || (!alone && error.code === 'phone_timeout'));
 }
 
 type FunctionErrorBody = { error?: { code?: string; message?: string } };
@@ -84,7 +88,8 @@ export async function requestDayReview(notes: string, today: string, apiKey: str
     const name = (result.error as { name?: string }).name || '';
     const cause = (result.error as { context?: { name?: unknown } }).context;
     if (name === 'FunctionsFetchError' && cause?.name === 'AbortError') {
-      throw new ReviewUnavailableError('The review took too long. Try a shorter part of the day.', 'unavailable', 'timeout');
+      // The phone stopped waiting (the function's own time limit answers 'timeout').
+      throw new ReviewUnavailableError('The review took too long. Try a shorter part of the day.', 'unavailable', 'phone_timeout');
     }
     if (name === 'FunctionsFetchError' || name === 'FunctionsRelayError') throw new ReviewUnavailableError(OFFLINE_MESSAGE, 'offline');
     const payload = await functionErrorBody(result.error);

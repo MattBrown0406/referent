@@ -7207,7 +7207,9 @@ export default function App() {
               <AppIcon name="reader-outline" size={20} color={COLORS.forest} />
               <View style={styles.globalDirectoryCopy}>
                 <Text style={styles.globalDirectoryTitle}>Review notes</Text>
-                <Text style={styles.globalDirectorySubtitle}>Read your Fieldy or Plaud recordings, or paste your call notes; approve the leads, notes and follow-ups it finds</Text>
+                <Text style={styles.globalDirectorySubtitle}>{IS_WEB
+                  ? 'Paste your call notes or a recorder’s summary; approve the leads, notes and follow-ups it finds'
+                  : 'Read your Fieldy or Plaud recordings, or paste your call notes; approve the leads, notes and follow-ups it finds'}</Text>
               </View>
               <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
             </TouchableOpacity>
