@@ -81,21 +81,21 @@ export const RECORDERS: Recorder[] = [FIELDY, PLAUD];
 // phone-only: its server refuses browser pages (403 forbidden_origin).
 
 /**
- * The web app's Fieldy client id. Empty until Matt approves the one
- * registration (scripts/register-fieldy-web-client.mjs prints the id to
- * paste here); while empty, the web app says Fieldy connects in the browser
- * soon and offers no Connect button.
+ * The web app's Fieldy client id: registered once on Matt's OK, 2026-11-22
+ * (scripts/register-fieldy-web-client.mjs --send --no-local). A public
+ * client (no secret, PKCE), like the phone's. Empty would hide Connect.
  */
-export const FIELDY_WEB_CLIENT_ID = '';
+export const FIELDY_WEB_CLIENT_ID = 'UsPgzDJSqPeKgDkSImfOWRUSJhVvrIbb';
 
 /** The page Fieldy sends the browser back to. */
 export const WEB_RETURN_PATH = '/oauth/fieldy';
 
-/** Every return the web client is registered with: the web app, and the two local dev servers. */
+/**
+ * Every return the web client is registered with. Fieldy takes only https
+ * returns for a web client, so a local dev server offers no Connect button.
+ */
 export const FIELDY_WEB_REDIRECTS = [
   'https://app.referralfit.com/oauth/fieldy',
-  'http://localhost:8081/oauth/fieldy',
-  'http://localhost:3222/oauth/fieldy',
 ];
 
 /**

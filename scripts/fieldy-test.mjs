@@ -351,13 +351,13 @@ check(() => {
 
 // ─── Fieldy on the web (2026-11-21) ────────────────────────────────────────
 check(() => {
-  assert.equal(f.FIELDY_WEB_CLIENT_ID, '', 'no web client until Matt approves the registration');
-  assert.equal(f.webRecorder(f.FIELDY, 'https://app.referralfit.com'), null, 'so the web app cannot connect yet');
+  assert.equal(f.FIELDY_WEB_CLIENT_ID, 'UsPgzDJSqPeKgDkSImfOWRUSJhVvrIbb', 'the web client registered on Matt\'s OK (2026-11-22)');
+  assert.equal(f.webRecorder(f.FIELDY, 'https://app.referralfit.com').clientId, 'UsPgzDJSqPeKgDkSImfOWRUSJhVvrIbb', 'the web app connects with its own client');
   const web = f.webRecorder(f.FIELDY, 'https://app.referralfit.com', 'WEBCLIENT');
   assert.equal(web.clientId, 'WEBCLIENT');
   assert.equal(web.redirectUri, 'https://app.referralfit.com/oauth/fieldy');
   assert.equal(web.id, 'fieldy', 'the same recorder: its marks are shared with the phone');
-  assert.equal(f.webRecorder(f.FIELDY, 'http://localhost:8081', 'WEBCLIENT').redirectUri, 'http://localhost:8081/oauth/fieldy');
+  assert.equal(f.webRecorder(f.FIELDY, 'http://localhost:8081', 'WEBCLIENT'), null, 'a local dev server has no registered return');
   assert.equal(f.webRecorder(f.FIELDY, 'https://evil.example', 'WEBCLIENT'), null, 'only registered origins');
   assert.equal(f.webRecorder(f.PLAUD, 'https://app.referralfit.com', 'WEBCLIENT'), null, 'Plaud stays phone-only');
   const url = f.authorizeUrl('C', 'S', web);

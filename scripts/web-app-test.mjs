@@ -47,7 +47,7 @@ assert.match(app, /await wipeAccountDataWithoutSession\(\);\s*removeBrowserAnthr
 
 // Fieldy connects in the browser (Matt, 2026-11-21); Plaud stays phone-only.
 const fieldy = read('src/lib/fieldy.ts');
-assert.match(fieldy, /export const FIELDY_WEB_CLIENT_ID = '';/, 'no web client until the registration is approved and run');
+assert.match(fieldy, /export const FIELDY_WEB_CLIENT_ID = '[A-Za-z0-9]{16,}';/, 'the web client registered on Matt\'s OK');
 assert.match(fieldy, /'https:\/\/app\.referralfit\.com\/oauth\/fieldy'/);
 assert.match(fieldy, /if \(recorder\.id !== 'fieldy' \|\| !clientId \|\| !origin\) return null;/, 'Plaud never connects in a browser');
 assert.match(read('index.ts'), /captureFieldyReturn\(\);/, 'the return page leaves the code out of the address bar');

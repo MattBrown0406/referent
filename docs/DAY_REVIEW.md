@@ -889,11 +889,14 @@ worked on the web (the Anthropic key is kept in the browser).
   old, came back to another origin, or its state or issuer differ
   (`codeFromCallback`, as on the phone), then exchanges the code.
 - **Its own client.** The web app is a separate public client at Fieldy
-  (no secret, PKCE), with returns `https://app.referralfit.com/oauth/fieldy`
-  and, for development, `http://localhost:8081/oauth/fieldy` and
-  `http://localhost:3222/oauth/fieldy` (`FIELDY_WEB_REDIRECTS`). Its id is
-  `FIELDY_WEB_CLIENT_ID` in `src/lib/fieldy.ts`: **empty until Matt approves
-  the registration**; while empty, the web app offers no Connect button.
+  (no secret, PKCE), with the one return `https://app.referralfit.com/oauth/fieldy`
+  (`FIELDY_WEB_REDIRECTS`; Fieldy refuses http returns for a web client, so
+  a local dev server offers no Connect button). Its id is
+  `FIELDY_WEB_CLIENT_ID` in `src/lib/fieldy.ts`, **registered on Matt's OK
+  on 2026-11-22** (`scripts/register-fieldy-web-client.mjs --send --no-local`).
+  It goes live when the web app is next deployed from this branch: deploy
+  it only once the iPhone build with the shared "already reviewed" list is
+  in the App Store (1.3.0 phones keep their own list).
 - **The refresh token** stays in the browser for this account
   (`localStorage`, or `sessionStorage` for "Only this tab"), never on
   ReferralFit's server. Every change to it (refresh, connect, disconnect)
