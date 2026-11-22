@@ -75,6 +75,41 @@ export const PLAUD: Recorder = {
 
 export const RECORDERS: Recorder[] = [FIELDY, PLAUD];
 
+// ─── Fieldy in the web app (docs/DAY_REVIEW.md, "Fieldy on the web") ───────
+// The browser signs in with its own public client (no secret, PKCE), whose
+// return is a page of the web app, never the phone's app scheme. Plaud stays
+// phone-only: its server refuses browser pages (403 forbidden_origin).
+
+/**
+ * The web app's Fieldy client id. Empty until Matt approves the one
+ * registration (scripts/register-fieldy-web-client.mjs prints the id to
+ * paste here); while empty, the web app says Fieldy connects in the browser
+ * soon and offers no Connect button.
+ */
+export const FIELDY_WEB_CLIENT_ID = '';
+
+/** The page Fieldy sends the browser back to. */
+export const WEB_RETURN_PATH = '/oauth/fieldy';
+
+/** Every return the web client is registered with: the web app, and the two local dev servers. */
+export const FIELDY_WEB_REDIRECTS = [
+  'https://app.referralfit.com/oauth/fieldy',
+  'http://localhost:8081/oauth/fieldy',
+  'http://localhost:3222/oauth/fieldy',
+];
+
+/**
+ * Fieldy as the web app on `origin` signs in to it: the web client, and a
+ * return to this origin. null when it cannot connect here: not Fieldy, no web
+ * client registered yet, or an origin the client does not know.
+ */
+export function webRecorder(recorder: Recorder, origin: string | null, clientId: string = FIELDY_WEB_CLIENT_ID): Recorder | null {
+  if (recorder.id !== 'fieldy' || !clientId || !origin) return null;
+  const redirectUri = `${origin.replace(/\/+$/, '')}${WEB_RETURN_PATH}`;
+  if (!FIELDY_WEB_REDIRECTS.includes(redirectUri)) return null;
+  return { ...recorder, clientId, redirectUri };
+}
+
 export class FieldyError extends Error {
   /** 'tool': the recorder answered with an error about the request itself (a recording it has no note for, say), not a lost connection. */
   constructor(message: string, readonly reason: 'cancelled' | 'disconnected' | 'unavailable' | 'denied' | 'tool' = 'unavailable') {
@@ -126,7 +161,9 @@ function queryOf(url: string): Record<string, string> {
  */
 export function codeFromCallback(url: string, state: string, recorder: Recorder = FIELDY): string {
   const name = recorder.name;
-  if (!url.startsWith(recorder.redirectUri)) throw new FieldyError(`${name} sent you back to the wrong place. Try connecting again.`);
+  // The return itself, with only its query after it (never a longer path on the same start).
+  const rest = url.startsWith(recorder.redirectUri) ? url.slice(recorder.redirectUri.length) : null;
+  if (rest === null || (rest !== '' && !/^[?#]/.test(rest))) throw new FieldyError(`${name} sent you back to the wrong place. Try connecting again.`);
   const query = queryOf(url);
   if (query.error) {
     throw query.error === 'access_denied'

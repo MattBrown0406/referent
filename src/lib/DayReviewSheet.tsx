@@ -82,10 +82,12 @@ import {
   FieldyError,
   fieldySupported,
   markRecordingsReviewed,
+  recorderOnWeb,
   readNewRecordings,
   recorderStatus,
   rememberReviewFailed,
   rememberSaved,
+  reviewCameBack,
   savedFrom,
 } from './fieldy-api';
 import { loadDayReviewReminder, saveDayReviewReminder } from './day-review-reminder';
@@ -97,7 +99,7 @@ import { appendToNotes, REVIEW_TEXT_MAX, sharedNoteMessage, type SharedNote } fr
 import { shareToAppSupported } from './share-receiver';
 import type { FollowUp } from './store';
 import { useVoiceNote } from './voice-note';
-import { WEB_PAGE } from './web-layout';
+import { IS_WEB, WEB_PAGE } from './web-layout';
 
 const COLORS = {
   ink: '#16352E',
@@ -222,8 +224,12 @@ export default function DayReviewSheet({
   // source). `held`: read again next time whatever happens here (the review
   // stopped at its cap and listed nothing from them). `waiting`: recordings
   // of this recorder left for the next read (beyond this one, or set aside).
+  // `carried`: urgent items found in recordings set aside (each tied to
+  // those only), with `carriedFrom`, the recordings set aside: kept so that
+  // "Back to the notes", then Find again, shows them again.
   const recorderReadRef = useRef<{
     recorder: Recorder; blocks: FieldyBlock[]; everyId: string[]; rowIds: Map<string, string[]>; skipped: string[]; held: string[]; waiting: number;
+    carried?: { found: FoundItem; ids: string[] }[]; carriedFrom?: FieldyBlock[];
   } | null>(null);
   // The read in progress (a recorder's, while it is fetched or reviewed, or
   // the box's): Cancel asks about it, never about the review it replaces.
@@ -505,7 +511,10 @@ export default function DayReviewSheet({
       if (text.trim()) setNotes((current) => (current.trim() ? `${current.trim()}\n\n${text.trim()}` : text.trim()));
       else setMessage({ ok: false, text: 'Nothing to paste. Copy the summary in Fieldy or Plaud first.' });
     } catch {
-      setMessage({ ok: false, text: 'Could not read what you copied. Long-press the box and choose Paste.' });
+      // A browser can refuse to hand over the clipboard: the keyboard still pastes.
+      setMessage({ ok: false, text: Platform.OS === 'web'
+        ? 'This browser did not let ReferralFit read what you copied. Click in the box and press Cmd+V (Ctrl+V on Windows).'
+        : 'Could not read what you copied. Long-press the box and choose Paste.' });
     }
   }
 
@@ -565,7 +574,11 @@ export default function DayReviewSheet({
     // found in them, shown with this review (each tied to its own recording).
     const setAside: FieldyBlock[] = [];
     let narrowedFor: 'cap' | 'failed' = 'cap';
-    let carried: { found: FoundItem; ids: string[] }[] = [];
+    // Find again after "Back to the notes": the urgent items carried with the
+    // review on screen come back, still tied only to their set-aside recordings.
+    const carriedBefore = !read && linked && kept.length ? linked.carried ?? [] : [];
+    const carriedFrom = !read && linked && kept.length ? linked.carriedFrom ?? [] : [];
+    let carried: { found: FoundItem; ids: string[] }[] = [...carriedBefore];
     // Extra reads, a couple at most, whatever they are for: never a loop of model calls.
     let extra = 0;
     try {
@@ -650,7 +663,7 @@ export default function DayReviewSheet({
       }
       const built = markSavedBefore(
         buildRows(items, workspaceRef.current, day, newUuid, blocks ? (found) => {
-          const from = carriedIds.has(found) ? blocksFor(found.evidence, setAside) : blocksFor(found.evidence, blocks);
+          const from = carriedIds.has(found) ? blocksFor(found.evidence, [...setAside, ...carriedFrom]) : blocksFor(found.evidence, blocks);
           return from.length === 1 ? { label: from[0].label, at: from[0].startTime } : null;
         } : undefined),
         savedSignaturesRef.current,
@@ -676,7 +689,11 @@ export default function DayReviewSheet({
         // its recordings, so they are read again next time (of one alone,
         // only when nothing was listed from it).
         held = recordingsHeld(blockIds, rowIds.values(), truncated);
-        recorderReadRef.current = { ...fromRecorder, rowIds, held, waiting: waitingBefore + setAside.length };
+        recorderReadRef.current = {
+          ...fromRecorder, rowIds, held, waiting: waitingBefore + setAside.length, carried, carriedFrom: [...setAside, ...carriedFrom],
+        };
+        // Reviewed: one whose review had failed on its own is an ordinary recording again.
+        void reviewCameBack(fromRecorder.recorder, userId, blockIds).catch(() => undefined);
         // A recording nothing was found in is done now (unless an item's
         // quote is in none of them: it could be from any; or the review
         // stopped at its cap); so is one with no text a day after it ended.
@@ -708,7 +725,8 @@ export default function DayReviewSheet({
       // One recording that failed on its own (after the others were set
       // aside, or read alone): it is read alone from now on, only when
       // nothing newer waits, so it never blocks the queue; and it can be let go.
-      const alone = fromRecorder && onlyRecordings && fromRecorder.blocks.length === 1 && failedForLength(error) ? fromRecorder : null;
+      // The phone giving up waiting on one alone is not held against it (failedForLength's `alone`).
+      const alone = fromRecorder && onlyRecordings && fromRecorder.blocks.length === 1 && failedForLength(error, true) ? fromRecorder : null;
       if (alone) void rememberReviewFailed(alone.recorder, userId, alone.blocks[0].id).catch(() => undefined);
       if (alone && setAside.length) keepLink(alone, setAside.length);
       else keepLink();
@@ -757,13 +775,31 @@ export default function DayReviewSheet({
 
   // ─── Recorders (Fieldy, Plaud) ───────────────────────────────────────────
 
-  async function connect(recorder: Recorder) {
+  // In a browser the page goes to Fieldy's sign-in and comes back (App.tsx
+  // finishes it): said first, with where the sign-in is kept, as for the
+  // Anthropic key (this browser, or only this tab).
+  function connectAsking(recorder: Recorder) {
+    if (!IS_WEB) { void connect(recorder); return; }
+    if (busy || recorders[recorder.id].state === 'busy') return;
+    const boxNote = notes.trim() ? ' What is in the box now is not kept: copy it first if you need it.' : '';
+    Alert.alert(
+      `Connect ${recorder.name}`,
+      `This page goes to ${recorder.name} for you to sign in, then comes back here.${boxNote} Keep the ${recorder.name} sign-in in this browser, or only in this tab until it closes? Either way it is removed when you sign out.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Only this tab', onPress: () => { void connect(recorder, { tabOnly: true }); } },
+        { text: 'This browser', onPress: () => { void connect(recorder); } },
+      ],
+    );
+  }
+
+  async function connect(recorder: Recorder, options: { tabOnly?: boolean } = {}) {
     if (busy || recorders[recorder.id].state === 'busy') return;
     const opening = openingRef.current;
     setRecorder(recorder.id, (current) => ({ ...current, state: 'busy' }));
     setMessage(null);
     try {
-      const status = await connectRecorder(recorder, userId);
+      const status = await connectRecorder(recorder, userId, options);
       if (opening !== openingRef.current) return;
       setRecorder(recorder.id, { state: 'on', email: status.email });
       onRecordersChanged?.();
@@ -919,6 +955,8 @@ export default function DayReviewSheet({
   async function readNext() {
     const read = recorderReadRef.current;
     if (!read || busy || savingRef.current) return;
+    // Never past an undecided row: it would hold every recording of this read.
+    if (!rows.every((row) => rowDecided(row, saved))) return;
     const opening = openingRef.current;
     const done = recordingsDone(saved, rows);
     setMessage(null);
@@ -1440,12 +1478,22 @@ export default function DayReviewSheet({
 
   // "Read the next N now": everything in this review is decided and more of
   // its recorder's recordings wait. Only on a tap: never a read by itself.
+  // Only once every row is decided, on Done as on the review (an undecided
+  // row would hold every recording, and the same ones would be read again).
+  // Recordings held by a review that stopped at its cap are read again first:
+  // the button says so.
   const nextRead = recorderReadRef.current;
-  const nextCount = nextRead && nextRead.waiting > 0 && (phase === 'done' || (phase === 'review' && rows.every((row) => rowDecided(row, saved))))
-    ? Math.min(nextRead.waiting, RECORDINGS_PER_REVIEW) : 0;
+  const allDecided = rows.every((row) => rowDecided(row, saved));
+  const heldCount = nextRead ? nextRead.held.length : 0;
+  const nextCount = nextRead && (nextRead.waiting > 0 || heldCount > 0) && (phase === 'done' || phase === 'review') && allDecided
+    ? Math.min(nextRead.waiting + heldCount, RECORDINGS_PER_REVIEW) : 0;
+  const nextLabel = !nextRead || !nextCount ? ''
+    : heldCount
+      ? `Read the ${heldCount === 1 ? nextRead.recorder.noun : `${heldCount} ${nextRead.recorder.noun}s`} not read in full again now`
+      : `Read the next ${nextCount === 1 ? nextRead.recorder.noun : `${nextCount} ${nextRead.recorder.noun}s`} now`;
   const nextButton = nextRead && nextCount ? (
     <TouchableOpacity accessibilityRole="button" onPress={() => { void readNext(); }} style={[styles.secondaryButton, styles.nextButton]}>
-      <Text style={styles.secondaryButtonText}>Read the next {nextCount === 1 ? nextRead.recorder.noun : `${nextCount} ${nextRead.recorder.noun}s`} now</Text>
+      <Text style={styles.secondaryButtonText}>{nextLabel}</Text>
     </TouchableOpacity>
   ) : null;
   // After a failed recorder read: let its recordings go.
@@ -1458,10 +1506,25 @@ export default function DayReviewSheet({
           ? 'Paste notes from your day, share them here from another app (a text thread, an email, a Voice Memos transcript, a note), or record a voice note after a call. ReferralFit finds new leads, notes, follow-ups and referrals, and you approve each one before anything is saved.'
           : 'Paste notes from your day: a summary from Fieldy or Plaud, or your own call notes. ReferralFit finds new leads, notes, follow-ups and referrals, and you approve each one before anything is saved.'}
       </Text>
-      {fieldySupported ? RECORDERS.map((recorder) => {
+      {fieldySupported || IS_WEB ? RECORDERS.map((recorder) => {
         const status = recorders[recorder.id];
         // Without a key there is nothing to read with, but a connected recorder can always be disconnected.
         if (keyMissing && status.state !== 'on' && status.state !== 'leaving') return null;
+        // In a browser: Plaud is phone-only (its server refuses browser
+        // pages); Fieldy says "soon" until the web client is registered.
+        const onWeb = IS_WEB ? recorderOnWeb(recorder) : 'ready';
+        if (onWeb !== 'ready' && status.state !== 'on' && status.state !== 'leaving') {
+          return (
+            <View key={recorder.id} style={styles.fieldyCard}>
+              <Text style={styles.label}>{recorder.name.toUpperCase()}</Text>
+              <Text style={styles.hint}>
+                {onWeb === 'phone'
+                  ? `${recorder.name} connects in the iPhone app.`
+                  : `${recorder.name} connects in the browser soon. For now, connect it in the ReferralFit app on your iPhone, or paste its summary here.`}
+              </Text>
+            </View>
+          );
+        }
         return (
           <View key={recorder.id} style={styles.fieldyCard}>
             <Text style={styles.label}>{recorder.name.toUpperCase()}</Text>
@@ -1481,8 +1544,8 @@ export default function DayReviewSheet({
               <ActivityIndicator color={COLORS.forest} accessibilityLabel={status.state === 'leaving' ? `Disconnecting ${recorder.name}` : `Checking ${recorder.name}`} />
             ) : (
               <>
-                <Text style={styles.hint}>Use {recorder.name}? Connect it once and ReferralFit reads your {recorder.noun}s for you: no copying or pasting. You sign in to {recorder.name}; your sign-in stays on this phone.</Text>
-                <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: status.state === 'busy' }} disabled={busy || status.state === 'busy'} onPress={() => { void connect(recorder); }} style={[styles.secondaryButton, (busy || status.state === 'busy') && styles.off]}>
+                <Text style={styles.hint}>Use {recorder.name}? Connect it once and ReferralFit reads your {recorder.noun}s for you: no copying or pasting. You sign in to {recorder.name}; your sign-in stays {IS_WEB ? 'in this browser' : 'on this phone'}.</Text>
+                <TouchableOpacity accessibilityRole="button" accessibilityState={{ busy: status.state === 'busy' }} disabled={busy || status.state === 'busy'} onPress={() => connectAsking(recorder)} style={[styles.secondaryButton, (busy || status.state === 'busy') && styles.off]}>
                   {status.state === 'busy' ? <ActivityIndicator color={COLORS.forest} accessibilityLabel="Connecting" /> : <Text style={styles.secondaryButtonText}>Connect {recorder.name}</Text>}
                 </TouchableOpacity>
               </>

@@ -41,9 +41,17 @@ const authSession = read('src/lib/auth-session.ts');
 assert.match(authSession, /export async function checkLinkToken\([\s\S]{0,600}fetch\(`\$\{SUPABASE_URL\}\/auth\/v1\/user`/, 'a link\'s token is read by a plain request, which never touches this device\'s session');
 assert.ok(!app.includes('supabase.auth.signOut()'), 'signing out ends this device\'s session only, never the phone\'s');
 // ...and a session that ended any other way does the same.
-assert.match(app, /resetAccountState\(\);\s*(\/\/[^\n]*\n\s*)+if \(IS_WEB\) \{\s*(\/\/[^\n]*\n\s*)*removeBrowserAnthropicKeys\(userId\);\s*void wipeAccountDataWithoutSession\(userId\)/,
-  'signed out elsewhere, revoked, or another account: the browser keeps practice data, and an Anthropic key, only for the account signed in now');
-assert.match(app, /await wipeAccountDataWithoutSession\(\);\s*removeBrowserAnthropicKeys\(\);/, 'Sign out removes every Anthropic key from this browser');
+assert.match(app, /resetAccountState\(\);\s*(\/\/[^\n]*\n\s*)+if \(IS_WEB\) \{\s*(\/\/[^\n]*\n\s*)*removeBrowserAnthropicKeys\(userId\);\s*(\/\/[^\n]*\n\s*)*removeBrowserRecorderSignIns\(userId\);\s*void wipeAccountDataWithoutSession\(userId\)/,
+  'signed out elsewhere, revoked, or another account: the browser keeps practice data, an Anthropic key and a Fieldy sign-in only for the account signed in now');
+assert.match(app, /await wipeAccountDataWithoutSession\(\);\s*removeBrowserAnthropicKeys\(\);\s*removeBrowserRecorderSignIns\(\);/, 'Sign out removes every Anthropic key and Fieldy sign-in from this browser');
+
+// Fieldy connects in the browser (Matt, 2026-11-21); Plaud stays phone-only.
+const fieldy = read('src/lib/fieldy.ts');
+assert.match(fieldy, /export const FIELDY_WEB_CLIENT_ID = '';/, 'no web client until the registration is approved and run');
+assert.match(fieldy, /'https:\/\/app\.referralfit\.com\/oauth\/fieldy'/);
+assert.match(fieldy, /if \(recorder\.id !== 'fieldy' \|\| !clientId \|\| !origin\) return null;/, 'Plaud never connects in a browser');
+assert.match(read('index.ts'), /captureFieldyReturn\(\);/, 'the return page leaves the code out of the address bar');
+assert.match(read('scripts/register-fieldy-web-client.mjs'), /const send = process\.argv\.includes\('--send'\);/, 'the registration sends nothing without --send');
 const outreachApi = read('src/lib/outreach-api.ts');
 assert.match(outreachApi, /export const aiKeysSupported = [^;]*Platform\.OS === 'web'/, 'AI helps work in the browser, on a key kept in this browser (Matt, 2026-11-21)');
 assert.match(outreachApi, /name\.startsWith\(KEY_PREFIX\) && name !== keep/, 'only the signed-in account keeps its key in this browser');

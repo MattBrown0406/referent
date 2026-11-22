@@ -268,13 +268,13 @@ const app = read('App.tsx');
 const appJson = JSON.parse(read('app.json'));
 check(() => {
   assert.match(api, /keychainAccessible: SecureStore\.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY/, 'the sign-in stays on this phone, never synced or backed up');
-  assert.doesNotMatch(api, /supabase/, 'nothing about Fieldy goes to ReferralFit\'s server');
+  assert.doesNotMatch(api, /from '\.\/supabase'/, 'the sign-in never goes to ReferralFit\'s server (only recording-marks-api sends marks)');
   assert.doesNotMatch(api, /console\.(log|error|warn)\([^)]*(token|refresh|summary|text)\b/i, 'no token or conversation is logged');
   assert.match(api, /function serial<T>\(key: string, work: \(\) => Promise<T>\)/, 'every change to the sign-in goes through one queue (refresh tokens rotate)');
   assert.match(api, /const slot = \(recorder: Recorder, userId: string\) => `\$\{recorder\.id\}:\$\{userId\}`/, 'tokens are kept per recorder and per account');
-  assert.match(api, /return serial\(key, async \(\) => \{[^]*await writeToken\(recorder, userId, \{ \.\.\.token, refreshToken: tokens\.refreshToken \}\)/, 'the new refresh token is kept at once, inside the queue');
-  assert.match(api, /recorder\.revokeUrl[^]*logoutPlan/, 'disconnecting revokes the access at the recorder (Fieldy: revocation; Plaud: logout)');
-  assert.match(api, /const held = await serial\(key, async \(\) => \{\s*const token = await readToken\(recorder, userId\);\s*const cached = access\.get\(key\);\s*access\.delete\(key\);\s*await SecureStore\.deleteItemAsync\(tokenKey\(recorder, userId\)\)/,
+  assert.match(api, /return signInQueue\(recorder, userId, async \(\) => \{[^]*await writeToken\(recorder, userId, \{ \.\.\.token, refreshToken: tokens\.refreshToken \}\)/, 'the new refresh token is kept at once, inside the queue');
+  assert.match(api, /here\.revokeUrl[^]*logoutPlan/, 'disconnecting revokes the access at the recorder (Fieldy: revocation; Plaud: logout)');
+  assert.match(api, /const held = await signInQueue\(recorder, userId, async \(\) => \{\s*const token = await readToken\(recorder, userId\);\s*const cached = access\.get\(key\);\s*access\.delete\(key\);\s*await deleteToken\(recorder, userId\)/,
     'a disconnect reads and forgets the newest token in one step, before anything goes over the network');
   assert.doesNotMatch(api.slice(api.indexOf('async function revokeAndForget'), api.indexOf('export function disconnectRecorder')), /accessToken\(recorder, userId\)/,
     'Plaud too: nothing is fetched before the sign-in is forgotten');
@@ -291,18 +291,19 @@ check(() => {
   assert.match(api, /delete state\.saved\[id\];/, 'and forgotten once it is reviewed');
   assert.match(api, /\.sort\(\(a, b\) => Date\.parse\(a\.startTime\) - Date\.parse\(b\.startTime\)/, 'detail reads go oldest first');
   assert.match(api, /\[\.\.\.untried\.slice\(0, DETAIL_READS - 2\), \.\.\.retry\.slice\(0, 2\)/, 'two reads are kept for recordings that failed before');
-  assert.match(api, /if \(forgotten\.has\(slot\(recorder, userId\)\)\) return;/, 'a deleted account\'s read state is never written again');
+  assert.match(api, /if \(forgotten\.has\(slot\(recorder, userId\)\)\) return \[\] as MarkRow\[\];/, 'a deleted account\'s read state is never written again');
   assert.match(api, /await Promise\.all\(RECORDERS\.map\(async \(recorder\) =>/, 'deleting the account forgets every recorder at once');
   assert.match(api, /return await Promise\.race\(\[work, deadline\]\)/, 'the deadline covers the whole answer, body included');
   assert.match(api, /if \(until!\(text\)\) \{ reader\.cancel\(\)/, 'an event stream is read only until the answer is in');
   assert.match(api, /if \(reads >= DETAIL_READS \|\| Date\.now\(\) - started > DETAIL_TIME_MS\) continue;/, 'the cap never holds back recordings after it');
   assert.match(api, /const started = Date\.now\(\);\s*let reads = 0;/, 'the time budget starts at the detail reads');
   assert.match(api, /error\.reason === 'disconnected' \? 0 : null/, 'a connection that ended counts nothing');
-  assert.match(api, /const readKey = [^\n]*\.read\.v1\./, 'what was reviewed is kept apart from the sign-in');
+  assert.match(api, /const READ_PREFIX = [^\n]*\.read\.v1\./, 'what was reviewed is kept apart from the sign-in');
   assert.match(api, /export async function forgetRecorders[^]*deleteItemAsync\(readKey\(recorder, userId\)\)/, 'deleting the account forgets what was reviewed too');
+  assert.match(api, /export async function forgetRecorders[^]*browserRemove\(readKey\(recorder, userId\)\)/, 'in a browser too');
   assert.match(api, /signal: controller\.signal/, 'every call gives up after a while');
   assert.match(api, /never taken for "no text" at once/, 'a failed read is never taken for "no text" at once');
-  assert.match(api, /WebBrowser\.openAuthSessionAsync\(authorizeUrl\(challenge, state, recorder\), recorder\.redirectUri\)/);
+  assert.match(api, /WebBrowser\.openAuthSessionAsync\(authorizeUrl\(challenge, state, here\), here\.redirectUri\)/);
 }, 'the connection');
 check(() => {
   assert.doesNotMatch(sheet, /commitRecorderRead/);
@@ -347,5 +348,118 @@ check(() => {
   const keys = read('src/lib/outreach-api.ts');
   assert.equal((keys.match(/keyChanged\(userId\);/g) || []).length, 2, 'saving and removing the key both tell listeners');
 }, 'the review and the app');
+
+// ─── Fieldy on the web (2026-11-21) ────────────────────────────────────────
+check(() => {
+  assert.equal(f.FIELDY_WEB_CLIENT_ID, '', 'no web client until Matt approves the registration');
+  assert.equal(f.webRecorder(f.FIELDY, 'https://app.referralfit.com'), null, 'so the web app cannot connect yet');
+  const web = f.webRecorder(f.FIELDY, 'https://app.referralfit.com', 'WEBCLIENT');
+  assert.equal(web.clientId, 'WEBCLIENT');
+  assert.equal(web.redirectUri, 'https://app.referralfit.com/oauth/fieldy');
+  assert.equal(web.id, 'fieldy', 'the same recorder: its marks are shared with the phone');
+  assert.equal(f.webRecorder(f.FIELDY, 'http://localhost:8081', 'WEBCLIENT').redirectUri, 'http://localhost:8081/oauth/fieldy');
+  assert.equal(f.webRecorder(f.FIELDY, 'https://evil.example', 'WEBCLIENT'), null, 'only registered origins');
+  assert.equal(f.webRecorder(f.PLAUD, 'https://app.referralfit.com', 'WEBCLIENT'), null, 'Plaud stays phone-only');
+  const url = f.authorizeUrl('C', 'S', web);
+  assert.ok(url.includes(`redirect_uri=${encodeURIComponent('https://app.referralfit.com/oauth/fieldy')}`) && url.includes('client_id=WEBCLIENT'));
+  const back = 'https://app.referralfit.com/oauth/fieldy?code=abc&state=S&iss=https%3A%2F%2Fapi.fieldy.ai%2Fapi%2Fauth';
+  assert.equal(f.codeFromCallback(back, 'S', web), 'abc');
+  assert.throws(() => f.codeFromCallback(back, 'OTHER', web), /did not match/);
+  assert.throws(() => f.codeFromCallback('https://app.referralfit.com/oauth/fieldyx?code=abc&state=S', 'S', web), /wrong place/, 'never a longer path on the same start');
+  assert.throws(() => f.codeFromCallback('https://app.referralfit.com/oauth/fieldy?code=abc&state=S&iss=https%3A%2F%2Fevil.example', 'S', web), /did not come from Fieldy/);
+  assert.equal(f.codeFromCallback('com.mattbrown.referralfit:/oauth/fieldy?code=p&state=S', 'S'), 'p', 'the phone\'s return still reads');
+}, 'the web client: empty until registered, its own return, state and issuer checked');
+
+const m = load('src/lib/recording-marks.ts', 'recording-marks.js');
+check(() => {
+  const state = {
+    floor: '2026-11-21T08:00:00.000Z', synced: false,
+    reviewed: { done: '2026-11-21T10:00:00.000Z' },
+    failing: { slow: '2026-11-21T09:00:00.000Z' },
+    saved: { half: '2026-11-21T11:00:00.000Z h:aa h:bb not-a-fingerprint', done: '2026-11-21T09:00:00.000Z h:zz' },
+    unreviewable: { bad: '2026-11-20T09:00:00.000Z 2026-11-21T09:30:00.000Z' },
+  };
+  const rows = m.rowsFor(state, m.idsIn(state), new Set(), new Set(['gone']));
+  assert.deepEqual(rows.find((row) => row.id === 'done'), { id: 'done', reviewed_at: '2026-11-21T10:00:00.000Z' }, 'reviewed: only the time');
+  assert.deepEqual(rows.find((row) => row.id === 'half').fingerprints, ['h:aa', 'h:bb'], 'only fingerprints ever leave: anything else is dropped');
+  assert.deepEqual(rows.find((row) => row.id === 'bad'), { id: 'bad', unreviewable_since: '2026-11-20T09:00:00.000Z', unreviewable_tried_at: '2026-11-21T09:30:00.000Z' });
+  assert.equal(m.rowsFor(state, ['slow'], new Set(['slow']))[0].failing_since, '2026-11-21T09:00:00.000Z');
+  assert.deepEqual(m.rowsFor({ ...state, failing: {} }, ['slow'], new Set(['slow'])), [{ id: 'slow', clear_failing: true }]);
+  assert.deepEqual(m.rowsFor({ ...state, unreviewable: {} }, ['bad'], new Set(), new Set(['bad'])), [{ id: 'bad', clear_unreviewable: true }]);
+  for (const row of rows) {
+    const keys = Object.keys(row);
+    assert.ok(keys.every((key) => ['id', 'reviewed_at', 'failing_since', 'clear_failing', 'unreviewable_since', 'unreviewable_tried_at', 'clear_unreviewable', 'saved_at', 'fingerprints'].includes(key)), 'ids, times and fingerprints only');
+  }
+  // Joined with the server: nothing lost on either side.
+  const joined = m.withServerMarks(state, [
+    { recording_id: 'half', reviewed_at: '2026-11-21T12:00:00.000Z', failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: null, fingerprints: [] },
+    { recording_id: 'phoneOnly', reviewed_at: '2026-11-21T07:00:00.000Z', failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: null, fingerprints: [] },
+    { recording_id: 'done', reviewed_at: null, failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: '2026-11-21T08:00:00Z', fingerprints: ['h:x'] },
+    { recording_id: 'shared', reviewed_at: null, failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: '2026-11-21T12:00:00.000Z', fingerprints: ['h:web', 'Words never'] },
+    { recording_id: 'bad', reviewed_at: null, failing_since: null, unreviewable_since: '2026-11-19T09:00:00.000Z', unreviewable_tried_at: '2026-11-21T08:00:00.000Z', saved_at: null, fingerprints: [] },
+  ]);
+  assert.equal(joined.reviewed.half, '2026-11-21T12:00:00.000Z', 'reviewed on another device: reviewed here');
+  assert.equal(joined.saved.half, undefined, 'and its fingerprints are no longer needed');
+  assert.equal(joined.reviewed.phoneOnly, '2026-11-21T07:00:00.000Z');
+  assert.equal(joined.reviewed.done, '2026-11-21T10:00:00.000Z', 'a mark here is never lost to the server not having it');
+  assert.deepEqual(joined.saved.shared.split(' ').slice(1), ['h:web'], 'words from the server are never taken as fingerprints');
+  assert.equal(joined.unreviewable.bad, '2026-11-19T09:00:00.000Z 2026-11-21T09:30:00.000Z', 'the first failure, the latest try');
+  assert.equal(state.reviewed.half, undefined, 'the state passed in is not changed');
+  const both = m.withServerMarks({ ...state, saved: { r: '2026-11-21T10:00:00.000Z h:a h:b' } },
+    [{ recording_id: 'r', reviewed_at: null, failing_since: null, unreviewable_since: null, unreviewable_tried_at: null, saved_at: '2026-11-21T11:00:00.000Z', fingerprints: ['h:b', 'h:c'] }]);
+  assert.equal(both.saved.r, '2026-11-21T11:00:00.000Z h:a h:b h:c', 'fingerprints joined, each once, newest last');
+  assert.equal(m.unionNewest(Array.from({ length: 200 }, (_, i) => `h:${i}`), ['h:n']).length, 200);
+  assert.ok(m.FINGERPRINT.test('h:2gosa7pa2gv') && !m.FINGERPRINT.test('h:Sarah') && !m.FINGERPRINT.test('call Sarah'));
+  assert.deepEqual(m.idGroups(['a', 'b', 'c'], 8).map((group) => group.length), [2, 1]);
+  assert.deepEqual(m.inGroups([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
+  for (const code of ['PGRST202', 'PGRST205', '42P01', '42883']) assert.ok(m.notOnServerYet(code), code);
+  assert.ok(!m.notOnServerYet('42501') && !m.notOnServerYet(undefined), 'a refusal is not "no table yet"');
+  // The fingerprints the phone keeps are exactly the server's format.
+  const dayRules = require(path.join(repoRoot, 'node_modules', '.cache', 'fieldy-test', 'recording-marks.js'));
+  assert.ok(dayRules.FINGERPRINT.test('h:abc123'));
+}, 'what goes to the server, and how it is joined with what a device keeps');
+
+check(() => {
+  const web = read('src/lib/fieldy-web.ts');
+  const marksApi = read('src/lib/recording-marks-api.ts');
+  const index = read('index.ts');
+  // The trip to Fieldy and back.
+  assert.match(web, /Cross-Origin-Opener-Policy: same-origin/, 'why the sign-in is a full-page trip, not a popup');
+  assert.match(web, /browserStore\('session'\)\?\.setItem\(RETURN_KEY, window\.location\.href\);\s*window\.history\.replaceState\(null, '', '\/'\);/, 'the code leaves the address bar at once');
+  assert.ok(index.indexOf('captureFieldyReturn();') > 0 && index.indexOf('captureFieldyReturn();') < index.indexOf('registerRootComponent('), 'before the app draws');
+  assert.match(web, /store\?\.removeItem\(PENDING_KEY\);/, 'a started sign-in is used once');
+  assert.match(api, /if \(pending\.userId !== userId\) \{\s*throw new FieldyError\('That Fieldy sign-in was started for another ReferralFit account/, 'never connected to another account');
+  assert.match(api, /Date\.now\(\) - pending\.at > CONNECT_WINDOW_MS/, 'nor late');
+  assert.match(api, /const code = codeFromCallback\(back, pending\.state, here\);/, 'state and issuer checked as on the phone');
+  assert.match(api, /savePendingConnect\(\{ state, verifier, userId, redirectUri: here\.redirectUri, scope: options\.tabOnly \? 'tab' : 'browser', at: Date\.now\(\) \}\);/, 'the verifier waits in this tab only');
+  // One change at a time across tabs.
+  assert.match(web, /locks\.request\(`referralfit-\$\{name\}`, work\)/);
+  assert.match(api, /function signInQueue<T>[^]*serial\(key, \(\) => acrossTabs\(`\$\{key\}:sign-in`, work\)\)/, 'the sign-in\'s queue holds across tabs');
+  assert.match(api, /\/\/ Read inside the lock: another tab may have rotated it a moment ago\.\s*const token = await readToken\(recorder, userId\);/);
+  assert.match(api, /if \(now && now\.refreshToken === token\.refreshToken\) await deleteToken\(recorder, userId\);/, 'a refused token never removes one another tab kept since');
+  assert.match(api, /return serial\(key, \(\) => acrossTabs\(key, async \(\) => \{\s*if \(forgotten/, 'what was reviewed, too');
+  // Leaving the browser.
+  assert.match(api, /export function removeBrowserRecorderSignIns\(keepUserId\?: string\): void/);
+  assert.match(app, /removeBrowserAnthropicKeys\(userId\);\s*\/\/[^\n]*\n\s*removeBrowserRecorderSignIns\(userId\);/, 'only the account signed in here keeps a Fieldy sign-in');
+  assert.match(app, /removeBrowserAnthropicKeys\(\);\s*removeBrowserRecorderSignIns\(\);/, 'Sign out removes every one');
+  assert.match(app, /void finishWebConnect\(userId\)\.then/, 'the return is finished once the account is known');
+  // The server's copy of what was reviewed.
+  assert.match(marksApi, /data\.session\?\.user\?\.id === userId/, 'marks go only to the account signed in now');
+  assert.match(marksApi, /\.eq\('user_id', userId\)/);
+  assert.match(marksApi, /supabase\.rpc\('day_review_mark_recordings', \{ p_recorder: recorder, p_marks: group \}\)/);
+  assert.doesNotMatch(marksApi, /refreshToken|accessToken|from '\.\/fieldy/, 'never a sign-in, nor anything read from a recorder');
+  assert.match(marksApi, /import \{ inGroups, idGroups, notOnServerYet, type MarkRow, type ServerMark \} from '\.\/recording-marks';/, 'only the rows rowsFor makes');
+  assert.match(api, /const emptyState = [^\n]*synced: true \}\);/, 'a new state has nothing to copy up');
+  assert.match(api, /synced: data\.synced === true,/, 'a state kept before the server knew of it is copied up once');
+  assert.match(api, /sendServerMarks\(recorder\.id, userId, rowsFor\(current, idsIn\(current\)\)\)/, 'everything kept here, joined on the server (never replacing)');
+  assert.match(api, /if \(!taken\) await changeState\(recorder, userId, \(state\) => \{ if \(!state\.synced\) return false; state\.synced = false; return true; \}\)/, 'a send not taken is copied up again later');
+  assert.match(api, /const state = await reviewedState\(recorder, userId, listed\.map\(\(item\) => item\.id\), now\);/, 'reviewed on the other device: not offered here');
+  assert.match(api, /const state = await reviewedState\(recorder, userId, ids\);\s*return ids\.flatMap/, 'items saved on the other device are known here');
+  // The sheet in a browser.
+  assert.match(sheet, /\$\{recorder\.name\} connects in the iPhone app\./, 'Plaud: a plain line');
+  assert.match(sheet, /connects in the browser soon/, 'Fieldy before the web client is registered: no Connect button');
+  assert.match(sheet, /Only this tab/, 'the sign-in kept in this tab only, if chosen');
+  assert.match(app, /if \(!userId \|\| !recordersHere \|\| !aiKeysSupported\) return;/, 'the Today card counts Fieldy in a browser once connected');
+}, 'Fieldy on the web: the trip, the tabs, sign-out, and the server\'s marks');
 
 console.log(`fieldy-test: ${checks} checks passed`);

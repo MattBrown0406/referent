@@ -17,7 +17,8 @@ iPhone build.
 | Share sheet | The browser's share sheet, or a copy to the clipboard (`src/lib/web-share.ts`) |
 | Push and reminders | None; Home shows what is due. Settings says to turn push on in the iPhone app |
 | AI helps (drafts, Day review, level-of-care suggestion, card reading, warmer words) | The same, on a key kept in this browser for this account (or this tab only), removed at sign-out (2026-11-21) |
-| Fieldy / Plaud, voice notes, Share to ReferralFit, Face ID lock, Contacts | iPhone only (Day review on the web is paste) |
+| Fieldy | Connects in the browser once its web client is registered (until then: "soon", paste works); the sign-in is kept in this browser for this account (or this tab only), removed at sign-out; what was reviewed is shared with the phone through the server (docs/DAY_REVIEW.md, "Fieldy on the web") |
+| Plaud, voice notes, Share to ReferralFit, Face ID lock, Contacts | iPhone only (Plaud's server refuses browser pages) |
 | Offline copy kept after sign-out | Signing out removes the practice's data from the browser |
 | Email links open the app | Email links return to the page they started on (`/auth/confirmed`, `/auth/recovery`) |
 
@@ -40,12 +41,14 @@ iPhone build.
 ## Checking a deploy
 
 - Open `https://app.referralfit.com`, sign in, and open a case.
-- Settings → Sign out, then check the browser keeps no practice data:
+- Settings → Sign out, then check the browser keeps no practice data (nor a
+  `referralfit.fieldy.v1.` Fieldy sign-in):
   DevTools → Application → Local Storage has no `referralfit-cache-`,
   `-write-queue-`, `-rejected-writes-`, `-case-list-`, `-case-file-` or
   `-workspace-` key. What stays holds ids and flags only, no client data:
   the welcome flag, partner snoozes, placement "seen" markers, the
-  notification prompt choice, and `referralfit.authFlowStarts.v1` /
+  notification prompt choice, `referralfit.fieldy.read.v1.*` (which Fieldy
+  conversations were reviewed: ids, times, one-way fingerprints), and `referralfit.authFlowStarts.v1` /
   `referralfit.authFlowEmails.v1` (the last day's sign-up and reset
   requests, so their emailed links work here).
 - The same holds when the session ends any other way: signed out on the
