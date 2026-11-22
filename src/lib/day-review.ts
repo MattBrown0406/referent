@@ -978,7 +978,6 @@ function claims(row: ReviewRow, saved: Set<string>): Claim[] {
   const out: Claim[] = [];
   possibleTargets(row).forEach((target, index) => {
     const own = index === 0;
-    const found: Claim[] = [];
     for (const signature of rowSignatures({ ...row, ...target })) {
       // Another place is known by the row's own wording only, never by its
       // quote: two items often quote one sentence ("both Sarahs want the
@@ -986,11 +985,8 @@ function claims(row: ReviewRow, saved: Set<string>): Claim[] {
       // must not hide the other's.
       if (!own && !byWording(signature)) continue;
       if (!knownBy(saved, signature)) continue;
-      found.push({ target, signature, score: (own ? 10 : 0) + (signature.includes('|t:') ? 3 : signature.includes('|s:') ? 2 : 1) });
+      out.push({ target, signature, score: (own ? 10 : 0) + (signature.includes('|t:') ? 3 : signature.includes('|s:') ? 2 : 1) });
     }
-    // How well the row matches that place: its closest signature there.
-    const best = Math.max(0, ...found.map((claim) => claim.score));
-    for (const claim of found) out.push({ ...claim, score: best });
   });
   return out;
 }
@@ -1014,31 +1010,68 @@ export function savedBefore(row: ReviewRow, saved: Set<string>): boolean {
 
 const NO_WORKSPACE: Workspace = { cases: [], contacts: [], partners: [], followUps: [], referrals: [], directory: null };
 
+/** How well a row matches one place: its closest signature there. */
+const closest = (list: Claim[]) => Math.max(0, ...list.map((claim) => claim.score));
+
+/**
+ * Which saved place each row is (one-to-one): the closest claims first; a
+ * row that takes a place lets go of its other claims, and the signatures it
+ * took there are no one else's. Between equals: the row with fewer places
+ * left, then the place fewer rows want, then the first row (rows that are
+ * alike end up the same whichever comes first). Each row's place and the
+ * signatures it took; a row with none is not there.
+ */
+function assignSaved(all: Claim[][]): Map<number, Claim[]> {
+  const taken = new Set<string>();
+  const placed = new Map<number, Claim[]>();
+  for (;;) {
+    // Each unplaced row's places, by the signatures still free there.
+    const open: { index: number; list: Claim[] }[] = [];
+    all.forEach((rowClaims, index) => {
+      if (placed.has(index)) return;
+      for (const target of uniqueTargets(rowClaims)) {
+        const list = rowClaims.filter((claim) => sameTarget(claim.target, target) && !taken.has(claim.signature));
+        if (list.length) open.push({ index, list });
+      }
+    });
+    if (!open.length) return placed;
+    const left = (index: number) => open.filter((option) => option.index === index).length;
+    const wanted = (list: Claim[]) => open.filter((option) => option.list.some((claim) => list.some((mine) => mine.signature === claim.signature))).length;
+    let best = open[0];
+    for (const option of open.slice(1)) {
+      const order = closest(option.list) - closest(best.list) || left(best.index) - left(option.index) || wanted(best.list) - wanted(option.list);
+      if (order > 0) best = option;
+    }
+    placed.set(best.index, best.list);
+    for (const claim of best.list) taken.add(claim.signature);
+  }
+}
+
 /**
  * Rows that were saved before start switched off. One saved on a case or
- * partner it could be (picked by hand then) shows that place again, when it
- * is the only one, set the way the row's own pickers set it (a referral's
- * client label follows its case). One saved signature marks one row only:
- * when two rows of this review match it, the closer one is the saved one
- * and the other stays as it was.
+ * partner it could be (picked by hand then) shows that place again, set the
+ * way the row's own pickers set it (a referral's client label follows its
+ * case). Saved places and rows are matched one to one (assignSaved): two
+ * notes worded alike, one saved on each Sarah's case, each go back to their
+ * own case; with only one saved, one row is the saved one and the other
+ * stays as it was. A row that alone matches two saved places is saved, with
+ * no place guessed for it.
  */
 export function markSavedBefore(rows: ReviewRow[], saved: Set<string>, workspace: Workspace = NO_WORKSPACE): ReviewRow[] {
   if (!saved.size) return rows;
   const all = rows.map((row) => claims(row, saved));
-  const owner = new Map<string, { index: number; score: number }>();
-  all.forEach((list, index) => {
-    for (const claim of list) {
-      const holder = owner.get(claim.signature);
-      // The closest match keeps it; between equals, the first row.
-      if (!holder || holder.score < claim.score) owner.set(claim.signature, { index, score: claim.score });
-    }
-  });
+  const placed = assignSaved(all);
+  const taken = new Set([...placed.values()].flat().map((claim) => claim.signature));
   return rows.map((row, index) => {
-    const kept = all[index].filter((claim) => owner.get(claim.signature)?.index === index);
-    const targets = uniqueTargets(kept);
-    if (!targets.length) return row;
-    const own = targets.find((target) => sameTarget(target, { kind: row.kind, caseId: row.caseId, partnerId: row.partnerId }));
-    const place = own ?? (targets.length === 1 ? targets[0] : null);
+    const kept = placed.get(index);
+    if (!kept) return row;
+    const ownTarget: Target = { kind: row.kind, caseId: row.caseId, partnerId: row.partnerId };
+    const target = kept[0].target;
+    const own = sameTarget(target, ownTarget);
+    // Another place this row matches that no other row took: it was saved
+    // on two, and neither is guessed (its own pick stays).
+    const alsoElsewhere = all[index].some((claim) => !sameTarget(claim.target, target) && !taken.has(claim.signature));
+    const place = own ? target : alsoElsewhere ? null : target;
     let next = row;
     if (place && !own) {
       // As the practitioner would have: a new lead made a note on its case,
@@ -1048,8 +1081,7 @@ export function markSavedBefore(rows: ReviewRow[], saved: Set<string>, workspace
       if (place.partnerId !== next.partnerId || place.kind !== next.kind) next = choosePartner(next, place.partnerId);
       next = { ...next, caseUnsure: false, partnerUnsure: false, noLink: false };
     }
-    const signatures = kept.filter((claim) => !place || sameTarget(claim.target, place)).map((claim) => claim.signature);
-    const when = signatures.some((signature) => saved.has(signature)) ? 'Saved earlier in this review.' : 'Saved in an earlier review.';
+    const when = kept.some((claim) => saved.has(claim.signature)) ? 'Saved earlier in this review.' : 'Saved in an earlier review.';
     return { ...next, include: false, savedEarlier: true, hint: row.hint ? `${when} ${row.hint}` : when };
   });
 }
@@ -1155,10 +1187,73 @@ export function readAgainLine(count: number, recorder: { name: string; noun: str
   return `${count} ${recorder.name} ${count === 1 ? `${recorder.noun} is` : `${recorder.noun}s are`} read again next time.`;
 }
 
-/** Said when a review of `from` recordings stopped at its cap and was read again with the oldest `read`. */
-export function narrowedMessage(from: number, read: number, recorder: { name: string; noun: string }): string {
+/**
+ * Said when a review of `from` recordings was read again with the oldest
+ * `read`: it stopped at its cap ('cap'), or it failed for its length (came
+ * back incomplete, was turned down, took too long: 'failed').
+ */
+export function narrowedMessage(from: number, read: number, recorder: { name: string; noun: string }, why: 'cap' | 'failed' = 'cap'): string {
   const oldest = read === 1 ? `the oldest ${recorder.noun}` : `the oldest ${read}`;
-  return `Your ${from} ${recorder.name} ${recorder.noun}s held more than one review can show (20 items), so this review reads ${oldest} on its own.`;
+  return why === 'failed'
+    ? `Your ${from} ${recorder.name} ${recorder.noun}s could not be reviewed together, so this review reads ${oldest} on its own.`
+    : `Your ${from} ${recorder.name} ${recorder.noun}s held more than one review can show (20 items), so this review reads ${oldest} on its own.`;
+}
+
+/** "1 urgent item already found in the Fieldy conversations that wait is shown here too." ('' for none). */
+export function carriedLine(count: number, recorder: { name: string; noun: string }): string {
+  if (count <= 0) return '';
+  return `${count === 1 ? '1 urgent item' : `${count} urgent items`} already found in the ${recorder.name} ${recorder.noun}s that wait ${count === 1 ? 'is' : 'are'} shown here too.`;
+}
+
+/**
+ * Said when a recording's review failed even read on its own: it can be
+ * tried again, or let go ("Done with this"); it no longer holds newer ones back.
+ */
+export function failedAloneLine(recorder: { name: string; noun: string }): string {
+  return `This ${recorder.name} ${recorder.noun} could not be reviewed even on its own. Try again later, or tap Done with this ${recorder.noun} so it is not offered again; until then it is read only when nothing newer waits.`;
+}
+
+/** The same item found by two reads: same kind, and the same quote or the same summary. */
+export function sameFinding(a: FoundItem, b: FoundItem): boolean {
+  if (a.kind !== b.kind) return false;
+  const quote = comparable(a.evidence);
+  return Boolean(quote && quote === comparable(b.evidence)) || Boolean(comparable(a.summary) && comparable(a.summary) === comparable(b.summary));
+}
+
+/**
+ * A review stopped at its cap and was read again with fewer recordings:
+ * the urgent items it had already found in those set aside are not dropped
+ * ("she's not safe tonight, call her back by 6"). Each is shown with the
+ * narrowed review (unless that review found it too), tied to the set-aside
+ * recordings it is from (every one of them when its quote is in none), so
+ * a save is remembered there and not offered again when they are read.
+ * `sourceOf`: the recordings of the first read an item's quote is in.
+ */
+export function carriedUrgent(items: FoundItem[], setAsideIds: string[], sourceOf: (item: FoundItem) => string[], shown: FoundItem[] = []): { found: FoundItem; ids: string[] }[] {
+  const aside = new Set(setAsideIds);
+  const out: { found: FoundItem; ids: string[] }[] = [];
+  for (const item of items) {
+    if (!item.urgent) continue;
+    const from = sourceOf(item);
+    const ids = from.length ? from.filter((id) => aside.has(id)) : [...setAsideIds];
+    if (!ids.length) continue;
+    if (shown.some((other) => sameFinding(item, other)) || out.some((other) => sameFinding(item, other.found))) continue;
+    out.push({ found: item, ids });
+  }
+  return out;
+}
+
+/**
+ * A recording whose review failed on its own (came back incomplete, was
+ * turned down, took too long) is read alone, and only when nothing else is
+ * new: it never holds newer recordings back. The others wait as before.
+ */
+export function failedApart<T extends { text: string; blocks: BlockLike[]; later: number }>(plan: T, failed: Set<string>): T {
+  const apart = plan.blocks.filter((block) => failed.has(block.id));
+  if (!apart.length) return plan;
+  const others = plan.blocks.filter((block) => !failed.has(block.id));
+  const blocks = others.length ? others : apart.slice(0, 1);
+  return { ...plan, blocks, text: blocks.map((block) => block.text).join('\n\n'), later: plan.later + plan.blocks.length - blocks.length };
 }
 
 // ─── The writes ────────────────────────────────────────────────────────────

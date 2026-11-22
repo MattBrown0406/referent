@@ -31,12 +31,15 @@ import {
   addDays,
   blocksInNotes,
   buildRows,
+  carriedLine,
+  carriedUrgent,
   caseLabel,
   choosePartner,
   chooseCase,
   comparable,
   countLine,
   destination,
+  failedAloneLine,
   KIND_LABEL,
   kindChoices,
   leadFor,
@@ -48,11 +51,13 @@ import {
   readAgainLine,
   recordingsDoneOnRead,
   recordingsHeld,
+  RECORDINGS_PER_REVIEW,
   rowProblem,
   rowReady,
   laterSignatures,
   rowSignatures,
   saveOrder,
+  sameFinding,
   savedLine,
   signatureHash,
   stoppedAtCapMessage,
@@ -62,12 +67,13 @@ import {
   withPendingCases,
   withPendingLeads,
   suggestedCaseTitle,
+  type FoundItem,
   type PendingCase,
   type ReviewRow,
   type RowContext,
   type Workspace,
 } from './day-review';
-import { requestDayReview, ReviewUnavailableError, saveReviewRow, type SaveResult } from './day-review-api';
+import { failedForLength, requestDayReview, ReviewUnavailableError, saveReviewRow, type SaveResult } from './day-review-api';
 import { fetchGlobalDirectory } from './directory';
 import { blocksFor, RECORDERS, type FieldyBlock, type Recorder, type RecorderId } from './fieldy';
 import {
@@ -78,6 +84,7 @@ import {
   markRecordingsReviewed,
   readNewRecordings,
   recorderStatus,
+  rememberReviewFailed,
   rememberSaved,
   savedFrom,
 } from './fieldy-api';
@@ -213,10 +220,16 @@ export default function DayReviewSheet({
   // `everyId`: every recording of the read, where an item whose quote is in
   // none of them is remembered once saved (one edited in the box may be its
   // source). `held`: read again next time whatever happens here (the review
-  // stopped at its cap and listed nothing from them).
+  // stopped at its cap and listed nothing from them). `waiting`: recordings
+  // of this recorder left for the next read (beyond this one, or set aside).
   const recorderReadRef = useRef<{
-    recorder: Recorder; blocks: FieldyBlock[]; everyId: string[]; rowIds: Map<string, string[]>; skipped: string[]; held: string[];
+    recorder: Recorder; blocks: FieldyBlock[]; everyId: string[]; rowIds: Map<string, string[]>; skipped: string[]; held: string[]; waiting: number;
   } | null>(null);
+  // The read in progress (a recorder's, while it is fetched or reviewed, or
+  // the box's): Cancel asks about it, never about the review it replaces.
+  const inFlightRef = useRef<{ recorder: Recorder | null; blocks: FieldyBlock[] } | null>(null);
+  // The last recorder read failed: its recordings can be let go ("Done with these").
+  const [failedRead, setFailedRead] = useState(false);
   // Rows the practitioner switched off: set aside (one off from the start, unchecked, is not).
   const switchedOffRef = useRef<Set<string>>(new Set());
   // This opening has read the key and the recorders (and started a recorder
@@ -259,6 +272,8 @@ export default function DayReviewSheet({
     savedCountRef.current = 0;
     savingRef.current = false;
     recorderReadRef.current = null;
+    inFlightRef.current = null;
+    setFailedRead(false);
     switchedOffRef.current = new Set();
   }
 
@@ -357,8 +372,9 @@ export default function DayReviewSheet({
 
   // Marked on this phone first; the Today card and the reminder drop by
   // that many at once (a recount may fail, or never come back).
-  function markReviewed(recorder: Recorder, ids: string[]) {
-    void markRecordingsReviewed(recorder, userId, ids)
+  // Answers once the mark is written (never failing), for a read that must not see them again.
+  function markReviewed(recorder: Recorder, ids: string[]): Promise<void> {
+    return markRecordingsReviewed(recorder, userId, ids)
       .then((count) => onRecordersChanged?.({ recorder: recorder.id, count }))
       .catch(() => undefined);
   }
@@ -427,7 +443,12 @@ export default function DayReviewSheet({
     // A read or a review can be stopped (what comes back late is ignored);
     // notes the practitioner typed, pasted, shared or spoke there (anything
     // in the box besides the recordings) are not thrown away without asking.
-    const recorderText = Boolean(recorderReadRef.current) && !notesBesides(notes, recorderReadRef.current?.blocks ?? []);
+    // While a read runs, the question is about that read: a recorder's
+    // recordings (still being fetched, or the box just them) close plainly.
+    const live = phase === 'finding' ? inFlightRef.current : null;
+    const recorderText = live
+      ? Boolean(live.recorder) && (!live.blocks.length || !notesBesides(notes, live.blocks))
+      : Boolean(recorderReadRef.current) && !notesBesides(notes, recorderReadRef.current?.blocks ?? []);
     if (phase === 'finding' && (!notes.trim() || recorderText)) { finish(); return; }
     const unsaved = phase === 'review'
       ? pending.some((row) => row.include)
@@ -462,7 +483,9 @@ export default function DayReviewSheet({
     // Said as it will happen: Discard settles the recordings whose items are
     // all decided (none while a review is being read); the rest are read again.
     const settling = read && rows.length && phase !== 'finding' ? recordingsDone(saved, rows).length : 0;
-    const again = read ? readAgainLine(read.blocks.length - settling, read.recorder) : '';
+    // During a read, the recordings of that read (none for notes alone).
+    const asked = live ? (live.recorder ? { recorder: live.recorder, blocks: live.blocks } : null) : read;
+    const again = asked ? readAgainLine(asked.blocks.length - settling, asked.recorder) : '';
     const againText = again ? ` ${again}` : '';
     Alert.alert(
       'Discard this review?',
@@ -500,15 +523,21 @@ export default function DayReviewSheet({
     let text = (read ? read.text : notes).trim();
     // All of them, as read (before any are set aside below).
     const first = fromRecorder;
+    // Recordings waiting beyond this read: counted by the recorder read, or
+    // kept from the review this one reads again.
+    const waitingBefore = read ? read.later ?? 0 : linked && kept.length ? linked.waiting : 0;
     // Until a new review lands, the one on screen keeps its link (which
     // recording each row came from, and those held), limited to the
     // recordings still in the box: closing after a failed read then settles
     // only what that review decided. A fresh read that failed keeps its
-    // recordings; the rows on screen were of other notes, and go.
+    // recordings; the rows on screen were of other notes, and go. `alone`:
+    // the one recording a narrowed read failed on, the others set aside: the
+    // box and the link are that one now.
     // Kept before the review runs, so a retry after a failed one is still these recordings.
-    const keepLink = () => {
-      if (read && first) {
-        recorderReadRef.current = { ...first, rowIds: new Map(), held: [] };
+    const keepLink = (alone: typeof fromRecorder = null, setAsideCount = 0) => {
+      if ((read && first) || alone) {
+        recorderReadRef.current = { ...(alone ?? first!), rowIds: new Map(), held: [], waiting: waitingBefore + setAsideCount };
+        if (alone) setNotes(alone.blocks.map((block) => block.text).join('\n\n'));
         setRows([]);
         setSaved({});
         setPicker(null);
@@ -524,24 +553,63 @@ export default function DayReviewSheet({
     const day = localDay();
     setToday(day);
     setMessage(null);
+    setFailedRead(false);
     setPhase('finding');
+    // The read in progress, for Cancel: what it would discard or read again.
+    inFlightRef.current = { recorder: fromRecorder?.recorder ?? null, blocks: fromRecorder?.blocks ?? [] };
+    // Fewer recordings are read only when the box is just the recordings:
+    // notes typed beside them are never dropped.
+    const onlyRecordings = Boolean(fromRecorder) && !notesBesides(text, fromRecorder!.blocks);
+    const firstCount = fromRecorder?.blocks.length ?? 0;
+    // Recordings set aside for the next read, and why; urgent items already
+    // found in them, shown with this review (each tied to its own recording).
+    const setAside: FieldyBlock[] = [];
+    let narrowedFor: 'cap' | 'failed' = 'cap';
+    let carried: { found: FoundItem; ids: string[] }[] = [];
+    // Extra reads, a couple at most, whatever they are for: never a loop of model calls.
+    let extra = 0;
     try {
       const key = await getAnthropicKey(userId);
       if (!key) {
         if (opening === openingRef.current) { keepLink(); setKeyState('missing'); setPhase('paste'); }
         return;
       }
-      let answer = await requestDayReview(text, day, key);
+      let answer: Awaited<ReturnType<typeof requestDayReview>>;
+      try {
+        answer = await requestDayReview(text, day, key);
+      } catch (error) {
+        if (opening !== openingRef.current) return;
+        // Several recordings that could not be reviewed together (it came
+        // back incomplete, was turned down, took too long): the older half on
+        // its own, down to one, the rest set aside for the next read; the
+        // same oldest few never block the queue.
+        let failure: unknown = error;
+        let narrowed: typeof answer | null = null;
+        while (!narrowed && onlyRecordings && failedForLength(failure) && extra < NARROWED_READS) {
+          const fewer: FieldyBlock[] | null = olderHalf(fromRecorder!.blocks);
+          if (!fewer) break;
+          extra += 1;
+          narrowedFor = 'failed';
+          setAside.push(...fromRecorder!.blocks.slice(fewer.length));
+          fromRecorder = { ...fromRecorder!, blocks: fewer, everyId: fewer.map((block) => block.id) };
+          text = fewer.map((block) => block.text).join('\n\n');
+          try {
+            narrowed = await requestDayReview(text, day, key);
+          } catch (again) {
+            failure = again;
+          }
+          if (opening !== openingRef.current) return;
+        }
+        if (!narrowed) throw failure;
+        answer = narrowed;
+      }
       if (opening !== openingRef.current) return;
       // Several recordings that held more than one review can list: the older
       // half is read again on its own (a few extra reads at most, down to
-      // one recording), the rest wait for the next read. Only when the box is
-      // just the recordings: notes typed beside them are never dropped.
-      const firstCount = fromRecorder?.blocks.length ?? 0;
-      let setAside = 0;
-      if (fromRecorder && !notesBesides(text, fromRecorder.blocks)) {
-        for (let extra = 0; answer.truncated && extra < NARROWED_READS; extra += 1) {
-          const fewer: FieldyBlock[] | null = olderHalf(fromRecorder.blocks);
+      // one recording), the rest wait for the next read.
+      if (onlyRecordings) {
+        for (; answer.truncated && extra < NARROWED_READS; extra += 1) {
+          const fewer: FieldyBlock[] | null = olderHalf(fromRecorder!.blocks);
           if (!fewer) break;
           const fewerText = fewer.map((block) => block.text).join('\n\n');
           let narrowed;
@@ -554,30 +622,42 @@ export default function DayReviewSheet({
             break;
           }
           if (opening !== openingRef.current) return;
-          setAside += fromRecorder.blocks.length - fewer.length;
-          fromRecorder = { ...fromRecorder, blocks: fewer, everyId: fewer.map((block) => block.id) };
+          const readNow = fromRecorder!.blocks;
+          const dropped = readNow.slice(fewer.length);
+          // What the wider review already found that is urgent, in those set aside, is kept.
+          carried = [...carried, ...carriedUrgent(answer.items, dropped.map((block) => block.id),
+            (item) => blocksFor(item.evidence, readNow).map((block) => block.id), carried.map((entry) => entry.found))];
+          setAside.push(...dropped);
+          fromRecorder = { ...fromRecorder!, blocks: fewer, everyId: fewer.map((block) => block.id) };
           text = fewerText;
           answer = narrowed;
         }
       }
-      const { items, truncated } = answer;
+      // Not those the narrowed review found again itself.
+      const shownItems = answer.items;
+      carried = carried.filter((entry) => !shownItems.some((item) => sameFinding(entry.found, item)));
+      const carriedIds = new Map(carried.map((entry) => [entry.found, entry.ids]));
+      const { truncated } = answer;
+      const items = [...answer.items, ...carried.map((entry) => entry.found)];
       const blocks = fromRecorder?.blocks ?? null;
-      // Items saved from these recordings in an earlier review are known again.
+      // Items saved from these recordings in an earlier review are known again
+      // (from those set aside too, for the urgent items shown from them).
       if (fromRecorder) {
-        const before = await savedFrom(fromRecorder.recorder, userId, fromRecorder.blocks.map((block) => block.id)).catch(() => [] as string[]);
+        const ids = [...new Set([...fromRecorder.blocks.map((block) => block.id), ...carried.flatMap((entry) => entry.ids)])];
+        const before = await savedFrom(fromRecorder.recorder, userId, ids).catch(() => [] as string[]);
         if (opening !== openingRef.current) return;
         for (const fingerprint of before) savedSignaturesRef.current.add(fingerprint);
       }
       const built = markSavedBefore(
         buildRows(items, workspaceRef.current, day, newUuid, blocks ? (found) => {
-          const from = blocksFor(found.evidence, blocks);
+          const from = carriedIds.has(found) ? blocksFor(found.evidence, setAside) : blocksFor(found.evidence, blocks);
           return from.length === 1 ? { label: from[0].label, at: from[0].startTime } : null;
         } : undefined),
         savedSignaturesRef.current,
         workspaceRef.current,
       );
       // The box holds what this review read: those set aside come back on the next read.
-      if (setAside) setNotes(text);
+      if (setAside.length) setNotes(text);
       setRows(built);
       // Rows are keyed by position: what was switched off in an earlier review is not this one's.
       switchedOffRef.current = new Set();
@@ -586,14 +666,17 @@ export default function DayReviewSheet({
       setPhase('review');
       let held: string[] = [];
       if (fromRecorder) {
-        const rowIds = new Map(built.map((row) => [row.key, blocksFor(row.found.evidence, fromRecorder!.blocks).map((block) => block.id)]));
+        // An urgent item from a recording set aside is tied to that one: its
+        // save is remembered there, and that recording is not settled here
+        // (it is not one of this read's), so it is read in full next time.
+        const rowIds = new Map(built.map((row) => [row.key, carriedIds.get(row.found) ?? blocksFor(row.found.evidence, fromRecorder!.blocks).map((block) => block.id)]));
         const { skipped } = fromRecorder;
         const blockIds = fromRecorder.blocks.map((block) => block.id);
         // The review stopped at its cap: what it left out may be in any of
         // its recordings, so they are read again next time (of one alone,
         // only when nothing was listed from it).
         held = recordingsHeld(blockIds, rowIds.values(), truncated);
-        recorderReadRef.current = { ...fromRecorder, rowIds, held };
+        recorderReadRef.current = { ...fromRecorder, rowIds, held, waiting: waitingBefore + setAside.length };
         // A recording nothing was found in is done now (unless an item's
         // quote is in none of them: it could be from any; or the review
         // stopped at its cap); so is one with no text a day after it ended.
@@ -604,10 +687,10 @@ export default function DayReviewSheet({
       }
       const recorder = fromRecorder?.recorder ?? null;
       const parts: string[] = [];
-      if (setAside && recorder) parts.push(narrowedMessage(firstCount, fromRecorder!.blocks.length, recorder));
+      if (setAside.length && recorder) parts.push(narrowedMessage(firstCount, fromRecorder!.blocks.length, recorder, narrowedFor));
       if (!items.length) {
         parts.push(recorder
-          ? `Nothing in ${setAside ? (fromRecorder!.blocks.length === 1 ? 'it' : 'them') : `your new ${recorder.name} ${recorder.noun}s`} needs to go into ReferralFit.`
+          ? `Nothing in ${setAside.length ? (fromRecorder!.blocks.length === 1 ? 'it' : 'them') : `your new ${recorder.name} ${recorder.noun}s`} needs to go into ReferralFit.`
           : 'Nothing in these notes needs to go into ReferralFit.');
       } else if (truncated) {
         const skippedToo = read?.skipped?.length ? ` ${read.skipped.length} with no summary or transcript a day after ending ${read.skipped.length === 1 ? 'was' : 'were'} skipped.` : '';
@@ -615,16 +698,31 @@ export default function DayReviewSheet({
       } else if (read?.skipped?.length) {
         parts.push(`${read.skipped.length} ${read.skipped.length === 1 ? read.recorder.noun : `${read.recorder.noun}s`} had no summary or transcript a day after ${read.skipped.length === 1 ? 'it' : 'they'} ended and ${read.skipped.length === 1 ? 'was' : 'were'} skipped.`);
       }
+      if (recorder) parts.push(carriedLine(carried.length, recorder));
       // Those waiting (beyond this read, or set aside above) are always said, beside any other line.
-      if (recorder) parts.push(waitingLine((read?.later ?? 0) + setAside, recorder));
+      if (recorder) parts.push(waitingLine(waitingBefore + setAside.length, recorder));
       const said = parts.filter(Boolean).join(' ');
       if (said) setMessage({ ok: true, text: said });
     } catch (error) {
       if (opening !== openingRef.current) return;
-      keepLink();
+      // One recording that failed on its own (after the others were set
+      // aside, or read alone): it is read alone from now on, only when
+      // nothing newer waits, so it never blocks the queue; and it can be let go.
+      const alone = fromRecorder && onlyRecordings && fromRecorder.blocks.length === 1 && failedForLength(error) ? fromRecorder : null;
+      if (alone) void rememberReviewFailed(alone.recorder, userId, alone.blocks[0].id).catch(() => undefined);
+      if (alone && setAside.length) keepLink(alone, setAside.length);
+      else keepLink();
       if (error instanceof ReviewUnavailableError && error.reason === 'key') setKeyState('missing');
-      setMessage({ ok: false, text: error instanceof Error ? error.message : 'Review is unavailable right now.' });
+      const recorder = recorderReadRef.current?.recorder ?? null;
+      const parts = [error instanceof Error ? error.message : 'Review is unavailable right now.'];
+      if (alone && recorder) parts.push(failedAloneLine(recorder));
+      if (alone && setAside.length && recorder) parts.push(waitingLine(waitingBefore + setAside.length, recorder));
+      setMessage({ ok: false, text: parts.join(' ') });
+      // A recorder read that failed can be let go ("Done with these"), so one bad recording never stays stuck.
+      setFailedRead(Boolean(recorderReadRef.current?.blocks.length));
       setPhase('paste');
+    } finally {
+      if (opening === openingRef.current) inFlightRef.current = null;
     }
   }
 
@@ -701,7 +799,10 @@ export default function DayReviewSheet({
   async function readRecorder(recorder: Recorder, opening = openingRef.current, otherwise?: Recorder) {
     if (savingRef.current) return;
     setMessage(null);
+    setFailedRead(false);
     setPhase('finding');
+    // Being fetched: Cancel closes plainly (the box is replaced by them).
+    inFlightRef.current = { recorder, blocks: [] };
     let read;
     try {
       read = await readNewRecordings(recorder, userId);
@@ -711,6 +812,7 @@ export default function DayReviewSheet({
       onRecordersChanged?.();
     } catch (error) {
       if (opening !== openingRef.current) return;
+      inFlightRef.current = null;
       setPhase('paste');
       if (error instanceof FieldyError && error.reason === 'disconnected') {
         setRecorder(recorder.id, { state: 'off', email: '' });
@@ -722,6 +824,7 @@ export default function DayReviewSheet({
     }
     if (opening !== openingRef.current) return;
     if (!read.blocks.length) {
+      inFlightRef.current = null;
       setPhase('paste');
       if (read.skipped.length) markReviewed(recorder, read.skipped);
       if (otherwise && !read.later) { await readRecorder(otherwise, opening); return; }
@@ -772,6 +875,68 @@ export default function DayReviewSheet({
         },
       },
     ]);
+  }
+
+  // A recorder read that failed (incomplete, turned down, too slow, or
+  // anything else): its recordings can be let go, so a recording that never
+  // reviews does not stay in the box and the count for good.
+  function doneWithUnread() {
+    const read = recorderReadRef.current;
+    if (!read || busy || !read.blocks.length) return;
+    const opening = openingRef.current;
+    const { recorder, blocks } = read;
+    const one = blocks.length === 1;
+    const noun = one ? recorder.noun : `${recorder.noun}s`;
+    Alert.alert(`Done with ${one ? 'this' : `these ${blocks.length}`} ${recorder.name} ${noun}?`,
+      `ReferralFit will not offer ${one ? 'it' : 'them'} again. ${one ? 'It' : 'They'} could not be reviewed this time: anything not saved from ${one ? 'it' : 'them'} yet is not saved, so add what you need by hand.`, [
+        { text: one ? 'Keep it' : 'Keep them', style: 'cancel' },
+        {
+          text: `Done with ${one ? 'it' : 'them'}`,
+          style: 'destructive',
+          onPress: () => {
+            if (opening !== openingRef.current || recorderReadRef.current !== read) return;
+            markReviewed(recorder, blocks.map((block) => block.id));
+            recorderReadRef.current = null;
+            setFailedRead(false);
+            setRows([]);
+            setSaved({});
+            setPicker(null);
+            setNewCases([]);
+            // The recordings leave the box; notes typed beside them stay.
+            setNotes((current) => blocks.reduce((rest, block) => rest.split(block.text).join(''), current).replace(/\n{3,}/g, '\n\n').trim());
+            const waits = waitingLine(read.waiting, recorder);
+            setMessage({ ok: true, text: `ReferralFit will not offer ${one ? 'it' : 'them'} again.${waits ? ` ${waits}` : ''}` });
+          },
+        },
+      ]);
+  }
+
+  // Everything in this review is decided and more recordings wait (set
+  // aside by a narrowed read, or beyond this one): the next read, now, in
+  // this opening. What was decided here is settled first (and written
+  // before the next read looks), so it is never read twice; what this
+  // opening saved stays known.
+  async function readNext() {
+    const read = recorderReadRef.current;
+    if (!read || busy || savingRef.current) return;
+    const opening = openingRef.current;
+    const done = recordingsDone(saved, rows);
+    setMessage(null);
+    setPhase('finding');
+    inFlightRef.current = { recorder: read.recorder, blocks: [] };
+    if (done.length) {
+      await markReviewed(read.recorder, done);
+      if (opening !== openingRef.current) return;
+    }
+    recorderReadRef.current = null;
+    switchedOffRef.current = new Set();
+    setRows([]);
+    setSaved({});
+    setPicker(null);
+    setNewCases([]);
+    setCaseDraft(null);
+    setNotes('');
+    await readRecorder(read.recorder, opening);
   }
 
   // An edit to a row clears the reason its last save failed.
@@ -1273,6 +1438,19 @@ export default function DayReviewSheet({
 
   const keyMissing = keyState === 'missing' || !aiKeysSupported;
 
+  // "Read the next N now": everything in this review is decided and more of
+  // its recorder's recordings wait. Only on a tap: never a read by itself.
+  const nextRead = recorderReadRef.current;
+  const nextCount = nextRead && nextRead.waiting > 0 && (phase === 'done' || (phase === 'review' && rows.every((row) => rowDecided(row, saved))))
+    ? Math.min(nextRead.waiting, RECORDINGS_PER_REVIEW) : 0;
+  const nextButton = nextRead && nextCount ? (
+    <TouchableOpacity accessibilityRole="button" onPress={() => { void readNext(); }} style={[styles.secondaryButton, styles.nextButton]}>
+      <Text style={styles.secondaryButtonText}>Read the next {nextCount === 1 ? nextRead.recorder.noun : `${nextCount} ${nextRead.recorder.noun}s`} now</Text>
+    </TouchableOpacity>
+  ) : null;
+  // After a failed recorder read: let its recordings go.
+  const unread = failedRead && phase === 'paste' ? recorderReadRef.current : null;
+
   const pasteScreen = (
     <View>
       <Text style={styles.intro}>
@@ -1401,6 +1579,13 @@ export default function DayReviewSheet({
         accessibilityLabel="Your notes"
         style={[styles.input, styles.notesInput]}
       />
+      {unread && unread.blocks.length ? (
+        <TouchableOpacity accessibilityRole="button" disabled={busy || voiceActive} onPress={doneWithUnread} style={styles.textButton}>
+          <Text style={styles.hint}>
+            Done with {unread.blocks.length === 1 ? `this ${unread.recorder.noun}` : `these ${unread.blocks.length} ${unread.recorder.noun}s`}: don't read {unread.blocks.length === 1 ? 'it' : 'them'} again
+          </Text>
+        </TouchableOpacity>
+      ) : null}
       <Text style={styles.hint}>
         Only this text and today's date are sent, to Anthropic on your own key; ReferralFit does not store them. Paste a recording only if everyone in it agreed to be recorded.
       </Text>
@@ -1459,11 +1644,15 @@ export default function DayReviewSheet({
                 ) : <Text style={styles.primaryButtonText}>Find what's in it</Text>}
               </TouchableOpacity>
             ) : phase === 'done' ? (
-              <TouchableOpacity accessibilityRole="button" onPress={close} style={styles.primaryButton}>
-                <Text style={styles.primaryButtonText}>Done</Text>
-              </TouchableOpacity>
+              <>
+                {nextButton}
+                <TouchableOpacity accessibilityRole="button" onPress={close} style={styles.primaryButton}>
+                  <Text style={styles.primaryButtonText}>Done</Text>
+                </TouchableOpacity>
+              </>
             ) : (
               <>
+                {nextButton}
                 {waiting ? <Text style={styles.footerHint}>{waiting} {waiting === 1 ? 'needs' : 'need'} a choice before {waiting === 1 ? 'it' : 'they'} can be saved.</Text> : null}
                 <TouchableOpacity
                   accessibilityRole="button"
@@ -1534,6 +1723,7 @@ const styles = StyleSheet.create({
   pillTextOn: { color: COLORS.white },
   footer: { padding: 14, gap: 8, borderTopWidth: 1, borderTopColor: COLORS.line, backgroundColor: COLORS.white },
   footerHint: { fontSize: 12, color: COLORS.muted, textAlign: 'center' },
+  nextButton: { alignSelf: 'stretch', marginTop: 0 },
   footerNotice: { marginTop: 0 },
   primaryButton: { minHeight: 52, borderRadius: 14, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },
   primaryButtonText: { color: COLORS.white, fontSize: 16, fontWeight: '800' },

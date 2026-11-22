@@ -28,9 +28,20 @@ export type ReviewFailureReason =
   | 'unavailable'; // anything else, usually passing
 
 export class ReviewUnavailableError extends Error {
-  constructor(message: string, readonly reason: ReviewFailureReason) {
+  /** `code`: the function's own error code ('incomplete', 'timeout', …), '' when there is none. */
+  constructor(message: string, readonly reason: ReviewFailureReason, readonly code = '') {
     super(message);
   }
+}
+
+/**
+ * The review failed for what it was given, not for the key, the cap or the
+ * connection: it came back incomplete, was turned down, or took too long.
+ * A read of several recordings that failed so is read again with fewer.
+ */
+export function failedForLength(error: unknown): boolean {
+  return error instanceof ReviewUnavailableError
+    && (error.reason === 'refused' || error.code === 'incomplete' || error.code === 'timeout');
 }
 
 type FunctionErrorBody = { error?: { code?: string; message?: string } };
@@ -73,16 +84,16 @@ export async function requestDayReview(notes: string, today: string, apiKey: str
     const name = (result.error as { name?: string }).name || '';
     const cause = (result.error as { context?: { name?: unknown } }).context;
     if (name === 'FunctionsFetchError' && cause?.name === 'AbortError') {
-      throw new ReviewUnavailableError('The review took too long. Try a shorter part of the day.', 'unavailable');
+      throw new ReviewUnavailableError('The review took too long. Try a shorter part of the day.', 'unavailable', 'timeout');
     }
     if (name === 'FunctionsFetchError' || name === 'FunctionsRelayError') throw new ReviewUnavailableError(OFFLINE_MESSAGE, 'offline');
     const payload = await functionErrorBody(result.error);
     const code = payload.error?.code || '';
     const message = payload.error?.message || 'Review is unavailable right now.';
-    if (KEY_CODES.includes(code)) throw new ReviewUnavailableError(message, 'key');
-    if (code === 'daily_limit') throw new ReviewUnavailableError(message, 'limit');
-    if (code === 'refused') throw new ReviewUnavailableError(message, 'refused');
-    throw new ReviewUnavailableError(message, 'unavailable');
+    if (KEY_CODES.includes(code)) throw new ReviewUnavailableError(message, 'key', code);
+    if (code === 'daily_limit') throw new ReviewUnavailableError(message, 'limit', code);
+    if (code === 'refused') throw new ReviewUnavailableError(message, 'refused', code);
+    throw new ReviewUnavailableError(message, 'unavailable', code);
   }
   const data = result.data as { items?: unknown; remaining?: unknown; truncated?: unknown } | null;
   if (!data || !Array.isArray(data.items)) {
