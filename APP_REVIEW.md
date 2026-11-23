@@ -288,6 +288,126 @@ below, and add it to the Notes:
 - Voice notes. Right after a call, say what happened and ReferralFit types it into Review notes for you to check.
 ```
 
+### 3c. As submitted: 1.4.0 (1), 2026-11-22
+
+1.3.0 never went to App Review, so 1.4.0 carries everything since 1.2.
+Submitted through the App Store Connect API (release: automatically after
+approval). Contact and demo account copied from 1.2; screenshots carried
+over (10 iPhone 6.5", 10 iPad 13").
+
+**Promotional text**
+
+```
+Your recorder fills in ReferralFit: a day of calls becomes leads, notes and follow-ups you approve. Plus a family intake that comes back ready to match. All free.
+```
+
+**What's New**
+
+```
+Review notes from your day
+• Paste your call notes, connect a Fieldy or Plaud recorder, share text from any app, or say a quick voice note. ReferralFit lists the new leads, notes, follow-ups and referrals it finds, and you approve each one before anything is saved. Uses your own Anthropic key.
+• A conversation about a family you haven't entered yet? Tap "+ New case" right on the row.
+• An optional reminder, at the time you choose, when recordings are waiting.
+
+Family assessment
+• Send a family a private intake link in your practice's name, with your logo. Their answers come back to the case.
+• See matches from their answers: Match opens already filled in, with a note on where each field came from.
+• Case brief for programs: a short, de-identified summary for an admissions team, ready to share or add to a referral packet.
+• Read the insurance card into Benefits, for you to check before saving.
+• Start the level-of-care rating from an AI suggestion that you confirm.
+
+Explain to the family
+• After a match, get a plain-language note on why these programs fit, in your order, ready to send.
+
+Also
+• Many reliability fixes.
+```
+
+**Notes for the reviewer**
+
+```
+ReferralFit is a free B2B tool for addiction-intervention practices, not offered to consumers or families. Nothing is sold in the app: no subscriptions, in-app purchases, or links to outside purchase.
+
+DEMO ACCOUNT: use the credentials in App Review Information. The demo workspace has fictional sample data and every feature. Sign in on the first screen.
+
+ACCOUNT CREATION: "Create account" on the sign-in screen (practice name, your name, email, password). Free. "Forgot password?" sends a reset link.
+
+ACCOUNT DELETION (5.1.1(v)): gear icon at the top right (Workspace and settings), "Delete account…", two confirmations. Please do not delete the demo account; create a throwaway account to test deletion.
+
+NEW IN 1.4.0:
+• REVIEW NOTES (Home tab): paste call notes; the app lists the leads, notes and follow-ups it finds, and nothing is saved until the user approves each item. It runs on the practice's own Anthropic API key (Workspace and settings, AI drafts), so a key is needed to try it; ReferralFit sells nothing and receives no payment for it. "+ New case" on a row creates a case for a family not yet entered.
+• FIELDY AND PLAUD (optional): third-party recorders some practitioners own. "Connect" opens the recorder's own sign-in page (OAuth in the system browser sheet); the app then reads the user's own recordings' text. The sign-in stays in the iPhone's keychain and is removed with "Disconnect" or account deletion. A Fieldy or Plaud account is needed to try it.
+• SHARE TO REFERRALFIT: ReferralFit appears in the iOS share sheet. Select text in Notes, Messages or Mail, tap Share, then ReferralFit: the app opens on Review notes with the text in the box. Nothing is sent until the user taps "Find what's in it".
+• VOICE NOTE (Review notes): types what the user says into the box with iOS speech recognition, on the device when the iPhone supports it. The microphone is used only while a voice note is recording; ReferralFit never saves or sends the audio.
+• FAMILY ASSESSMENT: on a case, "Family assessment" sends the family a private intake link on portal.referralfit.com (enter an email you can open to try it). The family signs a consent before sending; their answers appear on the case. From a finished assessment: "See matches from these answers" fills in Match; "Case brief for programs" makes a de-identified summary the practitioner shares; "Read the card into Benefits" (needs the key and a card photo the family uploaded) reads the insurer, plan and last four of the member ID for the practitioner to confirm; an AI suggestion can start the level-of-care rating.
+• EXPLAIN TO THE FAMILY (Match tab, after a match): a plain-language note on why the programs fit, to send by text or email. No setup.
+
+FOLLOW UP / AI DRAFTS (optional): "Follow up" gives a ready draft to send from the iPhone's own Messages or Mail, no setup. "Draft with AI" uses the same Anthropic key.
+
+NOTIFICATIONS are optional, requested only after the user turns them on, and use generic text without client, family or program names.
+
+SHARED DIRECTORY: submissions are reviewed by ReferralFit staff; one from the demo account goes to our queue and is discarded.
+
+The "Square" and "PandaDoc" labels on a case are optional links to a practice's own client invoices and agreements, not a way to pay ReferralFit.
+```
+
+**Description**
+
+```
+ReferralFit is the working notebook of a professional intervention practice. It keeps the people, programs and promises of this work in one place, so no family waits on a call that was forgotten and no referral partner goes cold.
+
+Built by an interventionist with 22 years in the field, for the practices doing this work every day.
+
+TODAY
+Open the app and see what is due: new leads to call back, consults on the calendar, beds to confirm, follow-ups you owe, and programs that have answered your placement requests. Overdue items rise to the top.
+
+REVIEW NOTES FROM YOUR DAY
+Paste your call notes, connect a Fieldy or Plaud recorder, share text from any app, or say a quick voice note. ReferralFit finds the new leads, case notes, follow-ups and referrals in it, matched to your cases and partners, and you approve each one before anything is saved. Runs on your own Anthropic account.
+
+FAMILY ASSESSMENT
+Send a family a private intake link in your practice's name. Their answers, a signed consent and their insurance card come back to the case. From there, open Match already filled in from their answers, share a de-identified case brief with a program's admissions team, and read the insurance card into the family's benefits.
+
+MATCHING
+Describe what a family needs, and ReferralFit ranks your partners by level of care, location, insurance, budget and therapy fit. Explain the order to the family in plain words, ready to send. Save the match to the case so the reasoning stays with the family.
+
+PLACEMENT REQUESTS
+Instead of calling programs one by one, send one de-identified request to several of your ranked programs and compare their answers side by side: whether they can admit, how soon, and the daily rate. Programs cannot pay to be asked, and their answers never change your rankings.
+
+LEVEL OF CARE
+A short, structured assessment across six areas recommends a level of care and writes out the rationale. You choose the level to place at, and the reasoning goes into the program's copy of the placement packet.
+
+TRUE COST TO THE FAMILY
+Record the family's deductible, out-of-pocket maximum and coinsurance, and see an estimate of what a placement would cost them. Always labeled an estimate, never shared with programs, and never used to rank.
+
+PROGRAM INTEGRITY
+Before you refer, see whether a program's state license, accreditation, LegitScript certification and NPI are on file and current.
+
+CASES
+One record per family: contacts, the timeline of calls and emails, documents, and the next step with a date on it, from first call through consult, intervention, placement and aftercare.
+
+FOLLOW UP
+Every case and partner gets a follow-up rhythm. Tap Follow up for a ready draft to text, email or call, sent from your own Messages or Mail. Optional AI drafts run on your own Anthropic account.
+
+REFERRALS AND HANDOFFS
+Track referrals sent and received. Send a program a private handoff link: they mark each step, from received to consult scheduled, and your reminder moves with them.
+
+DIRECTORY
+A shared, reviewed directory of treatment programs and professionals, open to every workspace. Submit a listing from your own partner list; nothing about your practice or your clients is shared.
+
+TEAM
+Invite colleagues into your workspace so everyone works from the same plan.
+
+PRIVATE BY DESIGN
+Your workspace belongs to your practice alone. Other practices using ReferralFit cannot see your partners, cases or notes. Lock the app with Face ID, and a cover keeps your cases out of the app switcher. Data syncs over an encrypted connection.
+
+FOR PROFESSIONALS
+ReferralFit is free for intervention practices, treatment-placement specialists and family coaches. Create your practice's account in the app. It is not a crisis service. If someone is in immediate danger, call 911; for a mental-health crisis, call or text 988.
+
+Privacy Policy: https://referralfit.com/privacy
+Terms of Use (EULA): https://referralfit.com/terms
+Support: https://referralfit.com/support
+```
+
 ## 4. What changed in the app for the resubmission
 
 - The app is free: a database switch (`free_launch_period()`) opens every
