@@ -140,9 +140,8 @@ for (const name of ['openMatchedReferral', 'openPacketComposer']) {
   assert.match(body, /const openings = screenOpenings\(\);\s*const \w+ = await (saveCurrentReferralMatch|currentOrSavedMatch)\(\);[\s\S]{0,500}?if \(anySheetOpenRef\.current \|\| overlayOpen\(\) \|\| screenOpenings\(\) !== openings\) return;/, `${name} must not present over, or as it closes, a sheet opened during its save`);
   assert.doesNotMatch(body, /setSelectedPartner\(null\)/, `${name} must not close one sheet and present another in the same frame`);
 }
-assert.match(source, /workspaceVisit !== workspaceVisitRef.current\) return;/, 'a late profile read cannot reopen a dismissed workspace');
-// The count behind those checks moves on every no-sheet → sheet render, and
-// an in-flight profile read must also belong to the same Workspace visit.
+assert.match(source, /workspaceVisitRef.current === workspaceVisit;[\s\S]{0,400}if \(!stillInWorkspace\(\)\) return;/, 'a late profile read cannot reopen a dismissed workspace');
+// The count behind the sheet guards moves on every no-sheet → sheet render.
 assert.match(source, /if \(sheetOpenNow && !anySheetOpenRef\.current\) sheetOpenedCountRef\.current \+= 1;\s*anySheetOpenRef\.current = sheetOpenNow;/, 'every sheet opening is counted before anySheetOpenRef updates');
 assert.match(source, /if \(activeCaseIdRef\.current === paymentCaseId\) setCasePaymentForm\(paymentForm\)/, 'an unconfirmed payment reopens only over its own case file');
 assert.match(source, /function openCase\(caseId: string\) \{[\s\S]{0,1200}setCasePaymentForm\(null\);[\s\S]{0,400}setVobAnswerForm\(null\);[\s\S]{0,200}loadCaseList\(userId\)/, 'opening a case file clears editors left from another case');

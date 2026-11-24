@@ -626,7 +626,7 @@ export const STATUS_LABELS: Record<RecipientStatus, string> = {
 export const BED_LABELS: Record<BedAnswer, string> = { yes: 'Bed available', no: 'No bed', waitlist: 'Waitlist' };
 export const ACCEPT_LABELS: Record<AcceptAnswer, string> = { yes: 'Likely to accept', maybe: 'Maybe', no: 'Not a fit' };
 
-/** "$950/day quoted · about $28,500 for 30 days, before insurance". */
+/** Estimated stay total for the program’s quoted daily rate. */
 export function quotedStayEstimate(dailyRate: number | null, days = DEFAULT_STAY_DAYS): string {
   if (dailyRate == null || !(dailyRate > 0)) return '';
   const money = (value: number) => `$${value.toLocaleString('en-US')}`;

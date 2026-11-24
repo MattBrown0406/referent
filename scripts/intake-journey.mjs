@@ -13,7 +13,8 @@ const key = config.PUBLISHABLE_KEY || config.ANON_KEY;
 const auth = { persistSession: false, autoRefreshToken: false };
 const admin = createClient(config.API_URL, config.SERVICE_ROLE_KEY, { auth });
 const practice = createClient(config.API_URL, key, { auth });
-const appOrigin = 'http://127.0.0.1:3320';
+// Metro binds the address localhost resolves to, including ::1 on Ubuntu.
+const appOrigin = 'http://localhost:3320';
 const siteOrigin = 'http://127.0.0.1:3310';
 const functionBase = config.API_URL + '/functions/v1/intake';
 const website = process.argv[2];
@@ -21,7 +22,7 @@ const servers = [];
 
 async function start(cwd, cli, args, env, origin) {
   const server = spawn(process.execPath, [resolve(cwd, cli), ...args], {
-    cwd, env: { ...process.env, CI: '1', ...env }, stdio: 'inherit',
+    cwd, env: { ...process.env, CI: '1', BROWSER: 'none', ...env }, stdio: 'inherit',
   });
   servers.push(server);
   for (let attempt = 0; attempt < 120; attempt++) {

@@ -8892,14 +8892,16 @@ export default function App() {
     // Same account in another workspace is a different listing.
     const generation = authGenerationRef.current;
     const workspaceVisit = workspaceVisitRef.current;
+    const stillInWorkspace = () => activeUserIdRef.current === userId
+      && authGenerationRef.current === generation && workspaceVisitRef.current === workspaceVisit;
     let existing: OrgDirectoryProfile | null = null;
     try {
       existing = (await fetchOrgDirectoryProfile()).profile;
     } catch (error) {
-      Alert.alert('Could not load your profile', describeError(error));
+      if (stillInWorkspace()) Alert.alert('Could not load your profile', describeError(error));
       return;
     }
-    if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation || workspaceVisit !== workspaceVisitRef.current) return;
+    if (!stillInWorkspace()) return;
     setOrgProfileExisting(existing);
     setOrgProfileForm(existing ? orgProfileFormFromListing(existing) : makeEmptyOrgProfileForm());
     setShowWorkspace(false);
