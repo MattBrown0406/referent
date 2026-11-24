@@ -273,6 +273,7 @@ assert.match(workspaceScreenSource, /await load\(\);\s*(\/\/[^\n]*\n\s*)*if \(!v
   const intakeToken = 'ab12'.repeat(10);
   assert.equal(intakeLink.intakeLinkUrl('https://ovfafffvcpaahktvlsdm.supabase.co', intakeToken), `https://referralfit.com/intake/${intakeToken}`, 'production shares the website form');
   assert.equal(intakeLink.intakeLinkUrl('https://ovfafffvcpaahktvlsdm.supabase.co/', intakeToken), `https://referralfit.com/intake/${intakeToken}`);
+  assert.equal(intakeLink.intakeLinkUrl('https://staging.supabase.co', intakeToken), `https://staging.supabase.co/functions/v1/intake/${intakeToken}`, 'a hosted development project keeps its own tokens');
   assert.equal(intakeLink.intakeLinkUrl('http://127.0.0.1:55421', intakeToken), `http://127.0.0.1:55421/functions/v1/intake/${intakeToken}`, 'a local stack shares its own function form');
   assert.equal(intakeLink.intakeLinkUrl('https://ovfafffvcpaahktvlsdm.supabase.co.evil.example', intakeToken), `https://ovfafffvcpaahktvlsdm.supabase.co.evil.example/functions/v1/intake/${intakeToken}`, 'only a real hosted project maps to the website');
   assert.equal(intakeLink.intakeLinkUrl('https://ovfafffvcpaahktvlsdm.supabase.co', ''), '', 'no token, no link');

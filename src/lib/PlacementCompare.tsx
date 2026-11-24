@@ -59,9 +59,9 @@ import {
   type PlacementRequest,
   type PlacementRequestView,
 } from './placement-requests';
-import { WEB_PAGE } from './web-layout';
+import { useWideWeb, WEB_PAGE } from './web-layout';
 
-// The answers, side by side: one row per program in the practice's own
+// The answers, side by side in a wide browser: one card per program in the practice's own
 // ranked order (rank: its place on the match screen when the request went
 // out, sent as p_ranks, so the numbers here are the ones the practitioner
 // saw there; never changed by an answer), with its status,
@@ -126,6 +126,7 @@ const STATUS_TONE: Record<string, { color: string; background: string }> = {
 export default function PlacementCompare({
   requestId, placement, partnersById, senderName, labelFor, integrityFor, familyCostLineFor, canChoose, onClose, onSwitch, onChoose,
 }: Props) {
+  const wideWeb = useWideWeb();
   const visible = Boolean(requestId);
   const [sort, setSort] = useState<CompareSort>('ranked');
   const [loading, setLoading] = useState(false);
@@ -140,6 +141,8 @@ export default function PlacementCompare({
   placementRef.current = placement;
 
   const view = requestId ? placement.state.requests.find((item) => item.request.id === requestId) || null : null;
+
+  const sideBySide = wideWeb && !log && (view?.recipients.length ?? 0) > 1;
 
   // The program whose answer link is being made right now (native only).
   const [preparingId, setPreparingId] = useState<string | null>(null);
@@ -336,7 +339,7 @@ export default function PlacementCompare({
     // The summary asks for an answer by the deadline: only while it is still ahead.
     const reachable = partner && recipient.channel === 'manual' && !answered && acceptingAnswers(view.request, now);
     return (
-      <View key={recipient.id} style={styles.row}>
+      <View key={recipient.id} style={[styles.row, sideBySide && styles.desktopCard]}>
         <View style={styles.rowTop}>
           <View style={styles.rankBadge}><Text style={styles.rankText}>{recipient.rank}</Text></View>
           <View style={styles.flex}>
@@ -469,7 +472,7 @@ export default function PlacementCompare({
         </View>
         <Text style={styles.hint}>Numbers are each program's place in your match results when you asked. Answers never change it; sorting only reorders this list.</Text>
         {loading ? <ActivityIndicator style={styles.inlineLoading} color={COLORS.forest} /> : null}
-        {rows.map(renderRow)}
+        <View style={sideBySide && styles.desktopGrid}>{rows.map(renderRow)}</View>
         <Text style={styles.label}>WHAT YOU ASKED</Text>
         <View style={styles.summaryCard}>
           {placementSummaryLines(view.request.payload).map((line) => (
@@ -489,7 +492,7 @@ export default function PlacementCompare({
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet" onRequestClose={log?.saving ? () => undefined : onClose}>
-      <SafeAreaView style={styles.page}>
+      <SafeAreaView style={[styles.page, sideBySide && styles.desktopPage]}>
         <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
           <View style={styles.header}>
             <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close answers" disabled={Boolean(log?.saving)} onPress={onClose} style={styles.headerButton}>
@@ -526,6 +529,9 @@ function Choice({ label, selected, onPress }: { label: string; selected: boolean
 
 const styles = StyleSheet.create({
   page: { flex: 1, backgroundColor: COLORS.cream, ...WEB_PAGE },
+  desktopPage: { maxWidth: 1200 },
+  desktopGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' },
+  desktopCard: { width: '49.4%' },
   flex: { flex: 1 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: COLORS.line, backgroundColor: COLORS.white },
   headerTitle: { flex: 1, textAlign: 'center', fontSize: 17, fontWeight: '800', color: COLORS.ink },
