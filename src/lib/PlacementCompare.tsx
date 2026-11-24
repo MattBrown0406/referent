@@ -44,7 +44,7 @@ import {
   normalizeAnswerDraft,
   placementRequestMessage,
   placementSummaryLines,
-  quotedRateLine,
+  quotedStayEstimate,
   requestProgress,
   requestStatusLine,
   sentOnStamp,
@@ -334,7 +334,8 @@ export default function PlacementCompare({
     const integrity = partner ? integrityFor(partner.id) : undefined;
     const cost = partner ? familyCostLineFor(view, partner) : null;
     const answered = isAnswered(recipient);
-    const rate = quotedRateLine(recipient.dailyRate);
+    const estimate = quotedStayEstimate(recipient.dailyRate);
+    const missingAnswer = answered ? 'Not provided' : '—';
     const loggable = canLogAnswer(view.request, recipient);
     // The summary asks for an answer by the deadline: only while it is still ahead.
     const reachable = partner && recipient.channel === 'manual' && !answered && acceptingAnswers(view.request, now);
@@ -343,23 +344,28 @@ export default function PlacementCompare({
         <View style={styles.rowTop}>
           <View style={styles.rankBadge}><Text style={styles.rankText}>{recipient.rank}</Text></View>
           <View style={styles.flex}>
-            <Text style={styles.programName} numberOfLines={2}>{partner?.organization || recipient.programName}</Text>
-            <Text style={styles.rowMeta}>{answerSourceLine(recipient)}</Text>
+            <Text style={[styles.programName, sideBySide && styles.comparisonName]} numberOfLines={2}>{partner?.organization || recipient.programName}</Text>
           </View>
           <View style={[styles.statusPill, { backgroundColor: tone.background }]}><Text style={[styles.statusText, { color: tone.color }]}>{STATUS_LABELS[status]}</Text></View>
         </View>
+        <View style={styles.answer}>
+          <View style={styles.answerGrid}>
+            <AnswerCell label="Bed" value={answered && recipient.bedAvailable ? BED_LABELS[recipient.bedAvailable] : missingAnswer} />
+            <AnswerCell label="Likely to accept" value={answered && recipient.likelyAccept ? ACCEPT_LABELS[recipient.likelyAccept] : missingAnswer} />
+          </View>
+          <View style={styles.answerGrid}>
+            <AnswerCell label="Earliest admit" value={answered && recipient.earliestAdmitOn ? formatStamp(recipient.earliestAdmitOn) : missingAnswer} />
+            <AnswerCell label="Quoted daily rate" value={answered && recipient.dailyRate ? `$${recipient.dailyRate.toLocaleString('en-US')}` : missingAnswer} />
+          </View>
+        </View>
+        <Text style={styles.rowMeta}>{answerSourceLine(recipient)}</Text>
         {integrity ? <View style={styles.chipRow}><ShieldChip integrity={integrity} /></View> : null}
         {answered ? (
-          <View style={styles.answer}>
-            <View style={styles.answerGrid}>
-              <AnswerCell label="Bed" value={recipient.bedAvailable ? BED_LABELS[recipient.bedAvailable] : 'Not said'} />
-              <AnswerCell label="Likely to accept" value={recipient.likelyAccept ? ACCEPT_LABELS[recipient.likelyAccept] : 'Not said'} />
-              <AnswerCell label="Earliest admit" value={recipient.earliestAdmitOn ? formatStamp(recipient.earliestAdmitOn) : 'Not said'} />
-            </View>
-            {rate ? <Text style={styles.costLine}>{rate}</Text> : null}
+          <>
+            {estimate ? <Text style={styles.costLine}>{estimate}</Text> : null}
             {recipient.costNote ? <Text style={styles.costLine}>Cost: {recipient.costNote}</Text> : null}
             {recipient.note ? <Text style={styles.programNote}>“{recipient.note}”</Text> : null}
-          </View>
+          </>
         ) : (
           <Text style={styles.waiting}>{waitingLine(recipient.channel, status)}</Text>
         )}
@@ -557,13 +563,14 @@ const styles = StyleSheet.create({
   rankBadge: { width: 28, height: 28, borderRadius: 14, backgroundColor: COLORS.mint, alignItems: 'center', justifyContent: 'center' },
   rankText: { fontSize: 13, fontWeight: '900', color: COLORS.forest },
   programName: { fontSize: 15, fontWeight: '800', color: COLORS.ink },
-  rowMeta: { fontSize: 12, color: COLORS.gray, marginTop: 2 },
+  comparisonName: { minHeight: 40, lineHeight: 20 },
+  rowMeta: { fontSize: 12, color: COLORS.gray, marginTop: 8 },
   statusPill: { borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4 },
   statusText: { fontSize: 11, fontWeight: '800' },
   chipRow: { flexDirection: 'row', marginTop: 8 },
-  answer: { marginTop: 10 },
-  answerGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  answerCell: { minWidth: 92, flexGrow: 1, padding: 8, borderRadius: 10, backgroundColor: COLORS.mintPale },
+  answer: { marginTop: 10, gap: 8 },
+  answerGrid: { flexDirection: 'row', gap: 8 },
+  answerCell: { flex: 1, padding: 8, borderRadius: 10, backgroundColor: COLORS.mintPale },
   answerLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 0.5, color: COLORS.gray },
   answerValue: { fontSize: 13, fontWeight: '700', color: COLORS.ink, marginTop: 2 },
   costLine: { fontSize: 13, color: COLORS.inkSoft, marginTop: 8 },

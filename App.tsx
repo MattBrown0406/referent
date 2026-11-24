@@ -346,7 +346,6 @@ const notificationPromptKey = (userId: string) => `referralfit-notification-prom
 const notificationScheduleKey = (userId: string) => `referralfit-notification-scheduling-v2:${userId.toLowerCase()}`;
 const partnerSnoozeKey = (userId: string) => `referralfit-partner-snooze-v2:${userId.toLowerCase()}`;
 const welcomeKey = (userId: string) => `referralfit-welcome-v1:${userId.toLowerCase()}`;
-const profilePromptKey = (userId: string) => `referralfit-profile-prompt-v1:${userId.toLowerCase()}`;
 
 // Every table's PK is a Postgres `uuid` column, so client-generated ids MUST be
 // valid UUIDs — a prefixed string like `p-1785096121092-t1etoz4` is rejected with
@@ -1221,16 +1220,10 @@ export default function App() {
   const [outcomeStatus, setOutcomeStatus] = useState<'enrolled' | 'completed' | 'left' | null>(null);
   const [notifPrePromptVisible, setNotifPrePromptVisible] = useState(false);
   const [welcomeVisible, setWelcomeVisible] = useState(false);
-  const [profilePromptVisible, setProfilePromptVisible] = useState(false);
   const [showOrgProfile, setShowOrgProfile] = useState(false);
   const [orgProfileForm, setOrgProfileForm] = useState<OrgProfileForm>(makeEmptyOrgProfileForm);
   const [orgProfileExisting, setOrgProfileExisting] = useState<OrgDirectoryProfile | null>(null);
   const [orgProfileSaving, setOrgProfileSaving] = useState(false);
-  // Reopen the Workspace screen after the profile form when it launched from there.
-  const orgProfileReturnToWorkspaceRef = useRef(false);
-  // The first-run welcome goes before the notification pre-prompt; when both
-  // are due, the notification prompt waits until the welcome is dismissed.
-  const notifPromptDeferredRef = useRef(false);
   const [notificationPermissionState, setNotificationPermissionState] = useState<'authorized' | 'askable' | 'blocked' | 'unsupported'>('unsupported');
   const [pendingNotificationPartnerId, setPendingNotificationPartnerId] = useState<string | null>(null);
   const authGenerationRef = useRef(0);
@@ -1257,6 +1250,10 @@ export default function App() {
   useEffect(() => { setReferralRowLimit(LIST_ROWS_SHOWN); }, [referralSearch, referralDirectionFilter]);
   const [showBusinessDashboard, setShowBusinessDashboard] = useState(false);
   const [showWorkspace, setShowWorkspace] = useState(false);
+  const workspaceVisitRef = useRef(0);
+  useEffect(() => {
+    workspaceVisitRef.current += 1;
+  }, [showWorkspace]);
   // Lead capture: the "New lead" quick-add sheet, the workspace's first-call
   // target and intake token (advisory; defaults when offline), and a slow
   // tick that keeps the NEW LEADS waiting clocks moving.
@@ -1707,9 +1704,7 @@ export default function App() {
     setShowOrgProfile(false);
     setOrgProfileExisting(null);
     setOrgProfileForm(makeEmptyOrgProfileForm());
-    orgProfileReturnToWorkspaceRef.current = false;
     setWelcomeVisible(false);
-    setProfilePromptVisible(false);
     setPendingPlacement(null);
     setBusinessData({ stages: [], integrations: [] });
     setBusinessLoading(false);
@@ -2204,7 +2199,6 @@ export default function App() {
         const welcomeSeen = await AsyncStorage.getItem(welcomeKey(userId));
         if (!active || generation !== authGenerationRef.current) return;
         const showWelcome = welcomeSeen !== 'seen';
-        notifPromptDeferredRef.current = false;
         if (showWelcome) whenScreenClear(() => setWelcomeVisible(true));
 
         const permission = await getNotificationPermissionState();
@@ -2227,11 +2221,11 @@ export default function App() {
                 }
               });
           }
-        } else if (permission === 'askable') {
+        } else if (!showWelcome && permission === 'askable') {
           const decision = await AsyncStorage.getItem(notificationPromptKey(userId));
           if (active && generation === authGenerationRef.current && decision !== 'dismissed') {
-            if (showWelcome) notifPromptDeferredRef.current = true;
-            else whenScreenClear(() => setNotifPrePromptVisible(true));
+            // The first visit ends at Today. Settings can enable reminders at any time.
+            whenScreenClear(() => setNotifPrePromptVisible(true));
           }
         }
       } catch (error) {
@@ -4725,7 +4719,7 @@ export default function App() {
     selectedPartner || showAddPartner || showAddReferral || touchPartner || packetTarget || outcomeFollowUp
     || activeCaseId || showNewCase || showNewLead || showOrgProfile || showBusinessDashboard || showGlobalDirectory || showPartnerImport || showDayReview || showMatchExplanation
     || showWorkspace || doneCard || nextStepCard || snoozeCard || showQuickAdd || contactPick || todayQuickNote
-    || outreach || rejectedList || welcomeVisible || profilePromptVisible || notifPrePromptVisible
+    || outreach || rejectedList || welcomeVisible || notifPrePromptVisible
     || placementSheet || placementCompareId || showHandoffs,
   );
   if (sheetOpenNow && !anySheetOpenRef.current) sheetOpenedCountRef.current += 1;
@@ -6859,9 +6853,9 @@ export default function App() {
         <View style={styles.todayRowBody}>
           <TouchableOpacity activeOpacity={card.caseId || card.partnerId ? 0.7 : 1} onPress={openLinked}>
             <Text numberOfLines={2} style={styles.todayRowTitle}>{card.title}</Text>
-            {card.subtitle ? <Text numberOfLines={1} style={styles.todayRowMeta}>{card.subtitle}</Text> : null}
             {overdue ? <Text style={styles.todayOverdueBadge}>{card.daysOverdue} {card.daysOverdue === 1 ? 'day' : 'days'} overdue</Text> : null}
             {card.lead ? renderLeadClock(card.lead) : null}
+            {card.subtitle ? <Text numberOfLines={1} style={styles.todayRowMeta}>{card.subtitle}</Text> : null}
             {teamWorkspace && cardAssigneeLabel(card) ? <Text style={styles.todayRowMeta}>{cardAssigneeLabel(card)}</Text> : null}
           </TouchableOpacity>
           {teamWorkspace && card.lead && card.caseId && !caseAssignee(card.caseId) ? (
@@ -6870,8 +6864,9 @@ export default function App() {
             </TouchableOpacity>
           ) : null}
           <View style={styles.todayActionRow}>
-            <TouchableOpacity accessibilityLabel={`Call — ${card.title}`} onPress={() => cardContactAction(card, 'call')} style={styles.todayIconButton}>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Call — ${card.title}`} onPress={() => cardContactAction(card, 'call')} style={card.lead ? styles.todayLeadCall : styles.todayIconButton}>
               <AppIcon name="call" size={15} color={COLORS.forest} />
+              {card.lead ? <Text style={styles.todayLeadCallText}>Call</Text> : null}
             </TouchableOpacity>
             <TouchableOpacity accessibilityLabel={`Text — ${card.title}`} onPress={() => cardContactAction(card, 'text')} style={styles.todayIconButton}>
               <AppIcon name="chatbubble" size={14} color={COLORS.forest} />
@@ -6952,6 +6947,34 @@ export default function App() {
             </View>
             <Text style={styles.heroSubtitle}>{loadLine}</Text>
           </View>
+          {teamWorkspace ? (
+            <View style={styles.todayScopeBlock}>
+              <View style={styles.segmented}>
+                {(['mine', 'everyone'] as TodayScope[]).map((scope) => (
+                  <TouchableOpacity key={scope} accessibilityRole="button" accessibilityState={{ selected: todayScope === scope }} onPress={() => setTodayScopeChoice(scope)} style={[styles.segment, todayScope === scope && styles.segmentActive]}>
+                    <Text style={[styles.segmentText, todayScope === scope && styles.segmentTextActive]}>{scope === 'mine' ? 'Mine' : 'Everyone'}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              {todayScope === 'mine' ? <Text style={styles.todayRowMeta}>Mine shows what is assigned to you and anything nobody has taken yet.</Text> : null}
+            </View>
+          ) : null}
+
+          {todaySections.newLeads.length ? (
+            <View style={styles.todaySection}>
+              <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderLead]}>⚡ NEW LEADS</Text>
+              {todaySections.newLeads.map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
+            </View>
+          ) : null}
+
+          {todaySections.overdue.length ? (
+            <View style={styles.todaySection}>
+              <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderOverdue]}>🔴 OVERDUE</Text>
+              {todaySections.overdue.slice(0, todayRowLimits.overdue).map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card, overdue: true })}</React.Fragment>)}
+              {TodayShowMore('overdue', todaySections.overdue.length)}
+            </View>
+          ) : null}
+
           {aiKeysSupported && fieldyWaiting > 0 ? (
             <TouchableOpacity
               accessibilityRole="button"
@@ -6983,34 +7006,6 @@ export default function App() {
               </View>
               <AppIcon name="chevron-forward" size={18} color={COLORS.gray} />
             </TouchableOpacity>
-          ) : null}
-
-          {teamWorkspace ? (
-            <View style={styles.todayScopeBlock}>
-              <View style={styles.segmented}>
-                {(['mine', 'everyone'] as TodayScope[]).map((scope) => (
-                  <TouchableOpacity key={scope} accessibilityRole="button" accessibilityState={{ selected: todayScope === scope }} onPress={() => setTodayScopeChoice(scope)} style={[styles.segment, todayScope === scope && styles.segmentActive]}>
-                    <Text style={[styles.segmentText, todayScope === scope && styles.segmentTextActive]}>{scope === 'mine' ? 'Mine' : 'Everyone'}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-              {todayScope === 'mine' ? <Text style={styles.todayRowMeta}>Mine shows what is assigned to you and anything nobody has taken yet.</Text> : null}
-            </View>
-          ) : null}
-
-          {todaySections.newLeads.length ? (
-            <View style={styles.todaySection}>
-              <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderLead]}>⚡ NEW LEADS</Text>
-              {todaySections.newLeads.map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card })}</React.Fragment>)}
-            </View>
-          ) : null}
-
-          {todaySections.overdue.length ? (
-            <View style={styles.todaySection}>
-              <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderOverdue]}>🔴 OVERDUE</Text>
-              {todaySections.overdue.slice(0, todayRowLimits.overdue).map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card, overdue: true })}</React.Fragment>)}
-              {TodayShowMore('overdue', todaySections.overdue.length)}
-            </View>
           ) : null}
 
           {todaySections.today.length ? (
@@ -8892,62 +8887,30 @@ export default function App() {
 
   // ─── Workspace directory profile ──────────────────────────────────────────
 
-  // Show the one-time "build your profile" prompt only to a workspace owner
-  // who has no profile and no open claim request. Any failure means no prompt.
-  async function shouldShowProfilePrompt(userId: string): Promise<boolean> {
-    try {
-      if ((await AsyncStorage.getItem(profilePromptKey(userId))) === 'decided') return false;
-      const state = await fetchOrgDirectoryProfile();
-      return state.canEdit && !state.profile && !state.pendingClaim;
-    } catch {
-      return false;
-    }
-  }
-
-  function showDeferredNotificationPrompt() {
-    if (notifPromptDeferredRef.current) {
-      notifPromptDeferredRef.current = false;
-      setNotifPrePromptVisible(true);
-    }
-  }
-
-  async function openOrgProfileForm(fromWorkspace: boolean) {
+  async function openOrgProfileForm() {
     const userId = activeUserIdRef.current;
     // Same account in another workspace is a different listing.
     const generation = authGenerationRef.current;
-    const openings = screenOpenings();
+    const workspaceVisit = workspaceVisitRef.current;
+    const stillInWorkspace = () => activeUserIdRef.current === userId
+      && authGenerationRef.current === generation && workspaceVisitRef.current === workspaceVisit;
     let existing: OrgDirectoryProfile | null = null;
     try {
       existing = (await fetchOrgDirectoryProfile()).profile;
     } catch (error) {
-      Alert.alert('Could not load your profile', describeError(error));
+      if (stillInWorkspace()) Alert.alert('Could not load your profile', describeError(error));
       return;
     }
-    if (activeUserIdRef.current !== userId || authGenerationRef.current !== generation) return;
+    if (!stillInWorkspace()) return;
     setOrgProfileExisting(existing);
     setOrgProfileForm(existing ? orgProfileFormFromListing(existing) : makeEmptyOrgProfileForm());
-    orgProfileReturnToWorkspaceRef.current = fromWorkspace;
-    if (fromWorkspace) {
-      // Let the Workspace sheet finish dismissing before presenting another.
-      setShowWorkspace(false);
-      afterSheetCloses(() => setShowOrgProfile(true));
-    } else if (anySheetOpenRef.current || overlayOpen() || screenOpenings() !== openings) {
-      // Something opened while the profile loaded (and may still be closing):
-      // present once it is gone.
-      afterSheetCloses(() => setShowOrgProfile(true), { ifScreenBusy: 'wait' });
-    } else {
-      setShowOrgProfile(true);
-    }
+    setShowWorkspace(false);
+    afterSheetCloses(() => setShowOrgProfile(true));
   }
 
   function closeOrgProfileForm() {
     setShowOrgProfile(false);
-    if (orgProfileReturnToWorkspaceRef.current) {
-      orgProfileReturnToWorkspaceRef.current = false;
-      afterSheetCloses(() => setShowWorkspace(true));
-    } else {
-      afterSheetCloses(showDeferredNotificationPrompt, { ifScreenBusy: 'wait' });
-    }
+    afterSheetCloses(() => setShowWorkspace(true));
   }
 
   async function saveOrgProfile() {
@@ -9099,44 +9062,6 @@ export default function App() {
             </ScrollView>
           </KeyboardAvoidingView>
         </SafeAreaView>
-      </Modal>
-    );
-  }
-
-  function ProfilePromptModal() {
-    if (!profilePromptVisible || !session) return null;
-    const userId = session.user.id;
-    const generation = authGenerationRef.current;
-    const accountIsCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
-    const finish = async (buildNow: boolean) => {
-      setProfilePromptVisible(false);
-      if (!accountIsCurrent()) return;
-      try {
-        await AsyncStorage.setItem(profilePromptKey(userId), 'decided');
-      } catch {
-        // Best effort: the prompt simply shows again after the next welcome.
-      }
-      if (!accountIsCurrent()) return;
-      if (buildNow) {
-        afterSheetCloses(() => { void openOrgProfileForm(false); }, { ifScreenBusy: 'wait' });
-      } else {
-        afterSheetCloses(showDeferredNotificationPrompt, { ifScreenBusy: 'wait' });
-      }
-    };
-    return (
-      <Modal visible transparent animationType="fade" onRequestClose={() => { void finish(false); }}>
-        <Pressable style={styles.dropdownOverlay} onPress={() => { void finish(false); }}>
-          <Pressable style={styles.dropdownSheet} onPress={(event) => event.stopPropagation()}>
-            <View style={styles.dropdownSheetHandle} />
-            <ScrollView style={styles.keyboardSheetScroll} contentContainerStyle={styles.prePromptBody} keyboardShouldPersistTaps="handled">
-              <View style={styles.prePromptIcon}><AppIcon name="ribbon-outline" size={24} color={COLORS.forest} /></View>
-              <Text style={styles.prePromptTitle}>Let other practices find you</Text>
-              <Text style={styles.prePromptText}>Build a verified profile for your practice in the shared Directory. It takes a minute, you control every word, and you can edit it any time from Workspace.</Text>
-              <TouchableOpacity style={styles.primaryButton} onPress={() => { void finish(true); }}><Text style={styles.primaryButtonText}>Build my profile</Text></TouchableOpacity>
-              <TouchableOpacity onPress={() => { void finish(false); }} style={styles.prePromptNotNow}><Text style={styles.prePromptNotNowText}>Maybe later</Text></TouchableOpacity>
-            </ScrollView>
-          </Pressable>
-        </Pressable>
       </Modal>
     );
   }
@@ -9385,13 +9310,6 @@ export default function App() {
       } catch {
         // Best effort: the welcome simply shows again next launch.
       }
-      // One-time offer to build the workspace's directory profile; the
-      // deferred notification prompt follows whichever way it is answered.
-      const offerProfile = await shouldShowProfilePrompt(userId);
-      if (!accountIsCurrent()) return;
-      // Wait for the welcome sheet to finish closing before the next one.
-      if (offerProfile) afterSheetCloses(() => setProfilePromptVisible(true), { ifScreenBusy: 'wait' });
-      else afterSheetCloses(showDeferredNotificationPrompt, { ifScreenBusy: 'wait' });
     };
     return (
       <Modal visible transparent animationType="fade" onRequestClose={dismiss}>
@@ -9402,13 +9320,8 @@ export default function App() {
               <View style={styles.prePromptIcon}><AppIcon name="lock-closed-outline" size={24} color={COLORS.forest} /></View>
               <Text style={styles.prePromptTitle}>Welcome to your private workspace</Text>
               <Text style={styles.prePromptText}>
-                Everything you add here — partners, cases, referrals, notes, and documents — belongs to your practice alone. Other practices using ReferralFit cannot see it, and it is never shared or sold.
-              </Text>
-              <Text style={styles.prePromptText}>
-                The only shared space is the Directory of programs and professionals, and one of your partners appears there only if you choose to submit it and ReferralFit approves it. Benchmarks use anonymized totals that never identify a practice.
-              </Text>
-              <Text style={styles.prePromptText}>
-                ReferralFit is free to use. There is nothing to buy in this app and no charge to your practice.
+                Cases, contacts, and notes stay in your practice’s workspace. You choose what to share with a program.
+                You can manage your practice’s shared directory profile in Workspace.
               </Text>
               <TouchableOpacity style={styles.primaryButton} onPress={dismiss}><Text style={styles.primaryButtonText}>Got it</Text></TouchableOpacity>
             </ScrollView>
@@ -10352,7 +10265,6 @@ export default function App() {
       {AddReferralModal()}
       {selectedPartner ? null : LogTouchModal()}
       {WelcomeModal()}
-      {ProfilePromptModal()}
       {NotifPrePromptModal()}
       {PacketComposeModal()}
       {OutcomeCaptureModal()}
@@ -10458,7 +10370,7 @@ export default function App() {
           setShowWorkspace(false);
           setWorkspaceEpoch((epoch) => epoch + 1);
         }}
-        onEditDirectoryProfile={() => { void openOrgProfileForm(true); }}
+        onEditDirectoryProfile={() => { void openOrgProfileForm(); }}
         onLeadSettingsChanged={() => { void reloadLeadSettings(); }}
         onAccountDeleted={() => {
           setShowWorkspace(false);
@@ -10990,7 +10902,9 @@ const styles = StyleSheet.create({
   todaySectionHeaderLead: { color: COLORS.forest },
   heroRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
   heroTitleGrow: { flex: 1 },
-  todayActionRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 },
+  todayLeadCall: { minHeight: 44, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, backgroundColor: COLORS.mintPale, borderRadius: 12 },
+  todayLeadCallText: { fontSize: 14, fontWeight: '700', color: COLORS.forest },
+  todayActionRow: { flexWrap: 'wrap', flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 },
   todayIconButton: { width: 44, height: 44, borderRadius: 12, backgroundColor: COLORS.mintPale, borderWidth: 1, borderColor: COLORS.line, alignItems: 'center', justifyContent: 'center' },
   todayTakeButton: { marginTop: 8, flex: 0 },
   todayDoneButton: { flex: 1, minHeight: 44, borderRadius: 12, backgroundColor: COLORS.forest, alignItems: 'center', justifyContent: 'center' },

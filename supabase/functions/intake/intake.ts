@@ -324,11 +324,11 @@ ${errorMessage ? `<div class="alert" role="alert">${escapeHtml(errorMessage)}</d
     <input type="email" id="email" name="email" maxlength="254" autocomplete="email" inputmode="email">
     <div class="row">
       <div>
-        <label for="about_relationship">They are your</label>
+        <label for="about_relationship">The person’s relationship to you (optional)</label>
         <input type="text" id="about_relationship" name="about_relationship" maxlength="60" placeholder="son, wife, friend" autocomplete="off">
       </div>
       <div>
-        <label for="about_first_name">Their first name</label>
+        <label for="about_first_name">Their first name (optional)</label>
         <input type="text" id="about_first_name" name="about_first_name" maxlength="60" autocomplete="off">
       </div>
     </div>
