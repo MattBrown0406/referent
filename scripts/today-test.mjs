@@ -253,7 +253,7 @@ const leadFollowUps = [
 const leadCards = today.newLeadCards(leadCases, leadContacts, leadFollowUps, 15, NOW);
 eq('NEW LEADS ids (immediate danger first, then longest waiting)', leadCards.map((c) => c.id), ['f-lead-2', 'f-lead-3', 'f-lead-1']);
 eq('a lead card is backed by its first-call follow-up and linked to the case', [leadCards[2].kind, leadCards[2].followUp?.id, leadCards[2].caseId], ['first_call', 'f-lead-1', 'c-lead-1']);
-eq('lead subtitle: primary contact with relationship, then the source', leadCards[2].subtitle, 'Maria Lopez (mother) · Website');
+eq('the caller heads the card and the case context stays visible', [leadCards[2].title, leadCards[2].subtitle], ['Maria Lopez', 'mother · son Jake · Website']);
 eq('lead info carries arrival, target, danger and contact', leadCards[1].lead, { arrivedAt: minutesAgo(90), targetMinutes: 15, leadSource: 'Unspecified', immediateDanger: false, contactName: '' });
 check('touched, lost, done-first-call and non-lead cases are excluded', !leadCards.some((c) => ['f-lead-touched', 'f-lead-lost', 'f-lead-done'].includes(c.id)));
 const leadSections = today.buildTodaySections(leadFollowUps, due, NOW, contextFor, leadCards);

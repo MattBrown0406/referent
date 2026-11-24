@@ -370,7 +370,7 @@ check('the comparison reads in the practice\'s ranked order', view.recipients.ma
   check('the logged answer lands on its row, in place', merged.recipients.map((item) => `${item.rank}:${item.status}`), ['1:responded', '2:responded', '3:responded', '4:declined', '5:responded']);
   check('progress moves to 5 of 5', rules.requestProgress(merged, new Date('2026-11-05T10:00:00Z')).label, '5 of 5 programs answered');
   check('the answer in one line', rules.answerLine(logged), 'Waitlist · Maybe · Earliest admit Nov 9, 2026');
-  check('a quoted rate, with the stay it implies', rules.quotedRateLine(1050), '$1,050/day quoted · about $31,500 for 30 days, before insurance');
+  check('a quoted rate, with the stay it implies', rules.quotedStayEstimate(1050), 'About $31,500 for 30 days, before insurance');
 
   // Today: new answers since the last look; the practitioner's own requests under "Mine".
   const now = new Date('2026-11-05T10:00:00Z');

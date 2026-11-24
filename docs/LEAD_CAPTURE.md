@@ -249,3 +249,14 @@ deno test  --node-modules-dir=none supabase/functions/intake/
 - `supabase/functions/intake/intake_test.ts` (Deno): token parsing,
   validation, honeypot, control-character stripping, page content and
   escaping, address and bucket handling.
+
+## Pre-release browser check
+
+The Quality workflow runs `npm run test:intake-journey` against its disposable Supabase stack.
+A family submits the function’s form in Chrome. A newly created practice signs in to the Expo web app and opens the caller from Today.
+The test reads through the practice account to check for exactly one lead, one primary contact and one open first call after the submission commits.
+
+The public website runs the same test with its Next.js intake page. To run both checkouts together, install dependencies in each,
+add `INTAKE_EXTRA_ORIGINS=http://127.0.0.1:3310` to the local function environment before starting Supabase,
+and run `npm run test:intake-journey -- ../referralfit-web` from this repository. The test starts Expo on port 3320 and the website on 3310.
+It expects the Supabase CLI on PATH and Chrome installed. Set `CHROME_BIN` to use another Chromium executable.

@@ -140,10 +140,10 @@ for (const name of ['openMatchedReferral', 'openPacketComposer']) {
   assert.match(body, /const openings = screenOpenings\(\);\s*const \w+ = await (saveCurrentReferralMatch|currentOrSavedMatch)\(\);[\s\S]{0,500}?if \(anySheetOpenRef\.current \|\| overlayOpen\(\) \|\| screenOpenings\(\) !== openings\) return;/, `${name} must not present over, or as it closes, a sheet opened during its save`);
   assert.doesNotMatch(body, /setSelectedPartner\(null\)/, `${name} must not close one sheet and present another in the same frame`);
 }
+assert.match(source, /workspaceVisit !== workspaceVisitRef.current\) return;/, 'a late profile read cannot reopen a dismissed workspace');
 // The count behind those checks moves on every no-sheet → sheet render, and
-// the org profile form waits out a sheet that opened (and maybe closed) while it loaded.
+// an in-flight profile read must also belong to the same Workspace visit.
 assert.match(source, /if \(sheetOpenNow && !anySheetOpenRef\.current\) sheetOpenedCountRef\.current \+= 1;\s*anySheetOpenRef\.current = sheetOpenNow;/, 'every sheet opening is counted before anySheetOpenRef updates');
-assert.match(source, /async function openOrgProfileForm\(fromWorkspace: boolean\) \{[\s\S]{0,300}const openings = screenOpenings\(\);[\s\S]{0,1200}\} else if \(anySheetOpenRef\.current \|\| overlayOpen\(\) \|\| screenOpenings\(\) !== openings\) \{[\s\S]{0,200}afterSheetCloses\(\(\) => setShowOrgProfile\(true\), \{ ifScreenBusy: 'wait' \}\)/, 'the org profile form never presents as a sheet opened during its load is closing');
 assert.match(source, /if \(activeCaseIdRef\.current === paymentCaseId\) setCasePaymentForm\(paymentForm\)/, 'an unconfirmed payment reopens only over its own case file');
 assert.match(source, /function openCase\(caseId: string\) \{[\s\S]{0,1200}setCasePaymentForm\(null\);[\s\S]{0,400}setVobAnswerForm\(null\);[\s\S]{0,200}loadCaseList\(userId\)/, 'opening a case file clears editors left from another case');
 assert.doesNotMatch(source, /setCases\(previousCases\);\s*Alert\.alert\('Assignment not saved'/, 'a failed assignment must not restore a stale whole case list');
@@ -153,7 +153,7 @@ assert.doesNotMatch(source, /setCaseDocuments\(previousDocs\)/, 'a failed docume
 assert.match(source, /async function submitPartnerForDirectory\(partner: Partner\) \{[\s\S]{0,900}const stillCurrent = \(\) => activeUserIdRef\.current === userId && authGenerationRef\.current === generation;/, 'a directory submission result is dropped after a workspace change');
 assert.doesNotMatch(source, /const nextPartners = partners\.map\(\(item\) => item\.id === updated\.id/, 'a directory submission applies only its link fields to the current list');
 const resetSource = source.slice(source.indexOf('const resetAccountState = useCallback('), source.indexOf('}, [applySnapshot]);', source.indexOf('const resetAccountState = useCallback(')));
-for (const call of ['setShowAddPartner(false)', 'setShowAddReferral(false)', 'setShowOrgProfile(false)', 'setOrgProfileForm(makeEmptyOrgProfileForm())', 'setWelcomeVisible(false)', 'setProfilePromptVisible(false)']) {
+for (const call of ['setShowAddPartner(false)', 'setShowAddReferral(false)', 'setShowOrgProfile(false)', 'setOrgProfileForm(makeEmptyOrgProfileForm())', 'setWelcomeVisible(false)']) {
   assert.ok(resetSource.includes(call), `resetAccountState must close ${call}`);
 }
 assert.match(source, /setSelectedPartner\(\(current\) => \{\s*if \(!current\) return current;\s*const fresh = partners\.find\(\(item\) => item\.id === current\.id\);\s*return fresh && fresh !== current \? fresh : current;\s*\}\);\s*\}, \[partners\]\);/, 'the open partner profile follows the partner list, so Edit never writes an older copy back');

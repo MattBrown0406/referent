@@ -260,12 +260,16 @@ export function newLeadCards(
     const caseContacts = contacts.filter((item) => item.caseId === record.id);
     const contact = caseContacts.find((item) => item.isPrimary) || caseContacts[0];
     const bits: string[] = [];
-    if (contact) bits.push(contact.relationship ? `${contact.name} (${contact.relationship})` : contact.name);
+    if (contact?.relationship) bits.push(contact.relationship);
+    if (contact?.name && record.title !== contact.name) {
+      const prefix = contact.name + ' — ';
+      bits.push(record.title.startsWith(prefix) ? record.title.slice(prefix.length) : record.title);
+    }
     if (record.leadSource && record.leadSource !== 'Unspecified') bits.push(record.leadSource);
     cards.push({
       id: firstCall.id,
       kind: 'first_call',
-      title: record.title,
+      title: contact?.name || record.title,
       subtitle: bits.join(' · '),
       daysOverdue: 0,
       followUp: firstCall,

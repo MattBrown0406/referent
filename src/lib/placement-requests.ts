@@ -627,10 +627,10 @@ export const BED_LABELS: Record<BedAnswer, string> = { yes: 'Bed available', no:
 export const ACCEPT_LABELS: Record<AcceptAnswer, string> = { yes: 'Likely to accept', maybe: 'Maybe', no: 'Not a fit' };
 
 /** "$950/day quoted · about $28,500 for 30 days, before insurance". */
-export function quotedRateLine(dailyRate: number | null, days = DEFAULT_STAY_DAYS): string {
+export function quotedStayEstimate(dailyRate: number | null, days = DEFAULT_STAY_DAYS): string {
   if (dailyRate == null || !(dailyRate > 0)) return '';
   const money = (value: number) => `$${value.toLocaleString('en-US')}`;
-  return `${money(dailyRate)}/day quoted · about ${money(dailyRate * days)} for ${days} days, before insurance`;
+  return `About ${money(dailyRate * days)} for ${days} days, before insurance`;
 }
 
 /** The answer in one line: "Bed available · Likely to accept · Earliest admit Nov 6, 2026". */
