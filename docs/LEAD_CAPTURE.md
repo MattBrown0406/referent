@@ -36,10 +36,10 @@ Two doors into the same place:
    https://ovfafffvcpaahktvlsdm.supabase.co/functions/v1/intake/<token>
    ```
 
-   for links shared before the website form, and for a development build on
-   a local stack (`intakeLinkUrl` in `src/lib/intake-link.ts`).
+   for links shared before the website form, and for development builds using
+   a different hosted project or a local stack (`intakeLinkUrl` in `src/lib/intake-link.ts`).
 
-   and a submission creates the same lead in that workspace
+   A submission creates the same lead in that workspace
    (`create_lead_from_intake`, service role only). The form says who will
    call, that it is not emergency medical care, and carries the 911/988 line
    tied to the "someone is in danger right now" choice.

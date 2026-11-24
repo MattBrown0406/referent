@@ -3,7 +3,7 @@
 // It opens the form on the ReferralFit website, which calls the intake Edge
 // Function from the family's own browser (referralfit-web src/lib/intake.ts,
 // docs/LEAD_CAPTURE.md). That page talks to the production project only, so
-// a development build pointed at a local Supabase stack shares the function's
+// a development build pointed at a different Supabase project shares the function's
 // own HTML form instead, which works against any project.
 
 // On since the website form went live (2026-11-07). Turning it off hides the
@@ -13,14 +13,13 @@ export const INTAKE_LINK_ENABLED = true;
 
 export const INTAKE_PAGE_BASE = 'https://referralfit.com/intake';
 
-// A hosted Supabase project (https://<ref>.supabase.co); anything else is a
-// local stack or a tunnel to one.
-const HOSTED_SUPABASE = /^https:\/\/[a-z0-9]+\.supabase\.co$/;
+// This is the project the public website looks up tokens in.
+const WEBSITE_INTAKE_PROJECT = 'https://ovfafffvcpaahktvlsdm.supabase.co';
 
 export function intakeLinkUrl(supabaseUrl: string, token: string): string {
   if (!token) return '';
   const project = supabaseUrl.replace(/\/+$/, '');
-  if (HOSTED_SUPABASE.test(project)) return `${INTAKE_PAGE_BASE}/${token}`;
+  if (project === WEBSITE_INTAKE_PROJECT) return `${INTAKE_PAGE_BASE}/${token}`;
   return `${project}/functions/v1/intake/${token}`;
 }
 

@@ -11,6 +11,7 @@ iPhone build.
 | --- | --- |
 | Native alerts | An in-page dialog (`src/lib/web-alert.tsx`); Escape is Cancel, Enter the main button (none in a list of three or more choices; a button reached with Tab presses itself) |
 | Bottom tabs | A sidebar from 960px wide (`src/lib/web-layout.ts`); sheets are a centered column |
+| Placement answers in a single column | Two program cards per row from 960px wide when comparing multiple programs |
 | Pull to refresh | A Refresh button in the header |
 | Messages compose sheet | The text is copied, with the number to send it to from the phone |
 | Call / Text buttons | Show the number; logged only after "I called" / "I texted" |

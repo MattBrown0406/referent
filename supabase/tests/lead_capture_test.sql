@@ -2,7 +2,7 @@
 -- Run after a local migration reset with: supabase test db
 
 BEGIN;
-SELECT plan(54);
+SELECT plan(55);
 
 -- Two practices (personal workspaces via handle_new_user) and one colleague
 -- who is re-homed into practice A as a plain member.
@@ -224,6 +224,14 @@ SELECT lives_ok(
        'lead_source', 'Website', 'lead_source_detail', 'Intake link', 'urgency', 'none'))::text, true) $$,
   'the intake link creates a lead with the service role'
 );
+
+-- PostgREST commits as service_role after the RPC returns. A rollback-only
+-- test would skip this deferred constraint and could report a false success.
+SELECT lives_ok(
+  $$ SET CONSTRAINTS public.case_contacts_require_primary IMMEDIATE $$,
+  'the intake caller can finish the deferred primary-contact check'
+);
+SET CONSTRAINTS public.case_contacts_require_primary DEFERRED;
 
 -- The service role holds no table grants on Supabase (only the RPCs above);
 -- read the result back as the superuser.
