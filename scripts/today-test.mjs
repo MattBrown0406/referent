@@ -312,7 +312,7 @@ console.log('\n── Closed and lost cases ──');
   const afterClose = [fu({ id: 'x-next', title: 'Follow up — alumni call', caseId: 'c-closed', kind: 'follow_up' }), ...closed];
   check('a step scheduled after the close shows on Today', today.buildTodaySections(afterClose, [], NOW, contextFor, []).today.some((c) => c.id === 'x-next'));
   check('App no longer filters Today by case status',
-    /buildTodaySections\(followUps, partnersDueToday\(partners, now, partnerSnoozes\), now, followUpContext, leads\);/.test(appSource)
+    /buildTodaySections\(followUps, partnersDueToday\(partners, now, partnerSnoozes\), now, followUpContext, leads, needsNextStep\);/.test(appSource)
     && !/inactiveCaseIds/.test(appSource));
   const statusBody = appSource.slice(appSource.indexOf('function changeCaseStatus('), appSource.indexOf('function saveCasePayment('));
   check('a status change to closed or lost skips the case’s steps on this device (and rolls back with it)',
@@ -356,6 +356,64 @@ eq('Mine keeps my items and unowned ones, drops a teammate\'s and a case assigne
 eq('Mine filters OVERDUE the same way', mine.overdue.map((c) => c.id), []);
 eq('partner cadence cards are nobody\'s and always show', mine.partnersDue.length, scopeSections.partnersDue.length);
 check('the original sections are untouched', scopeSections.today.length === 6);
+
+// ─── NEEDS A NEXT STEP (an open case never drops off Today) ────────────────
+{
+  const cases = [
+    { id: 'c-lead', title: 'Lead with nothing', status: 'inquiry', updatedAt: '2026-07-21T15:00:00.000Z' },
+    { id: 'c-active', title: 'Engaged with nothing', status: 'engaged', updatedAt: '2026-07-10T15:00:00.000Z' },
+    { id: 'c-has-step', title: 'Has a step', status: 'inquiry', updatedAt: '2026-07-20T15:00:00.000Z' },
+    { id: 'c-snoozed', title: 'Snoozed step', status: 'consult', updatedAt: '2026-07-20T15:00:00.000Z' },
+    { id: 'c-done-only', title: 'Only done steps', status: 'deciding', updatedAt: '2026-07-23T15:00:00.000Z' },
+    { id: 'c-closed', title: 'Closed', status: 'closed', updatedAt: '2026-07-01T15:00:00.000Z' },
+    { id: 'c-lost', title: 'Lost', status: 'lost', updatedAt: '2026-07-01T15:00:00.000Z' },
+  ];
+  const steps = [
+    fu({ id: 'n-open', caseId: 'c-has-step' }),
+    fu({ id: 'n-snoozed', caseId: 'c-snoozed', dueOn: '2026-07-20', snoozedUntil: '2026-08-01' }),
+    fu({ id: 'n-done', caseId: 'c-done-only', status: 'done' }),
+    fu({ id: 'n-skipped', caseId: 'c-done-only', status: 'skipped' }),
+    fu({ id: 'n-lead-done', caseId: 'c-lead', status: 'done' }),
+  ];
+  const cards = today.casesNeedingNextStep(cases, steps, NOW);
+  eq('every open case with no open step is listed (a snoozed step counts; done and skipped do not; closed and lost never)',
+    cards.map((card) => card.caseId), ['c-lead', 'c-active', 'c-done-only']);
+  eq('leads first, then the longest without a change', cards.map((card) => card.id), ['next-step-c-lead', 'next-step-c-active', 'next-step-c-done-only']);
+  check('the card says what is wrong and how long it has sat', cards[1].kind === 'no_next_step' && /engaged · no next step · last change 14 days ago/.test(cards[1].subtitle), cards[1].subtitle);
+  const sections = today.buildTodaySections(steps, [], NOW, contextFor, [], cards);
+  eq('Today carries them in their own section', sections.needsNextStep.map((card) => card.caseId), ['c-lead', 'c-active', 'c-done-only']);
+  const assignee = (caseId) => ({ 'c-lead': 'u2', 'c-active': 'U1' })[caseId];
+  const mineNext = today.filterTodaySections(sections, 'mine', 'u1', assignee);
+  eq('Mine keeps my cases and unassigned ones, not a teammate\'s', mineNext.needsNextStep.map((card) => card.caseId), ['c-active', 'c-done-only']);
+  eq('the case assignee owns the card', cards.map((card) => today.cardAssignee(card, assignee)), ['u2', 'u1', undefined]);
+
+  // The Done sheet's rule: the last open step goes only with a next step or a close.
+  const lastStep = [fu({ id: 'only', caseId: 'c1' }), fu({ id: 'other-case', caseId: 'c2' }), fu({ id: 'gone', caseId: 'c1', status: 'done' })];
+  check('completing the last open step and keeping the case open is refused', today.leavesCaseWithoutNextStep(lastStep, 'only', 'c1', 'inquiry'));
+  check('...for any open status, not only inquiry', ['consult', 'deciding', 'engaged', 'intervention', 'placed', 'aftercare'].every((status) => today.leavesCaseWithoutNextStep(lastStep, 'only', 'c1', status)));
+  check('closing or losing the case with it is allowed', !today.leavesCaseWithoutNextStep(lastStep, 'only', 'c1', 'closed') && !today.leavesCaseWithoutNextStep(lastStep, 'only', 'c1', 'lost'));
+  const twoSteps = [...lastStep, fu({ id: 'second', caseId: 'c1' })];
+  check('a step that is not the last completes as before', !today.leavesCaseWithoutNextStep(twoSteps, 'only', 'c1', 'inquiry'));
+  check('an item with no case is never blocked', !today.leavesCaseWithoutNextStep(lastStep, 'only', undefined, 'inquiry'));
+  eq('openStepCount ignores the step being completed', [today.openStepCount(twoSteps, 'c1'), today.openStepCount(twoSteps, 'c1', 'only')], [2, 1]);
+
+  // Wiring in App.tsx.
+  const doneSheet = appSource.slice(appSource.indexOf('function DoneSheet()'), appSource.indexOf('function DoneSheet()') + 6000);
+  check('the Done sheet offers only a next step or closed/lost on the last open step',
+    /const lastOpenStep = Boolean\(linkedCase && doneCard\.followUp && openStepCount\(followUps, linkedCase\.id, doneCard\.followUp\.id\) === 0\);/.test(doneSheet)
+    && /lastOpenStep \? CASE_STATUSES\.filter\(\(status\) => status === 'closed' \|\| status === 'lost'\) : CASE_STATUSES/.test(doneSheet)
+    && /\{lastOpenStep \? null : \(\s*<TouchableOpacity[\s\S]{0,400}Just complete/.test(doneSheet));
+  const closeLoop = appSource.slice(appSource.indexOf('function closeLoopWithStatus('), appSource.indexOf('function confirmNextStep('));
+  check('closeLoopWithStatus refuses to leave an open case without a step, before any write',
+    /if \(leavesCaseWithoutNextStep\(followUps, followUp\.id, record\.id, status === 'keep' \? record\.status : status\)\) \{[\s\S]{0,300}return;\s*\}\s*const now = new Date\(\)\.toISOString\(\);/.test(closeLoop));
+  check('Today lists open cases with no step', /const needsNextStep = casesNeedingNextStep\(cases, followUps, now\);/.test(appSource)
+    && /todaySections\.needsNextStep\.slice\(0, todayRowLimits\.needsNextStep\)\.map\(\(card\) => <React\.Fragment key=\{card\.id\}>\{NoNextStepRow\(\{ card \}\)\}/.test(appSource));
+  check('a VOB answer or an outcome that ends the last step asks for the next one',
+    /if \(nextFollowUps !== previousFollowUps\) promptNextStepIfNone\(record, nextFollowUps\);/.test(appSource)
+    && /if \(outcomeCase\) promptNextStepIfNone\(outcomeCase, nextFollowUps\);/.test(appSource));
+  check('"List is clear" never shows while a case needs a step or a lead is unsaved',
+    /todayCounts\.actions === 0 && !todaySections\.needsNextStep\.length && !leadRetries\.length \?/.test(appSource));
+}
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

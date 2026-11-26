@@ -18,8 +18,10 @@ export type TodayContext = {
 };
 
 export type TodayCard = {
-  id: string; // follow-up id, or `cadence-{partnerId}` for virtual cards
-  kind: FollowUpKind | 'cadence';
+  // follow-up id, `cadence-{partnerId}` for virtual cadence cards, or
+  // `next-step-{caseId}` for a case with no open step
+  id: string;
+  kind: FollowUpKind | 'cadence' | 'no_next_step';
   title: string;
   subtitle: string;
   daysOverdue: number; // 0 when due today / cadence crossed today
@@ -48,6 +50,8 @@ export type LeadCardInfo = {
 export type TodaySections = {
   newLeads: TodayCard[];
   overdue: TodayCard[];
+  // Open leads and cases with no open step at all (casesNeedingNextStep).
+  needsNextStep: TodayCard[];
   today: TodayCard[];
   partnersDue: TodayCard[];
 };
@@ -307,6 +311,8 @@ export function defaultTodayScope(memberCount: number): TodayScope {
 }
 
 export function cardAssignee(card: TodayCard, caseAssignee: (caseId: string) => string | undefined): string | undefined {
+  // A case with no next step is its case's assignee's to fix (or anyone's).
+  if (card.kind === 'no_next_step') return card.caseId ? caseAssignee(card.caseId)?.toLowerCase() : undefined;
   if (!card.followUp) return undefined;
   if (card.followUp.assignedTo) return card.followUp.assignedTo.toLowerCase();
   return card.caseId ? caseAssignee(card.caseId)?.toLowerCase() : undefined;
@@ -327,6 +333,7 @@ export function filterTodaySections(
   return {
     newLeads: sections.newLeads.filter(keep),
     overdue: sections.overdue.filter(keep),
+    needsNextStep: sections.needsNextStep.filter(keep),
     today: sections.today.filter(keep),
     partnersDue: sections.partnersDue,
   };
@@ -387,6 +394,7 @@ export function buildTodaySections(
   today: Date,
   contextFor: (followUp: FollowUp) => TodayContext,
   newLeads: TodayCard[] = [],
+  needsNextStep: TodayCard[] = [],
 ): TodaySections {
   const todayStamp = dateStamp(today);
   const overdue: TodayCard[] = [];
@@ -417,5 +425,70 @@ export function buildTodaySections(
     .filter((card) => !(card.kind === 'consult' && card.dueTime))
     .sort((a, b) => (TODAY_KIND_ORDER[a.kind] ?? 9) - (TODAY_KIND_ORDER[b.kind] ?? 9) || a.title.localeCompare(b.title));
 
-  return { newLeads, overdue, today: [...timedConsults, ...rest], partnersDue: partnersDue.map(partnerDueToCard) };
+  return { newLeads, overdue, needsNextStep, today: [...timedConsults, ...rest], partnersDue: partnersDue.map(partnerDueToCard) };
+}
+
+// ─── No next step ───────────────────────────────────────────────────────────────────────
+// Today is built from open steps, so a lead or case that is still open but
+// has no open step at all would never show here again. The rule: an open
+// case (any status but closed or lost) always has at least one open step.
+// A snoozed step counts (it comes back on its day); done and skipped ones do
+// not. The Done sheet will not complete a case's last open step without a
+// next one or a close (leavesCaseWithoutNextStep), and anything that still
+// ends up with none (an older record, a teammate's device, a step done on
+// another path) is listed under NEEDS A NEXT STEP until one is set.
+
+const CLOSED_STATUSES = new Set(['closed', 'lost']);
+
+export function isCaseStatusOpen(status: string): boolean {
+  return !CLOSED_STATUSES.has(status);
+}
+
+export function openStepCount(followUps: FollowUp[], caseId: string, exceptFollowUpId?: string): number {
+  let count = 0;
+  for (const item of followUps) {
+    if (item.caseId === caseId && item.status === 'open' && item.id !== exceptFollowUpId) count += 1;
+  }
+  return count;
+}
+
+// true when completing (or skipping) this step and leaving the case at
+// nextStatus would leave an open case with no open step.
+export function leavesCaseWithoutNextStep(
+  followUps: FollowUp[],
+  followUpId: string,
+  caseId: string | undefined,
+  nextStatus: string,
+): boolean {
+  if (!caseId || !isCaseStatusOpen(nextStatus)) return false;
+  return openStepCount(followUps, caseId, followUpId) === 0;
+}
+
+type NoNextStepCaseFields = Pick<CaseRecord, 'id' | 'title' | 'status' | 'updatedAt'> & { stageChangedAt?: string };
+
+export function casesNeedingNextStep(cases: NoNextStepCaseFields[], followUps: FollowUp[], now: Date): TodayCard[] {
+  const withStep = new Set<string>();
+  for (const item of followUps) if (item.caseId && item.status === 'open') withStep.add(item.caseId);
+  const cards: TodayCard[] = [];
+  for (const record of cases) {
+    if (!isCaseStatusOpen(record.status) || withStep.has(record.id)) continue;
+    const basis = record.updatedAt || record.stageChangedAt || '';
+    const parsed = new Date(basis);
+    const idle = Number.isNaN(parsed.getTime()) ? 0 : daysOverdue(dateStamp(parsed), now);
+    const bits = [`${record.status} · no next step`];
+    if (idle > 0) bits.push(`last change ${idle} ${idle === 1 ? 'day' : 'days'} ago`);
+    cards.push({
+      id: `next-step-${record.id}`,
+      kind: 'no_next_step',
+      title: record.title,
+      subtitle: bits.join(' · '),
+      daysOverdue: 0,
+      caseId: record.id,
+      context: { caseTitle: record.title },
+    });
+  }
+  // Leads first (they go cold fastest), then the longest without a change.
+  const leadRank = (card: TodayCard) => (cases.find((item) => item.id === card.caseId)?.status === 'inquiry' ? 0 : 1);
+  const basisOf = (card: TodayCard) => cases.find((item) => item.id === card.caseId)?.updatedAt || '';
+  return cards.sort((a, b) => leadRank(a) - leadRank(b) || basisOf(a).localeCompare(basisOf(b)) || a.title.localeCompare(b.title));
 }

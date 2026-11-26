@@ -87,7 +87,8 @@ trigger / hourly job  ->  notification_outbox  ->  push-dispatch (edge fn)  ->  
 | `follow_ups.assigned_to` set (insert or update) to someone other than the person assigning | the assignee | `assigned_to_me` |
 | `global_partners` inserted with status `pending` and a submitting workspace | every platform admin except the submitter | `directory_submission` |
 | `global_partners` moves from `pending` to `active` or `archived` | every member of the submitting workspace except the reviewer | `directory_decision` |
-| hourly job finds open follow-ups past their day that are mine (own assignee, or the case's assignee when the follow-up has none). Steps open when a case closed or was lost are skipped then (`TEAM_BASICS.md`), so they no longer count; a step scheduled after the close does | the member, once a day at 9 AM in their timezone | `overdue_mine` |
+| hourly job finds open follow-ups past their day that are mine (own assignee, or the case's assignee when the follow-up has none), or that nobody has (no assignee on the step or its case) in my practice: the Today "Mine" rule, so an untaken lead's overdue first call reaches the whole practice (20261126120000). Steps open when a case closed or was lost are skipped then (`TEAM_BASICS.md`), so they no longer count; a step scheduled after the close does | the member, once a day at 9 AM in their timezone | `overdue_mine` |
+| minute job finds a lead whose first call is still open and untouched `lead_response_target_minutes` after it arrived (`notify_missed_first_calls()`, 20261126120000). Once per lead (`lead_first_call_nudges`), leads from the last 24 hours only, never a possible-spam lead, a closed or lost one, or a first call snoozed past today | whoever has the lead (the step's assignee, else the case's); every member of the practice, the person who added it included, when nobody has taken it | `new_lead` (same copy; `data.reason = 'first_call_due'`) |
 | `set_listing_beds` moves a gender's count from 0 or unknown to open (`BED_AVAILABILITY.md`) | every member of a workspace that favorited or imported the listing, except the person who set it; opt-in, default off; at most once per listing per six hours | `bed_opened` |
 | a program answers a placement request in the center portal, or changes its answer (`respond_to_placement_request`; an answer the practitioner logs sends nothing) | the practitioner who sent the request, while still in that workspace and while the request is open (never for an answer they gave themselves); on by default. Answers that arrive before the next send fold into one push per request, a program editing its answer pushes at most once every 15 minutes per request, and closing, cancelling or deleting the request drops a push not yet sent (one the sender claimed in the last 5 minutes is left to it; if that send fails and is retried, the push can still arrive after the close, a rare edge accepted). The push says only "A program answered"; its data is the request id, and a tap opens that request's answers | `placement_response` |
 
@@ -138,13 +139,15 @@ SELECT vault.create_secret('<the PUSH_DISPATCH_SECRET value>', 'referralfit_push
 ```
 
 To change one later, `vault.update_secret(id, new_value)` with its id from
-`vault.secrets`. The three jobs (scheduled by 20261106120000 where `pg_cron`
-is on; re-run its `DO` block if `pg_cron` was enabled after it):
+`vault.secrets`. The four jobs (the first three scheduled by 20261106120000,
+the first-call job by 20261126120000, where `pg_cron` is on; re-run the `DO`
+block if `pg_cron` was enabled after it):
 
 | job | schedule | runs |
 | --- | --- | --- |
 | `referralfit-push-dispatch-minute` | every minute | `push_dispatch_tick()`: posts to the function through `pg_net` only when something is queued or receipts are due |
 | `referralfit-push-overdue-hourly` | minute 5 of every hour | `notify_overdue_follow_ups()` |
+| `referralfit-push-first-call-minute` | every minute | `notify_missed_first_calls()`: a lead past its first-call target (the dispatch job sends it the same minute or the next) |
 | `referralfit-push-outbox-prune-daily` | 03:40 UTC | `push_outbox_prune()`: removes delivered or failed rows older than 30 days |
 
 Check they exist and are firing:
@@ -227,6 +230,9 @@ SELECT count(*) FROM public.notification_outbox o
 
 * `supabase/tests/team_basics_test.sql`: outbox rows for every trigger
   case, generic copy, admin-only kind, token ownership, service-role RPCs.
+* `supabase/tests/lead_first_call_push_test.sql`: the first-call push (who
+  gets it, once per lead, every exclusion, no names) and the overdue push
+  reaching the practice for a step nobody has taken.
 * `supabase/functions/push-dispatch/push_test.ts` (`deno test`): message
   building, chunking, ticket and receipt folding, dead-token pruning,
   authorization.

@@ -52,6 +52,34 @@ Then:
   first-call follow-up's Done. A lead leaves the section once a call, text,
   email, or meeting is logged against the case or the first call is
   completed.
+- **The first call rings.** A lead taken in the app has its first call due
+  at a clock time (now + the target). The phone that took it sets an alarm
+  at that time, and one more 15 minutes later, while the call is still not
+  made ("New lead waiting", no name; `firstCallAlarmTimes` in
+  `src/lib/notifications.ts`). Logging a call or text to the lead,
+  completing the step, or snoozing it removes the alarm. On the server,
+  `notify_missed_first_calls()` (every minute, 20261126120000) sends one
+  "New lead waiting" push once a lead from either door passes the target
+  untouched: to whoever has the lead, or to every member when nobody has
+  taken it yet, which is how every lead arrives. See `NOTIFICATIONS.md`.
+- **A lead that did not save is kept on the phone.** A New lead whose save
+  fails (no signal, a timeout) is written to the device per account
+  (`src/lib/pending-leads.ts`) before the save is even sent, so iOS ending
+  the app does not lose it. It shows on Today under LEADS NOT SAVED YET, is
+  read back at the next launch, and is sent again without asking when the
+  app returns to the foreground, when the connection comes back, and every
+  30 seconds while one waits, always with the same case, contact and
+  follow-up ids (`create_lead` treats a repeat of a lead that landed as
+  success, so a retry never makes a second lead). The device copy is
+  removed only once the server has the lead. A save the server refused
+  (bad details) stays on Today with its reason for the person to fix.
+- **An open lead always has a next step.** Done on the last open step of
+  an open case offers only "Set the next step" or closing the case (closed
+  or lost); the old "Just complete, keep inquiry" is gone for that step. A
+  VOB answer or a recorded outcome that ends the last step asks for the
+  next one. Anything that still ends up with no open step (older records,
+  another path) is listed on Today under NEEDS A NEXT STEP until one is
+  set (`casesNeedingNextStep` in `src/lib/today.ts`).
 - **Speed to lead on Business.** Median time from lead arrival to first
   logged touch and the share answered within the target, for 30/90/365/all,
   plus per-source lead counts on the existing Lead sources list.
@@ -245,7 +273,11 @@ deno test  --node-modules-dir=none supabase/functions/intake/
   lead counts, and the dashboard wiring, on the same fixture shape.
 - `scripts/today-test.mjs`: NEW LEADS ordering (immediate danger first, then
   longest waiting), exclusions, no duplication under TODAY/OVERDUE, and the
-  clock formatting.
+  clock formatting; NEEDS A NEXT STEP and the last-step rule on Done.
+- `scripts/pending-leads-test.mjs`: unsaved leads on the device (round trip,
+  damaged storage, same-id retries, workspace scoping) and their wiring.
+- `scripts/notifications-test.mjs`: the first-call alarm and its re-nag.
+- `supabase/tests/lead_first_call_push_test.sql`: the first-call push.
 - `supabase/functions/intake/intake_test.ts` (Deno): token parsing,
   validation, honeypot, control-character stripping, page content and
   escaping, address and bucket handling.

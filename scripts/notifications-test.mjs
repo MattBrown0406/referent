@@ -420,4 +420,48 @@ assert.equal(nativeState.scheduled.some((item) => /Teammate/.test(item.content.b
   }
 }
 
+// ─── A new lead's first call rings at its due time, not the next 9 AM ──────
+{
+  const hhmm = (date) => `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+  const now = new Date();
+  const due = new Date(now.getTime() + 15 * 60000);
+  due.setSeconds(0, 0);
+  const firstCall = { id: 'fc-1', caseId: 'c-lead', kind: 'first_call', title: 'First call — Maria Lopez', dueOn: stamp(due), dueTime: hhmm(due), status: 'open', note: '' };
+
+  // The pure rule.
+  const times = notifications.firstCallAlarmTimes(firstCall, now, false);
+  assert.deepEqual(times.map((when) => when.getTime()), [due.getTime(), due.getTime() + notifications.FIRST_CALL_RENAG_MINUTES * 60000], 'an alarm at the due time and one re-nag');
+  assert.deepEqual(notifications.firstCallAlarmTimes(firstCall, now, true), [], 'no alarm once the lead has been called or texted');
+  assert.deepEqual(notifications.firstCallAlarmTimes({ ...firstCall, status: 'done' }, now, false), [], 'no alarm once the step is done');
+  assert.deepEqual(notifications.firstCallAlarmTimes({ ...firstCall, snoozedUntil: stamp(tomorrow) }, now, false), [], 'a snoozed first call does not ring');
+  assert.deepEqual(notifications.firstCallAlarmTimes({ ...firstCall, dueTime: undefined }, now, false), [], 'an untimed step (an intake lead) waits for the daily reminder');
+  assert.deepEqual(notifications.firstCallAlarmTimes({ ...firstCall, kind: 'follow_up' }, now, false), [], 'only first calls');
+  const late = new Date(due.getTime() + 5 * 60000);
+  assert.deepEqual(notifications.firstCallAlarmTimes(firstCall, late, false).map((when) => when.getTime()), [due.getTime() + notifications.FIRST_CALL_RENAG_MINUTES * 60000], 'past the target: only the re-nag is still ahead');
+
+  // Scheduled, with lock-screen-safe words, ahead of partner nags.
+  nativeState.scheduled = [];
+  await notifications.activateReferralFitNotificationOwner(ME);
+  const manyCold = Array.from({ length: 60 }, (_, index) => partner(`cold-fc-${index}`, `Cold ${index}`));
+  await notifications.rescheduleNotifications({ partners: manyCold, referrals: [], referralMatches: [], followUps: [firstCall], cases: [{ id: 'c-lead' }] }, ME);
+  const alarms = nativeState.scheduled.filter((item) => item.content.title === notifications.FIRST_CALL_ALARM_TITLE);
+  assert.equal(alarms.length, 2, 'the first call is scheduled even with 60 partners past cadence');
+  assert.equal(alarms[0].trigger.date.getTime(), due.getTime(), 'at the due time (now + target), not 9 AM');
+  assert.ok(alarms.every((item) => item.content.body === notifications.FIRST_CALL_ALARM_BODY && !/Maria|Lopez/.test(item.content.body + item.content.title)), 'no name on the lock screen');
+
+  // Done (or called): the rebuilt schedule has no alarm.
+  await notifications.rescheduleNotifications({ partners: [], referrals: [], referralMatches: [], followUps: [{ ...firstCall, status: 'done' }], cases: [{ id: 'c-lead' }] }, ME);
+  assert.equal(nativeState.scheduled.filter((item) => item.content.title === notifications.FIRST_CALL_ALARM_TITLE).length, 0, 'completing the step cancels its alarm');
+  await notifications.rescheduleNotifications({ partners: [], referrals: [], referralMatches: [], followUps: [firstCall], cases: [{ id: 'c-lead', firstTouchAt: now.toISOString() }] }, ME);
+  assert.equal(nativeState.scheduled.filter((item) => item.content.title === notifications.FIRST_CALL_ALARM_TITLE).length, 0, 'logging a call or text cancels it');
+
+  // A teammate's lead does not ring this phone; an unassigned one does.
+  await notifications.rescheduleNotifications({ partners: [], referrals: [], referralMatches: [], followUps: [{ ...firstCall, assignedTo: 'someone-else' }], cases: [{ id: 'c-lead' }] }, ME);
+  assert.equal(nativeState.scheduled.filter((item) => item.content.title === notifications.FIRST_CALL_ALARM_TITLE).length, 0, 'a teammate’s lead does not ring');
+
+  // App.tsx rebuilds the schedule when a lead is called (a timeline write alone does not).
+  assert.match(appSource, /const firstCallAlarmKey = useMemo\(\(\) => followUps[\s\S]{0,400}firstTouchAt \? 'touched' : ''/, 'the alarm key follows first touches');
+  assert.match(appSource, /if \(previous === null \|\| previous === firstCallAlarmKey \|\| !activeUserId\) return;\s*void rescheduleNotifications\(/, 'a change in what should ring rebuilds the schedule');
+}
+
 console.log('notification permission/scheduling/deep-link regression checks: ok');

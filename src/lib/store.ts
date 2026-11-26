@@ -446,6 +446,10 @@ function isQueueOp(value: unknown): value is QueueOp {
 // Writes go to this key first and only then out of the queue or the rejected
 // list: a crash in between leaves it in both (de-duplicated), never neither.
 const UNREADABLE_KEY_PREFIX = 'referralfit-unreadable-writes-v1:';
+// Leads that have not reached the server yet (App.tsx writes them; the same
+// prefix as PENDING_LEADS_KEY_PREFIX in pending-leads.ts, which this file does
+// not import so its tests can load it alone). Account data like the queue.
+const PENDING_LEADS_KEY_PREFIX = 'referralfit-pending-leads-v1:';
 const UNREADABLE_OP_REASON = 'This change was saved by a different version of ReferralFit and cannot be read by this one. Update the app to send it, or discard it.';
 const UNREADABLE_QUEUE_REASON = 'Changes waiting on this device were saved in a format this version of ReferralFit cannot read. Update the app to send them, or discard them.';
 
@@ -1628,7 +1632,15 @@ export async function prepareForWorkspaceChange(expectedUserId: string, options:
           );
         }
       }
-      const setAsideCount = (await readRejectedUnlocked(fence.userId)).length + (await readUnreadableUnlocked(fence.userId)).length;
+      // A lead that has not reached the server yet counts too: joining
+      // another workspace would otherwise remove it with the rest.
+      let pendingLeadCount = 0;
+      try {
+        pendingLeadCount = storedChangeCount(await AsyncStorage.getItem(accountStorageKey(PENDING_LEADS_KEY_PREFIX, fence.userId)));
+      } catch (error) {
+        throw persistenceError('cache', error);
+      }
+      const setAsideCount = (await readRejectedUnlocked(fence.userId)).length + (await readUnreadableUnlocked(fence.userId)).length + pendingLeadCount;
       if (setAsideCount && !options.discardRejected) {
         throw new StoreError(
           `${setAsideCount} ${setAsideCount === 1 ? 'change' : 'changes'} on this device could not be saved. Retry or discard ${setAsideCount === 1 ? 'it' : 'them'} before joining another workspace.`,
@@ -1642,6 +1654,7 @@ export async function prepareForWorkspaceChange(expectedUserId: string, options:
           accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
           accountStorageKey(REJECTED_KEY_PREFIX, fence.userId),
           accountStorageKey(UNREADABLE_KEY_PREFIX, fence.userId),
+          accountStorageKey(PENDING_LEADS_KEY_PREFIX, fence.userId),
           ...await caseCacheKeys(fence.userId),
         ]);
       } catch (error) {
@@ -1669,6 +1682,7 @@ export async function forgetWorkspaceBinding(expectedUserId: string): Promise<vo
         accountStorageKey(UNREADABLE_KEY_PREFIX, fence.userId),
         ...await caseCacheKeys(fence.userId),
         accountStorageKey(WORKSPACE_KEY_PREFIX, fence.userId),
+        accountStorageKey(PENDING_LEADS_KEY_PREFIX, fence.userId),
       ]);
     } catch (error) {
       throw persistenceError('cache', error);
@@ -1687,6 +1701,7 @@ export async function forgetWorkspaceBinding(expectedUserId: string): Promise<vo
 const ACCOUNT_DATA_PREFIXES = [
   CACHE_KEY_PREFIX, QUEUE_KEY_PREFIX, REJECTED_KEY_PREFIX, UNREADABLE_KEY_PREFIX,
   CASE_LIST_KEY_PREFIX, CASE_FILE_INDEX_KEY_PREFIX, CASE_FILE_KEY_PREFIX, WORKSPACE_KEY_PREFIX,
+  PENDING_LEADS_KEY_PREFIX,
 ];
 
 // The queue is { ops: [...] }; the set-aside and unreadable lists are
@@ -1725,7 +1740,7 @@ export async function wipeAccountDataWithoutSession(keepUserId?: string): Promis
     // (of the keys listed above) would then miss.
     let unsent = 0;
     for (const key of doomed) {
-      if (![QUEUE_KEY_PREFIX, REJECTED_KEY_PREFIX, UNREADABLE_KEY_PREFIX].some((prefix) => key.startsWith(prefix))) continue;
+      if (![QUEUE_KEY_PREFIX, REJECTED_KEY_PREFIX, UNREADABLE_KEY_PREFIX, PENDING_LEADS_KEY_PREFIX].some((prefix) => key.startsWith(prefix))) continue;
       try {
         unsent += storedChangeCount(await AsyncStorage.getItem(key));
       } catch {
@@ -1799,6 +1814,7 @@ export async function bindLocalWorkspace(expectedUserId: string, orgId: string):
             accountStorageKey(QUEUE_KEY_PREFIX, fence.userId),
             accountStorageKey(REJECTED_KEY_PREFIX, fence.userId),
             accountStorageKey(UNREADABLE_KEY_PREFIX, fence.userId),
+            accountStorageKey(PENDING_LEADS_KEY_PREFIX, fence.userId),
           ] : []),
         ]);
         await AsyncStorage.setItem(workspaceKey, orgId.toLowerCase());
