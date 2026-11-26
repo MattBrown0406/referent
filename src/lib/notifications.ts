@@ -144,6 +144,30 @@ function clockLabel(dueTime: string): string {
 const RENAG_DAYS = 2;
 const RENAG_OCCURRENCES = 3;
 
+// ─── First call on a new lead ───────────────────────────────────────────────
+// A lead taken in the app has its first call due at the practice's target
+// (15 minutes unless changed), on the clock: dueTime. The daily reminders
+// below only look at the day, so on their own the first nudge for a lead
+// taken at 2 PM was the next 9 AM. This is an alarm at the due time, and one
+// more FIRST_CALL_RENAG_MINUTES later while the call is still not made.
+// Logging a call or text to the lead (first touch), completing the step, or
+// snoozing it ends the alarm: the schedule is rebuilt from what is open.
+export const FIRST_CALL_RENAG_MINUTES = 15;
+export const FIRST_CALL_ALARM_TITLE = 'New lead waiting';
+export const FIRST_CALL_ALARM_BODY = 'A new lead is due a first call. Open ReferralFit to call back.';
+
+export function firstCallAlarmTimes(followUp: FollowUp, now: Date, firstTouched: boolean): Date[] {
+  if (followUp.status !== 'open' || followUp.kind !== 'first_call' || !followUp.dueTime) return [];
+  if (firstTouched || followUp.snoozedUntil) return [];
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(followUp.dueOn);
+  const time = /^(\d{2}):(\d{2})/.exec(followUp.dueTime);
+  if (!match || !time) return [];
+  const due = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(time[1]), Number(time[2]), 0);
+  if (Number.isNaN(due.getTime())) return [];
+  const renag = new Date(due.getTime() + FIRST_CALL_RENAG_MINUTES * 60000);
+  return [due, renag].filter((when) => when.getTime() > now.getTime());
+}
+
 function nextTime(hour: number, minute: number, now = new Date()): Date {
   const candidate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0);
   if (candidate.getTime() <= now.getTime()) candidate.setDate(candidate.getDate() + 1);
@@ -395,6 +419,29 @@ async function replaceSchedule(input: NotificationInput, generation: number, own
       ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
     },
   })) remaining -= 1;
+
+  // New leads' first calls before anything else that is timed: the
+  // speed-to-lead target is minutes, not days.
+  const firstTouched = new Set((input.cases || []).filter((record) => record.firstTouchAt).map((record) => record.id));
+  for (const followUp of followUps) {
+    if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;
+    for (const when of firstCallAlarmTimes(followUp, now, Boolean(followUp.caseId && firstTouched.has(followUp.caseId)))) {
+      if (remaining <= 0) break;
+      if (plan({
+        content: {
+          title: FIRST_CALL_ALARM_TITLE,
+          body: FIRST_CALL_ALARM_BODY,
+          data: { target: 'home', ownerId },
+          ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+        },
+        trigger: {
+          type: Notifications.SchedulableTriggerInputTypes.DATE,
+          date: when,
+          ...(Platform.OS === 'android' ? { channelId: 'referralfit' } : null),
+        },
+      })) remaining -= 1;
+    }
+  }
 
   for (const followUp of followUps) {
     if (remaining <= 0 || !isScheduleCurrent(generation, ownerId)) break;

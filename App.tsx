@@ -245,7 +245,10 @@ import {
 import {
   buildTodaySections,
   cardAssignee,
+  casesNeedingNextStep,
   defaultTodayScope,
+  leavesCaseWithoutNextStep,
+  openStepCount,
   filterTodaySections,
   type TodayScope,
   followUpToCard,
@@ -260,6 +263,16 @@ import {
   TodayCard,
   WhenChoice,
 } from './src/lib/today';
+import {
+  leadsToRetryQuietly,
+  mergePendingLeads,
+  parsePendingLeads,
+  pendingLeadInput,
+  pendingLeadLabel,
+  pendingLeadsKey,
+  serializePendingLeads,
+  type PendingLead,
+} from './src/lib/pending-leads';
 import {
   buildFitReasons,
   buildPacket,
@@ -321,7 +334,9 @@ type CreateRetry = {
   message: string;
   retryable: boolean;
 };
-type LeadRetry = CreateRetry & { draft: NewLeadDraft };
+// A lead's retry is also kept on this device (src/lib/pending-leads.ts), so
+// it survives the app being ended before it saves.
+type LeadRetry = PendingLead;
 type CaseRetry = CreateRetry & { form: CaseFormState };
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
 
@@ -385,7 +400,7 @@ const LIST_ROWS_SHOWN = 100;
 // Cards each Today section shows before "Show more": every card carries its
 // own call / text / done actions, and Today is the screen every launch opens.
 const TODAY_ROWS_SHOWN = 25;
-type TodayListSection = 'overdue' | 'today' | 'partnersDue';
+type TodayListSection = 'overdue' | 'needsNextStep' | 'today' | 'partnersDue';
 
 // Where the case list / open case file on screen came from. 'cache' is the
 // saved offline copy (read-only until the server is reached again);
@@ -558,6 +573,7 @@ function todayKindIcon(card: TodayCard): IconName {
     case 'check_in': return 'clipboard-outline';
     case 'referral_handshake': return 'paper-plane-outline';
     case 'cadence': return 'repeat';
+    case 'no_next_step': return 'alert-circle-outline';
     default: return 'return-up-back';
   }
 }
@@ -1179,7 +1195,7 @@ export default function App() {
   // a large practice's closed cases and referral history ran to thousands of
   // rows rendered at once, again on every keystroke anywhere in the app.
   const [closedCaseLimit, setClosedCaseLimit] = useState(LIST_ROWS_SHOWN);
-  const [todayRowLimits, setTodayRowLimits] = useState<Record<TodayListSection, number>>({ overdue: TODAY_ROWS_SHOWN, today: TODAY_ROWS_SHOWN, partnersDue: TODAY_ROWS_SHOWN });
+  const [todayRowLimits, setTodayRowLimits] = useState<Record<TodayListSection, number>>({ overdue: TODAY_ROWS_SHOWN, needsNextStep: TODAY_ROWS_SHOWN, today: TODAY_ROWS_SHOWN, partnersDue: TODAY_ROWS_SHOWN });
   const [caseSearch, setCaseSearch] = useState('');
   const [caseSearchResults, setCaseSearchResults] = useState<CaseSearchResult[] | null>(null);
   const [pendingCaseMatchId, setPendingCaseMatchId] = useState<string | null>(null);
@@ -1283,6 +1299,13 @@ export default function App() {
   const caseRetriesRef = useRef<CaseRetry[]>([]);
   leadRetriesRef.current = leadRetries;
   caseRetriesRef.current = caseRetries;
+  const leadSheetRetryRef = useRef<LeadRetry | null>(null);
+  leadSheetRetryRef.current = leadSheetRetry;
+  // The account whose unsaved leads have been read back from this device:
+  // until then nothing is written (an empty list on screen must never
+  // replace the stored ones before they are read).
+  const pendingLeadsLoadedForRef = useRef<string | null>(null);
+  const pendingLeadRetryRunningRef = useRef(false);
   const [leadSettings, setLeadSettings] = useState<LeadSettings>(DEFAULT_LEAD_SETTINGS);
   // Team basics: who is in the workspace (names on timeline rows, the
   // assignee pickers, "Take this lead") and the Today scope. A scope of null
@@ -1677,7 +1700,7 @@ export default function App() {
     catchUpTriesRef.current = 0;
     setClosedCaseLimit(LIST_ROWS_SHOWN);
     setReferralRowLimit(LIST_ROWS_SHOWN);
-    setTodayRowLimits({ overdue: TODAY_ROWS_SHOWN, today: TODAY_ROWS_SHOWN, partnersDue: TODAY_ROWS_SHOWN });
+    setTodayRowLimits({ overdue: TODAY_ROWS_SHOWN, needsNextStep: TODAY_ROWS_SHOWN, today: TODAY_ROWS_SHOWN, partnersDue: TODAY_ROWS_SHOWN });
     setActiveCaseId(null);
     setSelectedPartner(null);
     setTouchPartner(null);
@@ -1734,7 +1757,9 @@ export default function App() {
     setDocView(null);
     setShowNewLead(false);
     setShowNewCase(false);
-    // A draft kept for a retry belongs to the previous account.
+    // A draft kept for a retry belongs to the previous account. Its copy on
+    // the device stays under that account and comes back at its next sign-in.
+    pendingLeadsLoadedForRef.current = null;
     leadRetriesRef.current = [];
     caseRetriesRef.current = [];
     setLeadRetries([]);
@@ -2047,6 +2072,10 @@ export default function App() {
         await bindLocalWorkspace(userId, orgId);
         if (!active || generation !== authGenerationRef.current) return;
         activeOrgIdRef.current = orgId;
+        // Leads that did not save before the app was last ended: back on
+        // Today as unsaved, and retried quietly (same ids) once online.
+        await loadPendingLeads(userId);
+        if (!active || generation !== authGenerationRef.current) return;
         // The time this account picked for the day review reminder (or
         // "off"), before its schedule can be made: a save during the rest of
         // launch already schedules.
@@ -2834,6 +2863,25 @@ export default function App() {
   // of a linear find per row per render.
   const partnerById = useMemo(() => new Map(partners.map((item) => [item.id, item])), [partners]);
   const caseById = useMemo(() => new Map(cases.map((item) => [item.id, item])), [cases]);
+
+  // A new lead's first-call alarm (notifications.ts firstCallAlarmTimes)
+  // ends as soon as the lead is called or texted, which is a timeline write
+  // that does not rebuild the reminders by itself. Rebuild them whenever the
+  // set of first calls that should ring changes (the plan is compared before
+  // anything is applied, so an unchanged plan costs nothing).
+  const firstCallAlarmKey = useMemo(() => followUps
+    .filter((item) => item.status === 'open' && item.kind === 'first_call' && item.dueTime)
+    .map((item) => `${item.id}:${item.dueOn}:${item.dueTime}:${item.snoozedUntil || ''}:${item.caseId && caseById.get(item.caseId)?.firstTouchAt ? 'touched' : ''}`)
+    .sort()
+    .join('|'), [followUps, caseById]);
+  const firstCallAlarmKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = firstCallAlarmKeyRef.current;
+    firstCallAlarmKeyRef.current = firstCallAlarmKey;
+    if (previous === null || previous === firstCallAlarmKey || !activeUserId) return;
+    void rescheduleNotifications({ partners, referrals, referralMatches, followUps, cases }, activeUserId).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [firstCallAlarmKey]);
   // The contact each case card shows (CaseRow), found once per change rather
   // than by scanning every contact for every row.
   // What a handoff's alias must not contain: the case's title and its
@@ -4131,6 +4179,9 @@ export default function App() {
       if (confirmed.eventBody && activeCaseId === record.id) {
         applyCaseEvent({ id: eventId, caseId: record.id, kind: 'system', body: confirmed.eventBody, occurredAt: confirmed.occurredAt, actorId: activeUserId.toLowerCase() });
       }
+      // The answer completed the VOB's step: if that was the case's last
+      // open one, ask for the next.
+      if (nextFollowUps !== previousFollowUps) promptNextStepIfNone(record, nextFollowUps);
     });
   }
 
@@ -5209,7 +5260,9 @@ export default function App() {
     // A closed or lost case's steps leave Today because closing skips them
     // (skipFollowUpsOnCaseClose, as the server does), not by case status: a
     // step scheduled on the case after it closed still shows.
-    return buildTodaySections(followUps, partnersDueToday(partners, now, partnerSnoozes), now, followUpContext, leads);
+    // An open lead or case with no open step at all: listed until one is set.
+    const needsNextStep = casesNeedingNextStep(cases, followUps, now);
+    return buildTodaySections(followUps, partnersDueToday(partners, now, partnerSnoozes), now, followUpContext, leads, needsNextStep);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [followUps, partners, cases, allCaseContacts, referrals, partnerSnoozes, leadSettings.leadResponseTargetMinutes, todayStamp]);
 
@@ -5226,7 +5279,7 @@ export default function App() {
   );
 
   function cardAssigneeLabel(card: TodayCard): string {
-    if (!card.followUp) return '';
+    if (!card.followUp && card.kind !== 'no_next_step') return '';
     const assignee = cardAssignee(card, caseAssignee);
     if (!assignee) return 'Unassigned';
     return assignee === activeUserId.toLowerCase() ? 'Yours' : `Assigned to ${memberDisplayName(members, assignee)}`;
@@ -5370,10 +5423,16 @@ export default function App() {
     // from the sheet opened for that retry).
     const retrying = leadSheetRetry;
     const ids = retrying?.ids ?? { caseId: makeId('c'), contactId: makeId('cc'), followUpId: makeId('f') };
+    // Off the waiting list while this save runs; its copy on the device
+    // stays until the server has the lead (removePendingLeadCopy below).
+    if (retrying) leadRetriesRef.current = leadRetriesRef.current.filter((item) => item !== retrying);
     if (retrying) setLeadRetries((current) => current.filter((item) => item !== retrying));
     setLeadSheetRetry(null);
     const now = new Date();
     const nowIso = now.toISOString();
+    const capturedAt = retrying?.capturedAt ?? nowIso;
+    const leadUserId = activeUserIdRef.current;
+    const leadOrgId = activeOrgIdRef.current;
     const title = leadCaseTitle(draft);
     const record: CaseRecord = {
       id: ids.caseId,
@@ -5425,6 +5484,20 @@ export default function App() {
     setAllCaseContacts([contact, ...allCaseContacts]);
     setFollowUps(nextFollowUps);
     setShowNewLead(false);
+    // Written to the device before the save is sent: if iOS ends the app
+    // mid-save, the lead is still here at the next launch (and a retry with
+    // the same ids is a no-op if this save did land).
+    const pendingCopy: LeadRetry = {
+      draft,
+      ids,
+      retryable: true,
+      message: 'The lead has not reached the server yet. It is kept on this phone and sent again when you are back online.',
+      orgId: leadOrgId,
+      capturedAt,
+      dueOn,
+      dueTime,
+    };
+    void writePendingLeadCopy(leadUserId, pendingCopy);
     void settleOptimisticWrite(
       () => createLead({
         caseId: record.id,
@@ -5455,14 +5528,7 @@ export default function App() {
         // the reason, and the same ids, once it has finished closing.
         onRejected: (error) => {
           const retryable = isRetryable(error);
-          const retry: LeadRetry = {
-            draft,
-            ids,
-            retryable,
-            message: retryable
-              ? 'The lead did not reach the server (no connection). Nothing is lost: tap Retry when you have signal.'
-              : `The lead was not saved: ${describeError(error)}`,
-          };
+          const retry: LeadRetry = { ...pendingCopy, retryable, message: leadRetryMessage(retryable, error) };
           leadRetriesRef.current = [...leadRetriesRef.current, retry];
           setLeadRetries((current) => [...current, retry]);
           // A file opened on the unsaved case closes with it (else the
@@ -5472,8 +5538,144 @@ export default function App() {
           return true;
         },
       },
-    );
+    ).then((saved) => {
+      inFlightPendingLeadsRef.current.delete(ids.caseId);
+      // Saved: the server has it, so the device copy goes. Refused or not
+      // reached: it is in leadRetries now, and is written from there.
+      if (activeUserIdRef.current === leadUserId) void persistPendingLeads(leadUserId);
+      if (saved) setLeadRetries((current) => current.filter((item) => item.ids.caseId !== ids.caseId));
+    });
   }
+
+  function leadRetryMessage(retryable: boolean, error: unknown): string {
+    return retryable
+      ? 'The lead did not reach the server (no connection). It is kept on this phone and sent again when you are back online, or tap Retry.'
+      : `The lead was not saved: ${describeError(error)}`;
+  }
+
+  // ─── Unsaved leads kept on the device (src/lib/pending-leads.ts) ─────────
+  // A save on its way (written before it is sent, so an app ended mid-save
+  // keeps it) plus every lead waiting for its retry. One writer, in order.
+  const inFlightPendingLeadsRef = useRef(new Map<string, LeadRetry>());
+  const pendingLeadWriteChainRef = useRef<Promise<void>>(Promise.resolve());
+
+  function persistPendingLeads(userId: string): Promise<void> {
+    const run = async () => {
+      if (!userId || pendingLeadsLoadedForRef.current !== userId || activeUserIdRef.current !== userId) return;
+      const leads = mergePendingLeads(leadRetriesRef.current, Array.from(inFlightPendingLeadsRef.current.values()));
+      try {
+        if (leads.length) await AsyncStorage.setItem(pendingLeadsKey(userId), serializePendingLeads(leads));
+        else await AsyncStorage.removeItem(pendingLeadsKey(userId));
+      } catch {
+        // The lead is still on screen with its Retry; the next change writes again.
+      }
+    };
+    const next = pendingLeadWriteChainRef.current.catch(() => undefined).then(run);
+    pendingLeadWriteChainRef.current = next;
+    return next;
+  }
+
+  function writePendingLeadCopy(userId: string, lead: LeadRetry): Promise<void> {
+    inFlightPendingLeadsRef.current.set(lead.ids.caseId, lead);
+    return persistPendingLeads(userId);
+  }
+
+  async function loadPendingLeads(userId: string): Promise<void> {
+    inFlightPendingLeadsRef.current.clear();
+    let stored: LeadRetry[] = [];
+    try {
+      stored = parsePendingLeads(await AsyncStorage.getItem(pendingLeadsKey(userId)));
+    } catch {
+      stored = [];
+    }
+    if (activeUserIdRef.current !== userId) return;
+    pendingLeadsLoadedForRef.current = userId;
+    if (!stored.length) return;
+    const merged = mergePendingLeads(leadRetriesRef.current, stored);
+    leadRetriesRef.current = merged;
+    setLeadRetries(merged);
+  }
+
+  // Every change to the waiting list is written to the device.
+  useEffect(() => {
+    if (!activeUserId || pendingLeadsLoadedForRef.current !== activeUserId) return;
+    void persistPendingLeads(activeUserId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leadRetries, activeUserId]);
+
+  // Send the waiting leads again, without asking, with the SAME ids
+  // (create_lead: a repeat of a lead that landed is a no-op success, so this
+  // never makes a second lead). Only leads that failed for want of a
+  // connection, never the one open in the sheet, and never while another
+  // save holds the slot. Stops at the first one that still cannot get
+  // through. A refusal stays on Today with its reason for the person to fix.
+  async function retryPendingLeadsQuietly(): Promise<void> {
+    const userId = activeUserIdRef.current;
+    const generation = authGenerationRef.current;
+    if (!userId || pendingLeadRetryRunningRef.current || pendingLeadsLoadedForRef.current !== userId) return;
+    const stillCurrent = () => activeUserIdRef.current === userId && authGenerationRef.current === generation;
+    const waiting = leadsToRetryQuietly(leadRetriesRef.current, activeOrgIdRef.current, leadSheetRetryRef.current);
+    if (!waiting.length || mutationActiveRef.current) return;
+    pendingLeadRetryRunningRef.current = true;
+    let savedAny = false;
+    try {
+      for (const lead of waiting) {
+        if (!stillCurrent() || mutationActiveRef.current) break;
+        if (!leadRetriesRef.current.includes(lead) || leadSheetRetryRef.current === lead) continue;
+        const token = Symbol('The lead');
+        mutationActiveRef.current = token;
+        try {
+          await createLead(pendingLeadInput(lead, localDateStamp()), userId);
+          if (!stillCurrent()) break;
+          savedAny = true;
+          leadRetriesRef.current = leadRetriesRef.current.filter((item) => item.ids.caseId !== lead.ids.caseId);
+          setLeadRetries((current) => current.filter((item) => item.ids.caseId !== lead.ids.caseId));
+        } catch (error) {
+          if (!stillCurrent()) break;
+          if (isRetryable(error)) break; // still offline: try again later
+          const refused: LeadRetry = { ...lead, retryable: false, message: leadRetryMessage(false, error) };
+          leadRetriesRef.current = leadRetriesRef.current.map((item) => (item === lead ? refused : item));
+          setLeadRetries((current) => current.map((item) => (item.ids.caseId === lead.ids.caseId ? refused : item)));
+        } finally {
+          if (mutationActiveRef.current === token) mutationActiveRef.current = null;
+        }
+      }
+    } finally {
+      pendingLeadRetryRunningRef.current = false;
+    }
+    // The saved leads (and their first calls) come from the server now.
+    if (savedAny && stillCurrent()) {
+      lastServerRefreshAtRef.current = 0;
+      void refreshFromServer('foreground').catch(() => undefined);
+    }
+  }
+
+  // When to try: back in the foreground, when the connection comes back
+  // (the offline badge clears), and every 30 seconds while a lead waits and
+  // the app is open (there is no network-change event without a new native
+  // module, and a cheap retry that fails fast is the same thing).
+  useEffect(() => {
+    if (!activeUserId) return undefined;
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') void retryPendingLeadsQuietly();
+    });
+    return () => subscription.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeUserId]);
+  useEffect(() => {
+    if (!offline) void retryPendingLeadsQuietly();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [offline]);
+  const quietRetryCount = leadRetries.filter((item) => item.retryable).length;
+  useEffect(() => {
+    if (!activeUserId || !quietRetryCount) return undefined;
+    void retryPendingLeadsQuietly();
+    const timer = setInterval(() => {
+      if (AppState.currentState === 'active') void retryPendingLeadsQuietly();
+    }, 30000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeUserId, quietRetryCount]);
 
   // A lead still waiting for its retry (the oldest) opens with its draft,
   // not blank.
@@ -5691,6 +5893,24 @@ export default function App() {
     completePlainFollowUp(followUp);
   }
 
+  // A step completed on a path other than the Done sheet (a VOB answered, an
+  // outcome recorded) that left an open case with no open step: ask for the
+  // next one once the screen is clear. "Later" leaves it under NEEDS A NEXT
+  // STEP on Today until one is set.
+  function promptNextStepIfNone(record: CaseRecord, list: FollowUp[]) {
+    if (!isOpenCase(record) || openStepCount(list, record.id) > 0) return;
+    afterSheetCloses(() => {
+      Alert.alert(
+        'Set the next step',
+        `${record.title} has no open step now. Set what comes next so it stays on Today, or close the case.`,
+        [
+          { text: 'Later', style: 'cancel' },
+          { text: 'Set next step', onPress: () => openNextStepForCase(record) },
+        ],
+      );
+    }, { ifScreenBusy: 'wait' });
+  }
+
   // Case-linked close-the-loop: complete the item and set the case status
   // (status 'keep' = leave it where it is).
   function closeLoopWithStatus(status: CaseStatus | 'keep') {
@@ -5701,6 +5921,12 @@ export default function App() {
     const record = cases.find((item) => item.id === followUp.caseId);
     if (!record) {
       Alert.alert('Case file', 'The linked case could not be found. Refresh before closing this step.');
+      return;
+    }
+    // An open case always keeps an open step: its last one is completed only
+    // with a next step (Next step…) or by closing the case (closed / lost).
+    if (leavesCaseWithoutNextStep(followUps, followUp.id, record.id, status === 'keep' ? record.status : status)) {
+      Alert.alert('Set the next step', 'This is the last open step on this case. Set what comes next, or close the case as closed or lost, so it does not drop off Today.');
       return;
     }
     const now = new Date().toISOString();
@@ -5810,6 +6036,13 @@ export default function App() {
   function openCaseNextStep(record: CaseRecord) {
     setStepForm({ kind: 'follow_up', when: 'tomorrow', customDate: '', time: '', timePeriod: 'AM', waitingOn: '', note: '' });
     setCaseNextStepCaseId(record.id);
+  }
+
+  // From Today (NEEDS A NEXT STEP) or a prompt: the next-step editor lives
+  // inside the case file, so open the file first (same render batch).
+  function openNextStepForCase(record: CaseRecord) {
+    if (activeCaseIdRef.current !== record.id) openCase(record.id);
+    openCaseNextStep(record);
   }
 
   function saveCaseNextStep(record: CaseRecord) {
@@ -6146,6 +6379,10 @@ export default function App() {
       // Pull the server-created check-ins onto Today (no-op when offline:
       // they arrive with the next successful refresh after the queue flushes).
       if (saved && admission) void refreshFromServer('pull');
+      // No admission: no check-ins follow, so this may have been the case's
+      // last open step.
+      const outcomeCase = saved && !admission && completed.caseId ? cases.find((item) => item.id === completed.caseId) : undefined;
+      if (outcomeCase) promptNextStepIfNone(outcomeCase, nextFollowUps);
     });
   }
 
@@ -6837,6 +7074,33 @@ export default function App() {
   // Compact action row for the Today list. Primary row: Call / Text / Done;
   // the ⋯ overflow opens one sheet with Snooze + Set Next Step — all five
   // actions reachable in one tap + one sheet.
+  // A case with no open step: open it, call, or set the next step at once.
+  function NoNextStepRow({ card }: { card: TodayCard }) {
+    const record = card.caseId ? caseById.get(card.caseId) : undefined;
+    return (
+      <View style={[styles.todayRow, styles.todayRowOverdue]}>
+        <View style={[styles.todayKindIcon, styles.todayKindIconOverdue]}>
+          <AppIcon name={todayKindIcon(card)} size={16} color={COLORS.coral} />
+        </View>
+        <View style={styles.todayRowBody}>
+          <TouchableOpacity activeOpacity={0.7} onPress={() => { if (card.caseId) openCaseById(card.caseId); }}>
+            <Text numberOfLines={2} style={styles.todayRowTitle}>{card.title}</Text>
+            {card.subtitle ? <Text numberOfLines={1} style={styles.todayRowMeta}>{card.subtitle}</Text> : null}
+            {teamWorkspace && cardAssigneeLabel(card) ? <Text style={styles.todayRowMeta}>{cardAssigneeLabel(card)}</Text> : null}
+          </TouchableOpacity>
+          <View style={styles.todayActionRow}>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Call — ${card.title}`} onPress={() => cardContactAction(card, 'call')} style={styles.todayIconButton}>
+              <AppIcon name="call" size={15} color={COLORS.forest} />
+            </TouchableOpacity>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Set the next step — ${card.title}`} onPress={() => { if (record) openNextStepForCase(record); }} style={styles.todayDoneButton}>
+              <Text style={styles.todayDoneButtonText}>Set next step</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    );
+  }
+
   function TodayCardRow({ card, overdue }: { card: TodayCard; overdue?: boolean }) {
     const openLinked = () => {
       if (card.caseId) openCaseById(card.caseId);
@@ -6960,6 +7224,33 @@ export default function App() {
             </View>
           ) : null}
 
+          {leadRetries.length ? (
+            <View style={styles.todaySection}>
+              <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderOverdue]}>⏳ LEADS NOT SAVED YET</Text>
+              {leadRetries.map((lead) => (
+                <View key={lead.ids.caseId} style={[styles.todayRow, styles.todayRowOverdue]}>
+                  <View style={[styles.todayKindIcon, styles.todayKindIconOverdue]}>
+                    <AppIcon name="cloud-offline-outline" size={16} color={COLORS.coral} />
+                  </View>
+                  <View style={styles.todayRowBody}>
+                    <Text numberOfLines={2} style={styles.todayRowTitle}>{pendingLeadLabel(lead)}</Text>
+                    <Text style={styles.todayRowMeta}>{lead.message}</Text>
+                    <View style={styles.todayActionRow}>
+                      <TouchableOpacity
+                        accessibilityRole="button"
+                        accessibilityLabel={`Open the unsaved lead — ${pendingLeadLabel(lead)}`}
+                        onPress={() => { setLeadSheetRetry(lead); setShowNewLead(true); }}
+                        style={styles.todayDoneButton}
+                      >
+                        <Text style={styles.todayDoneButtonText}>{lead.retryable ? 'Retry now' : 'Fix and save'}</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                </View>
+              ))}
+            </View>
+          ) : null}
+
           {todaySections.newLeads.length ? (
             <View style={styles.todaySection}>
               <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderLead]}>⚡ NEW LEADS</Text>
@@ -6972,6 +7263,15 @@ export default function App() {
               <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderOverdue]}>🔴 OVERDUE</Text>
               {todaySections.overdue.slice(0, todayRowLimits.overdue).map((card) => <React.Fragment key={card.id}>{TodayCardRow({ card, overdue: true })}</React.Fragment>)}
               {TodayShowMore('overdue', todaySections.overdue.length)}
+            </View>
+          ) : null}
+
+          {todaySections.needsNextStep.length ? (
+            <View style={styles.todaySection}>
+              <Text style={[styles.todaySectionHeader, styles.todaySectionHeaderOverdue]}>🧭 NEEDS A NEXT STEP</Text>
+              <Text style={styles.todayRowMeta}>Open, with nothing scheduled. Set what comes next, or close the case.</Text>
+              {todaySections.needsNextStep.slice(0, todayRowLimits.needsNextStep).map((card) => <React.Fragment key={card.id}>{NoNextStepRow({ card })}</React.Fragment>)}
+              {TodayShowMore('needsNextStep', todaySections.needsNextStep.length)}
             </View>
           ) : null}
 
@@ -7050,9 +7350,9 @@ export default function App() {
             </View>
           ) : null}
 
-          {todayCounts.actions === 0 ? (
+          {todayCounts.actions === 0 && !todaySections.needsNextStep.length && !leadRetries.length ? (
             <EmptyState icon="checkmark-circle-outline" title="List is clear" body="No actions due and no partners past cadence. Log a touch, or capture the next thing with + below." />
-          ) : teamWorkspace && todayScope === 'mine' && !todaySections.newLeads.length && !todaySections.overdue.length && !todaySections.today.length && !todaySections.partnersDue.length ? (
+          ) : teamWorkspace && todayScope === 'mine' && !todaySections.newLeads.length && !todaySections.overdue.length && !todaySections.needsNextStep.length && !todaySections.today.length && !todaySections.partnersDue.length ? (
             <EmptyState icon="checkmark-circle-outline" title="Nothing of yours is due" body="Everything due today belongs to a teammate. Switch to Everyone to see the whole practice." />
           ) : null}
 
@@ -9950,6 +10250,9 @@ export default function App() {
     const referralAwaiting = Boolean(doneCard.referralId && doneCard.context.referralAwaitingAnswer);
     const linkedCase = doneCard.caseId ? cases.find((item) => item.id === doneCard.caseId) : undefined;
     const showingDoneNextStep = nextStepCard?.id === doneCard.id;
+    // The case's last open step: only a next step or a close completes it.
+    const lastOpenStep = Boolean(linkedCase && doneCard.followUp && openStepCount(followUps, linkedCase.id, doneCard.followUp.id) === 0);
+    const pickerStatuses = lastOpenStep ? CASE_STATUSES.filter((status) => status === 'closed' || status === 'lost') : CASE_STATUSES;
     return (
       <Modal visible transparent animationType="fade" onRequestClose={close}>
         {/* Next step's note and time fields sit low in the sheet: keep them,
@@ -9978,15 +10281,28 @@ export default function App() {
               ) : doneStatusPicker && linkedCase ? (
                 <>
                 <Text style={styles.prePromptTitle}>Close the loop — {linkedCase.title}</Text>
-                <Text style={styles.prePromptText}>Complete this item{doneCard.title ? ` (“${doneCard.title}”)` : ''} and set the case status. The change lands on the case timeline.</Text>
+                <Text style={styles.prePromptText}>
+                  {lastOpenStep
+                    ? `This is the last open step on this case. Set what comes next, or close the case. An open case with nothing scheduled would drop off Today.`
+                    : `Complete this item${doneCard.title ? ` (“${doneCard.title}”)` : ''} and set the case status. The change lands on the case timeline.`}
+                </Text>
+                {lastOpenStep ? (
+                  <TouchableOpacity accessibilityRole="button" disabled={caseCloseLoopSaving} style={[styles.primaryButton, caseCloseLoopSaving && { opacity: 0.55 }]} onPress={() => { setDoneStatusPicker(false); openDoneNextStepFlow(doneCard); }}>
+                    <Text style={styles.primaryButtonText}>Set the next step</Text>
+                  </TouchableOpacity>
+                ) : null}
+                {lastOpenStep ? <Text style={[styles.prePromptText, { marginTop: 8 }]}>Or close the case:</Text> : null}
                 <View style={[styles.cadenceRow, caseCloseLoopSaving && { opacity: 0.55 }]}>
-                  {CASE_STATUSES.map((status) => (
+                  {pickerStatuses.map((status) => (
                     <Pill key={status} label={status} active={status === linkedCase.status} disabled={caseCloseLoopSaving} onPress={() => closeLoopWithStatus(status)} />
                   ))}
                 </View>
+                {lastOpenStep && caseCloseLoopSaving ? <Text accessibilityLiveRegion="polite" style={[styles.prePromptText, { textAlign: 'center', marginTop: 8 }]}>Saving…</Text> : null}
+                {lastOpenStep ? null : (
                 <TouchableOpacity accessibilityRole="button" accessibilityState={{ disabled: caseCloseLoopSaving, busy: caseCloseLoopSaving }} disabled={caseCloseLoopSaving} style={[styles.modalHeaderAction, caseCloseLoopSaving && { opacity: 0.55 }]} onPress={() => closeLoopWithStatus('keep')}>
                   <Text style={styles.saveText}>{caseCloseLoopSaving ? 'Saving…' : `Just complete — keep “${linkedCase.status}”`}</Text>
                 </TouchableOpacity>
+                )}
                 {caseCloseLoopSaving ? <Text accessibilityLiveRegion="polite" style={[styles.prePromptText, { textAlign: 'center', marginTop: 8 }]}>Saving the follow-up and case status…</Text> : null}
                 </>
               ) : (
